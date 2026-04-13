@@ -1,6 +1,5 @@
 /**
  * Layer 4: toA2x helper - quickly converts an LlmAgent to an A2A server.
- * Full listen() implementation deferred to Phase 2.
  */
 
 import type { LlmAgent } from '../agent/llm-agent.js';
@@ -12,6 +11,7 @@ import { AgentExecutor, StreamingMode } from '../a2x/agent-executor.js';
 import { InMemoryTaskStore } from '../a2x/task-store.js';
 import { A2XAgent } from '../a2x/a2x-agent.js';
 import { DefaultRequestHandler } from './request-handler.js';
+import { createSSEStream } from './sse-handler.js';
 
 export interface ToA2xOptions {
   port?: number;
@@ -79,7 +79,6 @@ export function toA2x(
     async listen(port?: number): Promise<void> {
       const listenPort = port ?? options.port ?? 3000;
 
-      // Use Node.js built-in http module
       const { createServer } = await import('node:http');
 
       const server = createServer(async (req, res) => {
@@ -95,14 +94,16 @@ export function toA2x(
         }
 
         // GET /.well-known/agent.json
+        const parsedUrl = new URL(
+          req.url!,
+          `http://localhost:${listenPort}`,
+        );
         if (
           req.method === 'GET' &&
-          req.url === '/.well-known/agent.json'
+          parsedUrl.pathname === '/.well-known/agent.json'
         ) {
-          const version = new URL(
-            req.url,
-            `http://localhost:${listenPort}`,
-          ).searchParams.get('version') ?? undefined;
+          const version =
+            parsedUrl.searchParams.get('version') ?? undefined;
 
           try {
             const card = handler.getAgentCard(version);
@@ -128,19 +129,26 @@ export function toA2x(
 
           try {
             const parsed = JSON.parse(body);
+            const result = await handler.handle(parsed);
 
-            // Check if this is a streaming request
-            if (parsed.method === 'message/stream') {
+            // Streaming → AsyncGenerator → SSE
+            if (
+              result &&
+              typeof result === 'object' &&
+              Symbol.asyncIterator in result
+            ) {
               res.writeHead(200, {
                 'Content-Type': 'text/event-stream',
                 'Cache-Control': 'no-cache',
                 Connection: 'keep-alive',
               });
 
-              try {
-                const stream = handler.handleStream(parsed);
-                const reader = stream.getReader();
+              const stream = createSSEStream(
+                result as AsyncGenerator<never>,
+              );
+              const reader = stream.getReader();
 
+              try {
                 while (true) {
                   const { done, value } = await reader.read();
                   if (done) break;
@@ -163,10 +171,9 @@ export function toA2x(
               return;
             }
 
-            // Standard JSON-RPC
-            const response = await handler.handle(parsed);
+            // Standard JSON-RPC response
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify(response));
+            res.end(JSON.stringify(result));
           } catch {
             res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(

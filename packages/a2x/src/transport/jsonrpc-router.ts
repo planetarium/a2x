@@ -3,7 +3,6 @@
  */
 
 import type { JSONRPCRequest, JSONRPCResponse } from '../types/jsonrpc.js';
-import { A2A_METHODS } from '../types/jsonrpc.js';
 import {
   MethodNotFoundError,
   type A2AError,
@@ -17,7 +16,7 @@ export type MethodHandler = (
 export type StreamMethodHandler = (
   params: unknown,
   request: JSONRPCRequest,
-) => ReadableStream;
+) => AsyncGenerator<unknown>;
 
 export class JsonRpcRouter {
   private readonly handlers = new Map<string, MethodHandler>();
@@ -80,9 +79,9 @@ export class JsonRpcRouter {
   }
 
   /**
-   * Route a streaming JSON-RPC request.
+   * Route a streaming JSON-RPC request, returning an AsyncGenerator.
    */
-  routeStream(request: JSONRPCRequest): ReadableStream {
+  routeStream(request: JSONRPCRequest): AsyncGenerator<unknown> {
     const handler = this.streamHandlers.get(request.method);
     if (!handler) {
       throw new MethodNotFoundError(

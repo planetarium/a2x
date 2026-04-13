@@ -3,6 +3,7 @@
  */
 
 export { DefaultRequestHandler } from './request-handler.js';
+export type { HandleResult } from './request-handler.js';
 export { JsonRpcRouter } from './jsonrpc-router.js';
 export type { MethodHandler, StreamMethodHandler } from './jsonrpc-router.js';
 export { createSSEStream } from './sse-handler.js';

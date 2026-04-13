@@ -6,7 +6,7 @@ import { InMemoryTaskStore } from '../a2x/task-store.js';
 import { InMemoryRunner } from '../runner/in-memory-runner.js';
 import { LlmAgent } from '../agent/llm-agent.js';
 import { A2A_ERROR_CODES } from '../types/errors.js';
-import type { JSONRPCRequest, JSONRPCResponse, JSONRPCErrorResponse } from '../types/jsonrpc.js';
+import type { JSONRPCResponse, JSONRPCErrorResponse } from '../types/jsonrpc.js';
 
 // Ensure mappers are registered
 import '../a2x/index.js';
@@ -31,16 +31,26 @@ function createHandler(): DefaultRequestHandler {
   return new DefaultRequestHandler(a2xAgent);
 }
 
+function isAsyncGenerator(value: unknown): value is AsyncGenerator {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    Symbol.asyncIterator in (value as object)
+  );
+}
+
 describe('Layer 4: DefaultRequestHandler', () => {
   describe('JSON-RPC error handling', () => {
     it('should return parse error for invalid JSON string', async () => {
       const handler = createHandler();
       const response = await handler.handle('not json');
 
-      expect(response.jsonrpc).toBe('2.0');
-      expect(response.id).toBeNull();
-      expect('error' in response).toBe(true);
-      expect((response as JSONRPCErrorResponse).error.code).toBe(
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect(rpc.jsonrpc).toBe('2.0');
+      expect(rpc.id).toBeNull();
+      expect('error' in rpc).toBe(true);
+      expect((rpc as JSONRPCErrorResponse).error.code).toBe(
         A2A_ERROR_CODES.JSON_PARSE_ERROR,
       );
     });
@@ -53,8 +63,10 @@ describe('Layer 4: DefaultRequestHandler', () => {
         method: 'test',
       });
 
-      expect('error' in response).toBe(true);
-      expect((response as JSONRPCErrorResponse).error.code).toBe(
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('error' in rpc).toBe(true);
+      expect((rpc as JSONRPCErrorResponse).error.code).toBe(
         A2A_ERROR_CODES.INVALID_REQUEST,
       );
     });
@@ -67,8 +79,10 @@ describe('Layer 4: DefaultRequestHandler', () => {
         method: 'unknown/method',
       });
 
-      expect('error' in response).toBe(true);
-      expect((response as JSONRPCErrorResponse).error.code).toBe(
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('error' in rpc).toBe(true);
+      expect((rpc as JSONRPCErrorResponse).error.code).toBe(
         A2A_ERROR_CODES.METHOD_NOT_FOUND,
       );
     });
@@ -90,8 +104,10 @@ describe('Layer 4: DefaultRequestHandler', () => {
         },
       });
 
-      expect('result' in response).toBe(true);
-      const task = (response as { result: unknown }).result as { id: string; status: { state: string } };
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('result' in rpc).toBe(true);
+      const task = (rpc as { result: unknown }).result as { id: string; status: { state: string } };
       expect(task.id).toBeDefined();
       expect(task.status.state).toBe('completed');
     });
@@ -105,8 +121,10 @@ describe('Layer 4: DefaultRequestHandler', () => {
         params: {},
       });
 
-      expect('error' in response).toBe(true);
-      expect((response as JSONRPCErrorResponse).error.code).toBe(
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('error' in rpc).toBe(true);
+      expect((rpc as JSONRPCErrorResponse).error.code).toBe(
         A2A_ERROR_CODES.INVALID_PARAMS,
       );
     });
@@ -122,8 +140,10 @@ describe('Layer 4: DefaultRequestHandler', () => {
         params: { id: 'non-existent' },
       });
 
-      expect('error' in response).toBe(true);
-      expect((response as JSONRPCErrorResponse).error.code).toBe(
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('error' in rpc).toBe(true);
+      expect((rpc as JSONRPCErrorResponse).error.code).toBe(
         A2A_ERROR_CODES.TASK_NOT_FOUND,
       );
     });
@@ -145,7 +165,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
         },
       });
 
-      const task = (sendResponse as { result: unknown }).result as { id: string };
+      const task = ((sendResponse as JSONRPCResponse) as { result: unknown }).result as { id: string };
 
       // Get the task
       const getResponse = await handler.handle({
@@ -155,8 +175,10 @@ describe('Layer 4: DefaultRequestHandler', () => {
         params: { id: task.id },
       });
 
-      expect('result' in getResponse).toBe(true);
-      const retrieved = (getResponse as { result: unknown }).result as { id: string };
+      expect(isAsyncGenerator(getResponse)).toBe(false);
+      const rpc = getResponse as JSONRPCResponse;
+      expect('result' in rpc).toBe(true);
+      const retrieved = (rpc as { result: unknown }).result as { id: string };
       expect(retrieved.id).toBe(task.id);
     });
   });
@@ -171,17 +193,19 @@ describe('Layer 4: DefaultRequestHandler', () => {
         params: { id: 'non-existent' },
       });
 
-      expect('error' in response).toBe(true);
-      expect((response as JSONRPCErrorResponse).error.code).toBe(
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('error' in rpc).toBe(true);
+      expect((rpc as JSONRPCErrorResponse).error.code).toBe(
         A2A_ERROR_CODES.TASK_NOT_FOUND,
       );
     });
   });
 
   describe('message/stream', () => {
-    it('should return unsupported operation when called via handle()', async () => {
+    it('should return an AsyncGenerator via handle()', async () => {
       const handler = createHandler();
-      const response = await handler.handle({
+      const result = await handler.handle({
         jsonrpc: '2.0',
         id: 1,
         method: 'message/stream',
@@ -194,46 +218,29 @@ describe('Layer 4: DefaultRequestHandler', () => {
         },
       });
 
-      expect('error' in response).toBe(true);
-      expect((response as JSONRPCErrorResponse).error.code).toBe(
-        A2A_ERROR_CODES.UNSUPPORTED_OPERATION,
-      );
-    });
+      expect(isAsyncGenerator(result)).toBe(true);
 
-    it('should return a ReadableStream via handleStream()', async () => {
-      const handler = createHandler();
-      const stream = handler.handleStream({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'message/stream',
-        params: {
-          message: {
-            messageId: 'msg-1',
-            role: 'user',
-            parts: [{ text: 'Hello' }],
-          },
-        },
-      });
+      // Consume the async generator and collect events
+      const generator = result as AsyncGenerator<{ status?: { state: string } }>;
+      const events: unknown[] = [];
 
-      expect(stream).toBeInstanceOf(ReadableStream);
-
-      // Read all events from the stream
-      const reader = stream.getReader();
-      const decoder = new TextDecoder();
-      const events: string[] = [];
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        events.push(decoder.decode(value));
+      for await (const event of generator) {
+        events.push(event);
       }
 
-      // Should have received at least some SSE events
+      // Should have received events (status_update + artifact_updates + final status)
       expect(events.length).toBeGreaterThan(0);
-      // Should contain event/data format
-      const allText = events.join('');
-      expect(allText).toContain('event:');
-      expect(allText).toContain('data:');
+
+      // First event should be a working status update
+      const first = events[0] as { status?: { state: string } };
+      expect(first.status?.state).toBe('working');
+
+      // Last status event should be completed
+      const statusEvents = events.filter(
+        (e) => (e as { status?: unknown }).status !== undefined,
+      );
+      const lastStatus = statusEvents[statusEvents.length - 1] as { status: { state: string } };
+      expect(lastStatus.status.state).toBe('completed');
     });
   });
 

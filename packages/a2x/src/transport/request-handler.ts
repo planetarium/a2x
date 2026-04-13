@@ -1,5 +1,10 @@
 /**
  * Layer 4: DefaultRequestHandler - framework-agnostic JSON-RPC handler.
+ *
+ * Unified `handle()` entry point: returns a `JSONRPCResponse` for sync
+ * methods or an `AsyncGenerator` for streaming methods.  The caller
+ * (Next.js route, Express middleware, etc.) checks `Symbol.asyncIterator`
+ * on the result to decide between a JSON response and an SSE stream.
  */
 
 import type { A2XAgent } from '../a2x/a2x-agent.js';
@@ -12,6 +17,10 @@ import type {
 import { A2A_METHODS } from '../types/jsonrpc.js';
 import type { AgentCardV03, AgentCardV10 } from '../types/agent-card.js';
 import type { Task } from '../types/task.js';
+import type {
+  TaskStatusUpdateEvent,
+  TaskArtifactUpdateEvent,
+} from '../types/task.js';
 import { TERMINAL_STATES, TaskState } from '../types/task.js';
 import {
   InternalError,
@@ -25,7 +34,11 @@ import {
 } from '../types/errors.js';
 import { StreamingMode } from '../a2x/agent-executor.js';
 import { JsonRpcRouter } from './jsonrpc-router.js';
-import { createSSEStream } from './sse-handler.js';
+
+/** Return type of `handle()`. */
+export type HandleResult =
+  | JSONRPCResponse
+  | AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent>;
 
 export class DefaultRequestHandler {
   private readonly a2xAgent: A2XAgent;
@@ -38,9 +51,25 @@ export class DefaultRequestHandler {
   }
 
   /**
-   * Handle a JSON-RPC request body (already parsed or as a string).
+   * Handle a JSON-RPC request body.
+   *
+   * Returns a `JSONRPCResponse` for synchronous methods (`message/send`,
+   * `tasks/get`, `tasks/cancel`) or an `AsyncGenerator` for streaming
+   * methods (`message/stream`).
+   *
+   * The caller inspects the return value:
+   * ```ts
+   * const result = await handler.handle(body);
+   * if (result && typeof result === 'object' && Symbol.asyncIterator in result) {
+   *   // stream → convert to SSE Response
+   * } else {
+   *   // sync → return as JSON
+   * }
+   * ```
    */
-  async handle(body: JSONRPCRequest | string): Promise<JSONRPCResponse> {
+  async handle(
+    body: JSONRPCRequest | string | unknown,
+  ): Promise<HandleResult> {
     let request: JSONRPCRequest;
 
     // Parse if string
@@ -56,7 +85,7 @@ export class DefaultRequestHandler {
         };
       }
     } else {
-      request = body;
+      request = body as JSONRPCRequest;
     }
 
     // Validate basic JSON-RPC structure
@@ -74,67 +103,23 @@ export class DefaultRequestHandler {
       };
     }
 
-    // Check if this is a streaming method
+    // Streaming method → return AsyncGenerator
     if (this.router.isStreamMethod(request.method)) {
-      // For streaming methods called via handle(), return an error
-      // suggesting they use handleStream() instead
-      const error = new UnsupportedOperationError(
-        `Method '${request.method}' requires streaming. Use handleStream() instead.`,
-      );
-      return {
-        jsonrpc: '2.0',
-        id: request.id,
-        error: error.toJSONRPCError(),
-      };
+      try {
+        return this.router.routeStream(request) as AsyncGenerator<
+          TaskStatusUpdateEvent | TaskArtifactUpdateEvent
+        >;
+      } catch (err) {
+        return this._toErrorResponse(request.id, err);
+      }
     }
 
+    // Synchronous method → return JSONRPCResponse
     try {
       return await this.router.route(request);
     } catch (err) {
-      if (err && typeof err === 'object' && 'toJSONRPCError' in err) {
-        return {
-          jsonrpc: '2.0',
-          id: request.id,
-          error: (err as A2AError).toJSONRPCError(),
-        };
-      }
-      const internalError = new InternalError(
-        err instanceof Error ? err.message : 'Internal error',
-      );
-      return {
-        jsonrpc: '2.0',
-        id: request.id,
-        error: internalError.toJSONRPCError(),
-      };
+      return this._toErrorResponse(request.id, err);
     }
-  }
-
-  /**
-   * Handle a streaming JSON-RPC request, returning a ReadableStream of SSE events.
-   */
-  handleStream(body: JSONRPCRequest | string): ReadableStream {
-    let request: JSONRPCRequest;
-
-    if (typeof body === 'string') {
-      try {
-        request = JSON.parse(body) as JSONRPCRequest;
-      } catch {
-        throw new JSONParseError();
-      }
-    } else {
-      request = body;
-    }
-
-    if (
-      !request ||
-      request.jsonrpc !== '2.0' ||
-      !request.method ||
-      request.id === undefined
-    ) {
-      throw new InvalidRequestError('Invalid JSON-RPC 2.0 request');
-    }
-
-    return this.router.routeStream(request);
   }
 
   /**
@@ -187,15 +172,11 @@ export class DefaultRequestHandler {
   // ─── Private: Method Handlers ───
 
   private async _handleSendMessage(params: SendMessageParams): Promise<Task> {
-    // Create a task
     const task = await this.a2xAgent.taskStore.createTask({
       contextId: params.message.contextId,
       metadata: params.metadata,
     });
 
-    // Execute synchronously.
-    // The execute() method mutates the task object directly (same reference
-    // stored in TaskStore), so we do not need a separate updateTask() call.
     const completedTask = await this.a2xAgent.agentExecutor.execute(
       task,
       params.message,
@@ -204,8 +185,9 @@ export class DefaultRequestHandler {
     return completedTask;
   }
 
-  private _handleStreamMessage(params: SendMessageParams): ReadableStream {
-    // Check if streaming is supported
+  private async *_handleStreamMessage(
+    params: SendMessageParams,
+  ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
     if (
       this.a2xAgent.agentExecutor.runConfig.streamingMode ===
       StreamingMode.NONE
@@ -215,35 +197,30 @@ export class DefaultRequestHandler {
       );
     }
 
-    // We need to create the task synchronously and then stream
-    // Use an async IIFE wrapped in the SSE stream
-    const a2xAgent = this.a2xAgent;
-
-    const taskPromise = a2xAgent.taskStore.createTask({
+    const task = await this.a2xAgent.taskStore.createTask({
       contextId: params.message.contextId,
       metadata: params.metadata,
     });
 
-    // Create an async generator that first creates the task, then streams events
-    async function* streamEvents() {
-      const task = await taskPromise;
-      const eventStream = a2xAgent.agentExecutor.executeStream(
-        task,
-        params.message,
-      );
+    const eventStream = this.a2xAgent.agentExecutor.executeStream(
+      task,
+      params.message,
+    );
 
-      for await (const event of eventStream) {
-        // Update task in store for status events
-        if ('status' in event) {
-          await a2xAgent.taskStore.updateTask(task.id, {
-            status: event.status,
-          });
-        }
-        yield event;
+    for await (const event of eventStream) {
+      // Update task in store for non-terminal status events.
+      // Terminal states are already applied by AgentExecutor (same object
+      // reference), so calling updateTask would hit the guard.
+      if (
+        'status' in event &&
+        !TERMINAL_STATES.has(event.status.state)
+      ) {
+        await this.a2xAgent.taskStore.updateTask(task.id, {
+          status: event.status,
+        });
       }
+      yield event;
     }
-
-    return createSSEStream(streamEvents());
   }
 
   private async _handleGetTask(params: TaskIdParams): Promise<Task> {
@@ -275,7 +252,28 @@ export class DefaultRequestHandler {
     return canceledTask;
   }
 
-  // ─── Private: Param Validation ───
+  // ─── Private: Helpers ───
+
+  private _toErrorResponse(
+    id: string | number | null,
+    err: unknown,
+  ): JSONRPCResponse {
+    if (err && typeof err === 'object' && 'toJSONRPCError' in err) {
+      return {
+        jsonrpc: '2.0',
+        id,
+        error: (err as A2AError).toJSONRPCError(),
+      };
+    }
+    const internalError = new InternalError(
+      err instanceof Error ? err.message : 'Internal error',
+    );
+    return {
+      jsonrpc: '2.0',
+      id,
+      error: internalError.toJSONRPCError(),
+    };
+  }
 
   private _validateSendMessageParams(params: unknown): SendMessageParams {
     if (
