@@ -1,6 +1,6 @@
 import { Command } from 'commander';
 import { resolveAgentCard } from 'a2x/client';
-import { printAgentCard, printConnectionError, parseHeaders } from '../format.js';
+import { printAgentCard, printConnectionError, parseHeaders } from '../../format.js';
 
 export const agentCardCommand = new Command('agent-card')
   .description('Fetch and display an A2A agent card')
