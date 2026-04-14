@@ -5,16 +5,25 @@ import { AgentExecutor, StreamingMode } from '../a2x/agent-executor.js';
 import { InMemoryTaskStore } from '../a2x/task-store.js';
 import { InMemoryRunner } from '../runner/in-memory-runner.js';
 import { LlmAgent } from '../agent/llm-agent.js';
+import { BaseLlmProvider } from '../provider/base.js';
 import { A2A_ERROR_CODES } from '../types/errors.js';
 import type { JSONRPCResponse, JSONRPCErrorResponse } from '../types/jsonrpc.js';
 
 // Ensure mappers are registered
 import '../a2x/index.js';
 
+const mockProvider = new (class extends BaseLlmProvider {
+  readonly name = 'mock';
+  constructor() { super({ model: 'gpt-4' }); }
+  async generateContent() {
+    return { content: [], finishReason: 'stop' };
+  }
+})();
+
 function createHandler(): DefaultRequestHandler {
   const agent = new LlmAgent({
     name: 'test-agent',
-    model: 'gpt-4',
+    provider: mockProvider,
     description: 'A test agent',
     instruction: 'You are a helpful assistant.',
   });

@@ -25,7 +25,6 @@ export interface ToolCall {
 // ─── LLM Request ───
 
 export interface LlmRequest {
-  model: string;
   contents: Message[];
   systemInstruction?: string;
   tools?: ToolDeclaration[];

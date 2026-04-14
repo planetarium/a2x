@@ -1,13 +1,23 @@
 import { describe, it, expect } from 'vitest';
 import { LlmAgent } from '../agent/llm-agent.js';
 import { BaseAgent } from '../agent/base-agent.js';
+import type { LlmProvider } from '../agent/llm-provider.js';
+import { BaseLlmProvider } from '../provider/base.js';
+
+const mockProvider = new (class extends BaseLlmProvider {
+  readonly name = 'mock';
+  constructor() { super({ model: 'gpt-4' }); }
+  async generateContent() {
+    return { content: [], finishReason: 'stop' };
+  }
+})();
 
 describe('Layer 2: Agent', () => {
   describe('LlmAgent', () => {
     it('should create with required options', () => {
       const agent = new LlmAgent({
         name: 'test-agent',
-        model: 'gpt-4',
+        provider: mockProvider,
         instruction: 'You are a helpful assistant.',
       });
 
@@ -19,7 +29,7 @@ describe('Layer 2: Agent', () => {
     it('should accept description', () => {
       const agent = new LlmAgent({
         name: 'test-agent',
-        model: 'gpt-4',
+        provider: mockProvider,
         description: 'A test agent',
         instruction: 'You are a helpful assistant.',
       });
@@ -30,7 +40,7 @@ describe('Layer 2: Agent', () => {
     it('should be an instance of BaseAgent', () => {
       const agent = new LlmAgent({
         name: 'test-agent',
-        model: 'gpt-4',
+        provider: mockProvider,
         instruction: 'You are a helpful assistant.',
       });
 
@@ -40,7 +50,7 @@ describe('Layer 2: Agent', () => {
     it('should resolve function instruction', async () => {
       const agent = new LlmAgent({
         name: 'test-agent',
-        model: 'gpt-4',
+        provider: mockProvider,
         instruction: async () => 'Dynamic instruction',
       });
 
@@ -60,15 +70,16 @@ describe('Layer 2: Agent', () => {
       expect(instruction).toBe('Dynamic instruction');
     });
 
-    it('modelName should return "custom" for LlmProvider', () => {
+    it('modelName should return "custom" for plain LlmProvider without model', () => {
+      const plainProvider: LlmProvider = {
+        generateContent: async () => ({
+          content: [],
+          finishReason: 'stop',
+        }),
+      };
       const agent = new LlmAgent({
         name: 'test-agent',
-        model: {
-          generateContent: async () => ({
-            content: [],
-            finishReason: 'stop',
-          }),
-        },
+        provider: plainProvider,
         instruction: 'test',
       });
 

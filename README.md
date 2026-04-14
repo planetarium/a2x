@@ -36,11 +36,12 @@ import {
   DefaultRequestHandler,
   StreamingMode,
 } from 'a2x';
+import { GoogleProvider } from 'a2x/google';
 
 // 1. Define your agent
 const agent = new LlmAgent({
   name: 'my_assistant',
-  model: 'gemini-2.5-flash',
+  provider: new GoogleProvider({ model: 'gemini-2.5-flash', apiKey: process.env.GOOGLE_API_KEY! }),
   description: 'A helpful assistant.',
   instruction: 'You are a helpful assistant.',
 });
@@ -116,10 +117,11 @@ getAgentCard(version?)
 
 ```typescript
 import { LlmAgent, toA2x } from 'a2x';
+import { GoogleProvider } from 'a2x/google';
 
 const agent = new LlmAgent({
   name: 'quick_agent',
-  model: 'gemini-2.5-flash',
+  provider: new GoogleProvider({ model: 'gemini-2.5-flash', apiKey: process.env.GOOGLE_API_KEY! }),
   description: 'A quick prototype agent.',
   instruction: 'You are a helpful assistant.',
 });

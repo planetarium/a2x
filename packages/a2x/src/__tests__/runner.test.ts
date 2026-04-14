@@ -2,6 +2,15 @@ import { describe, it, expect } from 'vitest';
 import { InMemoryRunner } from '../runner/in-memory-runner.js';
 import { InMemorySessionService } from '../runner/in-memory-session.js';
 import { LlmAgent } from '../agent/llm-agent.js';
+import { BaseLlmProvider } from '../provider/base.js';
+
+const mockProvider = new (class extends BaseLlmProvider {
+  readonly name = 'mock';
+  constructor() { super({ model: 'gpt-4' }); }
+  async generateContent() {
+    return { content: [], finishReason: 'stop' };
+  }
+})();
 
 describe('Layer 2: Runner & Session', () => {
   describe('InMemorySessionService', () => {
@@ -39,7 +48,7 @@ describe('Layer 2: Runner & Session', () => {
     it('should create with agent and appName', () => {
       const agent = new LlmAgent({
         name: 'test-agent',
-        model: 'gpt-4',
+        provider: mockProvider,
         instruction: 'You are a helpful assistant.',
       });
 
@@ -55,7 +64,7 @@ describe('Layer 2: Runner & Session', () => {
     it('should create sessions', async () => {
       const agent = new LlmAgent({
         name: 'test-agent',
-        model: 'gpt-4',
+        provider: mockProvider,
         instruction: 'You are a helpful assistant.',
       });
 
@@ -72,7 +81,7 @@ describe('Layer 2: Runner & Session', () => {
     it('should run agent and yield events', async () => {
       const agent = new LlmAgent({
         name: 'test-agent',
-        model: 'gpt-4',
+        provider: mockProvider,
         instruction: 'You are a helpful assistant.',
       });
 

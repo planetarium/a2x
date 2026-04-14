@@ -37,8 +37,8 @@ export class Runner {
    * Run the agent asynchronously, yielding AgentEvents.
    */
   async *runAsync(session: Session, message: Message): AsyncGenerator<AgentEvent> {
-    // Store the incoming message in session events
-    session.events.push({ type: 'text', text: message.parts.map(p => ('text' in p ? p.text : '')).join('') });
+    // Store the incoming message in session events with user role
+    session.events.push({ type: 'text', text: message.parts.map(p => ('text' in p ? p.text : '')).join(''), role: 'user' });
     await this.sessionService.updateSession(session);
 
     // Create invocation context
@@ -46,6 +46,7 @@ export class Runner {
       session,
       state: session.state,
       agentName: this.agent.name,
+      plugins: this.plugins,
     };
 
     // Run the agent and yield events

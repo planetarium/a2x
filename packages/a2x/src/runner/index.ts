@@ -10,3 +10,10 @@ export { Runner } from './runner.js';
 export type { RunnerOptions } from './runner.js';
 export { InMemoryRunner } from './in-memory-runner.js';
 export type { InMemoryRunnerOptions } from './in-memory-runner.js';
+export { eventsToContents } from './event-history.js';
+export {
+  runBeforeModelCallbacks,
+  runAfterModelCallbacks,
+  runBeforeToolCallbacks,
+  runAfterToolCallbacks,
+} from './callback-runner.js';
