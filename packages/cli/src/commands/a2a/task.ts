@@ -1,5 +1,5 @@
 import { Command } from 'commander';
-import { printTask, printConnectionError, createClient } from '../format.js';
+import { printTask, printConnectionError, createClient } from '../../format.js';
 
 export const taskCommand = new Command('task')
   .description('Manage A2A tasks');

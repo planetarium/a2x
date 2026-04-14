@@ -2,7 +2,7 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import crypto from 'node:crypto';
 import type { SendMessageParams } from 'a2x';
-import { printStatusUpdate, printArtifactChunk, printConnectionError, createClient } from '../format.js';
+import { printStatusUpdate, printArtifactChunk, printConnectionError, createClient } from '../../format.js';
 
 export const streamCommand = new Command('stream')
   .description('Send a message and stream the response via SSE')
