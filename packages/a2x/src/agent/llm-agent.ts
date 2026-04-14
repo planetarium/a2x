@@ -30,7 +30,7 @@ export type BeforeToolCallback = (
 
 export interface LlmAgentOptions {
   name: string;
-  model: string | LlmProvider;
+  provider: LlmProvider;
   description?: string;
   instruction: string | ((context: InvocationContext) => string | Promise<string>);
   tools?: BaseTool[];
@@ -44,7 +44,7 @@ export interface LlmAgentOptions {
 // ─── LlmAgent ───
 
 export class LlmAgent extends BaseAgent {
-  readonly model: string | LlmProvider;
+  readonly provider: LlmProvider;
   readonly instruction: string | ((context: InvocationContext) => string | Promise<string>);
   readonly tools: BaseTool[];
   readonly outputSchema?: Record<string, unknown>;
@@ -55,7 +55,7 @@ export class LlmAgent extends BaseAgent {
 
   constructor(options: LlmAgentOptions) {
     super({ name: options.name, description: options.description });
-    this.model = options.model;
+    this.provider = options.provider;
     this.instruction = options.instruction;
     this.tools = options.tools ?? [];
     this.outputSchema = options.outputSchema;
@@ -76,11 +76,11 @@ export class LlmAgent extends BaseAgent {
   }
 
   /**
-   * Get the model name string. If model is an LlmProvider, returns 'custom'.
+   * Get the model name from the provider.
    */
   get modelName(): string {
-    if (typeof this.model === 'string') {
-      return this.model;
+    if ('model' in this.provider && typeof this.provider.model === 'string') {
+      return this.provider.model;
     }
     return 'custom';
   }

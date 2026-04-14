@@ -1,6 +1,7 @@
 import express from 'express';
 import {
   LlmAgent,
+  BaseLlmProvider,
   InMemoryRunner,
   AgentExecutor,
   StreamingMode,
@@ -10,16 +11,30 @@ import {
   createSSEStream,
 } from 'a2x';
 import type {
+  LlmRequest,
+  LlmResponse,
   TaskStatusUpdateEvent,
   TaskArtifactUpdateEvent,
 } from 'a2x';
+
+// ─── Echo Provider (returns the user message as-is) ───
+
+class EchoProvider extends BaseLlmProvider {
+  readonly name = 'echo';
+  constructor() { super({ model: 'echo' }); }
+  async generateContent(request: LlmRequest): Promise<LlmResponse> {
+    const lastMsg = request.contents[request.contents.length - 1];
+    const text = lastMsg?.parts?.map((p) => ('text' in p ? p.text : '')).join('') ?? '';
+    return { content: [{ text: `Echo: ${text}` }], finishReason: 'stop' };
+  }
+}
 
 // ─── 1. Define your agent ───
 
 const agent = new LlmAgent({
   name: 'echo-agent',
   description: 'A simple echo agent that returns your message.',
-  model: 'echo',
+  provider: new EchoProvider(),
   instruction: 'You are a helpful echo agent.',
 });
 

@@ -15,6 +15,9 @@ export default defineConfig([
   {
     entry: {
       'auth/index': 'src/auth/index.ts',
+      'provider/anthropic/index': 'src/provider/anthropic/index.ts',
+      'provider/openai/index': 'src/provider/openai/index.ts',
+      'provider/google/index': 'src/provider/google/index.ts',
     },
     format: ['esm', 'cjs'],
     dts: true,

@@ -4,6 +4,7 @@ import { AgentExecutor, StreamingMode } from '../a2x/agent-executor.js';
 import { InMemoryTaskStore } from '../a2x/task-store.js';
 import { InMemoryRunner } from '../runner/in-memory-runner.js';
 import { LlmAgent } from '../agent/llm-agent.js';
+import { BaseLlmProvider } from '../provider/base.js';
 import { ApiKeyAuthorization } from '../security/api-key.js';
 import { HttpBearerAuthorization } from '../security/http-bearer.js';
 import { OAuth2DeviceCodeAuthorization } from '../security/oauth2-device-code.js';
@@ -12,13 +13,21 @@ import type { AgentCardV03, AgentCardV10 } from '../types/agent-card.js';
 // Ensure mappers are registered
 import '../a2x/index.js';
 
+const mockProvider = new (class extends BaseLlmProvider {
+  readonly name = 'mock';
+  constructor() { super({ model: 'gpt-4' }); }
+  async generateContent() {
+    return { content: [], finishReason: 'stop' };
+  }
+})();
+
 function createA2XAgent(
   agentOpts?: { name?: string; description?: string; instruction?: string },
   streamingMode: StreamingMode = StreamingMode.SSE,
 ) {
   const agent = new LlmAgent({
     name: agentOpts?.name ?? 'my-agent',
-    model: 'gpt-4',
+    provider: mockProvider,
     description: agentOpts?.description ?? 'A test agent',
     instruction: agentOpts?.instruction ?? 'You are a helpful assistant.',
   });
@@ -211,7 +220,7 @@ describe('Layer 3: A2XAgent', () => {
     it('should throw when name is missing', () => {
       const agent = new LlmAgent({
         name: '',
-        model: 'gpt-4',
+        provider: mockProvider,
         instruction: 'test',
       });
 
@@ -228,7 +237,7 @@ describe('Layer 3: A2XAgent', () => {
     it('should throw when description is missing and cannot be auto-extracted', () => {
       const agent = new LlmAgent({
         name: 'test',
-        model: 'gpt-4',
+        provider: mockProvider,
         instruction: '',
       });
 

@@ -7,10 +7,11 @@ import {
   A2XAgent,
   DefaultRequestHandler,
 } from "a2x";
+import { AnthropicProvider } from "a2x/anthropic";
 
 const agent = new LlmAgent({
   name: "sample_agent",
-  model: "gpt-4",
+  provider: new AnthropicProvider({ model: "claude-sonnet-4-20250514", apiKey: process.env.ANTHROPIC_API_KEY! }),
   description: "A sample A2A agent built with Next.js and a2x SDK.",
   instruction:
     "You are a helpful assistant that responds to user queries. Be concise and informative.",

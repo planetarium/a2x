@@ -23,6 +23,9 @@ export * from './runner/index.js';
 // Layer 2: Plugin
 export * from './plugin/index.js';
 
+// Layer 2: Provider (base only — concrete providers via separate entry points)
+export * from './provider/index.js';
+
 // Layer 3: A2X Integration
 export * from './a2x/index.js';
 
