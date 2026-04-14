@@ -39,10 +39,90 @@ function createA2XAgent(
   });
   const taskStore = new InMemoryTaskStore();
 
-  return new A2XAgent(taskStore, executor);
+  return new A2XAgent({ taskStore, executor });
 }
 
 describe('Layer 3: A2XAgent', () => {
+  describe('Constructor - options object', () => {
+    it('should construct with required options', () => {
+      const a2x = createA2XAgent();
+      expect(a2x).toBeDefined();
+      expect(a2x.protocolVersion).toBe('1.0');
+    });
+
+    it('should accept protocolVersion 0.3', () => {
+      const agent = new LlmAgent({
+        name: 'test',
+        provider: mockProvider,
+        description: 'test',
+        instruction: 'test',
+      });
+      const runner = new InMemoryRunner({ agent, appName: 'test' });
+      const executor = new AgentExecutor({
+        runner,
+        runConfig: { streamingMode: StreamingMode.NONE },
+      });
+      const taskStore = new InMemoryTaskStore();
+
+      const a2x = new A2XAgent({ taskStore, executor, protocolVersion: '0.3' });
+      expect(a2x.protocolVersion).toBe('0.3');
+    });
+
+    it('should accept protocolVersion 1.0', () => {
+      const agent = new LlmAgent({
+        name: 'test',
+        provider: mockProvider,
+        description: 'test',
+        instruction: 'test',
+      });
+      const runner = new InMemoryRunner({ agent, appName: 'test' });
+      const executor = new AgentExecutor({
+        runner,
+        runConfig: { streamingMode: StreamingMode.NONE },
+      });
+      const taskStore = new InMemoryTaskStore();
+
+      const a2x = new A2XAgent({ taskStore, executor, protocolVersion: '1.0' });
+      expect(a2x.protocolVersion).toBe('1.0');
+    });
+
+    it('should default protocolVersion to 1.0 when omitted', () => {
+      const a2x = createA2XAgent();
+      expect(a2x.protocolVersion).toBe('1.0');
+    });
+
+    it('should throw for unsupported protocolVersion', () => {
+      const agent = new LlmAgent({
+        name: 'test',
+        provider: mockProvider,
+        description: 'test',
+        instruction: 'test',
+      });
+      const runner = new InMemoryRunner({ agent, appName: 'test' });
+      const executor = new AgentExecutor({
+        runner,
+        runConfig: { streamingMode: StreamingMode.NONE },
+      });
+      const taskStore = new InMemoryTaskStore();
+
+      expect(
+        () => new A2XAgent({ taskStore, executor, protocolVersion: '2.0' as '0.3' }),
+      ).toThrow("unsupported protocolVersion '2.0'");
+    });
+
+    it('should throw when taskStore is missing', () => {
+      expect(
+        () => new A2XAgent({ taskStore: null as never, executor: {} as never }),
+      ).toThrow('taskStore is required');
+    });
+
+    it('should throw when executor is missing', () => {
+      expect(
+        () => new A2XAgent({ taskStore: {} as never, executor: null as never }),
+      ).toThrow('executor is required');
+    });
+  });
+
   describe('Builder methods', () => {
     it('should chain builder methods', () => {
       const a2x = createA2XAgent();
@@ -216,6 +296,50 @@ describe('Layer 3: A2XAgent', () => {
     });
   });
 
+  describe('getAgentCard - default version from config', () => {
+    it('should use configured protocolVersion when no argument is given', () => {
+      const agent = new LlmAgent({
+        name: 'test',
+        provider: mockProvider,
+        description: 'test desc',
+        instruction: 'test',
+      });
+      const runner = new InMemoryRunner({ agent, appName: 'test' });
+      const executor = new AgentExecutor({
+        runner,
+        runConfig: { streamingMode: StreamingMode.NONE },
+      });
+      const taskStore = new InMemoryTaskStore();
+
+      const a2x = new A2XAgent({ taskStore, executor, protocolVersion: '0.3' });
+      a2x.setDefaultUrl('https://example.com/a2a');
+
+      const card = a2x.getAgentCard() as AgentCardV03;
+      expect(card.protocolVersion).toBe('0.3.0');
+    });
+
+    it('should allow explicit version to override configured protocolVersion', () => {
+      const agent = new LlmAgent({
+        name: 'test',
+        provider: mockProvider,
+        description: 'test desc',
+        instruction: 'test',
+      });
+      const runner = new InMemoryRunner({ agent, appName: 'test' });
+      const executor = new AgentExecutor({
+        runner,
+        runConfig: { streamingMode: StreamingMode.NONE },
+      });
+      const taskStore = new InMemoryTaskStore();
+
+      const a2x = new A2XAgent({ taskStore, executor, protocolVersion: '0.3' });
+      a2x.setDefaultUrl('https://example.com/a2a');
+
+      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      expect(card.supportedInterfaces).toBeDefined();
+    });
+  });
+
   describe('getAgentCard - validation', () => {
     it('should throw when name is missing', () => {
       const agent = new LlmAgent({
@@ -229,7 +353,7 @@ describe('Layer 3: A2XAgent', () => {
         runner,
         runConfig: { streamingMode: StreamingMode.NONE },
       });
-      const a2x = new A2XAgent(new InMemoryTaskStore(), executor);
+      const a2x = new A2XAgent({ taskStore: new InMemoryTaskStore(), executor });
 
       expect(() => a2x.getAgentCard()).toThrow('name is required');
     });
@@ -246,7 +370,7 @@ describe('Layer 3: A2XAgent', () => {
         runner,
         runConfig: { streamingMode: StreamingMode.NONE },
       });
-      const a2x = new A2XAgent(new InMemoryTaskStore(), executor);
+      const a2x = new A2XAgent({ taskStore: new InMemoryTaskStore(), executor });
 
       expect(() => a2x.getAgentCard()).toThrow('description is required');
     });

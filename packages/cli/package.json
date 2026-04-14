@@ -1,0 +1,29 @@
+{
+  "name": "@a2x/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "CLI for the a2x A2A protocol SDK",
+  "bin": {
+    "a2x": "./dist/index.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "a2x": "workspace:*",
+    "commander": "^13.0.0",
+    "chalk": "^5.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT"
+}

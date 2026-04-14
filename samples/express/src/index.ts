@@ -33,7 +33,11 @@ const agentExecutor = new AgentExecutor({
   runConfig: { streamingMode: StreamingMode.SSE },
 });
 const taskStore = new InMemoryTaskStore();
-const a2xAgent = new A2XAgent(taskStore, agentExecutor);
+const a2xAgent = new A2XAgent({
+  taskStore,
+  executor: agentExecutor,
+  protocolVersion: '0.3',
+});
 
 a2xAgent.setDefaultUrl(`${process.env.BASE_URL}/a2a`);
 a2xAgent.addSkill({
@@ -54,7 +58,7 @@ app.use(express.json());
 // Agent Card
 app.get('/.well-known/agent.json', (req, res) => {
   try {
-    const card = handler.getAgentCard('0.3');
+    const card = handler.getAgentCard();
     res.json(card);
   } catch (error) {
     res.status(500).json({
