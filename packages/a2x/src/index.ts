@@ -32,5 +32,8 @@ export * from './a2x/index.js';
 // Layer 4: Transport
 export * from './transport/index.js';
 
-// Remote (Phase 3 stubs)
+// Layer 4: Client
+export * from './client/index.js';
+
+// Remote
 export * from './remote/index.js';

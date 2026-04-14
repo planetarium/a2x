@@ -1,5 +1,5 @@
 import { program } from 'commander';
-import { agentCardCommand, sendCommand } from './commands/index.js';
+import { agentCardCommand, sendCommand, streamCommand, taskCommand } from './commands/index.js';
 
 program
   .name('a2x')
@@ -8,5 +8,7 @@ program
 
 program.addCommand(agentCardCommand);
 program.addCommand(sendCommand);
+program.addCommand(streamCommand);
+program.addCommand(taskCommand);
 
 program.parse();
