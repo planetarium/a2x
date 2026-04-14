@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "a2x": "workspace:*",
+    "dotenv": "^16",
     "express": "^5.1.0"
   },
   "devDependencies": {

@@ -17,8 +17,9 @@ pnpm-lock.yaml
 Thumbs.db
 
 # Environment
-.env
-.env.*
+.env*
+!.env.example
+
 
 # Coverage
 coverage/

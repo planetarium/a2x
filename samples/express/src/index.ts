@@ -1,7 +1,7 @@
+import 'dotenv/config';
 import express from 'express';
 import {
   LlmAgent,
-  BaseLlmProvider,
   InMemoryRunner,
   AgentExecutor,
   StreamingMode,
@@ -11,30 +11,17 @@ import {
   createSSEStream,
 } from 'a2x';
 import type {
-  LlmRequest,
-  LlmResponse,
   TaskStatusUpdateEvent,
   TaskArtifactUpdateEvent,
 } from 'a2x';
-
-// ─── Echo Provider (returns the user message as-is) ───
-
-class EchoProvider extends BaseLlmProvider {
-  readonly name = 'echo';
-  constructor() { super({ model: 'echo' }); }
-  async generateContent(request: LlmRequest): Promise<LlmResponse> {
-    const lastMsg = request.contents[request.contents.length - 1];
-    const text = lastMsg?.parts?.map((p) => ('text' in p ? p.text : '')).join('') ?? '';
-    return { content: [{ text: `Echo: ${text}` }], finishReason: 'stop' };
-  }
-}
+import { GoogleProvider } from 'a2x/google';
 
 // ─── 1. Define your agent ───
 
 const agent = new LlmAgent({
   name: 'echo-agent',
   description: 'A simple echo agent that returns your message.',
-  provider: new EchoProvider(),
+  provider: new GoogleProvider({ model: 'gemini-2.5-flash', apiKey: process.env.GOOGLE_API_KEY! }),
   instruction: 'You are a helpful echo agent.',
 });
 
@@ -48,7 +35,7 @@ const agentExecutor = new AgentExecutor({
 const taskStore = new InMemoryTaskStore();
 const a2xAgent = new A2XAgent(taskStore, agentExecutor);
 
-a2xAgent.setDefaultUrl('http://localhost:3000/a2a');
+a2xAgent.setDefaultUrl(`${process.env.BASE_URL}/a2a`);
 a2xAgent.addSkill({
   id: 'echo',
   name: 'Echo',
@@ -121,7 +108,7 @@ app.post('/a2a', async (req, res) => {
 
 // ─── 4. Start ───
 
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = Number(process.env.PORT) || 4000;
 
 app.listen(PORT, () => {
   console.log(`a2x Express sample running on http://localhost:${PORT}`);
