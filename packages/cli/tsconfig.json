@@ -4,6 +4,7 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "lib": ["ES2022"],
+    "types": ["node"],
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
@@ -16,10 +17,10 @@
     "noUnusedParameters": false,
     "noImplicitReturns": true,
     "noFallthroughCasesInSwitch": true,
-    "isolatedModules": true
+    "isolatedModules": true,
+    "rootDir": "src",
+    "outDir": "dist"
   },
-  "references": [
-    { "path": "./packages/a2x" },
-    { "path": "./packages/cli" }
-  ]
+  "include": ["src/**/*.ts"],
+  "exclude": ["dist"]
 }
