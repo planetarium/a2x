@@ -1,5 +1,5 @@
 /**
- * Remote - public API (Phase 3)
+ * Remote - public API for integrating remote A2A agents.
  */
 
 export { RemoteA2AAgent } from './remote-a2a-agent.js';
