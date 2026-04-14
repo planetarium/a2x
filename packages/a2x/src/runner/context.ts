@@ -3,6 +3,7 @@
  */
 
 import type { AgentEvent } from '../agent/base-agent.js';
+import type { BasePlugin } from '../plugin/base-plugin.js';
 
 // ─── Session ───
 
@@ -22,4 +23,6 @@ export interface InvocationContext {
   session: Session;
   state: Record<string, unknown>; // proxy to session.state
   agentName: string;
+  plugins?: BasePlugin[];
+  maxLlmCalls?: number;
 }

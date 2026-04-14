@@ -7,9 +7,9 @@ import type { InvocationContext } from '../runner/context.js';
 // ─── AgentEvent (events yielded by agents to the Runner) ───
 
 export type AgentEvent =
-  | { type: 'text'; text: string }
-  | { type: 'toolCall'; toolName: string; args: Record<string, unknown> }
-  | { type: 'toolResult'; toolName: string; result: unknown }
+  | { type: 'text'; text: string; role?: 'user' | 'agent' }
+  | { type: 'toolCall'; toolName: string; args: Record<string, unknown>; toolCallId?: string }
+  | { type: 'toolResult'; toolName: string; result: unknown; toolCallId?: string }
   | { type: 'done'; output?: unknown }
   | { type: 'error'; error: Error };
 
