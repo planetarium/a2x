@@ -18,9 +18,25 @@ import { AgentExecutor, StreamingMode } from './agent-executor.js';
 import { AgentCardMapperFactory } from './agent-card-mapper.js';
 import type { TaskStore } from './task-store.js';
 
+// ─── Protocol Version ───
+
+export type ProtocolVersion = '0.3' | '1.0';
+
+const SUPPORTED_PROTOCOL_VERSIONS: ReadonlySet<string> = new Set<string>([
+  '0.3',
+  '1.0',
+]);
+
+export interface A2XAgentOptions {
+  taskStore: TaskStore;
+  executor: AgentExecutor;
+  protocolVersion?: ProtocolVersion;
+}
+
 export class A2XAgent {
   private readonly _taskStore: TaskStore;
   private readonly _agentExecutor: AgentExecutor;
+  private readonly _protocolVersion: ProtocolVersion;
 
   // ─── Internal mutable state (builder pattern) ───
   private _name?: string;
@@ -42,9 +58,25 @@ export class A2XAgent {
   // ─── AgentCard cache ───
   private _cardCache = new Map<string, AgentCardV03 | AgentCardV10>();
 
-  constructor(taskStore: TaskStore, agentExecutor: AgentExecutor) {
-    this._taskStore = taskStore;
-    this._agentExecutor = agentExecutor;
+  constructor(options: A2XAgentOptions) {
+    if (!options.taskStore) {
+      throw new Error('A2XAgent: taskStore is required');
+    }
+    if (!options.executor) {
+      throw new Error('A2XAgent: executor is required');
+    }
+    if (
+      options.protocolVersion !== undefined &&
+      !SUPPORTED_PROTOCOL_VERSIONS.has(options.protocolVersion)
+    ) {
+      throw new Error(
+        `A2XAgent: unsupported protocolVersion '${options.protocolVersion}'. Supported versions: ${Array.from(SUPPORTED_PROTOCOL_VERSIONS).join(', ')}`,
+      );
+    }
+
+    this._taskStore = options.taskStore;
+    this._agentExecutor = options.executor;
+    this._protocolVersion = options.protocolVersion ?? '1.0';
   }
 
   // ─── Builder Methods (return this for chaining) ───
@@ -149,8 +181,7 @@ export class A2XAgent {
   // ─── Core Method ───
 
   getAgentCard(version?: string): AgentCardV03 | AgentCardV10 {
-    const resolvedVersion =
-      version ?? AgentCardMapperFactory.DEFAULT_VERSION;
+    const resolvedVersion = version ?? this._protocolVersion;
 
     // Check cache
     const cached = this._cardCache.get(resolvedVersion);
@@ -210,6 +241,10 @@ export class A2XAgent {
   }
 
   // ─── Accessors ───
+
+  get protocolVersion(): ProtocolVersion {
+    return this._protocolVersion;
+  }
 
   get taskStore(): TaskStore {
     return this._taskStore;

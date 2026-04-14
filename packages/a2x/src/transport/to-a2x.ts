@@ -6,6 +6,7 @@ import type { LlmAgent } from '../agent/llm-agent.js';
 import type { BaseSecurityScheme } from '../security/base.js';
 import type { A2XAgentSkill } from '../types/agent-card.js';
 import type { SecurityRequirement } from '../types/security.js';
+import type { ProtocolVersion } from '../a2x/a2x-agent.js';
 import { InMemoryRunner } from '../runner/in-memory-runner.js';
 import { AgentExecutor, StreamingMode } from '../a2x/agent-executor.js';
 import { InMemoryTaskStore } from '../a2x/task-store.js';
@@ -20,6 +21,7 @@ export interface ToA2xOptions {
   streamingMode?: StreamingMode;
   securitySchemes?: Record<string, BaseSecurityScheme>;
   securityRequirements?: SecurityRequirement[];
+  protocolVersion?: ProtocolVersion;
 }
 
 export interface ToA2xResult {
@@ -48,7 +50,11 @@ export function toA2x(
   });
 
   const taskStore = new InMemoryTaskStore();
-  const a2xAgent = new A2XAgent(taskStore, agentExecutor);
+  const a2xAgent = new A2XAgent({
+    taskStore,
+    executor: agentExecutor,
+    protocolVersion: options.protocolVersion,
+  });
 
   // Apply configuration
   a2xAgent.setDefaultUrl(options.defaultUrl);

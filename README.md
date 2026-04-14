@@ -55,7 +55,7 @@ const executor = new AgentExecutor({
 const taskStore = new InMemoryTaskStore();
 
 // 3. Create A2XAgent — name, description, and streaming are auto-extracted
-const a2xAgent = new A2XAgent(taskStore, executor)
+const a2xAgent = new A2XAgent({ taskStore, executor })
   .setDefaultUrl('https://my-agent.example.com/a2a')
   .addSkill({
     id: 'chat',

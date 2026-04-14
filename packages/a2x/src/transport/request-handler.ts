@@ -34,19 +34,23 @@ import {
 } from '../types/errors.js';
 import { StreamingMode } from '../a2x/agent-executor.js';
 import { JsonRpcRouter } from './jsonrpc-router.js';
+import type { ResponseMapper } from '../a2x/response-mapper.js';
+import { ResponseMapperFactory } from '../a2x/response-mapper.js';
 
 /** Return type of `handle()`. */
 export type HandleResult =
   | JSONRPCResponse
-  | AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent>;
+  | AsyncGenerator<unknown>;
 
 export class DefaultRequestHandler {
   private readonly a2xAgent: A2XAgent;
   private readonly router: JsonRpcRouter;
+  private readonly responseMapper: ResponseMapper;
 
   constructor(a2xAgent: A2XAgent) {
     this.a2xAgent = a2xAgent;
     this.router = new JsonRpcRouter();
+    this.responseMapper = ResponseMapperFactory.getMapper(a2xAgent.protocolVersion);
     this._registerRoutes();
   }
 
@@ -106,9 +110,7 @@ export class DefaultRequestHandler {
     // Streaming method → return AsyncGenerator
     if (this.router.isStreamMethod(request.method)) {
       try {
-        return this.router.routeStream(request) as AsyncGenerator<
-          TaskStatusUpdateEvent | TaskArtifactUpdateEvent
-        >;
+        return this.router.routeStream(request) as AsyncGenerator<unknown>;
       } catch (err) {
         return this._toErrorResponse(request.id, err);
       }
@@ -171,7 +173,7 @@ export class DefaultRequestHandler {
 
   // ─── Private: Method Handlers ───
 
-  private async _handleSendMessage(params: SendMessageParams): Promise<Task> {
+  private async _handleSendMessage(params: SendMessageParams): Promise<unknown> {
     const task = await this.a2xAgent.taskStore.createTask({
       contextId: params.message.contextId,
       metadata: params.metadata,
@@ -182,12 +184,12 @@ export class DefaultRequestHandler {
       params.message,
     );
 
-    return completedTask;
+    return this.responseMapper.mapTask(completedTask, params.message);
   }
 
   private async *_handleStreamMessage(
     params: SendMessageParams,
-  ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
+  ): AsyncGenerator<unknown> {
     if (
       this.a2xAgent.agentExecutor.runConfig.streamingMode ===
       StreamingMode.NONE
@@ -219,19 +221,23 @@ export class DefaultRequestHandler {
           status: event.status,
         });
       }
-      yield event;
+      if ('status' in event) {
+        yield this.responseMapper.mapStatusUpdateEvent(event as TaskStatusUpdateEvent);
+      } else {
+        yield this.responseMapper.mapArtifactUpdateEvent(event as TaskArtifactUpdateEvent);
+      }
     }
   }
 
-  private async _handleGetTask(params: TaskIdParams): Promise<Task> {
+  private async _handleGetTask(params: TaskIdParams): Promise<unknown> {
     const task = await this.a2xAgent.taskStore.getTask(params.id);
     if (!task) {
       throw new TaskNotFoundError(`Task not found: ${params.id}`);
     }
-    return task;
+    return this.responseMapper.mapTask(task);
   }
 
-  private async _handleCancelTask(params: TaskIdParams): Promise<Task> {
+  private async _handleCancelTask(params: TaskIdParams): Promise<unknown> {
     const task = await this.a2xAgent.taskStore.getTask(params.id);
     if (!task) {
       throw new TaskNotFoundError(`Task not found: ${params.id}`);
@@ -249,7 +255,7 @@ export class DefaultRequestHandler {
       status: canceledTask.status,
     });
 
-    return canceledTask;
+    return this.responseMapper.mapTask(canceledTask);
   }
 
   // ─── Private: Helpers ───

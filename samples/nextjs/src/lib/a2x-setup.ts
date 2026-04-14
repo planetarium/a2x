@@ -26,7 +26,7 @@ const executor = new AgentExecutor({
 
 const taskStore = new InMemoryTaskStore();
 
-export const a2xAgent = new A2XAgent(taskStore, executor)
+export const a2xAgent = new A2XAgent({ taskStore, executor, protocolVersion: '1.0' })
   .setDefaultUrl("http://localhost:3000/api/a2a")
   .addSkill({
     id: "chat",
