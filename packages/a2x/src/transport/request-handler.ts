@@ -23,6 +23,7 @@ import type {
 } from '../types/task.js';
 import { TERMINAL_STATES, TaskState } from '../types/task.js';
 import {
+  AuthenticationRequiredError,
   InternalError,
   InvalidParamsError,
   InvalidRequestError,
@@ -36,6 +37,7 @@ import { StreamingMode } from '../a2x/agent-executor.js';
 import { JsonRpcRouter } from './jsonrpc-router.js';
 import type { ResponseMapper } from '../a2x/response-mapper.js';
 import { ResponseMapperFactory } from '../a2x/response-mapper.js';
+import type { RequestContext, AuthResult } from '../types/auth.js';
 
 /** Return type of `handle()`. */
 export type HandleResult =
@@ -61,9 +63,13 @@ export class DefaultRequestHandler {
    * `tasks/get`, `tasks/cancel`) or an `AsyncGenerator` for streaming
    * methods (`message/stream`).
    *
+   * When `context` is provided and the agent has security requirements,
+   * authentication is evaluated before routing. When omitted, no auth
+   * check is performed (backward compatible).
+   *
    * The caller inspects the return value:
    * ```ts
-   * const result = await handler.handle(body);
+   * const result = await handler.handle(body, { headers: req.headers });
    * if (result && typeof result === 'object' && Symbol.asyncIterator in result) {
    *   // stream → convert to SSE Response
    * } else {
@@ -73,6 +79,7 @@ export class DefaultRequestHandler {
    */
   async handle(
     body: JSONRPCRequest | string | unknown,
+    context?: RequestContext,
   ): Promise<HandleResult> {
     let request: JSONRPCRequest;
 
@@ -107,6 +114,21 @@ export class DefaultRequestHandler {
       };
     }
 
+    // Authenticate if context is provided and security requirements exist
+    if (context && this.a2xAgent.securityRequirements.length > 0) {
+      const authResult = await this._authenticate(context);
+      if (!authResult.authenticated) {
+        const error = new AuthenticationRequiredError(
+          authResult.error ?? 'Authentication required',
+        );
+        return {
+          jsonrpc: '2.0',
+          id: request.id,
+          error: error.toJSONRPCError(),
+        };
+      }
+    }
+
     // Streaming method → return AsyncGenerator
     if (this.router.isStreamMethod(request.method)) {
       try {
@@ -129,6 +151,101 @@ export class DefaultRequestHandler {
    */
   getAgentCard(version?: string): AgentCardV03 | AgentCardV10 {
     return this.a2xAgent.getAgentCard(version);
+  }
+
+  // ─── Private: Authentication ───
+
+  /**
+   * Evaluate security requirements using OR-of-ANDs model (OpenAPI standard).
+   *
+   * Each SecurityRequirement in the array is an AND group:
+   *   { apiKey: [], oauth2: ["read"] } → apiKey AND oauth2(read) must pass
+   *
+   * Multiple requirements form an OR:
+   *   [{ apiKey: [] }, { oauth2: ["read"] }] → apiKey OR oauth2(read)
+   *
+   * Passes if ANY requirement group is fully satisfied.
+   */
+  private async _authenticate(context: RequestContext): Promise<AuthResult> {
+    const requirements = this.a2xAgent.securityRequirements;
+    const schemes = this.a2xAgent.securitySchemes;
+
+    const errors: string[] = [];
+
+    for (const requirement of requirements) {
+      const schemeNames = Object.keys(requirement);
+      let groupPassed = true;
+      let groupPrincipal: unknown = undefined;
+      let groupScopes: string[] = [];
+
+      for (const schemeName of schemeNames) {
+        const scheme = schemes.get(schemeName);
+        if (!scheme) {
+          groupPassed = false;
+          errors.push(`Unknown security scheme: ${schemeName}`);
+          break;
+        }
+
+        const requiredScopes = requirement[schemeName];
+
+        // Call authenticate — pass requiredScopes for OAuth2 schemes
+        let result: AuthResult;
+        if ('authenticate' in scheme && typeof scheme.authenticate === 'function') {
+          if (scheme.authenticate.length >= 2) {
+            // OAuth2-style: authenticate(context, requiredScopes)
+            result = await (scheme as { authenticate: (ctx: RequestContext, scopes: string[]) => Promise<AuthResult> })
+              .authenticate(context, requiredScopes);
+          } else {
+            result = await scheme.authenticate(context);
+          }
+        } else {
+          result = { authenticated: true };
+        }
+
+        if (!result.authenticated) {
+          groupPassed = false;
+          errors.push(result.error ?? `${schemeName}: authentication failed`);
+          break;
+        }
+
+        // Accumulate principal and scopes from successful auth
+        if (result.principal !== undefined) {
+          groupPrincipal = result.principal;
+        }
+        if (result.scopes) {
+          groupScopes = [...groupScopes, ...result.scopes];
+        }
+
+        // Verify required scopes are present (if scopes were returned)
+        if (requiredScopes.length > 0 && result.scopes) {
+          const missingScopes = requiredScopes.filter(
+            (s) => !result.scopes!.includes(s),
+          );
+          if (missingScopes.length > 0) {
+            groupPassed = false;
+            errors.push(
+              `${schemeName}: missing required scopes: ${missingScopes.join(', ')}`,
+            );
+            break;
+          }
+        }
+      }
+
+      // If all schemes in this requirement group passed → authenticated
+      if (groupPassed) {
+        return {
+          authenticated: true,
+          principal: groupPrincipal,
+          scopes: groupScopes.length > 0 ? groupScopes : undefined,
+        };
+      }
+    }
+
+    // No requirement group was satisfied
+    return {
+      authenticated: false,
+      error: errors.join('; '),
+    };
   }
 
   // ─── Private: Route Registration ───
