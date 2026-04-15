@@ -21,3 +21,10 @@ export { getResponseParser } from './response-parser.js';
 export type { ResponseParser } from './response-parser.js';
 
 export { parseSSEStream } from './sse-parser.js';
+
+export type { AuthProvider, AuthCredentials } from './auth-provider.js';
+export {
+  ApiKeyAuthProvider,
+  BearerTokenAuthProvider,
+  createAuthFromAgentCard,
+} from './auth-provider.js';
