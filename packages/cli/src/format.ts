@@ -5,6 +5,7 @@
 import chalk from 'chalk';
 import { A2XClient } from 'a2x/client';
 import type { Task, TaskStatusUpdateEvent, TaskArtifactUpdateEvent, Part } from 'a2x';
+import { CliAuthProvider } from './cli-auth-provider.js';
 
 // ─── Error Formatting ───
 
@@ -245,11 +246,15 @@ export function parseHeaders(headerArgs?: string[]): Record<string, string> | un
 
 /**
  * Create an A2XClient from CLI arguments.
+ * Automatically wires up the interactive CLI auth provider with token persistence.
  */
 export function createClient(
   url: string,
   opts: { header?: string[] },
 ): A2XClient {
   const headers = parseHeaders(opts.header);
-  return new A2XClient(url, { headers });
+  return new A2XClient(url, {
+    headers,
+    authProvider: new CliAuthProvider(url),
+  });
 }

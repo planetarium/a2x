@@ -244,7 +244,9 @@ describe('Layer 3: A2XAgent', () => {
       expect(card.securitySchemes!['bearer']).toEqual({
         httpAuthSecurityScheme: { scheme: 'bearer' },
       });
-      expect(card.securityRequirements).toEqual([{ bearer: [] }]);
+      expect(card.securityRequirements).toEqual([
+        { schemes: { bearer: { values: [] } } },
+      ]);
     });
   });
 

@@ -8,6 +8,7 @@ import type {
   SecuritySchemeV03,
   SecuritySchemeV10,
 } from '../types/security.js';
+import type { RequestContext, AuthResult } from '../types/auth.js';
 import { BaseSecurityScheme } from './base.js';
 
 export interface OAuth2DeviceCodeAuthorizationOptions {
@@ -16,6 +17,13 @@ export interface OAuth2DeviceCodeAuthorizationOptions {
   scopes: Record<string, string>;
   refreshUrl?: string;
   description?: string;
+  /**
+   * Token validator callback. Receives the bearer token and required scopes.
+   */
+  tokenValidator?: (
+    token: string,
+    requiredScopes: string[],
+  ) => Promise<AuthResult> | AuthResult;
 }
 
 export class OAuth2DeviceCodeAuthorization extends BaseSecurityScheme {
@@ -23,6 +31,10 @@ export class OAuth2DeviceCodeAuthorization extends BaseSecurityScheme {
   readonly tokenUrl: string;
   readonly scopes: Record<string, string>;
   readonly refreshUrl?: string;
+  private readonly _tokenValidator?: (
+    token: string,
+    requiredScopes: string[],
+  ) => Promise<AuthResult> | AuthResult;
 
   constructor(options: OAuth2DeviceCodeAuthorizationOptions) {
     super(options.description);
@@ -38,6 +50,7 @@ export class OAuth2DeviceCodeAuthorization extends BaseSecurityScheme {
     this.tokenUrl = options.tokenUrl;
     this.scopes = options.scopes;
     this.refreshUrl = options.refreshUrl;
+    this._tokenValidator = options.tokenValidator;
   }
 
   /**
@@ -65,5 +78,35 @@ export class OAuth2DeviceCodeAuthorization extends BaseSecurityScheme {
         ...(this.description ? { description: this.description } : {}),
       },
     };
+  }
+
+  async authenticate(
+    context: RequestContext,
+    requiredScopes: string[] = [],
+  ): Promise<AuthResult> {
+    if (!this._tokenValidator) {
+      return { authenticated: true };
+    }
+
+    const token = this._extractBearerToken(context);
+    if (!token) {
+      return {
+        authenticated: false,
+        error: 'Missing Bearer token in Authorization header',
+      };
+    }
+
+    return this._tokenValidator(token, requiredScopes);
+  }
+
+  private _extractBearerToken(context: RequestContext): string | undefined {
+    const authHeader = this.getHeader(context, 'authorization');
+    if (!authHeader) return undefined;
+
+    const parts = authHeader.split(' ');
+    if (parts.length !== 2 || parts[0].toLowerCase() !== 'bearer') {
+      return undefined;
+    }
+    return parts[1];
   }
 }

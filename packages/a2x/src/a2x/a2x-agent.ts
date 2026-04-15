@@ -254,6 +254,14 @@ export class A2XAgent {
     return this._agentExecutor;
   }
 
+  get securitySchemes(): ReadonlyMap<string, BaseSecurityScheme> {
+    return this._securitySchemes;
+  }
+
+  get securityRequirements(): readonly SecurityRequirement[] {
+    return this._securityRequirements;
+  }
+
   // ─── Private Methods ───
 
   private _invalidateCache(): void {

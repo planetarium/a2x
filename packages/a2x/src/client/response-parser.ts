@@ -9,6 +9,8 @@ import type {
   TaskArtifactUpdateEvent,
 } from '../types/task.js';
 import { TaskState, TASK_STATE_TO_V10 } from '../types/task.js';
+import type { Role } from '../types/common.js';
+import { V10_ROLE_TO_INTERNAL } from '../types/common.js';
 import type { ProtocolVersion } from './agent-card-resolver.js';
 
 // ─── Reverse map: v1.0 UPPER_SNAKE_CASE → internal lowercase TaskState ───
@@ -169,16 +171,48 @@ function convertV10TaskState(obj: Record<string, unknown>): void {
   }
 }
 
+function convertV10Role(role: string): Role {
+  const mapped = V10_ROLE_TO_INTERNAL.get(role);
+  if (mapped) return mapped;
+  // If already lowercase (internal format), pass through
+  if (role === 'user' || role === 'agent') return role;
+  throw new Error(`Unknown role: ${role}`);
+}
+
+function convertV10Roles(obj: Record<string, unknown>): void {
+  // Convert role in status.message
+  if (obj.status && typeof obj.status === 'object') {
+    const status = obj.status as Record<string, unknown>;
+    if (status.message && typeof status.message === 'object') {
+      const msg = status.message as Record<string, unknown>;
+      if (typeof msg.role === 'string') {
+        msg.role = convertV10Role(msg.role);
+      }
+    }
+  }
+
+  // Convert roles in history messages
+  if (Array.isArray(obj.history)) {
+    for (const m of obj.history) {
+      if (typeof m === 'object' && m !== null && typeof (m as Record<string, unknown>).role === 'string') {
+        (m as Record<string, unknown>).role = convertV10Role((m as Record<string, unknown>).role as string);
+      }
+    }
+  }
+}
+
 class V10ResponseParser implements ResponseParser {
   parseTask(raw: unknown): Task {
     const obj = { ...(raw as Record<string, unknown>) };
     convertV10TaskState(obj);
+    convertV10Roles(obj);
     return obj as unknown as Task;
   }
 
   parseStatusUpdateEvent(raw: unknown): TaskStatusUpdateEvent {
     const obj = { ...(raw as Record<string, unknown>) };
     convertV10TaskState(obj);
+    convertV10Roles(obj);
     return obj as unknown as TaskStatusUpdateEvent;
   }
 

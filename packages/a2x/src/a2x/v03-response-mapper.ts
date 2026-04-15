@@ -133,11 +133,14 @@ export class V03ResponseMapper implements ResponseMapper {
       return mapped;
     }
     if (isFilePart(part)) {
-      const mapped: Record<string, unknown> = { kind: 'file' };
-      if (part.raw !== undefined) mapped.raw = part.raw;
-      if (part.url !== undefined) mapped.url = part.url;
-      if (part.filename !== undefined) mapped.filename = part.filename;
-      if (part.mediaType !== undefined) mapped.mediaType = part.mediaType;
+      // v0.3 spec: { kind: "file", file: { bytes?, uri?, mimeType?, name? } }
+      const file: Record<string, unknown> = {};
+      if (part.raw !== undefined) file.bytes = part.raw;
+      if (part.url !== undefined) file.uri = part.url;
+      if (part.mediaType !== undefined) file.mimeType = part.mediaType;
+      if (part.filename !== undefined) file.name = part.filename;
+
+      const mapped: Record<string, unknown> = { kind: 'file', file };
       if (part.metadata !== undefined) mapped.metadata = part.metadata;
       return mapped;
     }

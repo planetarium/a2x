@@ -9,6 +9,9 @@ import { LlmAgent } from '../agent/llm-agent.js';
 import { BaseLlmProvider } from '../provider/base.js';
 import { A2A_ERROR_CODES } from '../types/errors.js';
 import type { JSONRPCResponse, JSONRPCErrorResponse } from '../types/jsonrpc.js';
+import { ApiKeyAuthorization } from '../security/api-key.js';
+import { HttpBearerAuthorization } from '../security/http-bearer.js';
+import type { RequestContext } from '../types/auth.js';
 
 // Ensure mappers are registered
 import '../a2x/index.js';
@@ -507,6 +510,211 @@ describe('Layer 4: DefaultRequestHandler', () => {
       const card = handler.getAgentCard('1.0');
       expect(card).toBeDefined();
       expect((card as { name: string }).name).toBe('test-agent');
+    });
+  });
+
+  describe('Authentication', () => {
+    function createAuthHandler(
+      schemeSetup: (agent: A2XAgent) => void,
+    ): DefaultRequestHandler {
+      const agent = new LlmAgent({
+        name: 'auth-test-agent',
+        provider: mockProvider,
+        description: 'A test agent with auth',
+        instruction: 'You are a helpful assistant.',
+      });
+
+      const runner = new InMemoryRunner({ agent, appName: 'test' });
+      const executor = new AgentExecutor({
+        runner,
+        runConfig: { streamingMode: StreamingMode.SSE },
+      });
+      const taskStore = new InMemoryTaskStore();
+      const a2xAgent = new A2XAgent({ taskStore, executor });
+      a2xAgent.setDefaultUrl('https://example.com/a2a');
+      schemeSetup(a2xAgent);
+
+      return new DefaultRequestHandler(a2xAgent);
+    }
+
+    const validRequest = {
+      jsonrpc: '2.0' as const,
+      id: 1,
+      method: 'message/send',
+      params: {
+        message: {
+          messageId: 'msg-1',
+          role: 'user',
+          parts: [{ text: 'Hello' }],
+        },
+      },
+    };
+
+    it('should pass without context (backward compatible)', async () => {
+      const handler = createAuthHandler((agent) => {
+        agent
+          .addSecurityScheme('apiKey', new ApiKeyAuthorization({
+            in: 'header',
+            name: 'x-api-key',
+            keys: ['secret'],
+          }))
+          .addSecurityRequirement({ apiKey: [] });
+      });
+
+      // No context → no auth check → should proceed
+      const response = await handler.handle(validRequest);
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('result' in rpc).toBe(true);
+    });
+
+    it('should authenticate with valid API key', async () => {
+      const handler = createAuthHandler((agent) => {
+        agent
+          .addSecurityScheme('apiKey', new ApiKeyAuthorization({
+            in: 'header',
+            name: 'x-api-key',
+            keys: ['secret-123'],
+          }))
+          .addSecurityRequirement({ apiKey: [] });
+      });
+
+      const context: RequestContext = {
+        headers: { 'x-api-key': 'secret-123' },
+      };
+      const response = await handler.handle(validRequest, context);
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('result' in rpc).toBe(true);
+    });
+
+    it('should reject with invalid API key', async () => {
+      const handler = createAuthHandler((agent) => {
+        agent
+          .addSecurityScheme('apiKey', new ApiKeyAuthorization({
+            in: 'header',
+            name: 'x-api-key',
+            keys: ['secret-123'],
+          }))
+          .addSecurityRequirement({ apiKey: [] });
+      });
+
+      const context: RequestContext = {
+        headers: { 'x-api-key': 'wrong-key' },
+      };
+      const response = await handler.handle(validRequest, context);
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('error' in rpc).toBe(true);
+      expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+        A2A_ERROR_CODES.AUTHENTICATION_REQUIRED,
+      );
+    });
+
+    it('should reject with missing API key', async () => {
+      const handler = createAuthHandler((agent) => {
+        agent
+          .addSecurityScheme('apiKey', new ApiKeyAuthorization({
+            in: 'header',
+            name: 'x-api-key',
+            keys: ['secret-123'],
+          }))
+          .addSecurityRequirement({ apiKey: [] });
+      });
+
+      const context: RequestContext = { headers: {} };
+      const response = await handler.handle(validRequest, context);
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('error' in rpc).toBe(true);
+      expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+        A2A_ERROR_CODES.AUTHENTICATION_REQUIRED,
+      );
+    });
+
+    it('should support OR logic: pass if any requirement group succeeds', async () => {
+      const handler = createAuthHandler((agent) => {
+        agent
+          .addSecurityScheme('apiKey', new ApiKeyAuthorization({
+            in: 'header',
+            name: 'x-api-key',
+            keys: ['key-1'],
+          }))
+          .addSecurityScheme('bearer', new HttpBearerAuthorization({
+            scheme: 'bearer',
+            validator: async (token) => ({
+              authenticated: token === 'valid-token',
+              error: token !== 'valid-token' ? 'Invalid token' : undefined,
+            }),
+          }))
+          // OR: either apiKey OR bearer
+          .addSecurityRequirement({ apiKey: [] })
+          .addSecurityRequirement({ bearer: [] });
+      });
+
+      // API key fails, but bearer succeeds → should pass
+      const context: RequestContext = {
+        headers: {
+          'x-api-key': 'wrong',
+          authorization: 'Bearer valid-token',
+        },
+      };
+      const response = await handler.handle(validRequest, context);
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('result' in rpc).toBe(true);
+    });
+
+    it('should reject when all requirement groups fail', async () => {
+      const handler = createAuthHandler((agent) => {
+        agent
+          .addSecurityScheme('apiKey', new ApiKeyAuthorization({
+            in: 'header',
+            name: 'x-api-key',
+            keys: ['key-1'],
+          }))
+          .addSecurityScheme('bearer', new HttpBearerAuthorization({
+            scheme: 'bearer',
+            validator: async (token) => ({
+              authenticated: token === 'valid-token',
+              error: token !== 'valid-token' ? 'Invalid token' : undefined,
+            }),
+          }))
+          .addSecurityRequirement({ apiKey: [] })
+          .addSecurityRequirement({ bearer: [] });
+      });
+
+      // Both fail
+      const context: RequestContext = {
+        headers: {
+          'x-api-key': 'wrong',
+          authorization: 'Bearer wrong-token',
+        },
+      };
+      const response = await handler.handle(validRequest, context);
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('error' in rpc).toBe(true);
+      expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+        A2A_ERROR_CODES.AUTHENTICATION_REQUIRED,
+      );
+    });
+
+    it('should skip auth when no security requirements are set', async () => {
+      const handler = createAuthHandler((agent) => {
+        // Add scheme but no requirement → no auth check
+        agent.addSecurityScheme('apiKey', new ApiKeyAuthorization({
+          in: 'header',
+          name: 'x-api-key',
+          keys: ['secret'],
+        }));
+      });
+
+      const context: RequestContext = { headers: {} };
+      const response = await handler.handle(validRequest, context);
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('result' in rpc).toBe(true);
     });
   });
 });

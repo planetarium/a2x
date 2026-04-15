@@ -10,6 +10,7 @@ import type {
 } from './common.js';
 import type {
   SecurityRequirement,
+  SecurityRequirementV10,
   SecuritySchemeV03,
   SecuritySchemeV10,
 } from './security.js';
@@ -114,7 +115,7 @@ export interface AgentCardV10 {
   provider?: AgentProvider;
   capabilities: AgentCapabilitiesV10;
   securitySchemes?: Record<string, SecuritySchemeV10>;
-  securityRequirements?: SecurityRequirement[];
+  securityRequirements?: SecurityRequirementV10[];
   skills: AgentSkillV10[];
   defaultInputModes: string[];
   defaultOutputModes: string[];
@@ -145,5 +146,5 @@ export interface AgentSkillV10 {
   examples?: string[];
   inputModes?: string[];
   outputModes?: string[];
-  securityRequirements?: SecurityRequirement[];
+  securityRequirements?: SecurityRequirementV10[];
 }
