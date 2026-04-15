@@ -9,6 +9,7 @@ import {
   OAuth2DeviceCodeAuthorization,
 } from "a2x";
 import { AnthropicProvider } from "a2x/anthropic";
+import { globalTokens } from "@/app/oauth/token/route";
 
 const agent = new LlmAgent({
   name: "sample_agent",
@@ -39,16 +40,12 @@ export const a2xAgent = new A2XAgent({ taskStore, executor, protocolVersion: '1.
   .addSecurityScheme(
     'deviceCode',
     new OAuth2DeviceCodeAuthorization({
-      deviceAuthorizationUrl: `${process.env.AUTH_ISSUER ?? 'https://auth.example.com'}/device/authorize`,
-      tokenUrl: `${process.env.AUTH_ISSUER ?? 'https://auth.example.com'}/oauth/token`,
+      deviceAuthorizationUrl: `${process.env.BASE_URL ?? 'http://localhost:3000'}/device/authorize`,
+      tokenUrl: `${process.env.BASE_URL ?? 'http://localhost:3000'}/oauth/token`,
       scopes: { 'agent:invoke': 'Invoke the agent' },
       description: 'OAuth2 Device Code flow for CLI / headless clients',
       tokenValidator: async (token, _requiredScopes) => {
-        const validToken = process.env.AUTH_TOKEN;
-        if (!validToken) {
-          return { authenticated: true };
-        }
-        if (token !== validToken) {
+        if (!globalTokens.has(token)) {
           return { authenticated: false, error: 'Invalid access token' };
         }
         return {

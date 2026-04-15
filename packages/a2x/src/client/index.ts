@@ -22,9 +22,18 @@ export type { ResponseParser } from './response-parser.js';
 
 export { parseSSEStream } from './sse-parser.js';
 
-export type { AuthProvider, AuthCredentials } from './auth-provider.js';
+export type { AuthProvider } from './auth-provider.js';
+export type { AuthRequestContext } from './auth-scheme.js';
 export {
-  ApiKeyAuthProvider,
-  BearerTokenAuthProvider,
-  createAuthFromAgentCard,
-} from './auth-provider.js';
+  AuthScheme,
+  ApiKeyAuthScheme,
+  HttpBearerAuthScheme,
+  HttpBasicAuthScheme,
+  OAuth2DeviceCodeAuthScheme,
+  OAuth2AuthorizationCodeAuthScheme,
+  OAuth2ClientCredentialsAuthScheme,
+  OAuth2ImplicitAuthScheme,
+  OAuth2PasswordAuthScheme,
+  OpenIdConnectAuthScheme,
+} from './auth-scheme.js';
+export { normalizeRequirements, normalizeScheme } from './auth-normalizer.js';

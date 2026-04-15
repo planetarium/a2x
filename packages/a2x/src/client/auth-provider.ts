@@ -1,131 +1,31 @@
 /**
- * Client-side authentication providers.
+ * Client-side AuthProvider interface.
  *
- * AuthProvider implementations inject credentials into outgoing HTTP requests.
- * The A2XClient calls `applyAuth()` before every request.
+ * The SDK calls the AuthProvider when an agent requires authentication.
+ * The client implements this interface to acquire credentials dynamically
+ * based on the agent's declared security schemes.
  */
 
-import type { AgentCardV03, AgentCardV10 } from '../types/agent-card.js';
-
-// ─── AuthProvider Interface ───
+import type { AuthScheme } from './auth-scheme.js';
 
 export interface AuthProvider {
   /**
-   * Mutate the outgoing request headers to include authentication credentials.
-   * Called before every HTTP request the client makes.
+   * Called by SDK with security requirements as AuthScheme[][].
+   *
+   * Structure mirrors OR-of-ANDs from the agent card:
+   *   - outer array: OR groups (satisfy ANY one group)
+   *   - inner array: AND schemes (satisfy ALL in the group)
+   *
+   * Client iterates groups, resolves all schemes in a group via
+   * setCredential(), and returns the resolved group.
+   * Throw if no group can be satisfied — authentication fails.
    */
-  applyAuth(headers: Record<string, string>): Promise<void> | void;
-}
+  provide(requirements: AuthScheme[][]): Promise<AuthScheme[]>;
 
-// ─── Built-in Providers ───
-
-/**
- * Injects an API key into a specific header, query parameter, or cookie.
- *
- * @example
- * ```ts
- * new ApiKeyAuthProvider({ headerName: 'x-api-key', key: 'my-secret' })
- * ```
- */
-export class ApiKeyAuthProvider implements AuthProvider {
-  private readonly _headerName: string;
-  private readonly _key: string;
-
-  constructor(options: { headerName: string; key: string }) {
-    this._headerName = options.headerName.toLowerCase();
-    this._key = options.key;
-  }
-
-  applyAuth(headers: Record<string, string>): void {
-    headers[this._headerName] = this._key;
-  }
-}
-
-/**
- * Injects a Bearer token into the Authorization header.
- *
- * @example
- * ```ts
- * new BearerTokenAuthProvider({ token: 'eyJhbG...' })
- * ```
- */
-export class BearerTokenAuthProvider implements AuthProvider {
-  private readonly _token: string;
-
-  constructor(options: { token: string }) {
-    this._token = options.token;
-  }
-
-  applyAuth(headers: Record<string, string>): void {
-    headers['authorization'] = `Bearer ${this._token}`;
-  }
-}
-
-// ─── Auto-resolve from AgentCard ───
-
-export interface AuthCredentials {
-  apiKey?: string;
-  token?: string;
-}
-
-/**
- * Create an AuthProvider by matching user credentials against the
- * AgentCard's declared security schemes.
- *
- * - `apiKey` → reads the scheme's header name from the card
- * - `token` → always maps to `Authorization: Bearer <token>`
- *
- * Returns undefined if no matching credentials are provided.
- */
-export function createAuthFromAgentCard(
-  card: AgentCardV03 | AgentCardV10,
-  credentials: AuthCredentials,
-): AuthProvider | undefined {
-  if (credentials.token) {
-    return new BearerTokenAuthProvider({ token: credentials.token });
-  }
-
-  if (credentials.apiKey) {
-    const headerName = resolveApiKeyHeaderName(card);
-    return new ApiKeyAuthProvider({
-      headerName: headerName ?? 'x-api-key',
-      key: credentials.apiKey,
-    });
-  }
-
-  return undefined;
-}
-
-/**
- * Extract the API key header name from an AgentCard's security schemes.
- * Searches for the first apiKey-type scheme and returns its name field.
- */
-function resolveApiKeyHeaderName(
-  card: AgentCardV03 | AgentCardV10,
-): string | undefined {
-  const raw = card as unknown as Record<string, unknown>;
-
-  // v0.3: securitySchemes is Record<string, { type, in, name }>
-  // v1.0: securitySchemes is Record<string, { apiKeySecurityScheme?: { name, location } }>
-  const schemes =
-    (raw.securitySchemes as Record<string, Record<string, unknown>> | undefined) ??
-    (raw.securityDefinitions as Record<string, Record<string, unknown>> | undefined);
-
-  if (!schemes) return undefined;
-
-  for (const scheme of Object.values(schemes)) {
-    // v0.3 format
-    if (scheme.type === 'apiKey' && typeof scheme.name === 'string') {
-      return scheme.name;
-    }
-    // v1.0 format
-    const apiKeyScheme = scheme.apiKeySecurityScheme as
-      | Record<string, unknown>
-      | undefined;
-    if (apiKeyScheme && typeof apiKeyScheme.name === 'string') {
-      return apiKeyScheme.name;
-    }
-  }
-
-  return undefined;
+  /**
+   * Called by SDK when a previously-authenticated request gets
+   * an auth error (e.g., token expired). Optional.
+   * Receives the same scheme array that was previously returned by provide().
+   */
+  refresh?(schemes: AuthScheme[]): Promise<AuthScheme[]>;
 }

@@ -28,6 +28,7 @@ import {
   ContentTypeNotSupportedError,
   InvalidAgentResponseError,
   AuthenticatedExtendedCardNotConfiguredError,
+  AuthenticationRequiredError,
   A2A_ERROR_CODES,
 } from '../types/errors.js';
 import type { ResolvedAgentCard } from './agent-card-resolver.js';
@@ -39,12 +40,16 @@ import {
 import { getResponseParser } from './response-parser.js';
 import type { ResponseParser } from './response-parser.js';
 import { parseSSEStream } from './sse-parser.js';
+import type { AuthProvider } from './auth-provider.js';
+import type { AuthScheme, AuthRequestContext } from './auth-scheme.js';
+import { normalizeRequirements } from './auth-normalizer.js';
 
 // ─── Types ───
 
 export interface A2XClientOptions {
   fetch?: typeof globalThis.fetch;
   headers?: Record<string, string>;
+  authProvider?: AuthProvider;
 }
 
 // ─── Error Code → Error Class Mapping ───
@@ -62,6 +67,7 @@ const ERROR_CODE_MAP: Record<number, new (message?: string, data?: unknown) => A
   [A2A_ERROR_CODES.CONTENT_TYPE_NOT_SUPPORTED]: ContentTypeNotSupportedError,
   [A2A_ERROR_CODES.INVALID_AGENT_RESPONSE]: InvalidAgentResponseError,
   [A2A_ERROR_CODES.AUTHENTICATED_EXTENDED_CARD_NOT_CONFIGURED]: AuthenticatedExtendedCardNotConfiguredError,
+  [A2A_ERROR_CODES.AUTHENTICATION_REQUIRED]: AuthenticationRequiredError,
 };
 
 // ─── v0.3 Request Formatting ───
@@ -112,9 +118,11 @@ export class A2XClient {
   private readonly _urlOrCard: string | AgentCardV03 | AgentCardV10;
   private readonly _fetchImpl: typeof globalThis.fetch;
   private readonly _headers: Record<string, string>;
+  private readonly _authProvider?: AuthProvider;
   private _resolved: ResolvedAgentCard | null = null;
   private _parser: ResponseParser | null = null;
   private _endpointUrl: string | null = null;
+  private _resolvedSchemes?: AuthScheme[];
   private _requestId = 0;
 
   constructor(
@@ -124,6 +132,7 @@ export class A2XClient {
     this._urlOrCard = urlOrAgentCard;
     this._fetchImpl = options?.fetch ?? globalThis.fetch;
     this._headers = options?.headers ?? {};
+    this._authProvider = options?.authProvider;
   }
 
   // ─── Public Methods ───
@@ -134,6 +143,7 @@ export class A2XClient {
    */
   async sendMessage(params: SendMessageParams): Promise<Task> {
     await this._ensureResolved();
+    await this._ensureAuthenticated();
     const formatted = this._formatParams(params);
     const request = this._buildJsonRpcRequest(A2A_METHODS.SEND_MESSAGE, formatted);
     const result = await this._postJsonRpc(request);
@@ -149,6 +159,7 @@ export class A2XClient {
     signal?: AbortSignal,
   ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
     await this._ensureResolved();
+    await this._ensureAuthenticated();
     const formatted = this._formatParams(params);
     const request = this._buildJsonRpcRequest(
       A2A_METHODS.STREAM_MESSAGE,
@@ -158,8 +169,11 @@ export class A2XClient {
     const headers = this._buildHeaders({
       Accept: 'text/event-stream',
     });
+    const url = new URL(this._endpointUrl!);
 
-    const response = await this._fetchImpl(this._endpointUrl!, {
+    this._applyAuth({ headers, url });
+
+    const response = await this._fetchImpl(url.toString(), {
       method: 'POST',
       headers,
       body: JSON.stringify(request),
@@ -194,6 +208,7 @@ export class A2XClient {
    */
   async getTask(taskId: string): Promise<Task> {
     await this._ensureResolved();
+    await this._ensureAuthenticated();
     const request = this._buildJsonRpcRequest(A2A_METHODS.GET_TASK, {
       id: taskId,
     });
@@ -207,6 +222,7 @@ export class A2XClient {
    */
   async cancelTask(taskId: string): Promise<Task> {
     await this._ensureResolved();
+    await this._ensureAuthenticated();
     const request = this._buildJsonRpcRequest(A2A_METHODS.CANCEL_TASK, {
       id: taskId,
     });
@@ -223,6 +239,48 @@ export class A2XClient {
   }
 
   // ─── Private Methods ───
+
+  /**
+   * Resolve security requirements from the agent card and call AuthProvider.
+   *
+   * SDK handles: requirement normalization, scheme class construction,
+   * OR-of-ANDs structure, OAuth2 flow expansion.
+   * Client handles: credential acquisition via provide() callback.
+   */
+  private async _ensureAuthenticated(): Promise<void> {
+    if (this._resolvedSchemes) return;
+    if (!this._authProvider) return;
+
+    const card = this._resolved!.card;
+    const rawCard = card as unknown as Record<string, unknown>;
+
+    const rawRequirements =
+      (rawCard.security as Array<Record<string, string[]>> | undefined) ??
+      (rawCard.securityRequirements as Array<Record<string, string[]>> | undefined) ??
+      [];
+    if (rawRequirements.length === 0) return;
+
+    const rawSchemes =
+      (rawCard.securitySchemes as Record<string, unknown> | undefined) ?? {};
+
+    const requirements = normalizeRequirements(
+      rawRequirements,
+      rawSchemes as Parameters<typeof normalizeRequirements>[1],
+    );
+    if (requirements.length === 0) return;
+
+    this._resolvedSchemes = await this._authProvider.provide(requirements);
+  }
+
+  /**
+   * Apply resolved auth schemes to the request context.
+   */
+  private _applyAuth(ctx: AuthRequestContext): void {
+    if (!this._resolvedSchemes) return;
+    for (const scheme of this._resolvedSchemes) {
+      scheme.applyToRequest(ctx);
+    }
+  }
 
   private async _ensureResolved(): Promise<void> {
     if (this._resolved) return;
@@ -306,14 +364,33 @@ export class A2XClient {
     };
   }
 
-  private async _postJsonRpc(request: JSONRPCRequest): Promise<unknown> {
+  private async _postJsonRpc(
+    request: JSONRPCRequest,
+    isRetry = false,
+  ): Promise<unknown> {
     const headers = this._buildHeaders();
+    const url = new URL(this._endpointUrl!);
 
-    const response = await this._fetchImpl(this._endpointUrl!, {
+    this._applyAuth({ headers, url });
+
+    const response = await this._fetchImpl(url.toString(), {
       method: 'POST',
       headers,
       body: JSON.stringify(request),
     });
+
+    // Token refresh on 401 (once)
+    if (
+      !isRetry &&
+      response.status === 401 &&
+      this._authProvider?.refresh &&
+      this._resolvedSchemes
+    ) {
+      this._resolvedSchemes = await this._authProvider.refresh(
+        this._resolvedSchemes,
+      );
+      return this._postJsonRpc(request, true);
+    }
 
     if (!response.ok) {
       throw new InternalError(

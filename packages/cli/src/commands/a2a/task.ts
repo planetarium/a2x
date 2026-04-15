@@ -12,17 +12,15 @@ taskCommand
   .argument('<url>', 'Agent base URL')
   .argument('<task-id>', 'Task ID to retrieve')
   .option('-H, --header <header...>', 'Custom headers (format: Key:Value)')
-  .option('--api-key <key>', 'Authenticate with API key (auto-detects header from AgentCard)')
-  .option('--token <token>', 'Authenticate with Bearer token')
   .option('--json', 'Output raw JSON response')
   .action(
     async (
       url: string,
       taskId: string,
-      opts: { header?: string[]; apiKey?: string; token?: string; json?: boolean },
+      opts: { header?: string[]; json?: boolean },
     ) => {
       try {
-        const client = await createClient(url, opts);
+        const client = createClient(url, opts);
         const task = await client.getTask(taskId);
 
         if (opts.json) {
@@ -46,17 +44,15 @@ taskCommand
   .argument('<url>', 'Agent base URL')
   .argument('<task-id>', 'Task ID to cancel')
   .option('-H, --header <header...>', 'Custom headers (format: Key:Value)')
-  .option('--api-key <key>', 'Authenticate with API key (auto-detects header from AgentCard)')
-  .option('--token <token>', 'Authenticate with Bearer token')
   .option('--json', 'Output raw JSON response')
   .action(
     async (
       url: string,
       taskId: string,
-      opts: { header?: string[]; apiKey?: string; token?: string; json?: boolean },
+      opts: { header?: string[]; json?: boolean },
     ) => {
       try {
-        const client = await createClient(url, opts);
+        const client = createClient(url, opts);
         const task = await client.cancelTask(taskId);
 
         if (opts.json) {
