@@ -3,7 +3,7 @@
  */
 
 import chalk from 'chalk';
-import { A2XClient, resolveAgentCard, BearerTokenAuthProvider, createAuthFromAgentCard } from 'a2x/client';
+import { A2XClient } from 'a2x/client';
 import type { Task, TaskStatusUpdateEvent, TaskArtifactUpdateEvent, Part } from 'a2x';
 
 // ─── Error Formatting ───
@@ -245,31 +245,11 @@ export function parseHeaders(headerArgs?: string[]): Record<string, string> | un
 
 /**
  * Create an A2XClient from CLI arguments.
- *
- * When `--api-key` is provided, fetches the AgentCard first to discover
- * the correct header name from the security scheme declaration.
- * When `--token` is provided, injects `Authorization: Bearer <token>` directly.
  */
-export async function createClient(
+export function createClient(
   url: string,
-  opts: { header?: string[]; apiKey?: string; token?: string },
-): Promise<A2XClient> {
+  opts: { header?: string[] },
+): A2XClient {
   const headers = parseHeaders(opts.header);
-
-  // Bearer token — no AgentCard fetch needed
-  if (opts.token) {
-    return new A2XClient(url, {
-      headers,
-      auth: new BearerTokenAuthProvider({ token: opts.token }),
-    });
-  }
-
-  // API Key — fetch AgentCard to discover header name
-  if (opts.apiKey) {
-    const resolved = await resolveAgentCard(url, { headers });
-    const auth = createAuthFromAgentCard(resolved.card, { apiKey: opts.apiKey });
-    return new A2XClient(resolved.card, { headers, auth });
-  }
-
   return new A2XClient(url, { headers });
 }

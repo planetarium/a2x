@@ -10,17 +10,15 @@ export const streamCommand = new Command('stream')
   .argument('<message>', 'Message text to send')
   .option('--context-id <id>', 'Continue an existing conversation context')
   .option('-H, --header <header...>', 'Custom headers (format: Key:Value)')
-  .option('--api-key <key>', 'Authenticate with API key (auto-detects header from AgentCard)')
-  .option('--token <token>', 'Authenticate with Bearer token')
   .option('--json', 'Output raw JSON events (one per line)')
   .action(
     async (
       url: string,
       message: string,
-      opts: { contextId?: string; header?: string[]; apiKey?: string; token?: string; json?: boolean },
+      opts: { contextId?: string; header?: string[]; json?: boolean },
     ) => {
       try {
-        const client = await createClient(url, opts);
+        const client = createClient(url, opts);
 
         const params: SendMessageParams = {
           message: {

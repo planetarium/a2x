@@ -39,15 +39,12 @@ import {
 import { getResponseParser } from './response-parser.js';
 import type { ResponseParser } from './response-parser.js';
 import { parseSSEStream } from './sse-parser.js';
-import type { AuthProvider } from './auth-provider.js';
 
 // ─── Types ───
 
 export interface A2XClientOptions {
   fetch?: typeof globalThis.fetch;
   headers?: Record<string, string>;
-  /** Authentication provider. Injects credentials into every request. */
-  auth?: AuthProvider;
 }
 
 // ─── Error Code → Error Class Mapping ───
@@ -115,7 +112,6 @@ export class A2XClient {
   private readonly _urlOrCard: string | AgentCardV03 | AgentCardV10;
   private readonly _fetchImpl: typeof globalThis.fetch;
   private readonly _headers: Record<string, string>;
-  private readonly _auth?: AuthProvider;
   private _resolved: ResolvedAgentCard | null = null;
   private _parser: ResponseParser | null = null;
   private _endpointUrl: string | null = null;
@@ -128,7 +124,6 @@ export class A2XClient {
     this._urlOrCard = urlOrAgentCard;
     this._fetchImpl = options?.fetch ?? globalThis.fetch;
     this._headers = options?.headers ?? {};
-    this._auth = options?.auth;
   }
 
   // ─── Public Methods ───
@@ -160,7 +155,7 @@ export class A2XClient {
       formatted,
     );
 
-    const headers = await this._buildHeaders({
+    const headers = this._buildHeaders({
       Accept: 'text/event-stream',
     });
 
@@ -289,18 +284,14 @@ export class A2XClient {
     return formatted;
   }
 
-  private async _buildHeaders(
+  private _buildHeaders(
     extra?: Record<string, string>,
-  ): Promise<Record<string, string>> {
-    const headers: Record<string, string> = {
+  ): Record<string, string> {
+    return {
       'Content-Type': 'application/json',
       ...extra,
       ...this._headers,
     };
-    if (this._auth) {
-      await this._auth.applyAuth(headers);
-    }
-    return headers;
   }
 
   private _buildJsonRpcRequest(
@@ -316,7 +307,7 @@ export class A2XClient {
   }
 
   private async _postJsonRpc(request: JSONRPCRequest): Promise<unknown> {
-    const headers = await this._buildHeaders();
+    const headers = this._buildHeaders();
 
     const response = await this._fetchImpl(this._endpointUrl!, {
       method: 'POST',
