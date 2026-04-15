@@ -45,6 +45,23 @@ export function isDataPart(part: Part): part is DataPart {
 
 export type Role = 'user' | 'agent';
 
+// ─── v1.0 Role Constants ───
+
+export enum RoleV10 {
+  ROLE_USER = 'ROLE_USER',
+  ROLE_AGENT = 'ROLE_AGENT',
+}
+
+export const ROLE_TO_V10: ReadonlyMap<Role, RoleV10> = new Map([
+  ['user', RoleV10.ROLE_USER],
+  ['agent', RoleV10.ROLE_AGENT],
+]);
+
+export const V10_ROLE_TO_INTERNAL: ReadonlyMap<string, Role> = new Map([
+  [RoleV10.ROLE_USER, 'user'],
+  [RoleV10.ROLE_AGENT, 'agent'],
+]);
+
 // ─── Message ───
 
 export interface Message {

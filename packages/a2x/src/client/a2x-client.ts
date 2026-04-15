@@ -254,11 +254,29 @@ export class A2XClient {
     const card = this._resolved!.card;
     const rawCard = card as unknown as Record<string, unknown>;
 
-    const rawRequirements =
-      (rawCard.security as Array<Record<string, string[]>> | undefined) ??
-      (rawCard.securityRequirements as Array<Record<string, string[]>> | undefined) ??
+    // v0.3 uses "security", v1.0 uses "securityRequirements"
+    const rawRequirementsField =
+      (rawCard.security as unknown[] | undefined) ??
+      (rawCard.securityRequirements as unknown[] | undefined) ??
       [];
-    if (rawRequirements.length === 0) return;
+    if (rawRequirementsField.length === 0) return;
+
+    // Normalize v1.0 wrapped format { schemes: { name: { values: [...] } } }
+    // to internal flat format { name: [...] }
+    const rawRequirements = rawRequirementsField.map((req) => {
+      const r = req as Record<string, unknown>;
+      if (r.schemes && typeof r.schemes === 'object') {
+        // v1.0 format
+        const flat: Record<string, string[]> = {};
+        for (const [name, val] of Object.entries(r.schemes as Record<string, unknown>)) {
+          const v = val as { values?: string[] };
+          flat[name] = v.values ?? [];
+        }
+        return flat;
+      }
+      // v0.3 format (already flat)
+      return r as Record<string, string[]>;
+    });
 
     const rawSchemes =
       (rawCard.securitySchemes as Record<string, unknown> | undefined) ?? {};

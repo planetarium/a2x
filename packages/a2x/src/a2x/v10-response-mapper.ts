@@ -2,6 +2,7 @@
  * Layer 3: V10ResponseMapper - maps internal response objects to v1.0 format.
  *
  * Transforms TaskState from lowercase to UPPER_SNAKE_CASE.
+ * Transforms Role from lowercase to ROLE_UPPER format.
  * Strips `kind` fields (defensive, in case they are accidentally present).
  * Does not inject `history` or default artifact `name`.
  */
@@ -14,7 +15,8 @@ import type {
 } from '../types/task.js';
 import { TASK_STATE_TO_V10 } from '../types/task.js';
 import type { TaskState } from '../types/task.js';
-import type { Message, Part, Artifact } from '../types/common.js';
+import type { Message, Part, Artifact, Role } from '../types/common.js';
+import { ROLE_TO_V10 } from '../types/common.js';
 import type { ResponseMapper } from './response-mapper.js';
 
 export class V10ResponseMapper implements ResponseMapper {
@@ -86,6 +88,11 @@ export class V10ResponseMapper implements ResponseMapper {
     return v10State ?? state;
   }
 
+  private _mapRoleToV10(role: Role): string {
+    const v10Role = ROLE_TO_V10.get(role);
+    return v10Role ?? role;
+  }
+
   private _mapStatus(status: TaskStatus): Record<string, unknown> {
     const mapped: Record<string, unknown> = {
       state: this._mapStateToV10(status.state),
@@ -102,7 +109,7 @@ export class V10ResponseMapper implements ResponseMapper {
   private _mapMessage(message: Message): Record<string, unknown> {
     const mapped: Record<string, unknown> = {
       messageId: message.messageId,
-      role: message.role,
+      role: this._mapRoleToV10(message.role),
       parts: message.parts.map((p) => this._mapPart(p)),
     };
 

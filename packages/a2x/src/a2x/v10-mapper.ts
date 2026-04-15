@@ -9,7 +9,11 @@ import type {
   AgentInterfaceV10,
   AgentSkillV10,
 } from '../types/agent-card.js';
-import type { SecuritySchemeV10 } from '../types/security.js';
+import type {
+  SecuritySchemeV10,
+  SecurityRequirement,
+  SecurityRequirementV10,
+} from '../types/security.js';
 import type { AgentCardMapper } from './agent-card-mapper.js';
 
 export class V10AgentCardMapper implements AgentCardMapper<AgentCardV10> {
@@ -38,9 +42,11 @@ export class V10AgentCardMapper implements AgentCardMapper<AgentCardV10> {
       card.securitySchemes = schemes;
     }
 
-    // securityRequirements
+    // securityRequirements (convert internal flat format to v1.0 wrapped format)
     if (state.securityRequirements.length > 0) {
-      card.securityRequirements = state.securityRequirements;
+      card.securityRequirements = state.securityRequirements.map(
+        (req) => this.mapSecurityRequirement(req),
+      );
     }
 
     // optional fields
@@ -108,12 +114,31 @@ export class V10AgentCardMapper implements AgentCardMapper<AgentCardV10> {
         ...(skill.examples ? { examples: skill.examples } : {}),
         ...(skill.inputModes ? { inputModes: skill.inputModes } : {}),
         ...(skill.outputModes ? { outputModes: skill.outputModes } : {}),
-        // v1.0 uses "securityRequirements"
+        // v1.0 uses wrapped "securityRequirements"
         ...(skill.securityRequirements
-          ? { securityRequirements: skill.securityRequirements }
+          ? {
+              securityRequirements: skill.securityRequirements.map(
+                (req) => this.mapSecurityRequirement(req),
+              ),
+            }
           : {}),
       }),
     );
+  }
+
+  /**
+   * Convert internal flat SecurityRequirement to v1.0 wrapped format.
+   * Internal: { "oauth2": ["read", "write"], "apiKey": [] }
+   * v1.0:    { schemes: { "oauth2": { values: ["read", "write"] }, "apiKey": { values: [] } } }
+   */
+  private mapSecurityRequirement(
+    requirement: SecurityRequirement,
+  ): SecurityRequirementV10 {
+    const schemes: Record<string, { values: string[] }> = {};
+    for (const [name, scopes] of Object.entries(requirement)) {
+      schemes[name] = { values: scopes };
+    }
+    return { schemes };
   }
 
   private mapSecuritySchemes(
