@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { handler } from "@/lib/a2x-setup";
 import { createSSEStream } from "a2x";
+import type { RequestContext } from "a2x";
 
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
@@ -20,7 +21,13 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
-  const result = await handler.handle(body);
+  // Build framework-agnostic RequestContext for authentication
+  const context: RequestContext = {
+    headers: Object.fromEntries(request.headers.entries()),
+    query: Object.fromEntries(new URL(request.url).searchParams.entries()),
+  };
+
+  const result = await handler.handle(body, context);
 
   // Streaming → AsyncGenerator → SSE response
   if (result && typeof result === "object" && Symbol.asyncIterator in result) {

@@ -6,6 +6,7 @@ import {
   InMemoryTaskStore,
   A2XAgent,
   DefaultRequestHandler,
+  OAuth2DeviceCodeAuthorization,
 } from "a2x";
 import { AnthropicProvider } from "a2x/anthropic";
 
@@ -34,6 +35,30 @@ export const a2xAgent = new A2XAgent({ taskStore, executor, protocolVersion: '1.
     description: "General conversation and Q&A",
     tags: ["chat", "general"],
   })
-  .setCapabilities({ streaming: true });
+  .setCapabilities({ streaming: true })
+  .addSecurityScheme(
+    'deviceCode',
+    new OAuth2DeviceCodeAuthorization({
+      deviceAuthorizationUrl: `${process.env.AUTH_ISSUER ?? 'https://auth.example.com'}/device/authorize`,
+      tokenUrl: `${process.env.AUTH_ISSUER ?? 'https://auth.example.com'}/oauth/token`,
+      scopes: { 'agent:invoke': 'Invoke the agent' },
+      description: 'OAuth2 Device Code flow for CLI / headless clients',
+      tokenValidator: async (token, _requiredScopes) => {
+        const validToken = process.env.AUTH_TOKEN;
+        if (!validToken) {
+          return { authenticated: true };
+        }
+        if (token !== validToken) {
+          return { authenticated: false, error: 'Invalid access token' };
+        }
+        return {
+          authenticated: true,
+          principal: { sub: 'device-user' },
+          scopes: ['agent:invoke'],
+        };
+      },
+    }),
+  )
+  .addSecurityRequirement({ deviceCode: ['agent:invoke'] });
 
 export const handler = new DefaultRequestHandler(a2xAgent);
