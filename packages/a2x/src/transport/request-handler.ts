@@ -16,12 +16,11 @@ import type {
 } from '../types/jsonrpc.js';
 import { A2A_METHODS } from '../types/jsonrpc.js';
 import type { AgentCardV03, AgentCardV10 } from '../types/agent-card.js';
-import type { Task } from '../types/task.js';
 import type {
   TaskStatusUpdateEvent,
   TaskArtifactUpdateEvent,
 } from '../types/task.js';
-import { TERMINAL_STATES, TaskState } from '../types/task.js';
+import { TERMINAL_STATES } from '../types/task.js';
 import {
   AuthenticationRequiredError,
   InternalError,

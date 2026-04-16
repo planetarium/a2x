@@ -25,5 +25,14 @@
   "engines": {
     "node": ">=20.0.0"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/planetarium/a2x.git",
+    "directory": "packages/cli"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": ["a2a", "agent-to-agent", "ai", "agent", "cli"],
   "license": "MIT"
 }

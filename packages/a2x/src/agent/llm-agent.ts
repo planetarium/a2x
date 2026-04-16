@@ -10,7 +10,6 @@ import type {
   ModelRequest,
   ModelResponse,
   ToolDeclaration,
-  ToolCall,
 } from './llm-provider.js';
 import type { Part, Message } from '../types/common.js';
 import { isTextPart } from '../types/common.js';

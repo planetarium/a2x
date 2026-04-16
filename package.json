@@ -1,16 +1,22 @@
 {
   "name": "a2x-sdk",
   "private": true,
+  "packageManager": "pnpm@10.32.1",
   "type": "module",
   "scripts": {
-    "build": "pnpm --filter a2x build",
+    "build": "pnpm -r build",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint packages/",
-    "typecheck": "tsc --noEmit",
-    "cli:install": "pnpm --filter @a2x/cli build && npm install -g ./packages/cli"
+    "typecheck": "pnpm -r typecheck",
+    "cli:install": "pnpm --filter @a2x/cli build && npm install -g ./packages/cli",
+    "changeset": "changeset",
+    "version": "changeset version",
+    "release": "pnpm -r build && changeset publish"
   },
   "devDependencies": {
+    "@changesets/changelog-github": "^0.6.0",
+    "@changesets/cli": "^2.30.0",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
     "eslint": "^9.0.0",
