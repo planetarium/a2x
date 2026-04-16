@@ -1,5 +1,6 @@
 {
   "name": "@a2x/cli",
+  "private": true,
   "version": "0.1.0",
   "type": "module",
   "description": "CLI for the a2x A2A protocol SDK",
@@ -29,9 +30,6 @@
     "type": "git",
     "url": "https://github.com/planetarium/a2x.git",
     "directory": "packages/cli"
-  },
-  "publishConfig": {
-    "access": "public"
   },
   "keywords": ["a2a", "agent-to-agent", "ai", "agent", "cli"],
   "license": "MIT"
