@@ -20,6 +20,7 @@ export type {
   TaskStore,
   CreateTaskParams,
   TaskUpdate,
+  InMemoryTaskStoreOptions,
 } from './task-store.js';
 
 // ─── Register default agent-card mappers ───
