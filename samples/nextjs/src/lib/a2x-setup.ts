@@ -7,8 +7,8 @@ import {
   A2XAgent,
   DefaultRequestHandler,
   OAuth2DeviceCodeAuthorization,
-} from "@a2x/a2x";
-import { AnthropicProvider } from "@a2x/a2x/anthropic";
+} from "@a2x/sdk";
+import { AnthropicProvider } from "@a2x/sdk/anthropic";
 import { globalTokens } from "@/app/oauth/token/route";
 
 const agent = new LlmAgent({

@@ -3,8 +3,8 @@
  */
 
 import chalk from 'chalk';
-import { A2XClient } from '@a2x/a2x/client';
-import type { Task, TaskStatusUpdateEvent, TaskArtifactUpdateEvent, Part } from '@a2x/a2x';
+import { A2XClient } from '@a2x/sdk/client';
+import type { Task, TaskStatusUpdateEvent, TaskArtifactUpdateEvent, Part } from '@a2x/sdk';
 import { CliAuthProvider } from './cli-auth-provider.js';
 
 // ─── Error Formatting ───

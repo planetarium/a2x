@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { handler } from "@/lib/a2x-setup";
-import { createSSEStream } from "@a2x/a2x";
-import type { RequestContext } from "@a2x/a2x";
+import { createSSEStream } from "@a2x/sdk";
+import type { RequestContext } from "@a2x/sdk";
 
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",

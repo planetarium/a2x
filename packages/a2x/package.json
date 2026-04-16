@@ -1,5 +1,5 @@
 {
-  "name": "@a2x/a2x",
+  "name": "@a2x/sdk",
   "version": "0.1.0",
   "type": "module",
   "description": "A2A (Agent-to-Agent) protocol SDK for TypeScript",

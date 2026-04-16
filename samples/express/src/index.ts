@@ -11,13 +11,13 @@ import {
   createSSEStream,
   ApiKeyAuthorization,
   OAuth2DeviceCodeAuthorization,
-} from '@a2x/a2x';
+} from '@a2x/sdk';
 import type {
   TaskStatusUpdateEvent,
   TaskArtifactUpdateEvent,
   RequestContext,
-} from '@a2x/a2x';
-import { GoogleProvider } from '@a2x/a2x/google';
+} from '@a2x/sdk';
+import { GoogleProvider } from '@a2x/sdk/google';
 
 // ─── 1. Define your agent ───
 

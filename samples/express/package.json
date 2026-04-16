@@ -9,7 +9,7 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
-    "@a2x/a2x": "workspace:*",
+    "@a2x/sdk": "workspace:*",
     "dotenv": "^16",
     "express": "^5.1.0"
   },
