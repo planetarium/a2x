@@ -2,9 +2,6 @@ node_modules/
 dist/
 *.tsbuildinfo
 
-# Lockfile
-pnpm-lock.yaml
-
 # IDE
 .idea/
 .vscode/

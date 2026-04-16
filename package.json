@@ -8,7 +8,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint packages/",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "pnpm -r typecheck",
     "cli:install": "pnpm --filter @a2x/cli build && npm install -g ./packages/cli",
     "changeset": "changeset",
     "version": "changeset version",
