@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { InMemoryTaskStore } from '../a2x/task-store.js';
-import { TaskState, TERMINAL_STATES } from '../types/task.js';
+import { TaskState } from '../types/task.js';
 
 describe('Layer 3: TaskStore', () => {
   describe('InMemoryTaskStore', () => {

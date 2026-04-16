@@ -8,8 +8,6 @@ import {
   OAuth2DeviceCodeAuthScheme,
   OAuth2AuthorizationCodeAuthScheme,
   OAuth2ClientCredentialsAuthScheme,
-  OAuth2ImplicitAuthScheme,
-  OAuth2PasswordAuthScheme,
   OpenIdConnectAuthScheme,
 } from '../client/auth-scheme.js';
 import { normalizeScheme, normalizeRequirements } from '../client/auth-normalizer.js';

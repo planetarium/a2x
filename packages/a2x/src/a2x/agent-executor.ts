@@ -2,7 +2,6 @@
  * Layer 3: AgentExecutor - bridges Runner/Agent with Task lifecycle.
  */
 
-import type { AgentEvent } from '../agent/base-agent.js';
 import type { Message, Artifact } from '../types/common.js';
 import type {
   Task,
