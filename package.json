@@ -1,6 +1,7 @@
 {
   "name": "a2x-sdk",
   "private": true,
+  "packageManager": "pnpm@10.32.1",
   "type": "module",
   "scripts": {
     "build": "pnpm -r build",
