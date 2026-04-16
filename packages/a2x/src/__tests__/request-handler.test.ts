@@ -9,6 +9,8 @@ import { LlmAgent } from '../agent/llm-agent.js';
 import { BaseLlmProvider } from '../provider/base.js';
 import { A2A_ERROR_CODES } from '../types/errors.js';
 import type { JSONRPCResponse, JSONRPCErrorResponse } from '../types/jsonrpc.js';
+import { InMemoryPushNotificationConfigStore } from '../a2x/push-notification-config-store.js';
+import type { TaskPushNotificationConfig } from '../types/jsonrpc.js';
 import { ApiKeyAuthorization } from '../security/api-key.js';
 import { HttpBearerAuthorization } from '../security/http-bearer.js';
 import type { RequestContext } from '../types/auth.js';
@@ -42,6 +44,36 @@ function createHandler(protocolVersion?: ProtocolVersion): DefaultRequestHandler
   a2xAgent.setDefaultUrl('https://example.com/a2a');
 
   return new DefaultRequestHandler(a2xAgent);
+}
+
+function createHandlerWithPushNotification(protocolVersion?: ProtocolVersion): {
+  handler: DefaultRequestHandler;
+  pushStore: InMemoryPushNotificationConfigStore;
+} {
+  const agent = new LlmAgent({
+    name: 'test-agent',
+    provider: mockProvider,
+    description: 'A test agent',
+    instruction: 'You are a helpful assistant.',
+  });
+
+  const runner = new InMemoryRunner({ agent, appName: 'test' });
+  const executor = new AgentExecutor({
+    runner,
+    runConfig: { streamingMode: StreamingMode.SSE },
+  });
+  const taskStore = new InMemoryTaskStore();
+  const pushStore = new InMemoryPushNotificationConfigStore();
+  const a2xAgent = new A2XAgent({
+    taskStore,
+    executor,
+    protocolVersion,
+    pushNotificationConfigStore: pushStore,
+  });
+  a2xAgent.setDefaultUrl('https://example.com/a2a');
+  a2xAgent.setCapabilities({ pushNotifications: true });
+
+  return { handler: new DefaultRequestHandler(a2xAgent), pushStore };
 }
 
 function isAsyncGenerator(value: unknown): value is AsyncGenerator {
@@ -715,6 +747,108 @@ describe('Layer 4: DefaultRequestHandler', () => {
       expect(isAsyncGenerator(response)).toBe(false);
       const rpc = response as JSONRPCResponse;
       expect('result' in rpc).toBe(true);
+    });
+  });
+
+  describe('tasks/pushNotificationConfig/delete', () => {
+    it('should return PushNotificationNotSupported when no store configured', async () => {
+      const handler = createHandler();
+      const response = await handler.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tasks/pushNotificationConfig/delete',
+        params: { id: 'task-1', pushNotificationConfigId: 'config-1' },
+      });
+
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('error' in rpc).toBe(true);
+      expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+        A2A_ERROR_CODES.PUSH_NOTIFICATION_NOT_SUPPORTED,
+      );
+    });
+
+    it('should delete an existing config and return null result', async () => {
+      const { handler, pushStore } = createHandlerWithPushNotification();
+
+      const config: TaskPushNotificationConfig = {
+        id: 'config-1',
+        taskId: 'task-1',
+        pushNotificationConfig: {
+          id: 'config-1',
+          url: 'https://example.com/webhook',
+        },
+      };
+      await pushStore.set(config);
+
+      const response = await handler.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tasks/pushNotificationConfig/delete',
+        params: { id: 'task-1', pushNotificationConfigId: 'config-1' },
+      });
+
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('error' in rpc).toBe(false);
+      expect((rpc as { result: unknown }).result).toBeNull();
+
+      const after = await pushStore.get('task-1', 'config-1');
+      expect(after).toBeNull();
+    });
+
+    it('should return TaskNotFound when config does not exist', async () => {
+      const { handler } = createHandlerWithPushNotification();
+
+      const response = await handler.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tasks/pushNotificationConfig/delete',
+        params: { id: 'task-1', pushNotificationConfigId: 'non-existent' },
+      });
+
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('error' in rpc).toBe(true);
+      expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+        A2A_ERROR_CODES.TASK_NOT_FOUND,
+      );
+    });
+
+    it('should return InvalidParams when id is missing', async () => {
+      const { handler } = createHandlerWithPushNotification();
+
+      const response = await handler.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tasks/pushNotificationConfig/delete',
+        params: { pushNotificationConfigId: 'config-1' },
+      });
+
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('error' in rpc).toBe(true);
+      expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+        A2A_ERROR_CODES.INVALID_PARAMS,
+      );
+    });
+
+    it('should return InvalidParams when pushNotificationConfigId is missing', async () => {
+      const { handler } = createHandlerWithPushNotification();
+
+      const response = await handler.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tasks/pushNotificationConfig/delete',
+        params: { id: 'task-1' },
+      });
+
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('error' in rpc).toBe(true);
+      expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+        A2A_ERROR_CODES.INVALID_PARAMS,
+      );
     });
   });
 });
