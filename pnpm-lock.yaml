@@ -57,7 +57,7 @@ importers:
 
   packages/cli:
     dependencies:
-      a2x:
+      '@a2x/a2x':
         specifier: workspace:*
         version: link:../a2x
       chalk:
@@ -79,7 +79,7 @@ importers:
 
   samples/express:
     dependencies:
-      a2x:
+      '@a2x/a2x':
         specifier: workspace:*
         version: link:../../packages/a2x
       dotenv:
@@ -104,7 +104,7 @@ importers:
 
   samples/nextjs:
     dependencies:
-      a2x:
+      '@a2x/a2x':
         specifier: workspace:*
         version: link:../../packages/a2x
       next:
