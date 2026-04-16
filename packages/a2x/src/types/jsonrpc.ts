@@ -68,3 +68,33 @@ export interface TaskIdParams {
   id: string;
   metadata?: Record<string, unknown>;
 }
+
+// ─── Push Notification Config Types ───
+
+export interface PushNotificationConfig {
+  id: string;
+  url: string;
+  token?: string;
+  authentication?: PushNotificationAuthenticationInfo;
+}
+
+export interface PushNotificationAuthenticationInfo {
+  schemes: string[];
+  credentials?: string;
+}
+
+export interface TaskPushNotificationConfig {
+  id: string;
+  taskId: string;
+  pushNotificationConfig: PushNotificationConfig;
+}
+
+// ─── Delete Push Notification Config Parameters ───
+
+export interface DeletePushNotificationConfigParams {
+  /** The task ID */
+  id: string;
+  /** The push notification config ID to delete */
+  pushNotificationConfigId: string;
+  metadata?: Record<string, unknown>;
+}
