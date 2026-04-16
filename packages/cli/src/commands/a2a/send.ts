@@ -1,6 +1,6 @@
 import { Command } from 'commander';
 import crypto from 'node:crypto';
-import type { SendMessageParams } from '@a2x/a2x';
+import type { SendMessageParams } from '@a2x/sdk';
 import { printTask, printConnectionError, createClient } from '../../format.js';
 
 export const sendCommand = new Command('send')

@@ -1,5 +1,5 @@
 import { Command } from 'commander';
-import { resolveAgentCard } from '@a2x/a2x/client';
+import { resolveAgentCard } from '@a2x/sdk/client';
 import { printAgentCard, printConnectionError, parseHeaders } from '../../format.js';
 
 export const agentCardCommand = new Command('agent-card')

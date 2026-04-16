@@ -9,7 +9,7 @@
 import * as readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import chalk from 'chalk';
-import type { AuthProvider } from '@a2x/a2x/client';
+import type { AuthProvider } from '@a2x/sdk/client';
 import {
   AuthScheme,
   ApiKeyAuthScheme,
@@ -21,7 +21,7 @@ import {
   OAuth2ImplicitAuthScheme,
   OAuth2PasswordAuthScheme,
   OpenIdConnectAuthScheme,
-} from '@a2x/a2x/client';
+} from '@a2x/sdk/client';
 import { loadCredentials, saveCredentials, clearCredentials } from './token-store.js';
 
 async function prompt(question: string): Promise<string> {

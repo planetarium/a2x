@@ -1,5 +1,8 @@
 # a2x
 
+[![npm version](https://img.shields.io/npm/v/@a2x/sdk.svg)](https://www.npmjs.com/package/@a2x/sdk)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A self-contained TypeScript SDK for building [A2A (Agent-to-Agent)](https://google.github.io/A2A/) protocol agents with integrated OAuth 2.0 Device Flow authentication.
 
 ## Why a2x?
@@ -12,12 +15,23 @@ Existing A2A libraries like Google ADK (`@google/adk`) and `@a2a-js/sdk` have fu
 
 a2x solves all three. Define your agent once, and a2x generates spec-compliant AgentCards for any protocol version — automatically.
 
+## Installation
+
+```bash
+# SDK
+npm install @a2x/sdk
+
+# CLI (via GitHub Releases)
+# Download the latest tarball from https://github.com/planetarium/a2x/releases
+```
+
 ## Key Features
 
 - **Auto-extraction** — `A2XAgent` infers AgentCard fields (`name`, `description`, `capabilities.streaming`) from your runtime objects. No manual duplication.
 - **Multi-version AgentCard** — Generate v0.3 and v1.0 AgentCards from the same `A2XAgent` instance with `getAgentCard('0.3')` / `getAgentCard('1.0')`.
 - **Builder pattern** — Override any auto-extracted value with chainable methods (`setName()`, `addSkill()`, `addSecurityScheme()`, etc.).
 - **ADK-compatible patterns** — Familiar `LlmAgent`, `SequentialAgent`, `ParallelAgent`, `LoopAgent`, `FunctionTool`, `AgentTool`, `Runner`, and `Session` APIs.
+- **Client SDK** — `A2XClient` for interacting with any A2A-compliant agent, with built-in auth scheme support.
 - **Device Flow auth** — Built-in OAuth 2.0 Device Authorization Grant (RFC 8628) for CLI and browserless environments.
 - **Framework-agnostic** — Works with Express, Fastify, Hono, Next.js, or any HTTP framework.
 - **SSE streaming** — First-class support for `message/stream` via Server-Sent Events.
@@ -35,8 +49,8 @@ import {
   InMemoryTaskStore,
   DefaultRequestHandler,
   StreamingMode,
-} from 'a2x';
-import { GoogleProvider } from 'a2x/google';
+} from '@a2x/sdk';
+import { GoogleProvider } from '@a2x/sdk/google';
 
 // 1. Define your agent
 const agent = new LlmAgent({
@@ -111,13 +125,35 @@ getAgentCard(version?)
 | `FunctionTool` | Wrap any async function as an agent tool (with Zod schema) |
 | `AgentTool` | Use another agent as a callable tool |
 
+## Client SDK
+
+```typescript
+import { A2XClient, resolveAgentCard } from '@a2x/sdk/client';
+
+// Discover an agent
+const card = await resolveAgentCard('https://agent.example.com');
+
+// Create a client and send messages
+const client = new A2XClient(card);
+const task = await client.sendMessage({
+  message: { role: 'user', parts: [{ text: 'Hello!' }] },
+});
+
+// Or stream responses
+for await (const event of client.sendMessageStream({
+  message: { role: 'user', parts: [{ text: 'Tell me a story' }] },
+})) {
+  console.log(event);
+}
+```
+
 ## Server Integration
 
 **Quick prototype** with `toA2x()`:
 
 ```typescript
-import { LlmAgent, toA2x } from 'a2x';
-import { GoogleProvider } from 'a2x/google';
+import { LlmAgent, toA2x } from '@a2x/sdk';
+import { GoogleProvider } from '@a2x/sdk/google';
 
 const agent = new LlmAgent({
   name: 'quick_agent',
@@ -148,7 +184,7 @@ export async function GET() {
 ## Device Flow Authentication
 
 ```typescript
-import { DeviceFlowClient } from 'a2x/auth';
+import { DeviceFlowClient } from '@a2x/sdk/auth';
 
 const authClient = new DeviceFlowClient({
   agentCardUrl: 'https://my-agent.example.com/.well-known/agent.json',
@@ -159,6 +195,33 @@ console.log(`Visit ${verificationUri} and enter code: ${userCode}`);
 
 const token = await authClient.pollForToken(deviceCode);
 const a2aClient = authClient.createAuthenticatedClient(token);
+```
+
+## CLI
+
+The `@a2x/cli` provides command-line tools for interacting with A2A agents.
+
+```bash
+# Send a message to an agent
+a2x a2a send <agent-url> "Hello, agent!"
+
+# Stream a response
+a2x a2a stream <agent-url> "Tell me a story"
+
+# Fetch an agent card
+a2x a2a agent-card <agent-url>
+
+# Check task status
+a2x a2a task <agent-url> <task-id>
+```
+
+Install from [GitHub Releases](https://github.com/planetarium/a2x/releases) or build from source:
+
+```bash
+git clone https://github.com/planetarium/a2x.git
+cd a2x
+pnpm install && pnpm build
+pnpm cli:install
 ```
 
 ## A2A Protocol Versions
@@ -182,7 +245,9 @@ a2x handles the structural differences between A2A v0.3 and v1.0 transparently:
 - **Build**: tsup (ESM + CJS dual emit)
 - **Package manager**: pnpm (workspace)
 - **Test**: vitest
+- **Versioning**: changesets (independent per package)
+- **CI/CD**: GitHub Actions
 
 ## License
 
-TBD
+MIT
