@@ -1,0 +1,59 @@
+name: Release CLI
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release-cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check CLI version
+        id: version
+        run: |
+          VERSION=$(jq -r '.version' packages/cli/package.json)
+          TAG="cli-v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if git rev-parse "${TAG}" >/dev/null 2>&1; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: pnpm/action-setup@v4
+        if: steps.version.outputs.changed == 'true'
+
+      - uses: actions/setup-node@v4
+        if: steps.version.outputs.changed == 'true'
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+        if: steps.version.outputs.changed == 'true'
+
+      - run: pnpm -r build
+        if: steps.version.outputs.changed == 'true'
+
+      - name: Pack CLI tarball
+        if: steps.version.outputs.changed == 'true'
+        run: pnpm --filter @a2x/cli pack
+
+      - name: Create GitHub Release
+        if: steps.version.outputs.changed == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: CLI ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: packages/cli/*.tgz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
