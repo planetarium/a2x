@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { program } from 'commander';
-import { a2aCommand } from './commands/index.js';
+import { a2aCommand, registryCommand } from './commands/index.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -14,5 +14,6 @@ program
   .version(pkg.version);
 
 program.addCommand(a2aCommand);
+program.addCommand(registryCommand);
 
 program.parse();
