@@ -393,10 +393,10 @@ export class DefaultRequestHandler {
       throw new PushNotificationNotSupportedError();
     }
 
-    const deleted = await store.delete(params.id, params.pushNotificationConfigId);
+    const deleted = await store.delete(params.taskId, params.configId);
     if (!deleted) {
       throw new TaskNotFoundError(
-        `Push notification config '${params.pushNotificationConfigId}' not found for task '${params.id}'`,
+        `Push notification config '${params.configId}' not found for task '${params.taskId}'`,
       );
     }
 
@@ -466,32 +466,64 @@ export class DefaultRequestHandler {
     return params as TaskIdParams;
   }
 
+  /**
+   * Validate and normalize delete push notification config params.
+   *
+   * v0.3 wire format: { id: taskId, pushNotificationConfigId: configId }
+   * v1.0 wire format: { taskId: taskId, id: configId }
+   *
+   * Both are normalized into { taskId, configId }.
+   */
   private _validateDeletePushNotificationConfigParams(
     params: unknown,
   ): DeletePushNotificationConfigParams {
     if (!params || typeof params !== 'object') {
       throw new InvalidParamsError(
-        'DeletePushNotificationConfig requires "id" and "pushNotificationConfigId" parameters',
+        'DeletePushNotificationConfig requires task ID and config ID parameters',
       );
     }
 
     const p = params as Record<string, unknown>;
+    let taskId: string;
+    let configId: string;
 
-    if (typeof p.id !== 'string' || p.id.trim() === '') {
-      throw new InvalidParamsError(
-        'DeletePushNotificationConfig: "id" must be a non-empty string',
-      );
+    if (this.a2xAgent.protocolVersion === '0.3') {
+      // v0.3: { id: taskId, pushNotificationConfigId: configId }
+      if (typeof p.id !== 'string' || p.id.trim() === '') {
+        throw new InvalidParamsError(
+          'DeletePushNotificationConfig: "id" (task ID) must be a non-empty string',
+        );
+      }
+      if (
+        typeof p.pushNotificationConfigId !== 'string' ||
+        (p.pushNotificationConfigId as string).trim() === ''
+      ) {
+        throw new InvalidParamsError(
+          'DeletePushNotificationConfig: "pushNotificationConfigId" must be a non-empty string',
+        );
+      }
+      taskId = p.id as string;
+      configId = p.pushNotificationConfigId as string;
+    } else {
+      // v1.0: { taskId: taskId, id: configId }
+      if (typeof p.taskId !== 'string' || (p.taskId as string).trim() === '') {
+        throw new InvalidParamsError(
+          'DeletePushNotificationConfig: "taskId" must be a non-empty string',
+        );
+      }
+      if (typeof p.id !== 'string' || p.id.trim() === '') {
+        throw new InvalidParamsError(
+          'DeletePushNotificationConfig: "id" (config ID) must be a non-empty string',
+        );
+      }
+      taskId = p.taskId as string;
+      configId = p.id as string;
     }
 
-    if (
-      typeof p.pushNotificationConfigId !== 'string' ||
-      p.pushNotificationConfigId.trim() === ''
-    ) {
-      throw new InvalidParamsError(
-        'DeletePushNotificationConfig: "pushNotificationConfigId" must be a non-empty string',
-      );
-    }
-
-    return params as DeletePushNotificationConfigParams;
+    return {
+      taskId,
+      configId,
+      metadata: p.metadata as Record<string, unknown> | undefined,
+    };
   }
 }

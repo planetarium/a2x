@@ -91,10 +91,16 @@ export interface TaskPushNotificationConfig {
 
 // ─── Delete Push Notification Config Parameters ───
 
+/**
+ * Version-agnostic internal representation for delete push notification config.
+ *
+ * v0.3 wire format: { id: taskId, pushNotificationConfigId: configId }
+ * v1.0 wire format: { taskId: taskId, id: configId }
+ *
+ * The validator normalizes both formats into this unified shape.
+ */
 export interface DeletePushNotificationConfigParams {
-  /** The task ID */
-  id: string;
-  /** The push notification config ID to delete */
-  pushNotificationConfigId: string;
+  taskId: string;
+  configId: string;
   metadata?: Record<string, unknown>;
 }
