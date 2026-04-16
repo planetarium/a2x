@@ -1,6 +1,6 @@
 {
   "name": "@a2x/sdk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "A2A (Agent-to-Agent) protocol SDK for TypeScript",
   "exports": {
@@ -84,6 +84,13 @@
   "publishConfig": {
     "access": "public"
   },
-  "keywords": ["a2a", "agent-to-agent", "ai", "agent", "sdk", "protocol"],
+  "keywords": [
+    "a2a",
+    "agent-to-agent",
+    "ai",
+    "agent",
+    "sdk",
+    "protocol"
+  ],
   "license": "MIT"
 }
