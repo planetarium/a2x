@@ -71,6 +71,8 @@ interface TokenErrorResponse {
   error_description?: string;
 }
 
+const CLI_CLIENT_ID = 'a2x-cli';
+
 async function performDeviceCodeFlow(
   scheme: OAuth2DeviceCodeAuthScheme,
 ): Promise<string> {
@@ -82,6 +84,7 @@ async function performDeviceCodeFlow(
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
+      client_id: CLI_CLIENT_ID,
       ...(scopeStr ? { scope: scopeStr } : {}),
     }),
   });
@@ -123,6 +126,7 @@ async function performDeviceCodeFlow(
       body: new URLSearchParams({
         grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
         device_code: deviceData.device_code,
+        client_id: CLI_CLIENT_ID,
       }),
     });
 
