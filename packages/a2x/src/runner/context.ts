@@ -25,4 +25,5 @@ export interface InvocationContext {
   agentName: string;
   plugins?: BasePlugin[];
   maxLlmCalls?: number;
+  signal?: AbortSignal;
 }
