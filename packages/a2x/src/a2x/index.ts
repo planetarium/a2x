@@ -20,6 +20,7 @@ export type {
   TaskStore,
   CreateTaskParams,
   TaskUpdate,
+  InMemoryTaskStoreOptions,
 } from './task-store.js';
 export { InMemoryPushNotificationConfigStore } from './push-notification-config-store.js';
 export type {
