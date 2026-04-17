@@ -17,6 +17,7 @@ import type { SecurityRequirement } from '../types/security.js';
 import { AgentExecutor, StreamingMode } from './agent-executor.js';
 import { AgentCardMapperFactory } from './agent-card-mapper.js';
 import type { TaskStore } from './task-store.js';
+import type { PushNotificationConfigStore } from './push-notification-config-store.js';
 
 // ─── Protocol Version ───
 
@@ -31,12 +32,14 @@ export interface A2XAgentOptions {
   taskStore: TaskStore;
   executor: AgentExecutor;
   protocolVersion?: ProtocolVersion;
+  pushNotificationConfigStore?: PushNotificationConfigStore;
 }
 
 export class A2XAgent {
   private readonly _taskStore: TaskStore;
   private readonly _agentExecutor: AgentExecutor;
   private readonly _protocolVersion: ProtocolVersion;
+  private readonly _pushNotificationConfigStore?: PushNotificationConfigStore;
 
   // ─── Internal mutable state (builder pattern) ───
   private _name?: string;
@@ -77,6 +80,7 @@ export class A2XAgent {
     this._taskStore = options.taskStore;
     this._agentExecutor = options.executor;
     this._protocolVersion = options.protocolVersion ?? '1.0';
+    this._pushNotificationConfigStore = options.pushNotificationConfigStore;
   }
 
   // ─── Builder Methods (return this for chaining) ───
@@ -260,6 +264,10 @@ export class A2XAgent {
 
   get securityRequirements(): readonly SecurityRequirement[] {
     return this._securityRequirements;
+  }
+
+  get pushNotificationConfigStore(): PushNotificationConfigStore | undefined {
+    return this._pushNotificationConfigStore;
   }
 
   // ─── Private Methods ───

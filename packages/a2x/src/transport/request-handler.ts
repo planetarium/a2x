@@ -13,6 +13,7 @@ import type {
   JSONRPCResponse,
   SendMessageParams,
   TaskIdParams,
+  DeletePushNotificationConfigParams,
 } from '../types/jsonrpc.js';
 import { A2A_METHODS } from '../types/jsonrpc.js';
 import type { AgentCardV03, AgentCardV10 } from '../types/agent-card.js';
@@ -27,6 +28,7 @@ import {
   InvalidParamsError,
   InvalidRequestError,
   JSONParseError,
+  PushNotificationNotSupportedError,
   TaskNotCancelableError,
   TaskNotFoundError,
   UnsupportedOperationError,
@@ -285,6 +287,15 @@ export class DefaultRequestHandler {
         return this._handleCancelTask(taskParams);
       },
     );
+
+    // tasks/pushNotificationConfig/delete
+    this.router.registerMethod(
+      A2A_METHODS.DELETE_PUSH_CONFIG,
+      async (params) => {
+        const deleteParams = this._validateDeletePushNotificationConfigParams(params);
+        return this._handleDeletePushNotificationConfig(deleteParams);
+      },
+    );
   }
 
   // ─── Private: Method Handlers ───
@@ -374,6 +385,24 @@ export class DefaultRequestHandler {
     return this.responseMapper.mapTask(canceledTask);
   }
 
+  private async _handleDeletePushNotificationConfig(
+    params: DeletePushNotificationConfigParams,
+  ): Promise<null> {
+    const store = this.a2xAgent.pushNotificationConfigStore;
+    if (!store) {
+      throw new PushNotificationNotSupportedError();
+    }
+
+    const deleted = await store.delete(params.taskId, params.configId);
+    if (!deleted) {
+      throw new TaskNotFoundError(
+        `Push notification config '${params.configId}' not found for task '${params.taskId}'`,
+      );
+    }
+
+    return null;
+  }
+
   // ─── Private: Helpers ───
 
   private _toErrorResponse(
@@ -435,5 +464,66 @@ export class DefaultRequestHandler {
     }
 
     return params as TaskIdParams;
+  }
+
+  /**
+   * Validate and normalize delete push notification config params.
+   *
+   * v0.3 wire format: { id: taskId, pushNotificationConfigId: configId }
+   * v1.0 wire format: { taskId: taskId, id: configId }
+   *
+   * Both are normalized into { taskId, configId }.
+   */
+  private _validateDeletePushNotificationConfigParams(
+    params: unknown,
+  ): DeletePushNotificationConfigParams {
+    if (!params || typeof params !== 'object') {
+      throw new InvalidParamsError(
+        'DeletePushNotificationConfig requires task ID and config ID parameters',
+      );
+    }
+
+    const p = params as Record<string, unknown>;
+    let taskId: string;
+    let configId: string;
+
+    if (this.a2xAgent.protocolVersion === '0.3') {
+      // v0.3: { id: taskId, pushNotificationConfigId: configId }
+      if (typeof p.id !== 'string' || p.id.trim() === '') {
+        throw new InvalidParamsError(
+          'DeletePushNotificationConfig: "id" (task ID) must be a non-empty string',
+        );
+      }
+      if (
+        typeof p.pushNotificationConfigId !== 'string' ||
+        (p.pushNotificationConfigId as string).trim() === ''
+      ) {
+        throw new InvalidParamsError(
+          'DeletePushNotificationConfig: "pushNotificationConfigId" must be a non-empty string',
+        );
+      }
+      taskId = p.id as string;
+      configId = p.pushNotificationConfigId as string;
+    } else {
+      // v1.0: { taskId: taskId, id: configId }
+      if (typeof p.taskId !== 'string' || (p.taskId as string).trim() === '') {
+        throw new InvalidParamsError(
+          'DeletePushNotificationConfig: "taskId" must be a non-empty string',
+        );
+      }
+      if (typeof p.id !== 'string' || p.id.trim() === '') {
+        throw new InvalidParamsError(
+          'DeletePushNotificationConfig: "id" (config ID) must be a non-empty string',
+        );
+      }
+      taskId = p.taskId as string;
+      configId = p.id as string;
+    }
+
+    return {
+      taskId,
+      configId,
+      metadata: p.metadata as Record<string, unknown> | undefined,
+    };
   }
 }

@@ -21,6 +21,10 @@ export type {
   CreateTaskParams,
   TaskUpdate,
 } from './task-store.js';
+export { InMemoryPushNotificationConfigStore } from './push-notification-config-store.js';
+export type {
+  PushNotificationConfigStore,
+} from './push-notification-config-store.js';
 
 // ─── Register default agent-card mappers ───
 
