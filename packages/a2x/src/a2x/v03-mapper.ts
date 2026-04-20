@@ -119,8 +119,8 @@ export class V03AgentCardMapper implements AgentCardMapper<AgentCardV03> {
       if (v03Schema !== null) {
         schemes[name] = v03Schema;
       }
-      // If null, the scheme is not supported in v0.3 (e.g., DeviceCode).
-      // Warning already emitted by the scheme's toV03Schema().
+      // If null, the scheme has no v0.3 representation; the scheme's
+      // toV03Schema() is expected to have emitted a warning.
     }
 
     return Object.keys(schemes).length > 0 ? schemes : undefined;

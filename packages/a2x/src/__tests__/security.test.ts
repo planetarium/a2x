@@ -169,14 +169,45 @@ describe('Layer 1: SecurityScheme Classes', () => {
       scopes: { read: 'Read' },
     };
 
-    it('toV03Schema should return null and emit warning', () => {
+    it('toV03Schema emits deviceCode as non-standard extension and warns', () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const scheme = new OAuth2DeviceCodeAuthorization({
+        ...opts,
+        refreshUrl: 'https://auth.example.com/refresh',
+        description: 'Device flow',
+      });
+      const v03 = scheme.toV03Schema();
+      expect(v03).toEqual({
+        type: 'oauth2',
+        flows: {
+          deviceCode: {
+            deviceAuthorizationUrl: opts.deviceAuthorizationUrl,
+            tokenUrl: opts.tokenUrl,
+            scopes: opts.scopes,
+            refreshUrl: 'https://auth.example.com/refresh',
+          },
+        },
+        description: 'Device flow',
+      });
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('non-standard extension'),
+      );
+      warnSpy.mockRestore();
+    });
+
+    it('toV03Schema omits refreshUrl and description when not provided', () => {
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
       const scheme = new OAuth2DeviceCodeAuthorization(opts);
-      const v03 = scheme.toV03Schema();
-      expect(v03).toBeNull();
-      expect(warnSpy).toHaveBeenCalledWith(
-        expect.stringContaining('not supported in A2A v0.3'),
-      );
+      const v03 = scheme.toV03Schema() as Extract<
+        ReturnType<typeof scheme.toV03Schema>,
+        { type: 'oauth2' }
+      >;
+      expect(v03.flows.deviceCode).toEqual({
+        deviceAuthorizationUrl: opts.deviceAuthorizationUrl,
+        tokenUrl: opts.tokenUrl,
+        scopes: opts.scopes,
+      });
+      expect('description' in v03).toBe(false);
       warnSpy.mockRestore();
     });
 

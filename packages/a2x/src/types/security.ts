@@ -24,6 +24,13 @@ export type SecuritySchemeV03 =
 export interface OAuthFlowsV03 {
   authorizationCode?: AuthorizationCodeFlowV03;
   clientCredentials?: ClientCredentialsFlowV03;
+  /**
+   * Non-standard extension: OpenAPI 3.0 (and therefore A2A v0.3) does not define
+   * a `deviceCode` flow. `@a2x/sdk` emits and consumes this key to bridge the
+   * compatibility gap for headless/CLI clients that still talk to v0.3 peers.
+   * Third-party v0.3 implementations may ignore an unknown flow.
+   */
+  deviceCode?: DeviceCodeFlowV03;
   implicit?: ImplicitFlowV03;
   password?: PasswordFlowV03;
 }
@@ -36,6 +43,13 @@ export interface AuthorizationCodeFlowV03 {
 }
 
 export interface ClientCredentialsFlowV03 {
+  tokenUrl: string;
+  scopes: Record<string, string>;
+  refreshUrl?: string;
+}
+
+export interface DeviceCodeFlowV03 {
+  deviceAuthorizationUrl: string;
   tokenUrl: string;
   scopes: Record<string, string>;
   refreshUrl?: string;
