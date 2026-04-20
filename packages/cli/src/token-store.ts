@@ -29,11 +29,12 @@ function readStore(): StoreData {
 }
 
 function writeStore(data: StoreData): void {
-  fs.mkdirSync(STORE_DIR, { recursive: true });
+  fs.mkdirSync(STORE_DIR, { recursive: true, mode: 0o700 });
   fs.writeFileSync(STORE_PATH, JSON.stringify(data, null, 2), {
     encoding: 'utf-8',
     mode: 0o600,
   });
+  fs.chmodSync(STORE_PATH, 0o600);
 }
 
 export function loadCredentials(agentUrl: string): StoredCredential[] | undefined {
