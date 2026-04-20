@@ -1,7 +1,7 @@
 {
   "name": "@a2x/cli",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "CLI for the a2x A2A protocol SDK",
   "bin": {
@@ -13,15 +13,17 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "binaries": "pkg bin-bundle/a2x.cjs --targets node20-linux-x64,node20-linux-arm64,node20-macos-x64,node20-macos-arm64,node20-win-x64 --out-path binaries --compress Brotli --public"
   },
   "dependencies": {
     "@a2x/sdk": "workspace:*",
-    "commander": "^13.0.0",
-    "chalk": "^5.4.0"
+    "chalk": "^5.4.0",
+    "commander": "^13.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@yao-pkg/pkg": "^6.17.0",
     "tsup": "^8.0.0",
     "typescript": "^5.6.0"
   },
