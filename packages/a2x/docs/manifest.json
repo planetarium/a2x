@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "sections": [
+    {
+      "id": "getting-started",
+      "label": "Getting Started",
+      "pages": [
+        { "slug": "introduction", "title": "What is A2X?" },
+        { "slug": "quickstart", "title": "Quickstart" }
+      ]
+    },
+    {
+      "id": "agent",
+      "label": "Agent (Server)",
+      "description": "Build and run A2A-compliant agents.",
+      "pages": [
+        { "slug": "agent/build-an-agent", "title": "Build an Agent" },
+        { "slug": "agent/providers", "title": "Choose an LLM Provider" },
+        { "slug": "agent/tools", "title": "Add Tools" },
+        { "slug": "agent/multi-agent", "title": "Multi-Agent Patterns" },
+        { "slug": "agent/framework-integration", "title": "Framework Integration" },
+        { "slug": "agent/streaming", "title": "Streaming Responses" }
+      ]
+    },
+    {
+      "id": "client",
+      "label": "Client",
+      "description": "Call remote A2A agents from your application.",
+      "pages": [
+        { "slug": "client/basics", "title": "Client Basics" },
+        { "slug": "client/streaming", "title": "Consuming Streams" },
+        { "slug": "client/agent-card-discovery", "title": "Agent Card Discovery" }
+      ]
+    },
+    {
+      "id": "advanced",
+      "label": "Advanced",
+      "description": "Customize, secure, and version your agents.",
+      "pages": [
+        { "slug": "advanced/manual-wiring", "title": "Manual Wiring" },
+        { "slug": "advanced/authentication", "title": "Authentication" },
+        { "slug": "advanced/task-store", "title": "Custom Task Stores" },
+        { "slug": "advanced/agent-card-versioning", "title": "AgentCard v0.3 vs v1.0" },
+        { "slug": "advanced/extensions", "title": "Protocol Extensions" }
+      ]
+    }
+  ]
+}
