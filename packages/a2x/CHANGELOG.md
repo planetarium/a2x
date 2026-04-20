@@ -1,5 +1,17 @@
 # @a2x/sdk
 
+## 0.3.0
+
+### Minor Changes
+
+- [#36](https://github.com/planetarium/a2x/pull/36) [`b57f711`](https://github.com/planetarium/a2x/commit/b57f711eca332fad3d64c09d1beeca7165d9fae1) Thanks [@ost006](https://github.com/ost006)! - Bundle a Guides directory (`docs/`) with the npm package. The new tree under
+  `node_modules/@a2x/sdk/docs/` contains progressive-disclosure guides (Getting
+  Started → Agent → Client → Advanced) plus a `manifest.json` describing the
+  navigation. The `a2x-web` documentation site consumes these files at build
+  time so guides stay version-locked to the SDK that introduced them.
+
+  No API surface change; this release only enlarges the published tarball.
+
 ## 0.2.0
 
 ### Minor Changes
