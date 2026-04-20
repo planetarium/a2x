@@ -260,6 +260,53 @@ describe('normalizeScheme', () => {
       expect(result[1]).toBeInstanceOf(OAuth2ClientCredentialsAuthScheme);
     });
 
+    it('normalizes oauth2 deviceCode flow as non-standard v0.3 extension', () => {
+      const raw: SecuritySchemeV03 = {
+        type: 'oauth2',
+        flows: {
+          deviceCode: {
+            deviceAuthorizationUrl: 'http://auth/device',
+            tokenUrl: 'http://auth/token',
+            scopes: { 'agent:invoke': 'Invoke' },
+            refreshUrl: 'http://auth/refresh',
+          },
+        },
+      };
+      const result = normalizeScheme(raw);
+
+      expect(result).toHaveLength(1);
+      expect(result[0]).toBeInstanceOf(OAuth2DeviceCodeAuthScheme);
+      expect((result[0] as OAuth2DeviceCodeAuthScheme).params).toEqual({
+        deviceAuthorizationUrl: 'http://auth/device',
+        tokenUrl: 'http://auth/token',
+        scopes: { 'agent:invoke': 'Invoke' },
+        refreshUrl: 'http://auth/refresh',
+      });
+    });
+
+    it('normalizes oauth2 with deviceCode alongside a standard flow', () => {
+      const raw: SecuritySchemeV03 = {
+        type: 'oauth2',
+        flows: {
+          deviceCode: {
+            deviceAuthorizationUrl: 'http://auth/device',
+            tokenUrl: 'http://auth/token',
+            scopes: {},
+          },
+          authorizationCode: {
+            authorizationUrl: 'http://auth/authorize',
+            tokenUrl: 'http://auth/token',
+            scopes: {},
+          },
+        },
+      };
+      const result = normalizeScheme(raw);
+
+      expect(result).toHaveLength(2);
+      expect(result[0]).toBeInstanceOf(OAuth2DeviceCodeAuthScheme);
+      expect(result[1]).toBeInstanceOf(OAuth2AuthorizationCodeAuthScheme);
+    });
+
     it('normalizes openIdConnect scheme', () => {
       const raw: SecuritySchemeV03 = { type: 'openIdConnect', openIdConnectUrl: 'http://auth/.well-known' };
       const result = normalizeScheme(raw);

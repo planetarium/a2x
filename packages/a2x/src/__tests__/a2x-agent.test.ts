@@ -277,7 +277,7 @@ describe('Layer 3: A2XAgent', () => {
       expect(card.skills[0].security).toEqual([{ api_key: [] }]);
     });
 
-    it('should exclude DeviceCode scheme from v0.3 with warning', () => {
+    it('should emit DeviceCode as non-standard v0.3 extension with warning', () => {
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
       const a2x = createA2XAgent();
       a2x
@@ -292,8 +292,20 @@ describe('Layer 3: A2XAgent', () => {
         );
 
       const card = a2x.getAgentCard('0.3') as AgentCardV03;
-      expect(card.securitySchemes).toBeUndefined();
-      expect(warnSpy).toHaveBeenCalled();
+      expect(card.securitySchemes).toBeDefined();
+      expect(card.securitySchemes!['device']).toEqual({
+        type: 'oauth2',
+        flows: {
+          deviceCode: {
+            deviceAuthorizationUrl: 'https://auth.example.com/device',
+            tokenUrl: 'https://auth.example.com/token',
+            scopes: { read: 'Read' },
+          },
+        },
+      });
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('non-standard extension'),
+      );
       warnSpy.mockRestore();
     });
   });

@@ -171,7 +171,18 @@ function normalizeOAuth2FlowsV03(
 ): AuthScheme[] {
   const result: AuthScheme[] = [];
 
-  // v0.3 spec does not define deviceCode flow
+  // `deviceCode` is a non-standard extension on v0.3. `@a2x/sdk` emits it
+  // alongside standard flows, so consume it the same way v1.0 does.
+  if (flows.deviceCode) {
+    result.push(
+      new OAuth2DeviceCodeAuthScheme(
+        flows.deviceCode.deviceAuthorizationUrl,
+        flows.deviceCode.tokenUrl,
+        flows.deviceCode.scopes ?? {},
+        flows.deviceCode.refreshUrl,
+      ),
+    );
+  }
 
   if (flows.authorizationCode) {
     result.push(

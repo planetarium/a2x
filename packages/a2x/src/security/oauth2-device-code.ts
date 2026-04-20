@@ -1,9 +1,15 @@
 /**
  * Layer 1: OAuth2DeviceCodeAuthorization security scheme.
- * Note: v0.3 does not support deviceCode flow. toV03Schema() returns null.
+ *
+ * A2A v0.3 (OpenAPI 3.0 based) does not standardize a deviceCode flow, but
+ * also does not prohibit vendor extensions inside `oauth2.flows`. toV03Schema()
+ * emits `deviceCode` as a non-standard extension so `@a2x/sdk` clients can
+ * negotiate the flow against v0.3 peers. Strict third-party parsers will
+ * typically ignore the unknown flow and fall back to other configured flows.
  */
 
 import type {
+  DeviceCodeFlowV03,
   DeviceCodeFlowV10,
   SecuritySchemeV03,
   SecuritySchemeV10,
@@ -54,14 +60,25 @@ export class OAuth2DeviceCodeAuthorization extends BaseSecurityScheme {
   }
 
   /**
-   * v0.3 does not support Device Code flow.
-   * Returns null; the caller (Mapper) should exclude this scheme from v0.3 AgentCard.
+   * Emits the Device Code flow on a v0.3 AgentCard as a non-standard extension.
+   * OpenAPI 3.0 does not define `oauth2.flows.deviceCode`, so strict third-party
+   * v0.3 parsers may ignore this flow. `@a2x/sdk` clients consume it natively.
    */
-  toV03Schema(): SecuritySchemeV03 | null {
+  toV03Schema(): SecuritySchemeV03 {
     console.warn(
-      'OAuth2DeviceCodeAuthorization: Device Code flow is not supported in A2A v0.3. This scheme will be excluded from the v0.3 AgentCard.',
+      'OAuth2DeviceCodeAuthorization: Device Code flow is emitted as a non-standard extension on the v0.3 AgentCard. Strict third-party v0.3 parsers may ignore it.',
     );
-    return null;
+    const flow: DeviceCodeFlowV03 = {
+      deviceAuthorizationUrl: this.deviceAuthorizationUrl,
+      tokenUrl: this.tokenUrl,
+      scopes: this.scopes,
+      ...(this.refreshUrl ? { refreshUrl: this.refreshUrl } : {}),
+    };
+    return {
+      type: 'oauth2',
+      flows: { deviceCode: flow },
+      ...(this.description ? { description: this.description } : {}),
+    };
   }
 
   toV10Schema(): SecuritySchemeV10 {
