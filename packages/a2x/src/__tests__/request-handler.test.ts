@@ -979,4 +979,476 @@ describe('Layer 4: DefaultRequestHandler', () => {
       });
     });
   });
+
+  describe('tasks/pushNotificationConfig/set', () => {
+    it('should return PushNotificationNotSupported when no store configured', async () => {
+      const handler = createHandler();
+      const response = await handler.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tasks/pushNotificationConfig/set',
+        params: {
+          taskId: 'task-1',
+          id: 'config-1',
+          pushNotificationConfig: {
+            id: 'config-1',
+            url: 'https://example.com/webhook',
+          },
+        },
+      });
+
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('error' in rpc).toBe(true);
+      expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+        A2A_ERROR_CODES.PUSH_NOTIFICATION_NOT_SUPPORTED,
+      );
+    });
+
+    describe('v1.0 parameter format (taskId + id + pushNotificationConfig)', () => {
+      it('should store a new config and echo it back', async () => {
+        const { handler, pushStore } = createHandlerWithPushNotification('1.0');
+
+        const config: TaskPushNotificationConfig = {
+          id: 'config-1',
+          taskId: 'task-1',
+          pushNotificationConfig: {
+            id: 'config-1',
+            url: 'https://example.com/webhook',
+            token: 't1',
+          },
+        };
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/set',
+          params: config,
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(false);
+        expect((rpc as { result: unknown }).result).toEqual(config);
+
+        const stored = await pushStore.get('task-1', 'config-1');
+        expect(stored).toEqual(config);
+      });
+
+      it('should return InvalidParams when params is not an object', async () => {
+        const { handler } = createHandlerWithPushNotification('1.0');
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/set',
+          params: 'not-an-object',
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(true);
+        expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+          A2A_ERROR_CODES.INVALID_PARAMS,
+        );
+      });
+
+      it('should return InvalidParams when taskId is missing', async () => {
+        const { handler } = createHandlerWithPushNotification('1.0');
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/set',
+          params: {
+            id: 'config-1',
+            pushNotificationConfig: {
+              id: 'config-1',
+              url: 'https://example.com/webhook',
+            },
+          },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(true);
+        expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+          A2A_ERROR_CODES.INVALID_PARAMS,
+        );
+      });
+
+      it('should return InvalidParams when id is missing', async () => {
+        const { handler } = createHandlerWithPushNotification('1.0');
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/set',
+          params: {
+            taskId: 'task-1',
+            pushNotificationConfig: {
+              id: 'config-1',
+              url: 'https://example.com/webhook',
+            },
+          },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(true);
+        expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+          A2A_ERROR_CODES.INVALID_PARAMS,
+        );
+      });
+
+      it('should return InvalidParams when pushNotificationConfig.url is missing', async () => {
+        const { handler } = createHandlerWithPushNotification('1.0');
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/set',
+          params: {
+            taskId: 'task-1',
+            id: 'config-1',
+            pushNotificationConfig: {
+              id: 'config-1',
+            },
+          },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(true);
+        expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+          A2A_ERROR_CODES.INVALID_PARAMS,
+        );
+      });
+    });
+  });
+
+  describe('tasks/pushNotificationConfig/get', () => {
+    it('should return PushNotificationNotSupported when no store configured', async () => {
+      const handler = createHandler();
+      const response = await handler.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tasks/pushNotificationConfig/get',
+        params: { taskId: 'task-1', id: 'config-1' },
+      });
+
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('error' in rpc).toBe(true);
+      expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+        A2A_ERROR_CODES.PUSH_NOTIFICATION_NOT_SUPPORTED,
+      );
+    });
+
+    describe('v1.0 parameter format (taskId + id)', () => {
+      it('should return an existing config', async () => {
+        const { handler, pushStore } = createHandlerWithPushNotification('1.0');
+
+        const config: TaskPushNotificationConfig = {
+          id: 'config-1',
+          taskId: 'task-1',
+          pushNotificationConfig: {
+            id: 'config-1',
+            url: 'https://example.com/webhook',
+          },
+        };
+        await pushStore.set(config);
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/get',
+          params: { taskId: 'task-1', id: 'config-1' },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(false);
+        expect((rpc as { result: unknown }).result).toEqual(config);
+      });
+
+      it('should return TaskNotFound when config does not exist', async () => {
+        const { handler } = createHandlerWithPushNotification('1.0');
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/get',
+          params: { taskId: 'task-1', id: 'non-existent' },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(true);
+        expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+          A2A_ERROR_CODES.TASK_NOT_FOUND,
+        );
+      });
+
+      it('should return InvalidParams when taskId is missing', async () => {
+        const { handler } = createHandlerWithPushNotification('1.0');
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/get',
+          params: { id: 'config-1' },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(true);
+        expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+          A2A_ERROR_CODES.INVALID_PARAMS,
+        );
+      });
+
+      it('should return InvalidParams when id is missing', async () => {
+        const { handler } = createHandlerWithPushNotification('1.0');
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/get',
+          params: { taskId: 'task-1' },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(true);
+        expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+          A2A_ERROR_CODES.INVALID_PARAMS,
+        );
+      });
+    });
+
+    describe('v0.3 parameter format (id + pushNotificationConfigId)', () => {
+      it('should return an existing config', async () => {
+        const { handler, pushStore } = createHandlerWithPushNotification('0.3');
+
+        const config: TaskPushNotificationConfig = {
+          id: 'config-1',
+          taskId: 'task-1',
+          pushNotificationConfig: {
+            id: 'config-1',
+            url: 'https://example.com/webhook',
+          },
+        };
+        await pushStore.set(config);
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/get',
+          params: { id: 'task-1', pushNotificationConfigId: 'config-1' },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(false);
+        expect((rpc as { result: unknown }).result).toEqual(config);
+      });
+
+      it('should return TaskNotFound when config does not exist', async () => {
+        const { handler } = createHandlerWithPushNotification('0.3');
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/get',
+          params: { id: 'task-1', pushNotificationConfigId: 'nope' },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(true);
+        expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+          A2A_ERROR_CODES.TASK_NOT_FOUND,
+        );
+      });
+
+      it('should return InvalidParams when id (task ID) is missing', async () => {
+        const { handler } = createHandlerWithPushNotification('0.3');
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/get',
+          params: { pushNotificationConfigId: 'config-1' },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(true);
+        expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+          A2A_ERROR_CODES.INVALID_PARAMS,
+        );
+      });
+
+      it('should return InvalidParams when pushNotificationConfigId is missing', async () => {
+        const { handler } = createHandlerWithPushNotification('0.3');
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/get',
+          params: { id: 'task-1' },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(true);
+        expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+          A2A_ERROR_CODES.INVALID_PARAMS,
+        );
+      });
+    });
+  });
+
+  describe('tasks/pushNotificationConfig/list', () => {
+    it('should return PushNotificationNotSupported when no store configured', async () => {
+      const handler = createHandler();
+      const response = await handler.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tasks/pushNotificationConfig/list',
+        params: { taskId: 'task-1' },
+      });
+
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('error' in rpc).toBe(true);
+      expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+        A2A_ERROR_CODES.PUSH_NOTIFICATION_NOT_SUPPORTED,
+      );
+    });
+
+    describe('v1.0 parameter format (taskId)', () => {
+      it('should return all configs for the given task', async () => {
+        const { handler, pushStore } = createHandlerWithPushNotification('1.0');
+
+        const config1: TaskPushNotificationConfig = {
+          id: 'config-1',
+          taskId: 'task-1',
+          pushNotificationConfig: {
+            id: 'config-1',
+            url: 'https://example.com/webhook-1',
+          },
+        };
+        const config2: TaskPushNotificationConfig = {
+          id: 'config-2',
+          taskId: 'task-1',
+          pushNotificationConfig: {
+            id: 'config-2',
+            url: 'https://example.com/webhook-2',
+          },
+        };
+        await pushStore.set(config1);
+        await pushStore.set(config2);
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/list',
+          params: { taskId: 'task-1' },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(false);
+        const result = (rpc as { result: unknown }).result as TaskPushNotificationConfig[];
+        expect(Array.isArray(result)).toBe(true);
+        expect(result).toHaveLength(2);
+        expect(result).toEqual(expect.arrayContaining([config1, config2]));
+      });
+
+      it('should return an empty array when no configs exist', async () => {
+        const { handler } = createHandlerWithPushNotification('1.0');
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/list',
+          params: { taskId: 'unknown-task' },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(false);
+        expect((rpc as { result: unknown }).result).toEqual([]);
+      });
+
+      it('should return InvalidParams when taskId is missing', async () => {
+        const { handler } = createHandlerWithPushNotification('1.0');
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/list',
+          params: {},
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(true);
+        expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+          A2A_ERROR_CODES.INVALID_PARAMS,
+        );
+      });
+    });
+
+    describe('v0.3 parameter format (id)', () => {
+      it('should return all configs for the given task', async () => {
+        const { handler, pushStore } = createHandlerWithPushNotification('0.3');
+
+        const config: TaskPushNotificationConfig = {
+          id: 'config-1',
+          taskId: 'task-1',
+          pushNotificationConfig: {
+            id: 'config-1',
+            url: 'https://example.com/webhook',
+          },
+        };
+        await pushStore.set(config);
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/list',
+          params: { id: 'task-1' },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(false);
+        const result = (rpc as { result: unknown }).result as TaskPushNotificationConfig[];
+        expect(Array.isArray(result)).toBe(true);
+        expect(result).toHaveLength(1);
+        expect(result[0]).toEqual(config);
+      });
+
+      it('should return InvalidParams when id is missing', async () => {
+        const { handler } = createHandlerWithPushNotification('0.3');
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/list',
+          params: {},
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(true);
+        expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+          A2A_ERROR_CODES.INVALID_PARAMS,
+        );
+      });
+    });
+  });
 });

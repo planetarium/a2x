@@ -104,3 +104,35 @@ export interface DeletePushNotificationConfigParams {
   configId: string;
   metadata?: Record<string, unknown>;
 }
+
+// ─── Get Push Notification Config Parameters ───
+
+/**
+ * Version-agnostic internal representation for get push notification config.
+ *
+ * v0.3 wire format: { id: taskId, pushNotificationConfigId: configId }
+ * v1.0 wire format: { taskId: taskId, id: configId }
+ *
+ * The validator normalizes both formats into this unified shape.
+ */
+export interface GetPushNotificationConfigParams {
+  taskId: string;
+  configId: string;
+  metadata?: Record<string, unknown>;
+}
+
+// ─── List Push Notification Configs Parameters ───
+
+/**
+ * Version-agnostic internal representation for list push notification configs.
+ *
+ * v0.3 wire format: { id: taskId }
+ * v1.0 wire format: { taskId, pageSize?, pageToken? }
+ *
+ * The validator normalizes both formats into this unified shape. Pagination
+ * fields are accepted on the wire but ignored in Phase A.
+ */
+export interface ListPushNotificationConfigsParams {
+  taskId: string;
+  metadata?: Record<string, unknown>;
+}

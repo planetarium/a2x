@@ -4,6 +4,7 @@ import {
   AgentExecutor,
   StreamingMode,
   InMemoryTaskStore,
+  InMemoryPushNotificationConfigStore,
   A2XAgent,
   DefaultRequestHandler,
   OAuth2DeviceCodeAuthorization,
@@ -27,8 +28,14 @@ const executor = new AgentExecutor({
 });
 
 const taskStore = new InMemoryTaskStore();
+const pushNotificationConfigStore = new InMemoryPushNotificationConfigStore();
 
-export const a2xAgent = new A2XAgent({ taskStore, executor, protocolVersion: '1.0' })
+export const a2xAgent = new A2XAgent({
+  taskStore,
+  executor,
+  protocolVersion: '1.0',
+  pushNotificationConfigStore,
+})
   .setDefaultUrl("http://localhost:3000/api/a2a")
   .addSkill({
     id: "chat",
@@ -36,7 +43,7 @@ export const a2xAgent = new A2XAgent({ taskStore, executor, protocolVersion: '1.
     description: "General conversation and Q&A",
     tags: ["chat", "general"],
   })
-  .setCapabilities({ streaming: true })
+  .setCapabilities({ streaming: true, pushNotifications: true })
   .addSecurityScheme(
     'deviceCode',
     new OAuth2DeviceCodeAuthorization({
