@@ -378,10 +378,6 @@ export class DefaultRequestHandler {
 
     const canceledTask = await this.a2xAgent.agentExecutor.cancel(task);
 
-    await this.a2xAgent.taskStore.updateTask(task.id, {
-      status: canceledTask.status,
-    });
-
     return this.responseMapper.mapTask(canceledTask);
   }
 
