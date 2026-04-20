@@ -661,13 +661,30 @@ export class DefaultRequestHandler {
         'SetPushNotificationConfig: "pushNotificationConfig.token" must be a string when provided',
       );
     }
-    if (
-      n.authentication !== undefined &&
-      (n.authentication === null || typeof n.authentication !== 'object')
-    ) {
-      throw new InvalidParamsError(
-        'SetPushNotificationConfig: "pushNotificationConfig.authentication" must be an object when provided',
-      );
+    if (n.authentication !== undefined) {
+      if (n.authentication === null || typeof n.authentication !== 'object') {
+        throw new InvalidParamsError(
+          'SetPushNotificationConfig: "pushNotificationConfig.authentication" must be an object when provided',
+        );
+      }
+      const auth = n.authentication as Record<string, unknown>;
+      if (!Array.isArray(auth.schemes) || auth.schemes.length === 0) {
+        throw new InvalidParamsError(
+          'SetPushNotificationConfig: "pushNotificationConfig.authentication.schemes" must be a non-empty array of strings',
+        );
+      }
+      for (const scheme of auth.schemes) {
+        if (typeof scheme !== 'string' || scheme.trim() === '') {
+          throw new InvalidParamsError(
+            'SetPushNotificationConfig: "pushNotificationConfig.authentication.schemes" entries must be non-empty strings',
+          );
+        }
+      }
+      if (auth.credentials !== undefined && typeof auth.credentials !== 'string') {
+        throw new InvalidParamsError(
+          'SetPushNotificationConfig: "pushNotificationConfig.authentication.credentials" must be a string when provided',
+        );
+      }
     }
 
     const innerConfig: PushNotificationConfig = {

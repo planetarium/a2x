@@ -1190,6 +1190,55 @@ describe('Layer 4: DefaultRequestHandler', () => {
           A2A_ERROR_CODES.INVALID_PARAMS,
         );
       });
+
+      it('should return InvalidParams when authentication.schemes is empty', async () => {
+        const { handler } = createHandlerWithPushNotification('1.0');
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/set',
+          params: {
+            taskId: 'task-1',
+            pushNotificationConfig: {
+              id: 'config-1',
+              url: 'https://example.com/webhook',
+              authentication: { schemes: [] },
+            },
+          },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(true);
+        expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+          A2A_ERROR_CODES.INVALID_PARAMS,
+        );
+      });
+
+      it('should accept valid authentication info', async () => {
+        const { handler } = createHandlerWithPushNotification('1.0');
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/set',
+          params: {
+            taskId: 'task-1',
+            pushNotificationConfig: {
+              id: 'config-1',
+              url: 'https://example.com/webhook',
+              authentication: { schemes: ['Bearer'], credentials: 'abc123' },
+            },
+          },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(false);
+        const result = (rpc as { result: { authentication: unknown } }).result;
+        expect(result.authentication).toEqual({ schemes: ['Bearer'], credentials: 'abc123' });
+      });
     });
   });
 
