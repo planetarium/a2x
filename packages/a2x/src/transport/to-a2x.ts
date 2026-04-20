@@ -13,6 +13,7 @@ import { InMemoryTaskStore } from '../a2x/task-store.js';
 import { A2XAgent } from '../a2x/a2x-agent.js';
 import { DefaultRequestHandler } from './request-handler.js';
 import { createSSEStream } from './sse-handler.js';
+import type { RequestContext } from '../types/auth.js';
 
 export interface ToA2xOptions {
   port?: number;
@@ -135,7 +136,11 @@ export function toA2x(
 
           try {
             const parsed = JSON.parse(body);
-            const result = await handler.handle(parsed);
+            const context: RequestContext = {
+              headers: req.headers as Record<string, string | string[] | undefined>,
+              query: Object.fromEntries(parsedUrl.searchParams.entries()),
+            };
+            const result = await handler.handle(parsed, context);
 
             // Streaming → AsyncGenerator → SSE
             if (
