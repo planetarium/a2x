@@ -18,6 +18,7 @@ import type { TaskState } from '../types/task.js';
 import type { Message, Part, Artifact, Role } from '../types/common.js';
 import { ROLE_TO_V10 } from '../types/common.js';
 import type { ResponseMapper } from './response-mapper.js';
+import type { TaskPushNotificationConfig } from '../types/jsonrpc.js';
 
 export class V10ResponseMapper implements ResponseMapper {
   readonly version = '1.0';
@@ -78,6 +79,25 @@ export class V10ResponseMapper implements ResponseMapper {
     }
 
     return mapped;
+  }
+
+  mapPushNotificationConfig(config: TaskPushNotificationConfig): unknown {
+    const inner = config.pushNotificationConfig;
+    const flat: Record<string, unknown> = {
+      id: inner.id ?? '',
+      taskId: config.taskId,
+      url: inner.url,
+    };
+    if (inner.token !== undefined) flat.token = inner.token;
+    if (inner.authentication !== undefined) flat.authentication = inner.authentication;
+    return flat;
+  }
+
+  mapPushNotificationConfigList(configs: TaskPushNotificationConfig[]): unknown {
+    return {
+      configs: configs.map((c) => this.mapPushNotificationConfig(c)),
+      nextPageToken: '',
+    };
   }
 
   // ─── Private Helpers ───

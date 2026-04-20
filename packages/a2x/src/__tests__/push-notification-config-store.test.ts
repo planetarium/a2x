@@ -10,7 +10,6 @@ describe('InMemoryPushNotificationConfigStore', () => {
   });
 
   const config: TaskPushNotificationConfig = {
-    id: 'config-1',
     taskId: 'task-1',
     pushNotificationConfig: {
       id: 'config-1',
@@ -29,6 +28,14 @@ describe('InMemoryPushNotificationConfigStore', () => {
     it('should return null for non-existent config', async () => {
       const result = await store.get('task-1', 'non-existent');
       expect(result).toBeNull();
+    });
+
+    it('should throw when pushNotificationConfig.id is missing', async () => {
+      const noId: TaskPushNotificationConfig = {
+        taskId: 'task-1',
+        pushNotificationConfig: { url: 'https://example.com/webhook' },
+      };
+      await expect(store.set(noId)).rejects.toThrow(/pushNotificationConfig\.id is required/);
     });
   });
 
@@ -51,7 +58,6 @@ describe('InMemoryPushNotificationConfigStore', () => {
   describe('list', () => {
     it('should list all configs for a task', async () => {
       const config2: TaskPushNotificationConfig = {
-        id: 'config-2',
         taskId: 'task-1',
         pushNotificationConfig: {
           id: 'config-2',
@@ -63,8 +69,8 @@ describe('InMemoryPushNotificationConfigStore', () => {
       await store.set(config2);
       const configs = await store.list('task-1');
       expect(configs).toHaveLength(2);
-      expect(configs.map(c => c.id)).toContain('config-1');
-      expect(configs.map(c => c.id)).toContain('config-2');
+      expect(configs.map((c) => c.pushNotificationConfig.id)).toContain('config-1');
+      expect(configs.map((c) => c.pushNotificationConfig.id)).toContain('config-2');
     });
 
     it('should return empty array for task with no configs', async () => {

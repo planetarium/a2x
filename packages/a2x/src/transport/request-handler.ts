@@ -7,6 +7,7 @@
  * on the result to decide between a JSON response and an SSE stream.
  */
 
+import { randomUUID } from 'node:crypto';
 import type { A2XAgent } from '../a2x/a2x-agent.js';
 import type {
   JSONRPCRequest,
@@ -16,6 +17,7 @@ import type {
   DeletePushNotificationConfigParams,
   GetPushNotificationConfigParams,
   ListPushNotificationConfigsParams,
+  PushNotificationConfig,
   TaskPushNotificationConfig,
 } from '../types/jsonrpc.js';
 import { A2A_METHODS } from '../types/jsonrpc.js';
@@ -431,42 +433,57 @@ export class DefaultRequestHandler {
 
   private async _handleSetPushNotificationConfig(
     params: TaskPushNotificationConfig,
-  ): Promise<TaskPushNotificationConfig> {
+  ): Promise<unknown> {
     const store = this.a2xAgent.pushNotificationConfigStore;
     if (!store) {
       throw new PushNotificationNotSupportedError();
     }
 
-    return store.set(params);
+    const saved = await store.set(params);
+    return this.responseMapper.mapPushNotificationConfig(saved);
   }
 
   private async _handleGetPushNotificationConfig(
     params: GetPushNotificationConfigParams,
-  ): Promise<TaskPushNotificationConfig> {
+  ): Promise<unknown> {
     const store = this.a2xAgent.pushNotificationConfigStore;
     if (!store) {
       throw new PushNotificationNotSupportedError();
     }
 
-    const config = await store.get(params.taskId, params.configId);
-    if (!config) {
-      throw new TaskNotFoundError(
-        `Push notification config '${params.configId}' not found for task '${params.taskId}'`,
-      );
+    let config: TaskPushNotificationConfig | null = null;
+    if (params.configId) {
+      config = await store.get(params.taskId, params.configId);
+      if (!config) {
+        throw new TaskNotFoundError(
+          `Push notification config '${params.configId}' not found for task '${params.taskId}'`,
+        );
+      }
+    } else {
+      // v0.3 spec allows { id: taskId } without pushNotificationConfigId; fall
+      // back to the first stored config for the task.
+      const all = await store.list(params.taskId);
+      if (all.length === 0) {
+        throw new TaskNotFoundError(
+          `No push notification configs found for task '${params.taskId}'`,
+        );
+      }
+      config = all[0]!;
     }
 
-    return config;
+    return this.responseMapper.mapPushNotificationConfig(config);
   }
 
   private async _handleListPushNotificationConfigs(
     params: ListPushNotificationConfigsParams,
-  ): Promise<TaskPushNotificationConfig[]> {
+  ): Promise<unknown> {
     const store = this.a2xAgent.pushNotificationConfigStore;
     if (!store) {
       throw new PushNotificationNotSupportedError();
     }
 
-    return store.list(params.taskId);
+    const configs = await store.list(params.taskId);
+    return this.responseMapper.mapPushNotificationConfigList(configs);
   }
 
   // ─── Private: Helpers ───
@@ -596,16 +613,20 @@ export class DefaultRequestHandler {
   /**
    * Validate set push notification config params.
    *
-   * Both v0.3 and v1.0 use the same nested shape — the wire params themselves
-   * are a TaskPushNotificationConfig object. The v1.0 top-level flattened form
-   * is not accepted in Phase A.
+   * Per v0.3 spec `SetTaskPushNotificationConfigRequest.params` is a
+   * `TaskPushNotificationConfig` with shape `{ taskId, pushNotificationConfig }`
+   * (no top-level `id`). `pushNotificationConfig.id` is optional per spec; the
+   * server assigns a UUID when the client omits it so the store can key it.
+   * v1.0 does not define a Set method; the SDK exposes the same JSON-RPC
+   * method name for both protocol versions as an extension and accepts the
+   * same nested shape.
    */
   private _validateSetPushNotificationConfigParams(
     params: unknown,
   ): TaskPushNotificationConfig {
     if (!params || typeof params !== 'object') {
       throw new InvalidParamsError(
-        'SetPushNotificationConfig requires a "taskId", "id", and "pushNotificationConfig" parameter',
+        'SetPushNotificationConfig requires a "taskId" and "pushNotificationConfig" parameter',
       );
     }
 
@@ -614,11 +635,6 @@ export class DefaultRequestHandler {
     if (typeof p.taskId !== 'string' || (p.taskId as string).trim() === '') {
       throw new InvalidParamsError(
         'SetPushNotificationConfig: "taskId" must be a non-empty string',
-      );
-    }
-    if (typeof p.id !== 'string' || (p.id as string).trim() === '') {
-      throw new InvalidParamsError(
-        'SetPushNotificationConfig: "id" must be a non-empty string',
       );
     }
 
@@ -654,47 +670,65 @@ export class DefaultRequestHandler {
       );
     }
 
-    return params as TaskPushNotificationConfig;
+    const innerConfig: PushNotificationConfig = {
+      id: typeof n.id === 'string' ? n.id : randomUUID(),
+      url: n.url,
+      ...(n.token !== undefined ? { token: n.token as string } : {}),
+      ...(n.authentication !== undefined
+        ? { authentication: n.authentication as PushNotificationConfig['authentication'] }
+        : {}),
+    };
+
+    return {
+      taskId: p.taskId,
+      pushNotificationConfig: innerConfig,
+    };
   }
 
   /**
    * Validate and normalize get push notification config params.
    *
-   * v0.3 wire format: { id: taskId, pushNotificationConfigId: configId }
-   * v1.0 wire format: { taskId: taskId, id: configId }
+   * v0.3 wire: anyOf(TaskIdParams, GetTaskPushNotificationConfigParams)
+   *   - TaskIdParams: { id: taskId }  → configId undefined (handler returns
+   *     the first config for that task).
+   *   - Get...Params: { id: taskId, pushNotificationConfigId?: configId }
+   * v1.0 wire: { taskId, id: configId }
    *
-   * Both are normalized into { taskId, configId }.
+   * Both are normalized into { taskId, configId? } so the handler can
+   * branch on whether a specific config was requested.
    */
   private _validateGetPushNotificationConfigParams(
     params: unknown,
   ): GetPushNotificationConfigParams {
     if (!params || typeof params !== 'object') {
       throw new InvalidParamsError(
-        'GetPushNotificationConfig requires task ID and config ID parameters',
+        'GetPushNotificationConfig requires a task ID parameter',
       );
     }
 
     const p = params as Record<string, unknown>;
     let taskId: string;
-    let configId: string;
+    let configId: string | undefined;
 
     if (this.a2xAgent.protocolVersion === '0.3') {
-      // v0.3: { id: taskId, pushNotificationConfigId: configId }
+      // v0.3: { id: taskId, pushNotificationConfigId?: configId }
       if (typeof p.id !== 'string' || p.id.trim() === '') {
         throw new InvalidParamsError(
           'GetPushNotificationConfig: "id" (task ID) must be a non-empty string',
         );
       }
-      if (
-        typeof p.pushNotificationConfigId !== 'string' ||
-        (p.pushNotificationConfigId as string).trim() === ''
-      ) {
-        throw new InvalidParamsError(
-          'GetPushNotificationConfig: "pushNotificationConfigId" must be a non-empty string',
-        );
-      }
       taskId = p.id as string;
-      configId = p.pushNotificationConfigId as string;
+      if (p.pushNotificationConfigId !== undefined) {
+        if (
+          typeof p.pushNotificationConfigId !== 'string' ||
+          (p.pushNotificationConfigId as string).trim() === ''
+        ) {
+          throw new InvalidParamsError(
+            'GetPushNotificationConfig: "pushNotificationConfigId" must be a non-empty string when provided',
+          );
+        }
+        configId = p.pushNotificationConfigId as string;
+      }
     } else {
       // v1.0: { taskId: taskId, id: configId }
       if (typeof p.taskId !== 'string' || (p.taskId as string).trim() === '') {
@@ -713,7 +747,7 @@ export class DefaultRequestHandler {
 
     return {
       taskId,
-      configId,
+      ...(configId !== undefined ? { configId } : {}),
       metadata: p.metadata as Record<string, unknown> | undefined,
     };
   }

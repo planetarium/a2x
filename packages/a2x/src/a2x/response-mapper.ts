@@ -7,6 +7,7 @@
 
 import type { Task, TaskStatusUpdateEvent, TaskArtifactUpdateEvent } from '../types/task.js';
 import type { Message } from '../types/common.js';
+import type { TaskPushNotificationConfig } from '../types/jsonrpc.js';
 
 // ─── ResponseMapper Interface ───
 
@@ -29,6 +30,20 @@ export interface ResponseMapper {
    * Map an internal TaskArtifactUpdateEvent to its version-specific output.
    */
   mapArtifactUpdateEvent(event: TaskArtifactUpdateEvent): unknown;
+
+  /**
+   * Map a single push notification config to the version-specific wire shape.
+   * v0.3: `{ taskId, pushNotificationConfig }` (nested).
+   * v1.0: `{ id, taskId, url, token?, authentication?, tenant }` (flattened).
+   */
+  mapPushNotificationConfig(config: TaskPushNotificationConfig): unknown;
+
+  /**
+   * Map a list of push notification configs to the version-specific wire shape.
+   * v0.3: bare array.
+   * v1.0: `{ configs: [...], nextPageToken: "" }` (paginated object).
+   */
+  mapPushNotificationConfigList(configs: TaskPushNotificationConfig[]): unknown;
 }
 
 // ─── ResponseMapperFactory ───
