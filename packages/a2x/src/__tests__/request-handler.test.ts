@@ -1068,6 +1068,31 @@ describe('Layer 4: DefaultRequestHandler', () => {
         const stored = await pushStore.get('task-1', generatedId!);
         expect(stored?.pushNotificationConfig.id).toBe(generatedId);
       });
+
+      it('should treat empty-string pushNotificationConfig.id as absent and auto-generate', async () => {
+        const { handler, pushStore } = createHandlerWithPushNotification('0.3');
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/set',
+          params: {
+            taskId: 'task-1',
+            pushNotificationConfig: { id: '', url: 'https://example.com/webhook' },
+          },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(false);
+        const result = (rpc as { result: { pushNotificationConfig: { id?: string } } }).result;
+        const generatedId = result.pushNotificationConfig.id;
+        expect(typeof generatedId).toBe('string');
+        expect(generatedId).not.toEqual('');
+
+        const stored = await pushStore.get('task-1', generatedId!);
+        expect(stored?.pushNotificationConfig.id).toBe(generatedId);
+      });
     });
 
     describe('v1.0 wire format (flattened response)', () => {

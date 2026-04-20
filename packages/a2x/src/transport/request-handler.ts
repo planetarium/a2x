@@ -687,8 +687,11 @@ export class DefaultRequestHandler {
       }
     }
 
+    // Empty-string id is treated as absent (v1.0 proto-default semantic);
+    // the server assigns a UUID so the store can key the entry.
+    const clientId = typeof n.id === 'string' && n.id.length > 0 ? n.id : undefined;
     const innerConfig: PushNotificationConfig = {
-      id: typeof n.id === 'string' ? n.id : randomUUID(),
+      id: clientId ?? randomUUID(),
       url: n.url,
       ...(n.token !== undefined ? { token: n.token as string } : {}),
       ...(n.authentication !== undefined
