@@ -138,6 +138,9 @@ export class LlmAgent extends BaseAgent {
 
     // 4. LLM call loop
     while (llmCallCount < maxCalls) {
+      // Check for abort before each LLM call
+      if (context.signal?.aborted) return;
+
       // Build LlmRequest
       const llmRequest: LlmRequest = {
         contents,
@@ -215,6 +218,9 @@ export class LlmAgent extends BaseAgent {
       const toolResults: { id: string; name: string; result: unknown }[] = [];
 
       for (const toolCall of response.toolCalls) {
+        // Check for abort before each tool execution
+        if (context.signal?.aborted) return;
+
         yield { type: 'toolCall', toolName: toolCall.name, args: toolCall.args, toolCallId: toolCall.id };
 
         const tool = this.tools.find((t) => t.name === toolCall.name);

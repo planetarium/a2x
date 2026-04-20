@@ -35,6 +35,7 @@ export interface AgentExecutorOptions {
 export class AgentExecutor {
   readonly runner: Runner;
   readonly runConfig: RunConfig;
+  private readonly _abortControllers = new Map<string, AbortController>();
 
   constructor(options: AgentExecutorOptions) {
     this.runner = options.runner;
@@ -48,6 +49,8 @@ export class AgentExecutor {
   async execute(task: Task, message: Message): Promise<Task> {
     // Create or retrieve session
     const session = await this.runner.createSession();
+    const abortController = new AbortController();
+    this._abortControllers.set(task.id, abortController);
 
     // Update task status to working
     task.status = {
@@ -59,7 +62,7 @@ export class AgentExecutor {
     const textParts: string[] = [];
 
     try {
-      for await (const event of this.runner.runAsync(session, message)) {
+      for await (const event of this.runner.runAsync(session, message, abortController.signal)) {
         switch (event.type) {
           case 'text':
             textParts.push(event.text);
@@ -87,13 +90,15 @@ export class AgentExecutor {
         }
       }
 
-      // Set completed status
-      task.status = {
-        state: TaskState.COMPLETED,
-        timestamp: new Date().toISOString(),
-      };
-      if (artifacts.length > 0) {
-        task.artifacts = artifacts;
+      // Set completed status (unless aborted by cancel)
+      if (!abortController.signal.aborted) {
+        task.status = {
+          state: TaskState.COMPLETED,
+          timestamp: new Date().toISOString(),
+        };
+        if (artifacts.length > 0) {
+          task.artifacts = artifacts;
+        }
       }
     } catch (error) {
       task.status = {
@@ -112,6 +117,8 @@ export class AgentExecutor {
         },
         timestamp: new Date().toISOString(),
       };
+    } finally {
+      this._abortControllers.delete(task.id);
     }
 
     return task;
@@ -128,6 +135,8 @@ export class AgentExecutor {
 
     // Create session
     const session = await this.runner.createSession();
+    const abortController = new AbortController();
+    this._abortControllers.set(task.id, abortController);
 
     // Emit working status
     task.status = {
@@ -143,7 +152,7 @@ export class AgentExecutor {
     try {
       const textParts: string[] = [];
 
-      for await (const event of this.runner.runAsync(session, message)) {
+      for await (const event of this.runner.runAsync(session, message, abortController.signal)) {
         switch (event.type) {
           case 'text':
             textParts.push(event.text);
@@ -230,13 +239,22 @@ export class AgentExecutor {
         contextId,
         status: task.status,
       } satisfies TaskStatusUpdateEvent;
+    } finally {
+      this._abortControllers.delete(task.id);
     }
   }
 
   /**
-   * Cancel a running task.
+   * Cancel a running task. Aborts in-flight agent execution if running.
    */
   async cancel(task: Task): Promise<Task> {
+    // Abort the running execution
+    const controller = this._abortControllers.get(task.id);
+    if (controller) {
+      controller.abort();
+      this._abortControllers.delete(task.id);
+    }
+
     task.status = {
       state: TaskState.CANCELED,
       timestamp: new Date().toISOString(),
