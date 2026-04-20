@@ -8,6 +8,7 @@ import { InMemoryRunner } from '../runner/in-memory-runner.js';
 import { LlmAgent } from '../agent/llm-agent.js';
 import { BaseLlmProvider } from '../provider/base.js';
 import { A2A_ERROR_CODES } from '../types/errors.js';
+import { TaskState } from '../types/task.js';
 import type { JSONRPCResponse, JSONRPCErrorResponse } from '../types/jsonrpc.js';
 import { InMemoryPushNotificationConfigStore } from '../a2x/push-notification-config-store.js';
 import type { TaskPushNotificationConfig } from '../types/jsonrpc.js';
@@ -413,6 +414,46 @@ describe('Layer 4: DefaultRequestHandler', () => {
       expect((rpc as JSONRPCErrorResponse).error.code).toBe(
         A2A_ERROR_CODES.TASK_NOT_FOUND,
       );
+    });
+
+    it('should cancel a working task without terminal state guard collision', async () => {
+      // Set up handler with access to taskStore
+      const agent = new LlmAgent({
+        name: 'test-agent',
+        provider: mockProvider,
+        description: 'A test agent',
+        instruction: 'You are a helpful assistant.',
+      });
+      const runner = new InMemoryRunner({ agent, appName: 'test' });
+      const executor = new AgentExecutor({
+        runner,
+        runConfig: { streamingMode: StreamingMode.SSE },
+      });
+      const taskStore = new InMemoryTaskStore();
+      const a2xAgent = new A2XAgent({ taskStore, executor });
+      a2xAgent.setDefaultUrl('https://example.com/a2a');
+      const handler = new DefaultRequestHandler(a2xAgent);
+
+      // Create a task and set it to WORKING state directly
+      const task = await taskStore.createTask({});
+      await taskStore.updateTask(task.id, {
+        status: { state: TaskState.WORKING, timestamp: new Date().toISOString() },
+      });
+
+      // Cancel the WORKING task — this should NOT throw InternalError
+      // Before fix: cancel() mutated task to CANCELED, then updateTask()
+      // hit the terminal state guard and threw "Cannot update task in terminal state"
+      const cancelResponse = await handler.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tasks/cancel',
+        params: { id: task.id },
+      });
+
+      expect(isAsyncGenerator(cancelResponse)).toBe(false);
+      const rpc = cancelResponse as JSONRPCResponse;
+      expect('error' in rpc).toBe(false);
+      expect('result' in rpc).toBe(true);
     });
   });
 
