@@ -128,13 +128,12 @@ getAgentCard(version?)
 ## Client SDK
 
 ```typescript
-import { A2XClient, resolveAgentCard } from '@a2x/sdk/client';
+import { A2XClient } from '@a2x/sdk/client';
 
-// Discover an agent
-const card = await resolveAgentCard('https://agent.example.com');
+// The client discovers the agent card from /.well-known/agent.json
+const client = new A2XClient('https://agent.example.com');
 
-// Create a client and send messages
-const client = new A2XClient(card);
+// Send messages
 const task = await client.sendMessage({
   message: { role: 'user', parts: [{ text: 'Hello!' }] },
 });
@@ -183,19 +182,34 @@ export async function GET() {
 
 ## Device Flow Authentication
 
+Plug an `AuthProvider` into `A2XClient`. The SDK hands you the auth schemes
+declared on the agent card (including `OAuth2DeviceCodeAuthScheme`) and you
+populate them via `scheme.setCredential(...)`:
+
 ```typescript
-import { DeviceFlowClient } from '@a2x/sdk/auth';
+import { A2XClient, OAuth2DeviceCodeAuthScheme } from '@a2x/sdk/client';
+import type { AuthProvider } from '@a2x/sdk/client';
 
-const authClient = new DeviceFlowClient({
-  agentCardUrl: 'https://my-agent.example.com/.well-known/agent.json',
-});
+const authProvider: AuthProvider = {
+  async provide(requirements) {
+    // requirements: AuthScheme[][] — OR of ANDs. Pick any satisfiable group.
+    const group = requirements[0];
+    for (const scheme of group) {
+      if (scheme instanceof OAuth2DeviceCodeAuthScheme) {
+        // Run the RFC 8628 poll loop against scheme.params.deviceAuthorizationUrl
+        // and scheme.params.tokenUrl, then call setCredential with the token.
+        scheme.setCredential(await runDeviceCodeFlow(scheme));
+      }
+    }
+    return group;
+  },
+};
 
-const { userCode, verificationUri } = await authClient.requestDeviceCode({ scope: 'read write' });
-console.log(`Visit ${verificationUri} and enter code: ${userCode}`);
-
-const token = await authClient.pollForToken(deviceCode);
-const a2aClient = authClient.createAuthenticatedClient(token);
+const client = new A2XClient('https://agent.example.com', { authProvider });
 ```
+
+For a working RFC 8628 flow (display user code, poll token endpoint, persist tokens),
+see `packages/cli/src/cli-auth-provider.ts` in the `@a2x/cli` package.
 
 ## CLI
 
