@@ -77,6 +77,31 @@ const handler = new DefaultRequestHandler(a2xAgent);
 
 `InMemoryTaskStore` is the default. It loses state on restart, which is fine for stateless deployments but not for production long-running tasks. See [Custom Task Stores](./task-store.md).
 
+### Task event bus
+
+The bus fans `message/stream` events out to any `tasks/resubscribe` subscribers. `A2XAgent` creates a default `InMemoryTaskEventBus` when you don't pass one — sufficient for single-process deployments.
+
+Swap it when you need cross-process fan-out (e.g. multiple worker nodes behind a load balancer):
+
+```ts
+import { A2XAgent, type TaskEventBus } from '@a2x/sdk';
+
+class RedisTaskEventBus implements TaskEventBus {
+  publish(taskId, event) { /* PUBLISH a2x:task:<taskId> */ }
+  close(taskId) { /* PUBLISH a2x:task:<taskId>:close */ }
+  async *subscribe(taskId, signal) { /* SUBSCRIBE + yield until close */ }
+  hasSubscribers(taskId) { /* SUBSCRIBERS count */ }
+}
+
+const a2xAgent = new A2XAgent({
+  taskStore,
+  executor,
+  taskEventBus: new RedisTaskEventBus(),
+});
+```
+
+The default implementation's queue is unbounded — fine for most agents, but consider bounded backpressure if a single task can emit thousands of events faster than slow subscribers can drain.
+
 ### AgentCard skills and metadata
 
 ```ts

@@ -47,6 +47,35 @@ For a `message/stream` call, the client gets an SSE stream of typed events. Each
 
 See [Consuming Streams](../client/streaming.md) for the client-side iteration pattern.
 
+## Client disconnect stops the work
+
+When an SSE client disconnects mid-stream — tab closed, network drop, process killed — A2X propagates the cancellation all the way into the agent's `AbortSignal`. In-flight LLM calls are aborted, long-running tool calls see `context.signal.aborted === true`, and the task generator exits cleanly. No runaway loops, no wasted tokens.
+
+`toA2x()` wires this automatically. If you mount the handler into your own HTTP stack (Express, Next.js, Fastify, …), wire a `res.on('close')` → `reader.cancel()` on the SSE branch — `IncomingMessage.close` fires when the request body is consumed (too early) and misses the later TCP close, so use `res.close`:
+
+```ts
+const stream = createSSEStream(result);
+const reader = stream.getReader();
+
+res.on('close', () => {
+  void reader.cancel().catch(() => {});
+});
+```
+
+See [Framework Integration](./framework-integration.md) for the full per-framework recipe.
+
+## Resuming a dropped SSE stream
+
+If a client loses connection mid-task, it can re-attach via the A2A `tasks/resubscribe` method without restarting the agent. A2X keeps an in-memory **task event bus** that fans events from the original `message/stream` to every live subscriber; a resubscriber catches the tail of the same execution.
+
+Semantics:
+
+- **Forward-only.** Events that fired before the resubscribe call are not replayed.
+- **Terminal replay.** Resubscribing to a task that already completed yields a single status-update event with the final state, then ends.
+- **Unknown task.** Returns `TaskNotFoundError` (JSON-RPC error code `-32001`).
+
+The bus is on by default. For custom storage or multi-process deployments you can inject your own implementation — see [Manual Wiring](../advanced/manual-wiring.md#task-event-bus).
+
 ## Disabling streaming
 
 If you want a deliberately non-streaming agent (e.g. for backpressure reasons), drop `streamingMode`:

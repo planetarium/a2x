@@ -173,6 +173,10 @@ const tokens = await flow.pollForTokens();
 
 Use the returned `access_token` as the bearer on subsequent `A2XClient` calls.
 
+## Exposing an authenticated extended AgentCard
+
+Declaring security also unlocks `agent/getAuthenticatedExtendedCard` — a way to return a richer card (extra skills, private documentation URLs, per-principal metadata) only to callers that pass the security check. See [Authenticated Extended AgentCard](./extended-agent-card.md).
+
 ## Inspecting what an agent requires
 
 Clients can introspect expected auth before calling:

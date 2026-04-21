@@ -74,6 +74,14 @@ app.post('/a2a', async (req, res) => {
     res.setHeader('Cache-Control', 'no-cache');
     const stream = createSSEStream(result);
     const reader = stream.getReader();
+
+    // Cancel the reader on client disconnect so the agent aborts in-flight
+    // LLM calls. Use `res.close` — `req.close` fires when the body is
+    // consumed, before streaming begins.
+    res.on('close', () => {
+      void reader.cancel().catch(() => {});
+    });
+
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -88,10 +96,11 @@ app.post('/a2a', async (req, res) => {
 app.listen(4000);
 ```
 
-Two things to notice:
+Three things to notice:
 
 1. `handler.handle()` returns either a plain object (regular response) or an async iterable (streaming response). Branch on `Symbol.asyncIterator`.
 2. `createSSEStream()` wraps the async iterable as an SSE-formatted `ReadableStream`.
+3. Wiring `res.on('close') → reader.cancel()` is what makes client disconnects propagate into the agent's `AbortSignal`. Without it, the LLM loop keeps running after the TCP connection dies. See [Streaming Responses](./streaming.md#client-disconnect-stops-the-work) for the why.
 
 ## Next.js App Router
 
