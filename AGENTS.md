@@ -41,6 +41,25 @@ If a change genuinely has no user-visible surface (internal refactor, test-only 
 
 Reviewers: if a diff touches `packages/a2x/src/index.ts` or `request-handler.ts` or exports a new symbol without touching `packages/a2x/docs/`, block the merge and ask why.
 
+### README sync
+
+Guides under `packages/a2x/docs/` cover everything. The two READMEs are **quickstart + feature highlights** and are what every new reader sees first:
+
+- `README.md` (repo root) — published on the GitHub repo landing page.
+- `packages/a2x/README.md` — published on the npm package page.
+
+Update them when a PR adds (or removes) something that belongs in those surfaces:
+
+- A new top-level "Key Features" bullet (e.g. tasks/resubscribe, Claude Agent Skills runtime, authenticated extended card).
+- A new top-level export path (e.g. `@a2x/sdk/client`, `@a2x/sdk/google`) — it belongs in Installation or Usage.
+- A new supported LLM provider, transport, or framework integration worth advertising.
+- A change to the minimum Node / pnpm version, peer-dependency requirement, or environment variable listed in the quickstart.
+- Anything already listed in either README whose behavior this PR materially changes.
+
+Don't update the READMEs for every public method — that's what guides are for. The rule of thumb: **if you would mention it in a release tweet, it belongs in the README**.
+
+Sample READMEs under `samples/*/README.md` follow the same logic scoped to that sample.
+
 ## Changesets
 
 - Every source-affecting PR adds a file under `.changeset/` using the changesets CLI or by hand.
