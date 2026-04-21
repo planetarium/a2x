@@ -24,12 +24,18 @@ export class InMemoryPushNotificationConfigStore implements PushNotificationConf
   }
 
   async set(config: TaskPushNotificationConfig): Promise<TaskPushNotificationConfig> {
+    const configId = config.pushNotificationConfig.id;
+    if (!configId) {
+      throw new Error(
+        'InMemoryPushNotificationConfigStore.set: pushNotificationConfig.id is required for indexing',
+      );
+    }
     let taskConfigs = this.configs.get(config.taskId);
     if (!taskConfigs) {
       taskConfigs = new Map();
       this.configs.set(config.taskId, taskConfigs);
     }
-    taskConfigs.set(config.id, config);
+    taskConfigs.set(configId, config);
     return config;
   }
 

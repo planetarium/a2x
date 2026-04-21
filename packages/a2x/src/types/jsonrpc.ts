@@ -83,8 +83,16 @@ export interface PushNotificationAuthenticationInfo {
   credentials?: string;
 }
 
+/**
+ * Spec-canonical v0.3 TaskPushNotificationConfig shape:
+ *   { taskId, pushNotificationConfig }
+ *
+ * The config identifier lives at `pushNotificationConfig.id` and is
+ * optional per spec; server-side handlers assign a UUID when clients omit
+ * it so the store can key it. v1.0 wire responses are produced by the
+ * response mapper (flattened shape) — do not add top-level `id` here.
+ */
 export interface TaskPushNotificationConfig {
-  id: string;
   taskId: string;
   pushNotificationConfig: PushNotificationConfig;
 }
@@ -102,5 +110,40 @@ export interface TaskPushNotificationConfig {
 export interface DeletePushNotificationConfigParams {
   taskId: string;
   configId: string;
+  metadata?: Record<string, unknown>;
+}
+
+// ─── Get Push Notification Config Parameters ───
+
+/**
+ * Version-agnostic internal representation for get push notification config.
+ *
+ * v0.3 wire format: anyOf(TaskIdParams, GetTaskPushNotificationConfigParams)
+ *   - TaskIdParams: { id: taskId }  → configId omitted (return first config)
+ *   - Get...Params: { id: taskId, pushNotificationConfigId?: configId }
+ * v1.0 wire format: { taskId: taskId, id: configId }
+ *
+ * `configId` is optional because v0.3 spec marks `pushNotificationConfigId`
+ * optional; handlers fall back to the first stored config when absent.
+ */
+export interface GetPushNotificationConfigParams {
+  taskId: string;
+  configId?: string;
+  metadata?: Record<string, unknown>;
+}
+
+// ─── List Push Notification Configs Parameters ───
+
+/**
+ * Version-agnostic internal representation for list push notification configs.
+ *
+ * v0.3 wire format: { id: taskId }
+ * v1.0 wire format: { taskId, pageSize?, pageToken? }
+ *
+ * The validator normalizes both formats into this unified shape. Pagination
+ * fields are accepted on the wire but ignored in Phase A.
+ */
+export interface ListPushNotificationConfigsParams {
+  taskId: string;
   metadata?: Record<string, unknown>;
 }

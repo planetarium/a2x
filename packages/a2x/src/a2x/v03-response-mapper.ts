@@ -16,6 +16,10 @@ import type {
 import type { Message, Part, Artifact } from '../types/common.js';
 import { isTextPart, isFilePart, isDataPart } from '../types/common.js';
 import type { ResponseMapper } from './response-mapper.js';
+import type {
+  PushNotificationConfig,
+  TaskPushNotificationConfig,
+} from '../types/jsonrpc.js';
 
 export class V03ResponseMapper implements ResponseMapper {
   readonly version = '0.3';
@@ -83,7 +87,28 @@ export class V03ResponseMapper implements ResponseMapper {
     return mapped;
   }
 
+  mapPushNotificationConfig(config: TaskPushNotificationConfig): unknown {
+    return {
+      taskId: config.taskId,
+      pushNotificationConfig: this._mapNestedConfig(config.pushNotificationConfig),
+    };
+  }
+
+  mapPushNotificationConfigList(configs: TaskPushNotificationConfig[]): unknown {
+    return configs.map((c) => this.mapPushNotificationConfig(c));
+  }
+
   // ─── Private Helpers ───
+
+  private _mapNestedConfig(inner: PushNotificationConfig): Record<string, unknown> {
+    const out: Record<string, unknown> = {
+      url: inner.url,
+    };
+    if (inner.id !== undefined) out.id = inner.id;
+    if (inner.token !== undefined) out.token = inner.token;
+    if (inner.authentication !== undefined) out.authentication = inner.authentication;
+    return out;
+  }
 
   private _mapStatus(status: TaskStatus): Record<string, unknown> {
     const mapped: Record<string, unknown> = {
