@@ -14,6 +14,8 @@ import type {
   AgentCardV10,
 } from '../types/agent-card.js';
 import type { SecurityRequirement } from '../types/security.js';
+import type { AuthResult } from '../types/auth.js';
+import { AuthenticatedExtendedCardNotConfiguredError } from '../types/errors.js';
 import { AgentExecutor, StreamingMode } from './agent-executor.js';
 import { AgentCardMapperFactory } from './agent-card-mapper.js';
 import type { TaskStore } from './task-store.js';
@@ -61,6 +63,9 @@ export class A2XAgent {
   private _documentationUrl?: string;
   private _iconUrl?: string;
   private _supportsAuthenticatedExtendedCard?: boolean;
+  private _authenticatedExtendedCardProvider?: (
+    authResult: AuthResult,
+  ) => Partial<A2XAgentState> | Promise<Partial<A2XAgentState>>;
 
   // ─── AgentCard cache ───
   private _cardCache = new Map<string, AgentCardV03 | AgentCardV10>();
@@ -187,6 +192,30 @@ export class A2XAgent {
     return this;
   }
 
+  /**
+   * Register a provider that enriches the AgentCard for authenticated users.
+   *
+   * When set, the JSON-RPC method `agent/getAuthenticatedExtendedCard`
+   * becomes available. The provider is invoked with the resolved AuthResult
+   * and returns a Partial<A2XAgentState> overlay that is merged on top of
+   * the base state before mapping to the target protocol version.
+   *
+   * Automatically advertises the capability on the base AgentCard:
+   *   - v0.3: `supportsAuthenticatedExtendedCard: true`
+   *   - v1.0: `capabilities.extendedAgentCard: true`
+   */
+  setAuthenticatedExtendedCardProvider(
+    provider: (
+      authResult: AuthResult,
+    ) => Partial<A2XAgentState> | Promise<Partial<A2XAgentState>>,
+  ): this {
+    this._authenticatedExtendedCardProvider = provider;
+    this._supportsAuthenticatedExtendedCard = true;
+    this._capabilities = { ...this._capabilities, extendedAgentCard: true };
+    this._invalidateCache();
+    return this;
+  }
+
   // ─── Core Method ───
 
   getAgentCard(version?: string): AgentCardV03 | AgentCardV10 {
@@ -277,6 +306,61 @@ export class A2XAgent {
 
   get taskEventBus(): TaskEventBus {
     return this._taskEventBus;
+  }
+
+  get hasAuthenticatedExtendedCardProvider(): boolean {
+    return this._authenticatedExtendedCardProvider !== undefined;
+  }
+
+  /**
+   * Build the authenticated extended AgentCard.
+   *
+   * Throws `AuthenticatedExtendedCardNotConfiguredError` if no provider
+   * has been registered. Does NOT perform authentication itself — the
+   * caller is responsible for passing an authenticated AuthResult.
+   */
+  async getAuthenticatedExtendedCard(
+    authResult: AuthResult,
+    version?: string,
+  ): Promise<AgentCardV03 | AgentCardV10> {
+    const provider = this._authenticatedExtendedCardProvider;
+    if (!provider) {
+      throw new AuthenticatedExtendedCardNotConfiguredError();
+    }
+
+    const baseState = this._buildState();
+    const overlay = await provider(authResult);
+
+    // Shallow merge for top-level fields; deep merge for capabilities and
+    // arrays (skills, interfaces, securityRequirements) are replaced wholesale
+    // by the overlay when present. This keeps semantics simple and predictable.
+    const mergedState: A2XAgentState = {
+      ...baseState,
+      ...overlay,
+      capabilities: {
+        ...baseState.capabilities,
+        ...(overlay.capabilities ?? {}),
+      },
+      // If overlay supplies securitySchemes (rare), merge Maps; otherwise keep base.
+      securitySchemes: overlay.securitySchemes
+        ? new Map([...baseState.securitySchemes, ...overlay.securitySchemes])
+        : baseState.securitySchemes,
+    };
+
+    if (!mergedState.name) {
+      throw new Error(
+        'A2XAgent.getAuthenticatedExtendedCard: name is required on the merged state',
+      );
+    }
+    if (!mergedState.description) {
+      throw new Error(
+        'A2XAgent.getAuthenticatedExtendedCard: description is required on the merged state',
+      );
+    }
+
+    const resolvedVersion = version ?? this._protocolVersion;
+    const mapper = AgentCardMapperFactory.getMapper(resolvedVersion);
+    return mapper.map(mergedState) as AgentCardV03 | AgentCardV10;
   }
 
   // ─── Private Methods ───
