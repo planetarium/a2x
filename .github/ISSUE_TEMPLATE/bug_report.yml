@@ -1,0 +1,86 @@
+name: Bug report
+description: Report a reproducible defect in @a2x/sdk or @a2x/cli.
+title: "bug: <short summary>"
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug report! Please fill in the fields below so we
+        can reproduce and fix the issue quickly.
+
+        **Security issues:** do not file them here. Follow `SECURITY.md` instead.
+  - type: dropdown
+    id: package
+    attributes:
+      label: Affected package
+      options:
+        - "@a2x/sdk"
+        - "@a2x/cli"
+        - both
+        - not sure
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Package version
+      description: Output of `npm ls @a2x/sdk` / `a2x --version`, or the installed release tag.
+      placeholder: "0.6.0"
+    validations:
+      required: true
+  - type: input
+    id: node
+    attributes:
+      label: Node.js version
+      placeholder: "v20.11.1"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS / platform
+      placeholder: "macOS 14.5 arm64"
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: A clear, concise description of the defect.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: |
+        Please provide the smallest possible snippet that reproduces the
+        issue, or a link to a repo / gist. For CLI issues, paste the exact
+        command you ran.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or output
+      description: Paste any error messages, stack traces, or console output. Redact secrets.
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checks
+      options:
+        - label: I searched existing issues and confirmed this is not a duplicate.
+          required: true
+        - label: I am using the latest published version, or have explained why I cannot upgrade.
+          required: true
