@@ -275,6 +275,15 @@ export class DefaultRequestHandler {
       },
     );
 
+    // tasks/resubscribe (SSE)
+    this.router.registerStreamMethod(
+      A2A_METHODS.RESUBSCRIBE,
+      (params) => {
+        const taskParams = this._validateTaskIdParams(params);
+        return this._handleResubscribe(taskParams);
+      },
+    );
+
     // tasks/get
     this.router.registerMethod(
       A2A_METHODS.GET_TASK,
@@ -368,18 +377,57 @@ export class DefaultRequestHandler {
       params.message,
     );
 
-    for await (const event of eventStream) {
-      // Update task in store for non-terminal status events.
-      // Terminal states are already applied by AgentExecutor (same object
-      // reference), so calling updateTask would hit the guard.
-      if (
-        'status' in event &&
-        !TERMINAL_STATES.has(event.status.state)
-      ) {
-        await this.a2xAgent.taskStore.updateTask(task.id, {
-          status: event.status,
-        });
+    const bus = this.a2xAgent.taskEventBus;
+
+    // finally closes the bus so resubscribers see the stream end regardless
+    // of how the primary stream terminates (normal, error, cancel via return).
+    try {
+      for await (const event of eventStream) {
+        // Update task in store for non-terminal status events.
+        // Terminal states are already applied by AgentExecutor (same object
+        // reference), so calling updateTask would hit the guard.
+        if (
+          'status' in event &&
+          !TERMINAL_STATES.has(event.status.state)
+        ) {
+          await this.a2xAgent.taskStore.updateTask(task.id, {
+            status: event.status,
+          });
+        }
+        bus.publish(task.id, event);
+        if ('status' in event) {
+          yield this.responseMapper.mapStatusUpdateEvent(event as TaskStatusUpdateEvent);
+        } else {
+          yield this.responseMapper.mapArtifactUpdateEvent(event as TaskArtifactUpdateEvent);
+        }
       }
+    } finally {
+      bus.close(task.id);
+    }
+  }
+
+  private async *_handleResubscribe(
+    params: TaskIdParams,
+  ): AsyncGenerator<unknown> {
+    const task = await this.a2xAgent.taskStore.getTask(params.id);
+    if (!task) {
+      throw new TaskNotFoundError(`Task not found: ${params.id}`);
+    }
+
+    // Terminal tasks replay a single status-update event so reconnecting
+    // clients learn the final state without needing a full history replay.
+    if (TERMINAL_STATES.has(task.status.state)) {
+      const terminal: TaskStatusUpdateEvent = {
+        taskId: task.id,
+        contextId: task.contextId ?? task.id,
+        status: task.status,
+      };
+      yield this.responseMapper.mapStatusUpdateEvent(terminal);
+      return;
+    }
+
+    const bus = this.a2xAgent.taskEventBus;
+    for await (const event of bus.subscribe(params.id)) {
       if ('status' in event) {
         yield this.responseMapper.mapStatusUpdateEvent(event as TaskStatusUpdateEvent);
       } else {
