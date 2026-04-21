@@ -18,6 +18,8 @@ import { AgentExecutor, StreamingMode } from './agent-executor.js';
 import { AgentCardMapperFactory } from './agent-card-mapper.js';
 import type { TaskStore } from './task-store.js';
 import type { PushNotificationConfigStore } from './push-notification-config-store.js';
+import type { TaskEventBus } from './task-event-bus.js';
+import { InMemoryTaskEventBus } from './task-event-bus.js';
 
 // ─── Protocol Version ───
 
@@ -33,6 +35,7 @@ export interface A2XAgentOptions {
   executor: AgentExecutor;
   protocolVersion?: ProtocolVersion;
   pushNotificationConfigStore?: PushNotificationConfigStore;
+  taskEventBus?: TaskEventBus;
 }
 
 export class A2XAgent {
@@ -40,6 +43,7 @@ export class A2XAgent {
   private readonly _agentExecutor: AgentExecutor;
   private readonly _protocolVersion: ProtocolVersion;
   private readonly _pushNotificationConfigStore?: PushNotificationConfigStore;
+  private readonly _taskEventBus: TaskEventBus;
 
   // ─── Internal mutable state (builder pattern) ───
   private _name?: string;
@@ -81,6 +85,7 @@ export class A2XAgent {
     this._agentExecutor = options.executor;
     this._protocolVersion = options.protocolVersion ?? '1.0';
     this._pushNotificationConfigStore = options.pushNotificationConfigStore;
+    this._taskEventBus = options.taskEventBus ?? new InMemoryTaskEventBus();
   }
 
   // ─── Builder Methods (return this for chaining) ───
@@ -268,6 +273,10 @@ export class A2XAgent {
 
   get pushNotificationConfigStore(): PushNotificationConfigStore | undefined {
     return this._pushNotificationConfigStore;
+  }
+
+  get taskEventBus(): TaskEventBus {
+    return this._taskEventBus;
   }
 
   // ─── Private Methods ───
