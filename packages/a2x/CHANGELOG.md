@@ -1,5 +1,42 @@
 # @a2x/sdk
 
+## 0.6.0
+
+### Minor Changes
+
+- [#47](https://github.com/planetarium/a2x/pull/47) [`1b6b6a6`](https://github.com/planetarium/a2x/commit/1b6b6a6c6d374f4c3cd197a3ab27f3f6114b9a4c) Thanks [@ost006](https://github.com/ost006)! - feat(skills): integrate Claude Agent Skills open standard runtime
+
+  Adds optional `skills` support to `LlmAgent` so any agent can load an
+  open Claude Agent Skills directory (SKILL.md frontmatter + body + bundled
+  files + scripts) or inline skills via `defineSkill()`. On activation the
+  SDK registers three provider-agnostic builtin tools — `load_skill`,
+  `read_skill_file`, `run_skill_script` — and injects the skill metadata
+  block into the system prompt so Anthropic, OpenAI, and Google providers
+  observe identical behaviour (progressive disclosure: eager metadata,
+  lazy body, lazy references). Script execution is policy-aware
+  (`allow` / `confirm` / `deny`) and audit-hook aware via
+  `onScriptExecute`. Zero new runtime dependencies: a minimal YAML
+  frontmatter parser is included. Existing agents are unaffected when the
+  `skills` option is absent.
+
+### Patch Changes
+
+- [#49](https://github.com/planetarium/a2x/pull/49) [`b506378`](https://github.com/planetarium/a2x/commit/b506378f2592a004dc0faec3b8550d36cdbc3463) Thanks [@ost006](https://github.com/ost006)! - docs: cover SSE disconnect handling, `tasks/resubscribe`, and the authenticated extended card
+
+  Extends the bundled guides to reflect the features landed in PRs [#42](https://github.com/planetarium/a2x/issues/42), [#43](https://github.com/planetarium/a2x/issues/43), [#44](https://github.com/planetarium/a2x/issues/44):
+
+  - `guides/agent/streaming.md` — new "Client disconnect stops the work" and "Resuming a dropped SSE stream" sections, with guidance on wiring `res.on('close')` when hand-rolling an HTTP handler.
+  - `guides/client/streaming.md` — new "Resuming a dropped stream" section showing the raw-JSON-RPC `tasks/resubscribe` pattern plus a note on the new cancel-on-disconnect contract.
+  - `guides/advanced/manual-wiring.md` — documents `A2XAgentOptions.taskEventBus` with a sketch of a cross-process custom bus.
+  - `guides/advanced/extended-agent-card.md` — **new** page covering `setAuthenticatedExtendedCardProvider`, overlay merge semantics, per-principal enrichment, and the `-32007` / `-32008` error codes. Linked from `authentication.md`, `agent-card-versioning.md`, and `manifest.json`.
+  - `guides/agent/framework-integration.md` — Express snippet updated to include the `res.on('close')` disconnect wiring.
+
+  Closes [#46](https://github.com/planetarium/a2x/issues/46).
+
+- [#47](https://github.com/planetarium/a2x/pull/47) [`11483ae`](https://github.com/planetarium/a2x/commit/11483ae02b91df5a4d3879454e0b44ef9d54e555) Thanks [@ost006](https://github.com/ost006)! - fix(provider/anthropic): emit tool_use blocks after text blocks in assistant messages
+
+  The Anthropic API treats a trailing tool_use block as the assistant's pending request and expects the next user message to begin with a matching tool_result. When the converter emitted tool_use before text inside the same assistant message, Anthropic rejected the conversation with `tool_use ids were found without tool_result blocks immediately after`, breaking any tool-calling flow where the model produced preamble text alongside a tool call.
+
 ## 0.5.0
 
 ### Minor Changes
