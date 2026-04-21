@@ -61,7 +61,18 @@ function convertPartsToAnthropicContent(
 ): Anthropic.ContentBlockParam[] {
   const blocks: Anthropic.ContentBlockParam[] = [];
 
-  // If metadata contains toolCalls, add tool_use blocks (assistant message)
+  // Emit text blocks first so that tool_use blocks sit at the end of the
+  // assistant message. Anthropic treats a trailing tool_use as the turn's
+  // pending request and requires the next user message to begin with a
+  // matching tool_result; when tool_use is followed by text inside the same
+  // assistant message, the API rejects the conversation as if the
+  // tool_result were missing.
+  for (const part of parts) {
+    if (isTextPart(part) && part.text) {
+      blocks.push({ type: 'text', text: part.text });
+    }
+  }
+
   if (metadata?.toolCalls) {
     const toolCalls = metadata.toolCalls as ToolCall[];
     for (const tc of toolCalls) {
@@ -71,12 +82,6 @@ function convertPartsToAnthropicContent(
         name: tc.name,
         input: tc.args,
       });
-    }
-  }
-
-  for (const part of parts) {
-    if (isTextPart(part) && part.text) {
-      blocks.push({ type: 'text', text: part.text });
     }
   }
 

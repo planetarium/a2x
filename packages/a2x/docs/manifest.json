@@ -17,6 +17,7 @@
         { "slug": "agent/build-an-agent", "title": "Build an Agent" },
         { "slug": "agent/providers", "title": "Choose an LLM Provider" },
         { "slug": "agent/tools", "title": "Add Tools" },
+        { "slug": "agent/skills", "title": "Agent Skills" },
         { "slug": "agent/multi-agent", "title": "Multi-Agent Patterns" },
         { "slug": "agent/framework-integration", "title": "Framework Integration" },
         { "slug": "agent/streaming", "title": "Streaming Responses" }

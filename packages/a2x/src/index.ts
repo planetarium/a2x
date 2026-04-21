@@ -26,6 +26,29 @@ export * from './plugin/index.js';
 // Layer 2: Provider (base only — concrete providers via separate entry points)
 export * from './provider/index.js';
 
+// Layer 2: Skill runtime (Claude Agent Skills open standard).
+// Selective re-export only — `AgentSkill*` names are intentionally kept
+// separate from the A2A `A2XAgentSkill` (AgentCard.skills) type so that
+// import paths remain unambiguous.
+export type {
+  SkillsConfig,
+  SkillLogger,
+  AgentSkill,
+  AgentSkillMetadata,
+  AgentSkillBody,
+  SkillScriptExecutionMeta,
+  DefineSkillInput,
+  InlineScriptHandler,
+} from './skills/index.js';
+export { defineSkill } from './skills/index.js';
+export {
+  SkillError,
+  SkillParseError,
+  SkillDiscoveryError,
+  SkillConfigError,
+  SkillExecutionError,
+} from './skills/index.js';
+
 // Layer 3: A2X Integration
 export * from './a2x/index.js';
 
