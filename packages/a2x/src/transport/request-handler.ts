@@ -28,6 +28,7 @@ import type {
 } from '../types/task.js';
 import { TERMINAL_STATES } from '../types/task.js';
 import {
+  AuthenticatedExtendedCardNotConfiguredError,
   AuthenticationRequiredError,
   InternalError,
   InvalidParamsError,
@@ -120,9 +121,12 @@ export class DefaultRequestHandler {
       };
     }
 
-    // Authenticate if context is provided and security requirements exist
+    // Authenticate if context is provided and security requirements exist.
+    // Capture authResult so special-case handlers (e.g. the authenticated
+    // extended card) can consume the resolved principal/scopes.
+    let authResult: AuthResult | undefined;
     if (context && this.a2xAgent.securityRequirements.length > 0) {
-      const authResult = await this._authenticate(context);
+      authResult = await this._authenticate(context);
       if (!authResult.authenticated) {
         const error = new AuthenticationRequiredError(
           authResult.error ?? 'Authentication required',
@@ -132,6 +136,29 @@ export class DefaultRequestHandler {
           id: request.id,
           error: error.toJSONRPCError(),
         };
+      }
+    }
+
+    // Special-case: authenticated extended card needs authResult; do not
+    // route via JsonRpcRouter because that layer has no access to auth.
+    if (request.method === A2A_METHODS.GET_EXTENDED_CARD) {
+      try {
+        if (!this.a2xAgent.hasAuthenticatedExtendedCardProvider) {
+          throw new AuthenticatedExtendedCardNotConfiguredError();
+        }
+        if (!authResult || !authResult.authenticated) {
+          throw new AuthenticationRequiredError(
+            'Authentication is required for the authenticated extended card',
+          );
+        }
+        const card = await this.a2xAgent.getAuthenticatedExtendedCard(authResult);
+        return {
+          jsonrpc: '2.0',
+          id: request.id,
+          result: card,
+        };
+      } catch (err) {
+        return this._toErrorResponse(request.id, err);
       }
     }
 

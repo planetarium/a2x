@@ -45,7 +45,7 @@ export const A2A_METHODS = {
   GET_PUSH_CONFIG: 'tasks/pushNotificationConfig/get',
   LIST_PUSH_CONFIGS: 'tasks/pushNotificationConfig/list',
   DELETE_PUSH_CONFIG: 'tasks/pushNotificationConfig/delete',
-  GET_EXTENDED_CARD: 'agent/authenticatedExtendedCard',
+  GET_EXTENDED_CARD: 'agent/getAuthenticatedExtendedCard',
 } as const;
 
 // ─── SendMessage Parameters ───
