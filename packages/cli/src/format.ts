@@ -3,7 +3,7 @@
  */
 
 import chalk from 'chalk';
-import { A2XClient } from '@a2x/sdk/client';
+import { A2XClient } from '@a2x/sdk';
 import type { Task, TaskStatusUpdateEvent, TaskArtifactUpdateEvent, Part } from '@a2x/sdk';
 import { CliAuthProvider } from './cli-auth-provider.js';
 

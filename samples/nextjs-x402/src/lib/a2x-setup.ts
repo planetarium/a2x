@@ -63,6 +63,25 @@ const innerExecutor = new AgentExecutor({
   runConfig: { streamingMode: StreamingMode.SSE },
 });
 
+// Development escape hatch: when X402_MOCK_FACILITATOR=1 the sample skips
+// verify/settle entirely and returns a fake receipt. Useful for running
+// the sample without an actual funded Base Sepolia wallet.
+const mockFacilitator = process.env.X402_MOCK_FACILITATOR === '1'
+  ? {
+      async verify() {
+        return { isValid: true, invalidReason: undefined, payer: '0xmock' as `0x${string}` };
+      },
+      async settle() {
+        return {
+          success: true,
+          transaction: '0xmocktx',
+          network: 'base-sepolia' as const,
+          payer: '0xmock' as `0x${string}`,
+        };
+      },
+    }
+  : undefined;
+
 const paymentExecutor = new X402PaymentExecutor(innerExecutor, {
   accepts: [
     {
@@ -74,9 +93,11 @@ const paymentExecutor = new X402PaymentExecutor(innerExecutor, {
       description: 'Per-call echo',
     },
   ],
-  ...(process.env.X402_FACILITATOR_URL
-    ? { facilitator: { url: process.env.X402_FACILITATOR_URL } }
-    : {}),
+  ...(mockFacilitator
+    ? { facilitator: mockFacilitator }
+    : process.env.X402_FACILITATOR_URL
+      ? { facilitator: { url: process.env.X402_FACILITATOR_URL } }
+      : {}),
 });
 
 export const a2xAgent = new A2XAgent({

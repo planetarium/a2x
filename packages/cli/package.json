@@ -19,7 +19,9 @@
   "dependencies": {
     "@a2x/sdk": "workspace:*",
     "chalk": "^5.4.0",
-    "commander": "^13.0.0"
+    "commander": "^13.0.0",
+    "viem": "^2.48.2",
+    "x402": "^1.2.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
