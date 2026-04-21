@@ -42,12 +42,17 @@ class EchoAgent extends BaseAgent {
   }
 }
 
-const requireEnv = (name: string): string => {
-  const value = process.env[name];
+const MISSING_ADDRESS_PLACEHOLDER = '0x0000000000000000000000000000000000000000';
+
+const resolveMerchantAddress = (): string => {
+  const value = process.env.X402_MERCHANT_ADDRESS;
   if (!value || value.length === 0) {
-    throw new Error(
-      `${name} is required. Copy .env.example to .env and fill in the merchant address.`,
-    );
+    if (process.env.NEXT_PHASE !== 'phase-production-build') {
+      console.warn(
+        '[a2x-x402 sample] X402_MERCHANT_ADDRESS is not set. Falling back to the zero address — payments will never succeed until you configure a real one (.env).',
+      );
+    }
+    return MISSING_ADDRESS_PLACEHOLDER;
   }
   return value;
 };
@@ -89,7 +94,7 @@ const paymentExecutor = new X402PaymentExecutor(innerExecutor, {
       // 0.001 USDC — tiny enough to be a believable per-call price on testnet.
       amount: '1000',
       asset: USDC_BASE_SEPOLIA,
-      payTo: requireEnv('X402_MERCHANT_ADDRESS'),
+      payTo: resolveMerchantAddress(),
       description: 'Per-call echo',
     },
   ],
