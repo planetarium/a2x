@@ -159,6 +159,12 @@ export function toA2x(
               );
               const reader = stream.getReader();
 
+              // On client TCP close, cancel the reader so the source
+              // generator terminates and aborts in-flight LLM calls.
+              req.on('close', () => {
+                void reader.cancel().catch(() => {});
+              });
+
               try {
                 while (true) {
                   const { done, value } = await reader.read();

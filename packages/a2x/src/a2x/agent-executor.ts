@@ -60,6 +60,7 @@ export class AgentExecutor {
 
     const artifacts: Artifact[] = [];
     const textParts: string[] = [];
+    let completedNormally = false;
 
     try {
       for await (const event of this.runner.runAsync(session, message, abortController.signal)) {
@@ -86,6 +87,7 @@ export class AgentExecutor {
               },
               timestamp: new Date().toISOString(),
             };
+            completedNormally = true;
             return task;
         }
       }
@@ -100,6 +102,7 @@ export class AgentExecutor {
           task.artifacts = artifacts;
         }
       }
+      completedNormally = true;
     } catch (error) {
       task.status = {
         state: TaskState.FAILED,
@@ -117,7 +120,14 @@ export class AgentExecutor {
         },
         timestamp: new Date().toISOString(),
       };
+      completedNormally = true;
     } finally {
+      // Abort any in-flight work if the awaiter exited abnormally
+      // (e.g. generator was .return()ed by an SSE client disconnect).
+      // On normal completion / error / cancel this is a no-op.
+      if (!completedNormally && !abortController.signal.aborted) {
+        abortController.abort();
+      }
       this._abortControllers.delete(task.id);
     }
 
@@ -148,6 +158,8 @@ export class AgentExecutor {
       contextId,
       status: task.status,
     };
+
+    let completedNormally = false;
 
     try {
       const textParts: string[] = [];
@@ -214,9 +226,11 @@ export class AgentExecutor {
               contextId,
               status: task.status,
             } satisfies TaskStatusUpdateEvent;
+            completedNormally = true;
             return;
         }
       }
+      completedNormally = true;
     } catch (error) {
       task.status = {
         state: TaskState.FAILED,
@@ -239,7 +253,14 @@ export class AgentExecutor {
         contextId,
         status: task.status,
       } satisfies TaskStatusUpdateEvent;
+      completedNormally = true;
     } finally {
+      // Abort any in-flight work if the generator was .return()ed by a
+      // consumer (e.g. SSE client disconnect) before it could finish.
+      // On normal completion / error / cancel this is a no-op.
+      if (!completedNormally && !abortController.signal.aborted) {
+        abortController.abort();
+      }
       this._abortControllers.delete(task.id);
     }
   }
