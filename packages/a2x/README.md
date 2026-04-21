@@ -13,6 +13,7 @@ A self-contained TypeScript SDK for building [A2A (Agent-to-Agent)](https://a2a-
 - **Framework-agnostic** — Works with Express, Fastify, Hono, Next.js, or any HTTP framework.
 - **SSE streaming** — First-class `message/stream` support via Server-Sent Events.
 - **Built-in auth** — API Key, Bearer, OAuth 2.0 (Authorization Code, Client Credentials, Device Code), OpenID Connect, and Mutual TLS.
+- **x402 payments** — Charge per call via the [a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402) extension. On-chain verify + settle through any x402 facilitator.
 - **Zero runtime dependencies** — Core module uses only Node.js built-in APIs.
 - **TypeScript-first** — Full type safety with types derived from A2A JSON Schema.
 
@@ -305,6 +306,49 @@ a2xAgent
 
 Supported schemes: `ApiKeyAuthorization`, `HttpBearerAuthorization`, `OAuth2AuthorizationCodeAuthorization`, `OAuth2ClientCredentialsAuthorization`, `OAuth2DeviceCodeAuthorization`, `OpenIdConnectAuthorization`, `MutualTlsAuthorization`.
 
+## x402 Payments
+
+Gate agent calls behind on-chain cryptocurrency payments using the [a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402) extension.
+
+Install the optional peers:
+
+```bash
+npm install x402 viem
+```
+
+Server:
+
+```typescript
+import { X402PaymentExecutor, X402_EXTENSION_URI } from '@a2x/sdk/x402';
+
+const executor = new X402PaymentExecutor(innerExecutor, {
+  accepts: [{
+    network: 'base-sepolia',
+    amount: '10000',                                   // 0.01 USDC (6 decimals)
+    asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e', // USDC on Base Sepolia
+    payTo: process.env.MERCHANT_ADDRESS!,
+  }],
+});
+
+const agent = new A2XAgent({ taskStore, executor })
+  .setCapabilities({ extensions: [{ uri: X402_EXTENSION_URI, required: true }] });
+```
+
+Client:
+
+```typescript
+import { A2XClient } from '@a2x/sdk/client';
+import { X402Client } from '@a2x/sdk/x402';
+import { privateKeyToAccount } from 'viem/accounts';
+
+const x402 = new X402Client(new A2XClient(url), {
+  signer: privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`),
+});
+const task = await x402.sendMessage({ message: { role: 'user', parts: [{ text: '...' }] } });
+```
+
+Full guide: [docs/guides/advanced/x402-payments.md](./docs/guides/advanced/x402-payments.md).
+
 ## AgentCard Versions
 
 a2x handles the structural differences between A2A protocol versions transparently:
@@ -330,6 +374,7 @@ const cardV03 = a2xAgent.getAgentCard('0.3');   // v0.3
 | `@a2x/sdk/anthropic` | `AnthropicProvider` |
 | `@a2x/sdk/openai` | `OpenAIProvider` |
 | `@a2x/sdk/google` | `GoogleProvider` |
+| `@a2x/sdk/x402` | a2a-x402 v0.2 payments (server + client) |
 
 ## Requirements
 

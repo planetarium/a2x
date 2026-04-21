@@ -19,6 +19,7 @@ export default defineConfig([
       'provider/anthropic/index': 'src/provider/anthropic/index.ts',
       'provider/openai/index': 'src/provider/openai/index.ts',
       'provider/google/index': 'src/provider/google/index.ts',
+      'x402/index': 'src/x402/index.ts',
     },
     format: ['esm', 'cjs'],
     dts: true,
