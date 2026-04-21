@@ -161,9 +161,15 @@ export function toA2x(
 
               // On client TCP close, cancel the reader so the source
               // generator terminates and aborts in-flight LLM calls.
-              req.on('close', () => {
+              // Use res.on('close') — req.on('close') fires when the
+              // request body stream is consumed (before response writing),
+              // so it misses the later disconnect during streaming.
+              // res.close also fires after a normal res.end(), at which
+              // point cancel() is a harmless no-op.
+              const cancelReader = () => {
                 void reader.cancel().catch(() => {});
-              });
+              };
+              res.on('close', cancelReader);
 
               try {
                 while (true) {
