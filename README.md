@@ -1,5 +1,6 @@
 # a2x
 
+[![CI](https://github.com/planetarium/a2x/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/planetarium/a2x/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/@a2x/sdk.svg)](https://www.npmjs.com/package/@a2x/sdk)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 

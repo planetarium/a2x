@@ -1,0 +1,60 @@
+name: Feature request
+description: Propose a new capability, API, or integration for @a2x/sdk or @a2x/cli.
+title: "feat: <short summary>"
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping shape a2x. Please describe the motivating use
+        case first — the API shape is easier to design once we agree on
+        what problem we're solving.
+  - type: dropdown
+    id: package
+    attributes:
+      label: Which package does this target?
+      options:
+        - "@a2x/sdk"
+        - "@a2x/cli"
+        - both
+        - documentation / samples
+        - not sure
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the use case, the current workaround (if any), and why the existing API falls short.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Sketch the API, CLI command, or behavior you have in mind. Pseudocode is fine.
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you thought about and why you ruled them out.
+    validations:
+      required: false
+  - type: input
+    id: spec
+    attributes:
+      label: Related A2A spec section (if any)
+      description: Link to the relevant section of `specification/a2a-v0.3.0.json` or `specification/a2a-v1.0.0.json`.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checks
+      options:
+        - label: I searched existing issues and discussions and confirmed this is not already proposed.
+          required: true
+        - label: I have read `AGENTS.md` and understand that a PR would also need a changeset and docs update.
+          required: false

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/planetarium/a2x/security/advisories/new
+    about: Please do not open a public issue. Report vulnerabilities privately via GitHub Security Advisories. See SECURITY.md for details.
+  - name: Question or general discussion
+    url: https://github.com/planetarium/a2x/discussions
+    about: For usage questions, design discussion, or "how do I...?" — please use Discussions instead of issues.

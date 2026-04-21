@@ -1,0 +1,30 @@
+# CODEOWNERS for planetarium/a2x
+#
+# Each line is a file pattern followed by one or more owners.
+# Owners are automatically requested for review when the matching
+# files are changed in a pull request.
+#
+# Syntax: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-security/customizing-your-repository/about-code-owners
+#
+# TODO: replace @Venstein with a @planetarium/<team> handle once the
+# maintainer team is established on GitHub.
+
+# Default owner for everything in the repo
+*                                     @Venstein
+
+# SDK
+/packages/a2x/                        @Venstein
+/packages/a2x/docs/                   @Venstein
+
+# CLI
+/packages/cli/                        @Venstein
+
+# Samples
+/samples/                             @Venstein
+
+# Protocol specification mirrors — touch with care
+/specification/                       @Venstein
+
+# CI / release automation
+/.github/                             @Venstein
+/.changeset/                          @Venstein
