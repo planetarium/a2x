@@ -40,6 +40,7 @@
       "pages": [
         { "slug": "advanced/manual-wiring", "title": "Manual Wiring" },
         { "slug": "advanced/authentication", "title": "Authentication" },
+        { "slug": "advanced/extended-agent-card", "title": "Authenticated Extended AgentCard" },
         { "slug": "advanced/task-store", "title": "Custom Task Stores" },
         { "slug": "advanced/agent-card-versioning", "title": "AgentCard v0.3 vs v1.0" },
         { "slug": "advanced/extensions", "title": "Protocol Extensions" }

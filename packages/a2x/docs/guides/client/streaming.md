@@ -60,6 +60,42 @@ for await (const event of stream) {
 
 If you want the agent itself to stop doing work (not just your client to stop listening), call `client.cancelTask(taskId)` using the `id` from the first `task` event.
 
+As of A2X **0.5.0**, breaking out of the loop is enough on its own: when the underlying HTTP connection closes the server aborts the in-flight agent execution. You don't need to call `cancelTask` just to save tokens on abandoned streams.
+
+## Resuming a dropped stream
+
+If the connection drops but you still want the results — flaky network, mobile tab restore, proxy idle timeout — re-attach to the same task with the A2A `tasks/resubscribe` method. The server keeps publishing events to any live subscriber, so a resubscriber catches the tail of the original execution.
+
+`A2XClient` doesn't yet expose a convenience helper, so issue the call at the JSON-RPC level. The response is an SSE stream with the same event shape as `message/stream`:
+
+```ts
+async function resubscribe(url: string, taskId: string) {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+    },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tasks/resubscribe',
+      params: { id: taskId },
+    }),
+  });
+
+  // Parse the SSE body however you like — reuse your own SSE parser,
+  // or the one the A2X transport layer exports if you prefer.
+  return response.body!.getReader();
+}
+```
+
+Behavior to know:
+
+- **Forward-only.** Events that fired before the resubscribe call are not replayed — you see what the server publishes from that point on.
+- **Terminal replay.** If the task already completed, you receive a single `status-update` event with the final state, then the stream ends.
+- **Unknown task.** The server emits an SSE `error` event carrying `TaskNotFoundError` (JSON-RPC code `-32001`).
+
 ## Accumulating output
 
 A common pattern — render text as it arrives, keep a running buffer:

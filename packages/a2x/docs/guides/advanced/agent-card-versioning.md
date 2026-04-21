@@ -40,6 +40,15 @@ If you have CLI tools or third-party agents still pinned to v0.3, they read `url
 
 OAuth 2.0 Device Code is a v1.0-native security flow. A2X extends it onto v0.3 cards as a non-standard extension so headless clients can still negotiate it. See [Protocol Extensions](./extensions.md) for details.
 
+### Advertising the authenticated extended card
+
+When you call `a2xAgent.setAuthenticatedExtendedCardProvider(...)`, A2X flips the version-specific capability flag on the base card automatically:
+
+- v0.3: top-level `supportsAuthenticatedExtendedCard: true`
+- v1.0: `capabilities.extendedAgentCard: true`
+
+Conforming clients read this to decide whether to call `agent/getAuthenticatedExtendedCard`. You don't set either flag by hand — registering the provider is the only signal you need. See [Authenticated Extended AgentCard](./extended-agent-card.md).
+
 ### 3. Multi-transport agents
 
 If you plan to expose JSON-RPC over HTTP **and** another transport (e.g. gRPC), only v1.0 expresses this cleanly. Legacy v0.3 consumers will only see the first/primary interface.
