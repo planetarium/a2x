@@ -22,6 +22,25 @@ import {
   runBeforeToolCallbacks,
   runAfterToolCallbacks,
 } from '../runner/callback-runner.js';
+import type { SkillsConfig } from '../skills/types.js';
+import { SkillConfigError } from '../skills/errors.js';
+import { SkillLoader } from '../skills/loader.js';
+import { SkillRegistry } from '../skills/registry.js';
+import { combineSystemInstruction } from '../skills/prompt.js';
+import {
+  createLoadSkillTool,
+  LOAD_SKILL_TOOL_NAME,
+  READ_SKILL_FILE_TOOL_NAME,
+  RUN_SKILL_SCRIPT_TOOL_NAME,
+} from '../skills/load-skill-tool.js';
+import { createReadSkillFileTool } from '../skills/read-skill-file-tool.js';
+import { createRunSkillScriptTool } from '../skills/run-skill-script-tool.js';
+
+const RESERVED_SKILL_TOOL_NAMES: ReadonlySet<string> = new Set([
+  LOAD_SKILL_TOOL_NAME,
+  READ_SKILL_FILE_TOOL_NAME,
+  RUN_SKILL_SCRIPT_TOOL_NAME,
+]);
 
 const DEFAULT_MAX_LLM_CALLS = 25;
 
@@ -57,6 +76,13 @@ export interface LlmAgentOptions {
   beforeModelCallback?: BeforeModelCallback;
   afterModelCallback?: AfterModelCallback;
   beforeToolCallback?: BeforeToolCallback;
+  /**
+   * Claude Agent Skills (open standard) configuration. When set, the agent
+   * eagerly loads all skill metadata and registers the `load_skill` /
+   * `read_skill_file` / `run_skill_script` builtin tools automatically.
+   * When undefined the agent behaves exactly as before.
+   */
+  skills?: SkillsConfig;
 }
 
 // ─── LlmAgent ───
@@ -71,6 +97,10 @@ export class LlmAgent extends BaseAgent {
   readonly beforeModelCallback?: BeforeModelCallback;
   readonly afterModelCallback?: AfterModelCallback;
   readonly beforeToolCallback?: BeforeToolCallback;
+  /** Pending skill registry load. `null` when no skills are configured. */
+  private readonly _skillsPromise: Promise<SkillRegistry> | null;
+  /** Resolved skill registry (populated on first run). */
+  private _skillRegistry: SkillRegistry | null = null;
 
   constructor(options: LlmAgentOptions) {
     super({ name: options.name, description: options.description });
@@ -83,6 +113,36 @@ export class LlmAgent extends BaseAgent {
     this.beforeModelCallback = options.beforeModelCallback;
     this.afterModelCallback = options.afterModelCallback;
     this.beforeToolCallback = options.beforeToolCallback;
+
+    // Validate that the developer hasn't collided with the reserved skill
+    // tool names. This is synchronous and fatal (FR-031).
+    if (options.skills !== undefined) {
+      for (const tool of this.tools) {
+        if (RESERVED_SKILL_TOOL_NAMES.has(tool.name)) {
+          throw new SkillConfigError(
+            `tool name "${tool.name}" is reserved by the skill runtime; rename the tool or remove the "skills" option`,
+          );
+        }
+      }
+      this._skillsPromise = SkillLoader.load(options.skills).then(
+        (res) => res.registry,
+      );
+    } else {
+      this._skillsPromise = null;
+    }
+  }
+
+  /**
+   * Wait for the skill registry to finish loading. Returns `null` when the
+   * agent was constructed without a `skills` option. Primarily intended for
+   * tests; normal callers rely on `run()` resolving the registry before the
+   * first LLM invocation (FR-081).
+   */
+  async whenSkillsReady(): Promise<SkillRegistry | null> {
+    if (this._skillsPromise === null) return null;
+    if (this._skillRegistry) return this._skillRegistry;
+    this._skillRegistry = await this._skillsPromise;
+    return this._skillRegistry;
   }
 
   /**
@@ -106,10 +166,11 @@ export class LlmAgent extends BaseAgent {
   }
 
   /**
-   * Build ToolDeclaration[] from registered tools.
+   * Build ToolDeclaration[] from the supplied tool list (which includes any
+   * skill builtin tools when a skill registry is active).
    */
-  private buildToolDeclarations(): ToolDeclaration[] {
-    return this.tools.map((tool) => ({
+  private buildToolDeclarations(tools: readonly BaseTool[]): ToolDeclaration[] {
+    return tools.map((tool) => ({
       name: tool.name,
       description: tool.description,
       parameters: tool.getParameterSchema(),
@@ -121,6 +182,22 @@ export class LlmAgent extends BaseAgent {
     const maxCalls = context.maxLlmCalls ?? this.maxLlmCalls ?? DEFAULT_MAX_LLM_CALLS;
     let llmCallCount = 0;
 
+    // 0. Resolve skill registry (eager metadata, lazy bodies)
+    let skillRegistry: SkillRegistry | null = null;
+    if (this._skillsPromise !== null) {
+      try {
+        skillRegistry = await this.whenSkillsReady();
+      } catch (err) {
+        yield {
+          type: 'error',
+          error: new Error(
+            `[LlmAgent:${this.name}] Failed to load skills: ${(err as Error).message}`,
+          ),
+        };
+        return;
+      }
+    }
+
     // 1. Resolve instruction
     let systemInstruction: string;
     try {
@@ -130,8 +207,25 @@ export class LlmAgent extends BaseAgent {
       return;
     }
 
-    // 2. Build tool declarations
-    const toolDeclarations = this.buildToolDeclarations();
+    // 1a. Prepend the skill metadata block to the resolved instruction
+    // (FR-020, FR-021). Provider-agnostic — identical for all providers.
+    if (skillRegistry !== null) {
+      systemInstruction = combineSystemInstruction(systemInstruction, skillRegistry);
+    }
+
+    // 2. Build the effective tool list. Skill builtin tools precede the
+    // developer-supplied tools so that ordering is deterministic regardless
+    // of whether the caller passed a tools array.
+    const effectiveTools: BaseTool[] =
+      skillRegistry !== null && !skillRegistry.isEmpty
+        ? [
+          createLoadSkillTool(skillRegistry),
+          createReadSkillFileTool(skillRegistry),
+          createRunSkillScriptTool(skillRegistry),
+          ...this.tools,
+        ]
+        : this.tools;
+    const toolDeclarations = this.buildToolDeclarations(effectiveTools);
 
     // 3. Build initial contents from session history
     const contents: Message[] = eventsToContents(context.session.events);
@@ -223,7 +317,7 @@ export class LlmAgent extends BaseAgent {
 
         yield { type: 'toolCall', toolName: toolCall.name, args: toolCall.args, toolCallId: toolCall.id };
 
-        const tool = this.tools.find((t) => t.name === toolCall.name);
+        const tool = effectiveTools.find((t) => t.name === toolCall.name);
 
         let result: unknown;
         try {
