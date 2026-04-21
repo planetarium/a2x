@@ -48,7 +48,9 @@ export function createSSEStream(
     },
 
     cancel() {
-      // Stream was canceled by the client
+      // Propagate client disconnect up the for-await chain so each finally
+      // block runs and the shared AbortController is aborted.
+      void events.return(undefined).catch(() => {});
     },
   });
 }
