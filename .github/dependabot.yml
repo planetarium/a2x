@@ -45,3 +45,10 @@ updates:
       - "github-actions"
     commit-message:
       prefix: "chore(ci)"
+    ignore:
+      # Action major bumps are handled manually. A semver-valid major can
+      # still be freshly released and unstable (see pnpm/action-setup v6
+      # which ignored the packageManager field and corrupted the lockfile
+      # on install — pnpm/action-setup#227 and #228).
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
