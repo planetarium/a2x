@@ -366,13 +366,36 @@ export class DefaultRequestHandler {
     );
   }
 
-  // ─── Private: Method Handlers ───
+  // ─── Private: Task Resolution ───
 
-  private async _handleSendMessage(params: SendMessageParams): Promise<unknown> {
-    const task = await this.a2xAgent.taskStore.createTask({
+  /**
+   * Resolve the `Task` an incoming `message/send` or `message/stream`
+   * should execute against.
+   *
+   * Per A2A spec, a client can continue an existing conversation by
+   * setting `message.taskId`. When that points at a live task (not in a
+   * terminal state) we reuse it so mid-task state (e.g. the x402
+   * extension's `payment-required` → `payment-submitted` hand-off) is
+   * preserved; otherwise we create a fresh task.
+   */
+  private async _resolveTaskForMessage(params: SendMessageParams) {
+    const messageTaskId = (params.message as { taskId?: unknown }).taskId;
+    if (typeof messageTaskId === 'string' && messageTaskId.length > 0) {
+      const existing = await this.a2xAgent.taskStore.getTask(messageTaskId);
+      if (existing && !TERMINAL_STATES.has(existing.status.state)) {
+        return existing;
+      }
+    }
+    return this.a2xAgent.taskStore.createTask({
       contextId: params.message.contextId,
       metadata: params.metadata,
     });
+  }
+
+  // ─── Private: Method Handlers ───
+
+  private async _handleSendMessage(params: SendMessageParams): Promise<unknown> {
+    const task = await this._resolveTaskForMessage(params);
 
     const completedTask = await this.a2xAgent.agentExecutor.execute(
       task,
@@ -394,10 +417,7 @@ export class DefaultRequestHandler {
       );
     }
 
-    const task = await this.a2xAgent.taskStore.createTask({
-      contextId: params.message.contextId,
-      metadata: params.metadata,
-    });
+    const task = await this._resolveTaskForMessage(params);
 
     const eventStream = this.a2xAgent.agentExecutor.executeStream(
       task,

@@ -27,6 +27,6 @@ export default [
     },
   },
   {
-    ignores: ['**/dist/**', '**/node_modules/**'],
+    ignores: ['**/dist/**', '**/node_modules/**', '**/bin-bundle/**'],
   },
 ];
