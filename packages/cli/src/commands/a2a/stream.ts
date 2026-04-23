@@ -230,21 +230,41 @@ async function consumeUntilPaymentRequired(
   return undefined;
 }
 
+/**
+ * Whether the cursor is currently mid-line after a streaming artifact chunk
+ * that was written without a trailing newline.
+ */
+let midLine = false;
+
+function flushLine(): void {
+  if (midLine) {
+    process.stdout.write('\n');
+    midLine = false;
+  }
+}
+
 function renderEvent(event: StreamEvent, opts: { json?: boolean }): void {
   if (opts.json) {
     console.log(JSON.stringify(event));
     return;
   }
   if ('status' in event) {
+    flushLine();
     printStatusUpdate(event);
   } else {
     printArtifactChunk(event, true);
+    if (event.artifact.parts.some((p) => 'text' in p)) {
+      midLine = true;
+    }
+    if (event.lastChunk) {
+      flushLine();
+    }
   }
 }
 
 function finish(opts: { json?: boolean }): void {
   if (opts.json) return;
-  process.stdout.write('\n');
+  flushLine();
   console.log(chalk.gray('─'.repeat(40)));
   console.log(chalk.green('Stream completed'));
 }
