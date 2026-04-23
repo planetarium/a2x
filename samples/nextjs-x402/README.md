@@ -1,14 +1,20 @@
 # nextjs-x402 sample
 
-An [A2A](https://a2a-protocol.org) agent built with Next.js and `@a2x/sdk` where every call is paywalled using the [a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402) extension.
+An [A2A](https://a2a-protocol.org) agent built with Next.js and `@a2x/sdk` that demos **both** payment flows defined by [a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402):
 
-The agent itself is a trivial echo — the interesting bit is the x402 payment flow:
+- **Standalone gate.** A fixed browsing fee (0.001 USDC on Base Sepolia) is charged before the agent even starts.
+- **Embedded checkout.** Once inside, the agent offers a tiny inventory and asks for a per-item payment mid-execution via an artifact-shaped challenge. Ship happens after the embedded charge settles.
+
+The two charges stack: a single `sendMessage` call settles the gate, lets the agent think, settles the embedded checkout, and returns the completed task with both receipts.
+
+### Payment lifecycle
 
 1. Client sends a message.
-2. Server responds with task state `input-required` and `x402.payment.required` metadata (0.001 USDC on Base Sepolia).
-3. Client signs an EIP-3009 authorization over that requirement with their wallet.
-4. Client resubmits the same task with `x402.payment.submitted` + signed `PaymentPayload`.
-5. Server verifies + settles through the Coinbase facilitator, runs the agent, and attaches the settlement receipt to the completed task.
+2. Server responds with `input-required` + `x402.payment.required` (gate challenge, 0.001 USDC).
+3. Client signs an EIP-3009 authorization and resubmits → gate settles → agent runs.
+4. Agent yields `paymentRequired` → server emits an artifact-shaped cart challenge (0.05–0.12 USDC).
+5. Client signs the embedded payload and resubmits → embedded payment settles → agent resumes and ships the item.
+6. Completed task carries two receipts stacked under `x402.payment.receipts`.
 
 ## Setup
 
@@ -39,7 +45,9 @@ a2x wallet use default
 # Select "Base Sepolia" and use the address from `a2x wallet show`
 
 # Call the paywalled agent — the CLI handles the full x402 dance
-a2x a2a send http://localhost:3000/api/a2a "hello"
+a2x a2a send http://localhost:3000/api/a2a "sku-air-max"
+# Two payments will settle: the 0.001 USDC gate, then 0.12 USDC for the Air Max.
+# Try "sku-react-tee" for the cheaper inventory item.
 ```
 
 Using the SDK directly:
@@ -57,15 +65,16 @@ const task = await x402.sendMessage({
   message: {
     messageId: crypto.randomUUID(),
     role: 'user',
-    parts: [{ text: 'hello' }],
+    parts: [{ text: 'sku-air-max' }],
   },
 });
 
-console.log(task); // { state: "completed", artifacts: [...], receipts: [...] }
+console.log(task); // { state: "completed", artifacts: [...cart + shipping...], receipts: [gate, embedded] }
 ```
 
 ## What to tweak
 
-- `src/lib/a2x-setup.ts` — swap `EchoAgent` for `LlmAgent` + your preferred provider to paywall a real assistant.
-- `accepts[]` in the same file — adjust price, switch networks (e.g. `base` mainnet), or list multiple accept options.
+- `src/lib/a2x-setup.ts` — swap `StorefrontAgent` for `LlmAgent` + your preferred provider to paywall a real assistant. Drop the gate `accepts` entirely for a purchase-only (no gate) flow.
+- `INVENTORY` in the same file — add SKUs, rename, reprice. The embedded challenge is built from the selected entry.
+- `accepts[]` in the same file — adjust the gate price, switch networks (e.g. `base` mainnet), or list multiple accept options.
 - `facilitator` — point at your own facilitator via `X402_FACILITATOR_URL`.

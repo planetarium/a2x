@@ -63,8 +63,18 @@ export type {
   X402Network,
 } from './types.js';
 
-export { X402PaymentExecutor } from './executor.js';
-export type { X402PaymentExecutorOptions } from './executor.js';
+export {
+  X402PaymentExecutor,
+  X402_EMBEDDED_ARTIFACT_NAME,
+  X402_EMBEDDED_DATA_KEY,
+} from './executor.js';
+export type {
+  X402PaymentExecutorOptions,
+  X402ResolveAcceptsContext,
+} from './executor.js';
+
+export { paymentRequiredEvent } from './events.js';
+export type { PaymentRequiredEventOptions } from './events.js';
 
 export {
   resolveFacilitator,
@@ -77,12 +87,14 @@ export {
   getX402PaymentRequirements,
   getX402Receipts,
   getX402Status,
+  getEmbeddedX402Challenges,
   X402Client,
 } from './client.js';
 export type {
   SignX402PaymentOptions,
   SignedX402Payment,
   X402ClientOptions,
+  EmbeddedX402Challenge,
 } from './client.js';
 
 export {

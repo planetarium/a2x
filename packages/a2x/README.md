@@ -13,7 +13,7 @@ A self-contained TypeScript SDK for building [A2A (Agent-to-Agent)](https://a2a-
 - **Framework-agnostic** — Works with Express, Fastify, Hono, Next.js, or any HTTP framework.
 - **SSE streaming** — First-class `message/stream` support via Server-Sent Events.
 - **Built-in auth** — API Key, Bearer, OAuth 2.0 (Authorization Code, Client Credentials, Device Code), OpenID Connect, and Mutual TLS.
-- **x402 payments** — Charge per call via the [a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402) extension. On-chain verify + settle through any x402 facilitator.
+- **x402 payments** — Charge per call via the [a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402) extension. Supports both the Standalone gate (one charge at the door) and the Embedded flow (mid-execution per-action charges on artifacts, e.g. cart checkout). On-chain verify + settle through any x402 facilitator.
 - **Zero runtime dependencies** — Core module uses only Node.js built-in APIs.
 - **TypeScript-first** — Full type safety with types derived from A2A JSON Schema.
 

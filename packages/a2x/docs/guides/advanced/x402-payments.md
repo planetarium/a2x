@@ -188,11 +188,192 @@ for (const receipt of receipts) {
 }
 ```
 
+## Embedded Flow
+
+The Standalone flow above gates the whole task behind a single charge at the door. The **Embedded Flow** from a2a-x402 v0.2 lets an agent ask for an additional payment *mid-execution* — useful for cart-style checkouts, premium-asset delivery, or any "charge once you've decided to buy" flow. The gate and embedded charges compose: a call can settle both, or skip the gate entirely and charge only on purchase.
+
+### How it works
+
+1. The inner agent yields `paymentRequired` (optionally carrying a higher-level wrapper like an AP2 `CartMandate`).
+2. The executor stashes the paused generator, emits an artifact carrying the challenge, and transitions the task into `input-required`.
+3. The client signs the payload and resubmits.
+4. The executor verifies + settles, then resumes the generator from where it paused — no re-run.
+
+Per spec §4.2 the status metadata carries only `x402.payment.status: payment-required` (no `x402.payment.required` key); the actual challenge lives on `task.artifacts[]`.
+
+### Server — agent yielding mid-execution payment
+
+```ts
+import { BaseAgent, type AgentEvent } from '@a2x/sdk';
+import { paymentRequiredEvent, X402PaymentExecutor } from '@a2x/sdk/x402';
+
+class CartAgent extends BaseAgent {
+  async *run(): AsyncGenerator<AgentEvent> {
+    yield { type: 'text', text: 'Your cart: 1× Nike Air Max — 120 USDC.' };
+
+    // Pause here until the client pays.
+    yield paymentRequiredEvent({
+      accepts: [{
+        network: 'base',
+        amount: '120000000',               // 120 USDC (6 decimals)
+        asset: '0x833589fCD6eDb6E08f4c7C32D4f71b54bda02913',
+        payTo: process.env.MERCHANT_ADDRESS!,
+        description: 'Nike Air Max checkout',
+      }],
+      // Optional: attach your own higher-level object (rendered on the
+      // emitted artifact next to the x402 challenge).
+      embeddedObject: { cartId: 'cart-shoes-123', total: { currency: 'USD', value: 120 } },
+      artifactName: 'demo-cart',
+    });
+
+    yield { type: 'text', text: 'Paid — shipping shoes now.' };
+    yield { type: 'done' };
+  }
+}
+```
+
+Pair it with a gate-less executor if you only want per-purchase pricing:
+
+```ts
+const executor = new X402PaymentExecutor(inner, {
+  // No `accepts` → no gate. The executor only charges when the agent emits
+  // `paymentRequired`.
+});
+```
+
+### Dynamic pricing with `resolveAccepts`
+
+If the price depends on the cart (or on who's asking, or on the current inventory), let the agent yield `paymentRequired` without inline `accepts` and resolve them at the executor layer:
+
+```ts
+const executor = new X402PaymentExecutor(inner, {
+  resolveAccepts: async ({ embeddedObject, task, message }) => {
+    const cart = embeddedObject as { productId: string };
+    const unitPrice = await priceBook.lookup(cart.productId); // e.g. 75000000
+    return [{
+      network: 'base',
+      amount: unitPrice,
+      asset: USDC_BASE,
+      payTo,
+      description: `Checkout for ${cart.productId}`,
+    }];
+  },
+});
+
+class LookupAgent extends BaseAgent {
+  async *run() {
+    yield paymentRequiredEvent({ embeddedObject: { productId: 'sku-42' } });
+    yield { type: 'text', text: 'Delivered.' };
+    yield { type: 'done' };
+  }
+}
+```
+
+Inline `accepts` always wins — `resolveAccepts` is only consulted when the event omits them.
+
+### Client — stacking gate + embedded in one call
+
+`X402Client.sendMessage` loops over every payment challenge the merchant emits:
+
+```ts
+const x402 = new X402Client(new A2XClient(url), {
+  signer,
+  onPaymentRequired: (required) => {
+    console.log('Gate asks for', required.accepts);
+  },
+  onEmbeddedPaymentRequired: (challenge) => {
+    console.log('Embedded charge:', challenge.required.accepts, 'artifact=', challenge.artifactId);
+  },
+  // Safety cap — default 8. Raise for flows with many sequential charges.
+  maxPaymentHops: 8,
+});
+
+const task = await x402.sendMessage({
+  message: {
+    messageId: crypto.randomUUID(),
+    role: 'user',
+    parts: [{ text: 'buy shoes' }],
+  },
+});
+console.log(task.status.state); // "completed" after the gate AND the embedded charge settle
+```
+
+### Parsing Embedded challenges yourself
+
+For custom UIs (render the cart, show a confirmation modal, swap signers per artifact), use the primitive:
+
+```ts
+import { getEmbeddedX402Challenges, signX402Payment } from '@a2x/sdk/x402';
+
+const task = await client.sendMessage({ message: { … } });
+const challenges = getEmbeddedX402Challenges(task);
+for (const ch of challenges) {
+  console.log('artifactId', ch.artifactId);
+  console.log('full data (AP2, cart, etc.)', ch.data);
+  console.log('x402 requirements', ch.required.accepts);
+}
+
+const signed = await signX402Payment(task, { signer });
+const next = await client.sendMessage({
+  message: {
+    messageId: crypto.randomUUID(),
+    role: 'user',
+    taskId: task.id,
+    parts: [{ text: '' }],
+    metadata: signed.metadata,
+  },
+});
+```
+
+`getEmbeddedX402Challenges` recognizes the bare shape the SDK emits (data-part with an `x402.payment.required` key) AND `x402PaymentRequiredResponse`-shaped objects nested anywhere inside a higher-level wrapper (AP2 `CartMandate`, your own custom schema, etc.). If you transport the x402 payload inside your wrapper's `message.parts` on submission (true AP2), unwrap it into `message.metadata['x402.payment.payload']` yourself before handing to the SDK.
+
+### What gets emitted
+
+On an embedded charge, the task transitions to `input-required` and the status message carries just:
+
+```json
+{
+  "x402.payment.status": "payment-required"
+}
+```
+
+The actual challenge sits on a `task.artifacts[]` entry (named `x402-payment-required` by default, or whatever you passed as `artifactName`):
+
+```json
+{
+  "artifactId": "x402-challenge-1712345678",
+  "name": "demo-cart",
+  "parts": [{
+    "data": {
+      "cartId": "cart-shoes-123",
+      "total": { "currency": "USD", "value": 120 },
+      "x402.payment.required": {
+        "x402Version": 1,
+        "accepts": [{ /* PaymentRequirements */ }]
+      }
+    }
+  }]
+}
+```
+
+On success, all receipts (gate + every embedded charge) stack under `x402.payment.receipts`:
+
+```json
+{
+  "x402.payment.status": "payment-completed",
+  "x402.payment.receipts": [
+    { "success": true, "transaction": "0x…", "network": "base-sepolia" },
+    { "success": true, "transaction": "0x…", "network": "base-sepolia" }
+  ]
+}
+```
+
 ## Supported scope
 
-- **Standalone Flow** from a2a-x402 v0.2. Embedded Flow (AP2 `CartMandate` etc.) isn't yet wired up — the extension spec notes the embedded flow "supports" nesting but implementing it is separate work.
+- **Standalone Flow + Embedded Flow** from a2a-x402 v0.2. The SDK handles bare embedded challenges out of the box; for full AP2 `CartMandate`/`PaymentMandate` interop you can ship your own wrapper via `embeddedObject` and unwrap the payload on submission yourself (the data part shape is preserved verbatim).
 - **`exact` scheme, EVM networks** (`base`, `base-sepolia`, `polygon`, `avalanche`, …). The x402 npm package powers signing; adding Solana/SVM support means passing a Solana-compatible signer in a later release.
 - The base protocol is **x402 v1** (`x402Version: 1`). a2a-x402 v0.2 pins to this version; x402 v2 exists as a forward-looking draft but a2a-x402 has not adopted it yet.
+- Embedded-flow pause/resume is **in-memory** on the server: the paused generator lives in the `X402PaymentExecutor` instance keyed by `taskId`. If the server restarts between `paymentRequired` and the client's follow-up, the pending charge is lost (the task is effectively orphaned). Horizontally-scaled deployments should pin task resumption back to the originating instance.
 
 ## Reference
 

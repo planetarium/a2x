@@ -9,37 +9,90 @@ import {
   StreamingMode,
   X402PaymentExecutor,
   X402_EXTENSION_URI,
+  paymentRequiredEvent,
   type AgentEvent,
 } from '@a2x/sdk';
 import type { InvocationContext } from '@a2x/sdk';
 
 /**
- * A deliberately boring agent: we're showcasing the x402 payment gate,
- * not LLM integration. The agent just echoes the last text part it
- * received along with a greeting.
+ * A toy storefront agent to showcase both x402 flows:
  *
- * Swap in `LlmAgent` + a provider if you want a real response here.
+ *  - **Standalone gate**: the executor charges a tiny "browsing fee" up
+ *    front before the agent runs.
+ *  - **Embedded flow**: once the user is past the gate, the agent hands
+ *    back a cart artifact with an x402 challenge sized to the chosen
+ *    SKU — a per-purchase charge that settles before shoes ship.
+ *
+ * The SKUs are hardcoded in a fake inventory. Real integrations would
+ * swap this for a price lookup, stripping out the trailing "ship"
+ * message into whatever post-purchase work your agent actually does.
  */
-class EchoAgent extends BaseAgent {
+const INVENTORY: Record<string, { name: string; priceUsdc: string }> = {
+  'sku-air-max': { name: 'Nike Air Max', priceUsdc: '120000' },   // 0.12 USDC
+  'sku-react-tee': { name: 'React Tee', priceUsdc: '50000' },     // 0.05 USDC
+};
+
+class StorefrontAgent extends BaseAgent {
   constructor() {
     super({
-      name: 'echo_agent',
-      description: 'Echoes the most recent user message back to the caller.',
+      name: 'storefront_agent',
+      description:
+        'Sells a tiny in-memory inventory via an x402 embedded-flow checkout.',
     });
   }
 
   async *run(context: InvocationContext): AsyncGenerator<AgentEvent> {
-    // The Runner pushes the incoming user message into session.events as a
-    // text event right before invoking agent.run(). The most recent
-    // user-role text event is what we want to echo.
     const last = [...context.session.events]
       .reverse()
       .find((e) => e.type === 'text' && e.role === 'user');
-    const text = last && last.type === 'text' ? last.text : '(empty message)';
+    const text = last && last.type === 'text' ? last.text : '';
 
-    yield { type: 'text', role: 'agent', text: `You said: ${text}` };
+    // Pick a SKU out of the user text; default to the first.
+    const skuId =
+      Object.keys(INVENTORY).find((id) => text.includes(id)) ??
+      'sku-air-max';
+    const sku = INVENTORY[skuId]!;
+
+    yield {
+      type: 'text',
+      role: 'agent',
+      text: `Adding ${sku.name} to cart (${formatUsdc(sku.priceUsdc)} USDC)… `,
+    };
+
+    // Suspend until the client pays for the item.
+    yield paymentRequiredEvent({
+      accepts: [
+        {
+          network: 'base-sepolia',
+          amount: sku.priceUsdc,
+          asset: USDC_BASE_SEPOLIA,
+          payTo: resolveMerchantAddress(),
+          description: `Checkout: ${sku.name}`,
+        },
+      ],
+      embeddedObject: {
+        cartId: `cart-${skuId}`,
+        items: [{ id: skuId, name: sku.name }],
+        total: {
+          currency: 'USD',
+          // Friendly decimal value for UIs; ignore for payment math.
+          value: Number(sku.priceUsdc) / 1_000_000,
+        },
+      },
+      artifactName: 'demo-cart',
+    });
+
+    yield {
+      type: 'text',
+      role: 'agent',
+      text: `Shipped ${sku.name}! Thanks for the purchase.`,
+    };
     yield { type: 'done' };
   }
+}
+
+function formatUsdc(amount: string): string {
+  return (Number(amount) / 1_000_000).toFixed(6).replace(/0+$/, '').replace(/\.$/, '');
 }
 
 const MISSING_ADDRESS_PLACEHOLDER = '0x0000000000000000000000000000000000000000';
@@ -60,7 +113,7 @@ const resolveMerchantAddress = (): string => {
 // USDC contract address on Base Sepolia (official Circle deployment).
 const USDC_BASE_SEPOLIA = '0x036CbD53842c5426634e7929541eC2318f3dCF7e';
 
-const agent = new EchoAgent();
+const agent = new StorefrontAgent();
 const runner = new InMemoryRunner({ agent, appName: 'nextjs-x402' });
 
 const innerExecutor = new AgentExecutor({
@@ -88,14 +141,15 @@ const mockFacilitator = process.env.X402_MOCK_FACILITATOR === '1'
   : undefined;
 
 const paymentExecutor = new X402PaymentExecutor(innerExecutor, {
+  // Standalone "browsing fee" gate — 0.001 USDC. Set `requiresPayment: () =>
+  // false` or remove `accepts` entirely for a pure embedded-only flow.
   accepts: [
     {
       network: 'base-sepolia',
-      // 0.001 USDC — tiny enough to be a believable per-call price on testnet.
       amount: '1000',
       asset: USDC_BASE_SEPOLIA,
       payTo: resolveMerchantAddress(),
-      description: 'Per-call echo',
+      description: 'Storefront browsing fee',
     },
   ],
   ...(mockFacilitator
@@ -115,10 +169,11 @@ export const a2xAgent = new A2XAgent({
     `${process.env.BASE_URL ?? 'http://localhost:3000'}/api/a2a`,
   )
   .addSkill({
-    id: 'echo',
-    name: 'Paid Echo',
-    description: 'Echoes your message back — paid per call via x402.',
-    tags: ['echo', 'x402', 'demo'],
+    id: 'shop',
+    name: 'x402 Storefront',
+    description:
+      'Browse and buy a tiny demo inventory. Gate fee + per-item checkout via x402 embedded flow.',
+    tags: ['shop', 'x402', 'embedded', 'demo'],
   })
   .addExtension({ uri: X402_EXTENSION_URI, required: true });
 

@@ -36,7 +36,7 @@ npm install @a2x/sdk
 - **Device Flow auth** — Built-in OAuth 2.0 Device Authorization Grant (RFC 8628) for CLI and browserless environments.
 - **Framework-agnostic** — Works with Express, Fastify, Hono, Next.js, or any HTTP framework.
 - **SSE streaming** — First-class support for `message/stream` via Server-Sent Events.
-- **x402 payments** — Optional `@a2x/sdk/x402` subpath gates agent calls behind on-chain cryptocurrency payments using the [a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402) extension.
+- **x402 payments** — Optional `@a2x/sdk/x402` subpath gates agent calls behind on-chain cryptocurrency payments using the [a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402) extension. Supports both the Standalone gate and the Embedded flow (mid-execution charges carried on artifacts, e.g. per-item checkout).
 - **Zero runtime dependencies** — Core module uses only Node.js built-in APIs.
 - **TypeScript-first** — Full type safety with types derived directly from A2A JSON Schema and proto definitions.
 

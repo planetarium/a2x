@@ -6,8 +6,9 @@ export default function Home() {
           a2x x402 Sample
         </h1>
         <p className="mt-2 text-gray-600">
-          An A2A agent paywalled with the a2a-x402 v0.2 extension. Every
-          call is gated behind a 0.001 USDC payment on Base Sepolia.
+          An A2A agent paywalled with the a2a-x402 v0.2 extension. Each
+          call settles two charges on Base Sepolia: a 0.001 USDC browsing
+          gate, then a per-item embedded checkout (0.05–0.12 USDC).
         </p>
       </header>
 
@@ -39,8 +40,8 @@ a2x wallet use default
 
 # 2. Fund the wallet with Base Sepolia USDC (faucet: https://faucet.circle.com)
 
-# 3. Call the agent
-a2x a2a send http://localhost:3000/api/a2a "hello"`}
+# 3. Call the agent — the CLI handles the full two-payment dance
+a2x a2a send http://localhost:3000/api/a2a "sku-air-max"`}
         </pre>
       </section>
     </main>
