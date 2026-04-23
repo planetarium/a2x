@@ -8,8 +8,12 @@ permissions:
   contents: write
 
 jobs:
-  release-cli:
+  check-version:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      changed: ${{ steps.version.outputs.changed }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -28,35 +32,95 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
+  build-binaries:
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Ubuntu cross-compiles Linux + Windows targets (no signing required).
+          - os: ubuntu-latest
+            script: binaries:non-macos
+            artifact: binaries-non-macos
+          # macOS runner builds Mach-O binaries so @yao-pkg/pkg can apply an
+          # ad-hoc codesign (`codesign -s -`) as its post-build step. Apple
+          # Silicon rejects unsigned Mach-O at exec time (SIGKILL / EBADEXEC),
+          # so arm64 MUST be built here; x64 is built alongside for consistency.
+          - os: macos-14
+            script: binaries:macos
+            artifact: binaries-macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
       - uses: pnpm/action-setup@v4
-        if: steps.version.outputs.changed == 'true'
 
       - uses: actions/setup-node@v6
-        if: steps.version.outputs.changed == 'true'
         with:
           node-version: 20
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
-        if: steps.version.outputs.changed == 'true'
 
       - run: pnpm -r build
-        if: steps.version.outputs.changed == 'true'
-
-      - name: Pack CLI tarball
-        if: steps.version.outputs.changed == 'true'
-        run: pnpm --filter @a2x/cli pack --pack-destination packages/cli
 
       - name: Build platform binaries
-        if: steps.version.outputs.changed == 'true'
-        run: pnpm --filter @a2x/cli binaries
+        run: pnpm --filter @a2x/cli ${{ matrix.script }}
+
+      - name: Verify macOS binaries are ad-hoc signed
+        if: matrix.os == 'macos-14'
+        run: |
+          for bin in packages/cli/binaries/a2x-macos-arm64 packages/cli/binaries/a2x-macos-x64; do
+            if ! codesign -dv "$bin" 2>&1 | grep -q 'Signature=adhoc'; then
+              echo "::error::$bin is not ad-hoc signed. Refusing to upload."
+              codesign -dv "$bin" || true
+              exit 1
+            fi
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: packages/cli/binaries/a2x-*
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: [check-version, build-binaries]
+    if: needs.check-version.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm -r build
+
+      - name: Pack CLI tarball
+        run: pnpm --filter @a2x/cli pack --pack-destination packages/cli
+
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: packages/cli/binaries
+          pattern: binaries-*
+          merge-multiple: true
 
       - name: Create GitHub Release
-        if: steps.version.outputs.changed == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: CLI ${{ steps.version.outputs.version }}
+          tag_name: ${{ needs.check-version.outputs.tag }}
+          name: CLI ${{ needs.check-version.outputs.version }}
           generate_release_notes: true
           files: |
             packages/cli/*.tgz
