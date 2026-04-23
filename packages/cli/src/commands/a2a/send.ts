@@ -12,6 +12,7 @@ import { activeWalletAccount } from '../../wallet-store.js';
 import {
   DEFAULT_MAX_AMOUNT_ATOMIC,
   buildBudgetedX402ClientSettings,
+  parseEmbeddedPolicy,
   parseMaxAmount,
   printPaymentRequirement,
   printX402Error,
@@ -27,8 +28,21 @@ export const sendCommand = new Command('send')
   .option('--no-x402', 'Don\'t auto-sign an x402 payment even if the agent asks for one')
   .option(
     '--max-amount <atomic>',
-    'Maximum amount (in asset\'s atomic units) to auto-sign for an x402 payment. ' +
-      `Defaults to ${DEFAULT_MAX_AMOUNT_ATOMIC.toString()}.`,
+    'Maximum amount (in atomic units) to auto-sign for the Standalone gate. ' +
+      `Defaults to ${DEFAULT_MAX_AMOUNT_ATOMIC.toString()}. ` +
+      'Does NOT apply to Embedded charges.',
+  )
+  .option(
+    '--auto-embedded',
+    'Auto-sign Embedded-flow charges up to --max-embedded-amount instead of prompting.',
+  )
+  .option(
+    '--max-embedded-amount <atomic>',
+    'Ceiling (in atomic units) used when --auto-embedded is set. Required with --auto-embedded.',
+  )
+  .option(
+    '--no-embedded',
+    'Refuse every Embedded-flow charge outright (useful for scripts).',
   )
   .action(
     async (
@@ -40,11 +54,20 @@ export const sendCommand = new Command('send')
         json?: boolean;
         x402?: boolean;
         maxAmount?: string;
+        autoEmbedded?: boolean;
+        maxEmbeddedAmount?: string;
+        embedded?: boolean; // commander --no-embedded → embedded: false
       },
     ) => {
-      const maxAmount = parseMaxAmount(opts.maxAmount);
-
       try {
+        const gateMaxAmount = parseMaxAmount(opts.maxAmount);
+        const embeddedPolicy = parseEmbeddedPolicy({
+          noEmbedded: opts.embedded === false,
+          autoEmbedded: opts.autoEmbedded,
+          maxEmbeddedAmount: opts.maxEmbeddedAmount,
+          json: opts.json,
+        });
+
         const client = createClient(url, opts);
 
         const params: SendMessageParams = {
@@ -87,15 +110,16 @@ export const sendCommand = new Command('send')
           }
 
           if (!opts.json) {
-            printPaymentRequirement(required, maxAmount);
+            printPaymentRequirement(required, gateMaxAmount);
           }
 
           const x402 = new X402Client(
             client,
             buildBudgetedX402ClientSettings({
               signer,
-              maxAmount,
-              verbose: opts.json !== true,
+              gateMaxAmount,
+              embeddedPolicy,
+              json: opts.json,
             }),
           );
           task = await x402.sendMessage(params);

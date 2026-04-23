@@ -46,8 +46,17 @@ a2x wallet use default
 
 # Call the paywalled agent — the CLI handles the full x402 dance
 a2x a2a send http://localhost:3000/api/a2a "sku-air-max"
-# Two payments will settle: the 0.001 USDC gate, then 0.12 USDC for the Air Max.
+# Gate (0.001 USDC) auto-signs under the default --max-amount ceiling.
+# Then the CLI pauses and prompts for the 0.12 USDC Nike Air Max checkout:
+#   Approve this embedded payment? [y/N] y
 # Try "sku-react-tee" for the cheaper inventory item.
+
+# Skip the prompt in scripts with an explicit embedded ceiling:
+a2x a2a send http://localhost:3000/api/a2a "sku-air-max" \
+  --auto-embedded --max-embedded-amount 120000
+
+# Refuse every embedded charge outright (the gate still runs):
+a2x a2a send http://localhost:3000/api/a2a "sku-react-tee" --no-embedded
 ```
 
 Using the SDK directly:

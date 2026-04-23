@@ -9,6 +9,7 @@ import type {
   TaskArtifactUpdateEvent,
   TaskStatusUpdateEvent,
   X402PaymentRequiredResponse,
+  X402PaymentRequirements,
 } from '@a2x/sdk';
 import {
   getEmbeddedX402Challenges,
@@ -25,19 +26,22 @@ import {
 } from '../../format.js';
 import { activeWalletAccount } from '../../wallet-store.js';
 import {
+  confirmEmbeddedPayment,
   DEFAULT_MAX_AMOUNT_ATOMIC,
   enforceBudget,
   isEmbeddedChallengeArtifact,
+  parseEmbeddedPolicy,
   parseMaxAmount,
   pickAffordableRequirement,
-  printEmbeddedChallenge,
+  pickCheapestExact,
   printPaymentRequirement,
   printX402Error,
+  type EmbeddedPolicy,
 } from '../../x402-cli.js';
 
 type StreamEvent = TaskStatusUpdateEvent | TaskArtifactUpdateEvent;
 
-/** Hard cap on how many payment hops we will auto-sign in one call. */
+/** Hard cap on how many payment hops we will handle in one call. */
 const MAX_PAYMENT_HOPS = 8;
 
 /**
@@ -67,8 +71,21 @@ export const streamCommand = new Command('stream')
   )
   .option(
     '--max-amount <atomic>',
-    'Maximum amount (in asset\'s atomic units) to auto-sign for an x402 payment. ' +
-      `Defaults to ${DEFAULT_MAX_AMOUNT_ATOMIC.toString()}.`,
+    'Maximum amount (in atomic units) to auto-sign for the Standalone gate. ' +
+      `Defaults to ${DEFAULT_MAX_AMOUNT_ATOMIC.toString()}. ` +
+      'Does NOT apply to Embedded charges.',
+  )
+  .option(
+    '--auto-embedded',
+    'Auto-sign Embedded-flow charges up to --max-embedded-amount instead of prompting.',
+  )
+  .option(
+    '--max-embedded-amount <atomic>',
+    'Ceiling (in atomic units) used when --auto-embedded is set. Required with --auto-embedded.',
+  )
+  .option(
+    '--no-embedded',
+    'Refuse every Embedded-flow charge outright (useful for scripts).',
   )
   .action(
     async (
@@ -80,11 +97,20 @@ export const streamCommand = new Command('stream')
         json?: boolean;
         x402?: boolean;
         maxAmount?: string;
+        autoEmbedded?: boolean;
+        maxEmbeddedAmount?: string;
+        embedded?: boolean;
       },
     ) => {
-      const maxAmount = parseMaxAmount(opts.maxAmount);
-
       try {
+        const gateMaxAmount = parseMaxAmount(opts.maxAmount);
+        const embeddedPolicy = parseEmbeddedPolicy({
+          noEmbedded: opts.embedded === false,
+          autoEmbedded: opts.autoEmbedded,
+          maxEmbeddedAmount: opts.maxEmbeddedAmount,
+          json: opts.json,
+        });
+
         const client = createClient(url, opts);
 
         const baseMessage: SendMessageParams['message'] = {
@@ -155,24 +181,29 @@ export const streamCommand = new Command('stream')
             process.exit(2);
           }
 
-          // Budget check + display before signing.
-          enforceBudget(signal.required, maxAmount);
-          if (!opts.json) {
-            console.log();
-            if (signal.kind === 'embedded' && signal.embedded) {
-              printEmbeddedChallenge(signal.embedded, maxAmount);
-            } else {
-              printPaymentRequirement(signal.required, maxAmount);
+          // Per-hop policy: gate uses --max-amount auto-sign; embedded
+          // consults parseEmbeddedPolicy (prompt / auto / refuse).
+          if (signal.kind === 'standalone') {
+            enforceBudget(signal.required, gateMaxAmount, 'gate');
+            if (!opts.json) {
+              console.log();
+              printPaymentRequirement(signal.required, gateMaxAmount);
             }
+          } else if (signal.embedded) {
+            await confirmEmbeddedPayment(signal.embedded, embeddedPolicy, {
+              json: opts.json,
+            });
           }
 
           const signed = await signX402Payment(signal.syntheticTask, {
             signer,
             selectRequirement: (accepts) =>
-              pickAffordableRequirement(
-                { x402Version: 1, accepts },
-                maxAmount,
-              ),
+              signal.kind === 'standalone'
+                ? pickAffordableRequirement(
+                    { x402Version: 1, accepts },
+                    gateMaxAmount,
+                  )
+                : pickCheapestExactForEmbedded(accepts, embeddedPolicy),
           });
 
           if (!opts.json) {
@@ -184,7 +215,6 @@ export const streamCommand = new Command('stream')
             console.log();
           }
 
-          // Build the follow-up params: same content + taskId + payment metadata.
           currentParams = {
             ...currentParams,
             message: {
@@ -209,19 +239,29 @@ export const streamCommand = new Command('stream')
   );
 
 /**
- * Iterate the stream, printing events as they come in. As soon as we
- * see a TaskStatusUpdateEvent whose status is `input-required` with
- * an x402 challenge, we synthesize a minimal Task so the caller can
- * feed it to `signX402Payment` and stop consuming further events.
- *
- * The challenge might live on `status.message.metadata`
- * (Standalone/gate) or on one of the `task.artifacts[]`
- * (Embedded). We track accumulated artifacts across the stream so
- * Embedded challenges can be surfaced even though no single event
- * carries the full task.
- *
- * Returns `undefined` when the stream ended without a pending
- * challenge.
+ * After `confirmEmbeddedPayment` has approved the spend, pick which
+ * requirement to sign. Under an auto policy we still respect the
+ * ceiling; under a prompt or refuse policy the user's `y` applies to
+ * whatever cheapest `exact`-scheme requirement we pick.
+ */
+function pickCheapestExactForEmbedded(
+  accepts: X402PaymentRequirements[],
+  policy: EmbeddedPolicy,
+): X402PaymentRequirements | undefined {
+  if (policy.kind === 'auto') {
+    return pickAffordableRequirement(
+      { x402Version: 1, accepts },
+      policy.maxAmount,
+    );
+  }
+  return pickCheapestExact(accepts);
+}
+
+/**
+ * Iterate the stream, printing events as they come in. Pauses as
+ * soon as a pending x402 challenge surfaces (Standalone via status
+ * metadata, or Embedded via an accumulated artifact) and returns a
+ * synthetic Task for the caller to sign against.
  */
 async function consumeUntilPaymentRequired(
   stream: AsyncGenerator<StreamEvent>,
@@ -250,7 +290,6 @@ async function consumeUntilPaymentRequired(
         artifacts,
       };
 
-      // Gate first (Standalone): status.message.metadata carries the challenge.
       const standalone = getX402PaymentRequirements(syntheticTask);
       if (standalone) {
         renderEvent(event, opts);
@@ -263,7 +302,6 @@ async function consumeUntilPaymentRequired(
         };
       }
 
-      // Embedded: scan accumulated artifacts.
       const embedded = getEmbeddedX402Challenges(syntheticTask);
       if (embedded.length > 0) {
         const first = embedded[0]!;
@@ -284,11 +322,6 @@ async function consumeUntilPaymentRequired(
   return undefined;
 }
 
-/**
- * Accumulate artifact updates by artifactId so a later
- * `getEmbeddedX402Challenges()` can see the full artifact. Append-style
- * updates extend parts; non-append updates replace.
- */
 function captureArtifact(
   artifacts: Artifact[],
   event: TaskArtifactUpdateEvent,
@@ -311,10 +344,6 @@ function captureArtifact(
   }
 }
 
-/**
- * Whether the cursor is currently mid-line after a streaming artifact chunk
- * that was written without a trailing newline.
- */
 let midLine = false;
 
 function flushLine(): void {
@@ -334,9 +363,6 @@ function renderEvent(event: StreamEvent, opts: { json?: boolean }): void {
     printStatusUpdate(event);
     return;
   }
-  // Artifact update: skip x402 embedded challenge artifacts — the
-  // payment-dance block re-renders them with proper formatting. Still
-  // flush any pending text line so the transition is clean.
   if (isEmbeddedChallengeArtifact(event.artifact)) {
     flushLine();
     return;
