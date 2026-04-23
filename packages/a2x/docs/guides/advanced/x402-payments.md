@@ -38,9 +38,7 @@ const executor = new X402PaymentExecutor(inner, {
 const agent = new A2XAgent({ taskStore: new InMemoryTaskStore(), executor })
   .setName('Paid Agent')
   .setDescription('Charges per call')
-  .setCapabilities({
-    extensions: [{ uri: X402_EXTENSION_URI, required: true }],
-  });
+  .addExtension({ uri: X402_EXTENSION_URI, required: true });
 ```
 
 ### Multiple payment options

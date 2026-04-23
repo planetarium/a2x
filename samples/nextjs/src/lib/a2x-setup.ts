@@ -43,7 +43,6 @@ export const a2xAgent = new A2XAgent({
     description: "General conversation and Q&A",
     tags: ["chat", "general"],
   })
-  .setCapabilities({ streaming: true, pushNotifications: true })
   .addSecurityScheme(
     'deviceCode',
     new OAuth2DeviceCodeAuthorization({
