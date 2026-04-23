@@ -3,6 +3,11 @@
   "version": "0.7.0",
   "type": "module",
   "description": "A2A (Agent-to-Agent) protocol SDK for TypeScript",
+  "author": {
+    "name": "Planetarium",
+    "email": "a2x@planetariumhq.com",
+    "url": "https://a2x.sh"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
