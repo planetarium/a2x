@@ -92,7 +92,11 @@ export const sendCommand = new Command('send')
 
           const x402 = new X402Client(
             client,
-            buildBudgetedX402ClientSettings({ signer, maxAmount }),
+            buildBudgetedX402ClientSettings({
+              signer,
+              maxAmount,
+              verbose: opts.json !== true,
+            }),
           );
           task = await x402.sendMessage(params);
         }

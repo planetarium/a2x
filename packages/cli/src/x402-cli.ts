@@ -1,21 +1,33 @@
 /**
  * Shared x402 helpers used by `a2x a2a send` and `a2x a2a stream`.
  *
- * The SDK exposes `X402Client.onPaymentRequired` and `selectRequirement`
- * as callbacks. The CLI wires them to a spend ceiling so an auto-signed
- * payment can never exceed `--max-amount` — if the server advertises
- * only expensive options we throw `X402BudgetExceededError` before any
- * EIP-3009 authorization gets signed.
+ * The SDK exposes budget-shaped callbacks on both flows:
+ *
+ *  - `onPaymentRequired` / `selectRequirement` for the Standalone gate
+ *    (see a2a-x402 v0.2 §5.1 Standalone flow).
+ *  - `onEmbeddedPaymentRequired` for each mid-execution charge
+ *    (v0.2 §5.1 Embedded flow).
+ *
+ * The CLI wires both to a spend ceiling so no EIP-3009 authorization is
+ * ever signed for more than `--max-amount` — the refusal happens
+ * BEFORE the signature, not after.
  */
 
 import chalk from 'chalk';
 import type {
+  Artifact,
+  EmbeddedX402Challenge,
   SignX402PaymentOptions,
+  Task,
   X402ClientOptions,
   X402PaymentRequiredResponse,
   X402PaymentRequirements,
 } from '@a2x/sdk';
-import { X402PaymentFailedError } from '@a2x/sdk';
+import {
+  X402PaymentFailedError,
+  getEmbeddedX402Challenges,
+} from '@a2x/sdk';
+import { TaskState } from '@a2x/sdk';
 
 /**
  * Default spend ceiling, in the asset's atomic units, applied to every
@@ -71,34 +83,34 @@ export function safeBigInt(raw: string): bigint {
 }
 
 /**
- * Build the `{ onPaymentRequired, selectRequirement }` pair that both
- * `X402Client` (used by send) and the manual payment dance in stream
- * should share. Takes the same `SignX402PaymentOptions.signer` shape
- * so callers can spread `{ signer, ...buildBudgetedX402ClientOptions }`
- * without repeating themselves.
+ * Combine `signer` + budget callbacks (gate + embedded) into a full
+ * `X402ClientOptions` block.
+ *
+ * `verbose` controls whether the embedded-hop callback prints the
+ * challenge to stdout — on by default for interactive UX, disabled in
+ * `--json` mode.
  */
-export function buildBudgetedX402ClientOptions(
-  maxAmount: bigint,
-): Pick<X402ClientOptions, 'onPaymentRequired' | 'selectRequirement'> {
+export function buildBudgetedX402ClientSettings(args: {
+  signer: SignX402PaymentOptions['signer'];
+  maxAmount: bigint;
+  verbose?: boolean;
+}): X402ClientOptions {
+  const verbose = args.verbose ?? true;
   return {
-    onPaymentRequired: (r) => {
-      const affordable = r.accepts.filter(
-        (a) => safeBigInt(a.maxAmountRequired) <= maxAmount,
-      );
-      if (affordable.length === 0) {
-        const cheapest = r.accepts
-          .map((a) => ({ v: safeBigInt(a.maxAmountRequired), asset: a.asset }))
-          .sort((x, y) => (x.v < y.v ? -1 : 1))[0];
-        throw new X402BudgetExceededError(
-          cheapest?.v ?? 0n,
-          maxAmount,
-          cheapest?.asset ?? 'unknown',
-        );
+    signer: args.signer,
+    onPaymentRequired: (required) => {
+      enforceBudget(required, args.maxAmount);
+    },
+    onEmbeddedPaymentRequired: (challenge: EmbeddedX402Challenge) => {
+      if (verbose) {
+        console.log();
+        printEmbeddedChallenge(challenge, args.maxAmount);
       }
+      enforceBudget(challenge.required, args.maxAmount);
     },
     selectRequirement: (accepts) => {
       const affordable = accepts
-        .filter((a) => safeBigInt(a.maxAmountRequired) <= maxAmount)
+        .filter((a) => safeBigInt(a.maxAmountRequired) <= args.maxAmount)
         .sort((x, y) =>
           safeBigInt(x.maxAmountRequired) < safeBigInt(y.maxAmountRequired)
             ? -1
@@ -106,20 +118,6 @@ export function buildBudgetedX402ClientOptions(
         );
       return affordable.find((a) => a.scheme === 'exact') ?? affordable[0];
     },
-  };
-}
-
-/**
- * Combine `signer` + budget callbacks into a full `X402ClientOptions`
- * in one call.
- */
-export function buildBudgetedX402ClientSettings(args: {
-  signer: SignX402PaymentOptions['signer'];
-  maxAmount: bigint;
-}): X402ClientOptions {
-  return {
-    signer: args.signer,
-    ...buildBudgetedX402ClientOptions(args.maxAmount),
   };
 }
 
@@ -177,6 +175,48 @@ export function printPaymentRequirement(
   console.log();
 }
 
+export function printEmbeddedChallenge(
+  challenge: EmbeddedX402Challenge,
+  budget: bigint,
+): void {
+  console.log(chalk.bold.magenta('x402: embedded payment required'));
+  console.log(chalk.gray('─'.repeat(40)));
+  if (challenge.artifactName) {
+    console.log(`  ${chalk.bold('artifact:')} ${challenge.artifactName}`);
+  }
+  // Surface any non-x402 fields on the data wrapper (cartId, total, etc.)
+  // so the user sees what they're paying for.
+  const summary = summarizeEmbeddedData(challenge.data);
+  if (summary.length > 0) {
+    for (const line of summary) console.log(`  ${line}`);
+  }
+  for (const accept of challenge.required.accepts) {
+    printAccept(accept, budget);
+  }
+  console.log(
+    chalk.gray(
+      `  (budget: ${budget.toString()} atomic — use --max-amount to change)`,
+    ),
+  );
+  console.log();
+}
+
+function summarizeEmbeddedData(data: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  for (const [key, value] of Object.entries(data)) {
+    // Skip the x402 challenge itself; the rows below already print it.
+    if (key === 'x402.payment.required') continue;
+    if (value === null || value === undefined) continue;
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      out.push(`${chalk.bold(`${key}:`)} ${String(value)}`);
+    } else {
+      // Compact JSON for nested shapes (cart items list, total object, …).
+      out.push(`${chalk.bold(`${key}:`)} ${chalk.gray(JSON.stringify(value))}`);
+    }
+  }
+  return out;
+}
+
 function printAccept(accept: X402PaymentRequirements, budget: bigint): void {
   const amount = accept.maxAmountRequired;
   const overBudget = safeBigInt(amount) > budget;
@@ -190,6 +230,27 @@ function printAccept(accept: X402PaymentRequirements, budget: bigint): void {
   if (accept.description) {
     console.log(`  ${chalk.bold('note:')}     ${accept.description}`);
   }
+}
+
+// ─── Artifact classification (stream path) ─────────────────────────
+
+/**
+ * True when `artifact` carries an x402 embedded payment challenge —
+ * either the bare SDK shape (`x402.payment.required` key on a data part)
+ * or any `x402PaymentRequiredResponse`-shaped object nested inside a
+ * higher-level wrapper.
+ *
+ * The stream command uses this to skip dumping the raw challenge JSON
+ * into the text stream; the payment-dance block re-renders it with
+ * proper formatting.
+ */
+export function isEmbeddedChallengeArtifact(artifact: Artifact): boolean {
+  const probe: Task = {
+    id: '_probe',
+    status: { state: TaskState.INPUT_REQUIRED },
+    artifacts: [artifact],
+  };
+  return getEmbeddedX402Challenges(probe).length > 0;
 }
 
 // ─── Error handling ─────────────────────────────────────────────────
