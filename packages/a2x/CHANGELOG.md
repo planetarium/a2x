@@ -1,5 +1,47 @@
 # @a2x/sdk
 
+## 0.8.0
+
+### Minor Changes
+
+- [#89](https://github.com/planetarium/a2x/pull/89) [`5a5c858`](https://github.com/planetarium/a2x/commit/5a5c858486212131dae55a662f6b18160a1bf1fd) Thanks [@ost006](https://github.com/ost006)! - Refactor `A2XAgent` capabilities API into focused builder methods.
+
+  `setCapabilities()` is now `@deprecated` and will be removed in the next major.
+  In the meantime, `setCapabilities({ extensions: [...] })` appends instead of
+  overwriting so multi-source callers no longer clobber one another.
+
+  New methods:
+
+  - `addExtension(ext)` / `addExtension(uri, opts?)` — append to
+    `capabilities.extensions`. Append-only, never drops earlier entries.
+  - `setPushNotifications(enabled)` — override the auto-derived flag. The
+    default is `true` when the constructor receives a
+    `pushNotificationConfigStore` and `false` otherwise, so most callers no
+    longer need to touch it.
+  - `setStateTransitionHistory(enabled)` — v0.3-only flag (silently dropped
+    from v1.0 cards).
+
+  `capabilities.streaming` continues to be auto-extracted from
+  `runConfig.streamingMode`, and `capabilities.extendedAgentCard` is still
+  auto-set by `setAuthenticatedExtendedCardProvider()`.
+
+  Migration:
+
+  ```ts
+  // Before
+  a2xAgent.setCapabilities({
+    pushNotifications: true,
+    extensions: [{ uri: X402_EXTENSION_URI, required: true }],
+    stateTransitionHistory: true,
+  });
+
+  // After
+  a2xAgent
+    .addExtension({ uri: X402_EXTENSION_URI, required: true })
+    .setStateTransitionHistory(true);
+  // pushNotifications: true is auto-derived from pushNotificationConfigStore.
+  ```
+
 ## 0.7.0
 
 ### Minor Changes
