@@ -72,7 +72,6 @@ function createHandlerWithPushNotification(protocolVersion?: ProtocolVersion): {
     pushNotificationConfigStore: pushStore,
   });
   a2xAgent.setDefaultUrl('https://example.com/a2a');
-  a2xAgent.setCapabilities({ pushNotifications: true });
 
   return { handler: new DefaultRequestHandler(a2xAgent), pushStore };
 }

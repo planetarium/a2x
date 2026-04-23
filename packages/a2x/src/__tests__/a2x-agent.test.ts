@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { A2XAgent } from '../a2x/a2x-agent.js';
 import { AgentExecutor, StreamingMode } from '../a2x/agent-executor.js';
 import { InMemoryTaskStore } from '../a2x/task-store.js';
+import { InMemoryPushNotificationConfigStore } from '../a2x/push-notification-config-store.js';
 import { InMemoryRunner } from '../runner/in-memory-runner.js';
 import { LlmAgent } from '../agent/llm-agent.js';
 import { BaseLlmProvider } from '../provider/base.js';
@@ -398,6 +399,130 @@ describe('Layer 3: A2XAgent', () => {
       expect(() => a2x.getAgentCard()).toThrow(
         "references unregistered scheme 'nonexistent'",
       );
+    });
+  });
+
+  describe('Capabilities API', () => {
+    it('addExtension appends without clobbering earlier entries', () => {
+      const a2x = createA2XAgent();
+      a2x
+        .setDefaultUrl('https://example.com/a2a')
+        .addExtension({ uri: 'https://example.com/ext/a', required: true })
+        .addExtension('https://example.com/ext/b', { description: 'B' });
+
+      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      expect(card.capabilities.extensions).toEqual([
+        { uri: 'https://example.com/ext/a', required: true },
+        { uri: 'https://example.com/ext/b', description: 'B' },
+      ]);
+    });
+
+    it('deprecated setCapabilities({ extensions }) appends instead of overwriting', () => {
+      const a2x = createA2XAgent();
+      a2x
+        .setDefaultUrl('https://example.com/a2a')
+        .setCapabilities({ extensions: [{ uri: 'ext-a' }] })
+        .setCapabilities({ extensions: [{ uri: 'ext-b' }] });
+
+      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      expect(card.capabilities.extensions).toEqual([
+        { uri: 'ext-a' },
+        { uri: 'ext-b' },
+      ]);
+    });
+
+    it('preserves extensions across mixed old + new calls', () => {
+      const a2x = createA2XAgent();
+      a2x
+        .setDefaultUrl('https://example.com/a2a')
+        .addExtension({ uri: 'ext-a' })
+        .setCapabilities({ extensions: [{ uri: 'ext-b' }] })
+        .addExtension('ext-c');
+
+      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      expect(card.capabilities.extensions).toEqual([
+        { uri: 'ext-a' },
+        { uri: 'ext-b' },
+        { uri: 'ext-c' },
+      ]);
+    });
+
+    it('auto-derives pushNotifications=true when the store is provided', () => {
+      const agent = new LlmAgent({
+        name: 'test',
+        provider: mockProvider,
+        description: 'test',
+        instruction: 'test',
+      });
+      const runner = new InMemoryRunner({ agent, appName: 'test' });
+      const executor = new AgentExecutor({
+        runner,
+        runConfig: { streamingMode: StreamingMode.NONE },
+      });
+      const a2x = new A2XAgent({
+        taskStore: new InMemoryTaskStore(),
+        executor,
+        pushNotificationConfigStore: new InMemoryPushNotificationConfigStore(),
+      }).setDefaultUrl('https://example.com/a2a');
+
+      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      expect(card.capabilities.pushNotifications).toBe(true);
+    });
+
+    it('auto-derives pushNotifications=false when no store is provided', () => {
+      const a2x = createA2XAgent();
+      a2x.setDefaultUrl('https://example.com/a2a');
+
+      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      expect(card.capabilities.pushNotifications).toBe(false);
+    });
+
+    it('setPushNotifications(false) overrides the auto-derived value', () => {
+      const agent = new LlmAgent({
+        name: 'test',
+        provider: mockProvider,
+        description: 'test',
+        instruction: 'test',
+      });
+      const runner = new InMemoryRunner({ agent, appName: 'test' });
+      const executor = new AgentExecutor({
+        runner,
+        runConfig: { streamingMode: StreamingMode.NONE },
+      });
+      const a2x = new A2XAgent({
+        taskStore: new InMemoryTaskStore(),
+        executor,
+        pushNotificationConfigStore: new InMemoryPushNotificationConfigStore(),
+      })
+        .setDefaultUrl('https://example.com/a2a')
+        .setPushNotifications(false);
+
+      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      expect(card.capabilities.pushNotifications).toBe(false);
+    });
+
+    it('setStateTransitionHistory flips the v0.3 flag', () => {
+      const agent = new LlmAgent({
+        name: 'test',
+        provider: mockProvider,
+        description: 'test',
+        instruction: 'test',
+      });
+      const runner = new InMemoryRunner({ agent, appName: 'test' });
+      const executor = new AgentExecutor({
+        runner,
+        runConfig: { streamingMode: StreamingMode.NONE },
+      });
+      const a2x = new A2XAgent({
+        taskStore: new InMemoryTaskStore(),
+        executor,
+        protocolVersion: '0.3',
+      })
+        .setDefaultUrl('https://example.com/a2a')
+        .setStateTransitionHistory(true);
+
+      const card = a2x.getAgentCard('0.3') as AgentCardV03;
+      expect(card.capabilities.stateTransitionHistory).toBe(true);
     });
   });
 

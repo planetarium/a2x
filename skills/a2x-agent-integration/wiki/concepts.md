@@ -119,7 +119,7 @@ a2xAgent
   .setDescription('Agent desc')     // Override auto-extracted description
   .setVersion('1.0.0')              // Agent version
   .setDefaultUrl('http://localhost:3000/a2a')  // Required: endpoint URL
-  .setCapabilities({ streaming: true, pushNotifications: false })
+  .setPushNotifications(false)                 // Override the auto-derived flag
   .addSkill({
     id: 'skill-id',
     name: 'Skill Name',

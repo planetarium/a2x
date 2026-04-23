@@ -140,6 +140,35 @@ a2xAgent
 
 See [Authentication](./authentication.md) for all available schemes.
 
+### Capabilities
+
+Most capability flags on the AgentCard are derived automatically:
+
+- `capabilities.streaming` is taken from `runConfig.streamingMode`.
+- `capabilities.pushNotifications` is `true` when the constructor receives a
+  `pushNotificationConfigStore`, `false` otherwise.
+- `capabilities.extendedAgentCard` is set when
+  `setAuthenticatedExtendedCardProvider()` is called.
+
+Two capabilities need explicit builder calls — both are append-only / boolean:
+
+```ts
+import { X402_EXTENSION_URI } from '@a2x/sdk/x402';
+
+a2xAgent
+  .addExtension({ uri: X402_EXTENSION_URI, required: true })
+  // or: .addExtension('https://example.com/ext', { required: true })
+  .setStateTransitionHistory(true); // v0.3 only; dropped on v1.0 cards
+```
+
+`setPushNotifications(false)` exists for the rare case where the store is
+wired but you want to hide the capability.
+
+> `setCapabilities(...)` is deprecated in favor of the focused methods above
+> and will be removed in the next major. While it coexists, the `extensions`
+> field is treated as append-only so multi-source callers no longer clobber
+> each other.
+
 ## Serving the handler
 
 Once you have `handler`, mount it in any HTTP framework. The recipe is in [Framework Integration](../agent/framework-integration.md).

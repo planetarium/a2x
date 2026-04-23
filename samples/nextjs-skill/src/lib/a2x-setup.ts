@@ -76,7 +76,6 @@ export const a2xAgent = new A2XAgent({
     description:
       "Ask about the weather in a city, suggest a recipe from ingredients, or do a quick calculation to trigger a bundled skill.",
     tags: ["demo", "skills"],
-  })
-  .setCapabilities({ streaming: true });
+  });
 
 export const handler = new DefaultRequestHandler(a2xAgent);

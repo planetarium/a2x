@@ -331,7 +331,7 @@ const executor = new X402PaymentExecutor(innerExecutor, {
 });
 
 const agent = new A2XAgent({ taskStore, executor })
-  .setCapabilities({ extensions: [{ uri: X402_EXTENSION_URI, required: true }] });
+  .addExtension({ uri: X402_EXTENSION_URI, required: true });
 ```
 
 Client:

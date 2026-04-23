@@ -5,7 +5,7 @@
 
 import type { LlmAgent } from '../agent/llm-agent.js';
 import type { BaseSecurityScheme } from '../security/base.js';
-import type { AgentProvider } from '../types/common.js';
+import type { AgentExtension, AgentProvider } from '../types/common.js';
 import type {
   A2XAgentSkill,
   A2XAgentState,
@@ -186,8 +186,93 @@ export class A2XAgent {
     return this;
   }
 
+  /**
+   * @deprecated Use the focused builder methods instead:
+   *   - `addExtension(ext)` for `capabilities.extensions` (append-only, no clobber).
+   *   - `setPushNotifications(enabled)` to force-set the flag; by default it's
+   *     derived from whether `pushNotificationConfigStore` was provided to the
+   *     constructor.
+   *   - `setStateTransitionHistory(enabled)` for the v0.3-only flag.
+   *   - `streaming` is already auto-extracted from `runConfig.streamingMode`
+   *     and needs no manual setter.
+   *   - `extendedAgentCard` is already auto-set by
+   *     `setAuthenticatedExtendedCardProvider()`.
+   *
+   * This method will be removed in the next major. While it coexists with the
+   * replacements, `setCapabilities({ extensions: [...] })` appends (same
+   * semantics as `addExtension`) rather than overwriting, so calls from
+   * multiple sources no longer clobber one another.
+   */
   setCapabilities(capabilities: Partial<A2XAgentState['capabilities']>): this {
-    this._capabilities = { ...this._capabilities, ...capabilities };
+    const { extensions, ...rest } = capabilities;
+    this._capabilities = { ...this._capabilities, ...rest };
+    if (extensions && extensions.length > 0) {
+      const existing = this._capabilities.extensions ?? [];
+      this._capabilities.extensions = [...existing, ...extensions];
+    }
+    this._invalidateCache();
+    return this;
+  }
+
+  /**
+   * Append an extension to `capabilities.extensions`.
+   *
+   * Extensions are A2A-level capability declarations keyed by URI (e.g. the
+   * a2a-x402 payment extension). `addExtension` is append-only — calling it
+   * repeatedly never drops a previously added extension.
+   *
+   * Two call shapes:
+   * - `addExtension({ uri, description?, required?, params? })`
+   * - `addExtension(uri, { description?, required?, params? })`
+   */
+  addExtension(extension: AgentExtension): this;
+  addExtension(
+    uri: string,
+    options?: Omit<AgentExtension, 'uri'>,
+  ): this;
+  addExtension(
+    extensionOrUri: AgentExtension | string,
+    options?: Omit<AgentExtension, 'uri'>,
+  ): this {
+    const extension: AgentExtension =
+      typeof extensionOrUri === 'string'
+        ? { uri: extensionOrUri, ...(options ?? {}) }
+        : extensionOrUri;
+    const existing = this._capabilities.extensions ?? [];
+    this._capabilities = {
+      ...this._capabilities,
+      extensions: [...existing, extension],
+    };
+    this._invalidateCache();
+    return this;
+  }
+
+  /**
+   * Force the `capabilities.pushNotifications` flag. Rarely needed — the
+   * flag defaults to `true` when the constructor receives a
+   * `pushNotificationConfigStore` and `false` otherwise. Call this only to
+   * override the derived value (e.g. advertise the capability before wiring
+   * the store, or suppress it when the store is present but unused).
+   */
+  setPushNotifications(enabled: boolean): this {
+    this._capabilities = {
+      ...this._capabilities,
+      pushNotifications: enabled,
+    };
+    this._invalidateCache();
+    return this;
+  }
+
+  /**
+   * Advertise support for returning historical task state transitions on
+   * `tasks/get` / `tasks/resubscribe`. Only part of the v0.3 AgentCard —
+   * v1.0 does not expose the flag and it is silently dropped from v1.0 cards.
+   */
+  setStateTransitionHistory(enabled: boolean): this {
+    this._capabilities = {
+      ...this._capabilities,
+      stateTransitionHistory: enabled,
+    };
     this._invalidateCache();
     return this;
   }
@@ -399,6 +484,13 @@ export class A2XAgent {
       this._capabilities.streaming ??
       this._agentExecutor.runConfig.streamingMode === StreamingMode.SSE;
 
+    // Auto-derive push-notification capability from the presence of a
+    // configured store. An explicit value set via setPushNotifications() or
+    // the deprecated setCapabilities() still wins.
+    const pushNotifications =
+      this._capabilities.pushNotifications ??
+      this._pushNotificationConfigStore !== undefined;
+
     return {
       name,
       description,
@@ -409,6 +501,7 @@ export class A2XAgent {
       capabilities: {
         ...this._capabilities,
         streaming,
+        pushNotifications,
       },
       securitySchemes: new Map(this._securitySchemes),
       securityRequirements: [...this._securityRequirements],

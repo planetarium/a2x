@@ -120,9 +120,6 @@ export const a2xAgent = new A2XAgent({
     description: 'Echoes your message back — paid per call via x402.',
     tags: ['echo', 'x402', 'demo'],
   })
-  .setCapabilities({
-    streaming: true,
-    extensions: [{ uri: X402_EXTENSION_URI, required: true }],
-  });
+  .addExtension({ uri: X402_EXTENSION_URI, required: true });
 
 export const handler = new DefaultRequestHandler(a2xAgent);
