@@ -4,6 +4,11 @@
   "version": "0.2.0",
   "type": "module",
   "description": "CLI for the a2x A2A protocol SDK",
+  "author": {
+    "name": "Planetarium",
+    "email": "a2x@planetariumhq.com",
+    "url": "https://a2x.sh"
+  },
   "bin": {
     "a2x": "./dist/index.js"
   },

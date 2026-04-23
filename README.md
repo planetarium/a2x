@@ -264,6 +264,14 @@ a2x handles the structural differences between A2A v0.3 and v1.0 transparently:
 - **Versioning**: changesets (independent per package)
 - **CI/CD**: GitHub Actions
 
+## Contact
+
+Maintained by [Planetarium](https://github.com/planetarium). For questions, bug reports, and community inquiries:
+
+- GitHub Issues — https://github.com/planetarium/a2x/issues
+- Email — a2x@planetariumhq.com
+- Website — https://a2x.sh
+
 ## License
 
 MIT
