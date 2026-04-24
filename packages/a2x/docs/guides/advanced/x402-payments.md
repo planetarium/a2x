@@ -106,7 +106,53 @@ On a successful payment, the completed task's status message carries:
 }
 ```
 
-Failures surface under `x402.payment.error` with one of `INVALID_PAYLOAD`, `NETWORK_MISMATCH`, `INVALID_PAY_TO`, `AMOUNT_EXCEEDED`, `VERIFY_FAILED`, `SETTLE_FAILED`.
+Failures surface under `x402.payment.error` with one of the codes below. The seven names listed first come straight from spec §9.1; the remaining three are SDK-specific codes covering failure modes the SDK detects outside the facilitator's purview.
+
+| Code | Source | Meaning |
+|---|---|---|
+| `INSUFFICIENT_FUNDS` | spec §9.1 | Wallet can't cover the payment. |
+| `INVALID_SIGNATURE` | spec §9.1 | Authorization signature failed verification. |
+| `EXPIRED_PAYMENT` | spec §9.1 | Authorization was submitted after its validity window. |
+| `DUPLICATE_NONCE` | spec §9.1 | Nonce has already been spent. |
+| `NETWORK_MISMATCH` | spec §9.1 | Payload's network doesn't match any advertised `accepts`. |
+| `INVALID_AMOUNT` | spec §9.1 | Authorization value doesn't match the required amount. |
+| `SETTLEMENT_FAILED` | spec §9.1 | On-chain settle call failed. |
+| `INVALID_PAYLOAD` | SDK | Payment payload is missing or structurally invalid. |
+| `INVALID_PAY_TO` | SDK | Authorization target address doesn't match `payTo`. |
+| `VERIFY_FAILED` | SDK | Facilitator rejected the signature, but the reason string didn't match any of the spec codes above. |
+
+The SDK uses the facilitator's `invalidReason` string to dispatch into the spec codes (`mapVerifyFailureToCode()` exports the same logic if you need it client-side). Clients SHOULD branch on the spec codes first and treat `VERIFY_FAILED` as an unmapped fallback.
+
+### Payment lifecycle
+
+Every paid task runs through the same state machine (spec §7.1):
+
+```
+PAYMENT_REQUIRED → PAYMENT_REJECTED           (client declined the challenge)
+PAYMENT_REQUIRED → PAYMENT_SUBMITTED          (client signed and resubmitted)
+PAYMENT_SUBMITTED → PAYMENT_VERIFIED          (facilitator verified the signature)
+PAYMENT_VERIFIED → PAYMENT_COMPLETED          (on-chain settlement succeeded)
+PAYMENT_VERIFIED → PAYMENT_FAILED             (settlement failed on-chain)
+```
+
+The SDK emits `payment-verified` as a transient `working`-state event between submit and completion when streaming, so clients can surface a "settling on-chain…" indicator. In the blocking `execute()` path the state is recorded on `task.status` but clients only observe the final value.
+
+### Retry-on-failure (opt-in)
+
+By default, verify/settle failures terminate the task with state `failed` and an error code. Spec §9 also allows the merchant to "request a payment requirement with input-required again"; set `retryOnFailure: true` on the executor to pick that strategy — failures will re-publish `payment-required` on the same task with the prior failure reason carried in `X402PaymentRequiredResponse.error`, letting the client top up the wallet (or refresh the nonce) and resubmit without creating a new task.
+
+```ts
+new X402PaymentExecutor(inner, {
+  accepts: [...],
+  retryOnFailure: true,
+});
+```
+
+`x402.payment.receipts` accumulates every settle attempt (success or failure) across the task's lifetime per spec §7's "complete history" requirement.
+
+### Rejection handling
+
+When a client decides not to pay it can respond with `x402.payment.status: payment-rejected` (spec §5.4.2). The executor terminates the task with state `failed` and status `payment-rejected` — no further challenges are published, the loop ends.
 
 ## Client
 
@@ -187,6 +233,31 @@ for (const receipt of receipts) {
   console.log(receipt.success, receipt.transaction, receipt.network);
 }
 ```
+
+## Extension activation
+
+Per spec §8, x402-capable clients MUST include the extension URI in the `X-A2A-Extensions` HTTP header on every JSON-RPC request. `X402Client` does this automatically — wrapping an `A2XClient` registers `X402_EXTENSION_URI` on it so subsequent `sendMessage` / `sendMessageStream` calls emit the header:
+
+```
+X-A2A-Extensions: https://github.com/google-agentic-commerce/a2a-x402/blob/main/spec/v0.2
+```
+
+If you're driving `A2XClient` directly (without `X402Client`), pass `extensions` to the constructor:
+
+```ts
+new A2XClient(url, {
+  extensions: [X402_EXTENSION_URI],
+  // …other options
+});
+```
+
+Or register at runtime (the same mechanism `X402Client` uses internally):
+
+```ts
+client.registerExtension(X402_EXTENSION_URI);
+```
+
+**Server side.** When an agent declares an extension with `required: true`, `DefaultRequestHandler` rejects requests whose `X-A2A-Extensions` header doesn't list that URI (error `-32600`). The check is only applied when a `RequestContext` is provided to `handler.handle()` — pure in-process invocations skip it.
 
 ## Supported scope
 

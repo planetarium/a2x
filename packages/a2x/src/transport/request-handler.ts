@@ -139,6 +139,22 @@ export class DefaultRequestHandler {
       }
     }
 
+    // Enforce `required: true` extension activation per spec a2a-x402 v0.2
+    // §3.1 / §8. Clients must list the extension URI in the
+    // `X-A2A-Extensions` header; unactivated clients get a -32600
+    // InvalidRequest. Skipped when no request context is provided
+    // (in-process / test invocations without HTTP framing).
+    if (context) {
+      const activationError = this._validateExtensionActivation(context);
+      if (activationError) {
+        return {
+          jsonrpc: '2.0',
+          id: request.id,
+          error: activationError.toJSONRPCError(),
+        };
+      }
+    }
+
     // Special-case: authenticated extended card needs authResult; do not
     // route via JsonRpcRouter because that layer has no access to auth.
     if (request.method === A2A_METHODS.GET_EXTENDED_CARD) {
@@ -279,6 +295,32 @@ export class DefaultRequestHandler {
       authenticated: false,
       error: errors.join('; '),
     };
+  }
+
+  /**
+   * Parse the `X-A2A-Extensions` header (comma-separated list) and
+   * validate that every `required: true` extension declared on the
+   * AgentCard is present. Returns an `InvalidRequestError` when any
+   * required extension is missing, `null` on success.
+   *
+   * Spec a2a-x402 v0.2 §3.1 / §8: clients MUST list activated extension
+   * URIs, and agents should reject requests that omit a required one.
+   */
+  private _validateExtensionActivation(
+    context: RequestContext,
+  ): InvalidRequestError | null {
+    const required = this.a2xAgent.extensions.filter((ext) => ext.required);
+    if (required.length === 0) return null;
+
+    const activated = parseActivatedExtensions(context.headers);
+    const missing = required
+      .map((ext) => ext.uri)
+      .filter((uri) => !activated.has(uri));
+
+    if (missing.length === 0) return null;
+    return new InvalidRequestError(
+      `Required A2A extensions not activated. Include these URIs in the X-A2A-Extensions header: ${missing.join(', ')}`,
+    );
   }
 
   // ─── Private: Route Registration ───
@@ -910,4 +952,26 @@ export class DefaultRequestHandler {
       metadata: p.metadata as Record<string, unknown> | undefined,
     };
   }
+}
+
+/**
+ * Parse the `X-A2A-Extensions` header into a set of URIs. Header names
+ * are case-insensitive; values may be comma-separated or repeated. Runs
+ * against the generic `RequestContext.headers` map populated by the
+ * transport adapter (Next.js / Express / etc.).
+ */
+function parseActivatedExtensions(
+  headers: Record<string, string | string[] | undefined>,
+): Set<string> {
+  const activated = new Set<string>();
+  for (const [name, value] of Object.entries(headers)) {
+    if (name.toLowerCase() !== 'x-a2a-extensions') continue;
+    const raw = Array.isArray(value) ? value : value ? [value] : [];
+    for (const entry of raw) {
+      for (const uri of entry.split(',').map((s) => s.trim())) {
+        if (uri.length > 0) activated.add(uri);
+      }
+    }
+  }
+  return activated;
 }

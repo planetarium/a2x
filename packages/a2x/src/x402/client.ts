@@ -26,6 +26,7 @@ import type { SendMessageParams } from '../types/jsonrpc.js';
 import type { Task } from '../types/task.js';
 import type { Message } from '../types/common.js';
 import {
+  X402_EXTENSION_URI,
   X402_METADATA_KEYS,
   X402_PAYMENT_STATUS,
   type X402PaymentStatus,
@@ -174,7 +175,12 @@ export class X402Client {
   constructor(
     private readonly _client: A2XClient,
     private readonly _options: X402ClientOptions,
-  ) {}
+  ) {
+    // a2a-x402 v0.2 §8: clients MUST activate the extension via the
+    // `X-A2A-Extensions` header. Register on the wrapped A2XClient so
+    // callers don't have to remember to pass `extensions` themselves.
+    this._client.registerExtension(X402_EXTENSION_URI);
+  }
 
   /**
    * Send a message, resolving payment if the merchant asks for it.

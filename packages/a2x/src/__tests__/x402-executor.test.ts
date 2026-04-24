@@ -155,7 +155,7 @@ describe('X402PaymentExecutor — request/submit flow', () => {
     expect(meta[X402_METADATA_KEYS.ERROR]).toBe(X402_ERROR_CODES.INVALID_PAYLOAD);
   });
 
-  it('emits VERIFY_FAILED when facilitator.verify() returns isValid=false', async () => {
+  it('maps nonce_reused verify failure to DUPLICATE_NONCE (spec §9.1)', async () => {
     const executor = makeExecutor(
       mockFacilitator({
         verify: async () => ({
@@ -176,12 +176,52 @@ describe('X402PaymentExecutor — request/submit flow', () => {
 
     expect(result.status.state).toBe(TaskState.FAILED);
     const meta = result.status.message?.metadata as Record<string, unknown>;
-    expect(meta[X402_METADATA_KEYS.ERROR]).toBe(X402_ERROR_CODES.VERIFY_FAILED);
+    expect(meta[X402_METADATA_KEYS.ERROR]).toBe(X402_ERROR_CODES.DUPLICATE_NONCE);
     const receipts = meta[X402_METADATA_KEYS.RECEIPTS] as X402SettleResponse[];
     expect(receipts[0]).toMatchObject({ success: false, errorReason: expect.any(String) });
   });
 
-  it('emits SETTLE_FAILED when facilitator.settle() fails', async () => {
+  it('maps insufficient_balance verify failure to INSUFFICIENT_FUNDS (spec §9.1)', async () => {
+    const executor = makeExecutor(
+      mockFacilitator({
+        verify: async () => ({
+          isValid: false,
+          invalidReason: 'invalid_exact_evm_insufficient_balance',
+          payer: TEST_ACCOUNT.address,
+        }),
+      }),
+    );
+    const first = await executor.execute(newTask(), newMessage());
+    const { metadata } = await signAgainst(first);
+    const result = await executor.execute(
+      newTask(),
+      newMessage({ messageId: 'm2', metadata }),
+    );
+    const meta = result.status.message?.metadata as Record<string, unknown>;
+    expect(meta[X402_METADATA_KEYS.ERROR]).toBe(X402_ERROR_CODES.INSUFFICIENT_FUNDS);
+  });
+
+  it('falls back to VERIFY_FAILED when invalidReason does not match any spec §9.1 code', async () => {
+    const executor = makeExecutor(
+      mockFacilitator({
+        verify: async () => ({
+          isValid: false,
+          invalidReason: 'something_the_sdk_does_not_recognize',
+          payer: TEST_ACCOUNT.address,
+        }),
+      }),
+    );
+    const first = await executor.execute(newTask(), newMessage());
+    const { metadata } = await signAgainst(first);
+    const result = await executor.execute(
+      newTask(),
+      newMessage({ messageId: 'm2', metadata }),
+    );
+    const meta = result.status.message?.metadata as Record<string, unknown>;
+    expect(meta[X402_METADATA_KEYS.ERROR]).toBe(X402_ERROR_CODES.VERIFY_FAILED);
+  });
+
+  it('emits SETTLEMENT_FAILED when facilitator.settle() fails', async () => {
     const executor = makeExecutor(
       mockFacilitator({
         settle: async () => ({
@@ -204,7 +244,7 @@ describe('X402PaymentExecutor — request/submit flow', () => {
 
     expect(result.status.state).toBe(TaskState.FAILED);
     const meta = result.status.message?.metadata as Record<string, unknown>;
-    expect(meta[X402_METADATA_KEYS.ERROR]).toBe(X402_ERROR_CODES.SETTLE_FAILED);
+    expect(meta[X402_METADATA_KEYS.ERROR]).toBe(X402_ERROR_CODES.SETTLEMENT_FAILED);
   });
 
   it('emits NETWORK_MISMATCH when the submitted payload targets an unaccepted network', async () => {
@@ -234,7 +274,7 @@ describe('X402PaymentExecutor — request/submit flow', () => {
     expect(meta[X402_METADATA_KEYS.ERROR]).toBe(X402_ERROR_CODES.NETWORK_MISMATCH);
   });
 
-  it('emits AMOUNT_EXCEEDED when authorization value is greater than maxAmountRequired', async () => {
+  it('emits INVALID_AMOUNT when authorization value is greater than maxAmountRequired (spec §9.1)', async () => {
     const executor = makeExecutor(mockFacilitator());
     const first = await executor.execute(newTask(), newMessage());
     const { payload } = await signAgainst(first);
@@ -265,7 +305,108 @@ describe('X402PaymentExecutor — request/submit flow', () => {
 
     expect(result.status.state).toBe(TaskState.FAILED);
     const meta = result.status.message?.metadata as Record<string, unknown>;
-    expect(meta[X402_METADATA_KEYS.ERROR]).toBe(X402_ERROR_CODES.AMOUNT_EXCEEDED);
+    expect(meta[X402_METADATA_KEYS.ERROR]).toBe(X402_ERROR_CODES.INVALID_AMOUNT);
+  });
+
+  it('terminates the task when client sends payment-rejected (spec §5.4.2)', async () => {
+    const executor = makeExecutor(mockFacilitator());
+
+    const result = await executor.execute(
+      newTask(),
+      newMessage({
+        metadata: { [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REJECTED },
+      }),
+    );
+
+    expect(result.status.state).toBe(TaskState.FAILED);
+    const meta = result.status.message?.metadata as Record<string, unknown>;
+    expect(meta[X402_METADATA_KEYS.STATUS]).toBe(X402_PAYMENT_STATUS.REJECTED);
+  });
+
+  it('preserves prior receipts when payment completes after a previous failure (spec §7 history)', async () => {
+    const executor = makeExecutor(mockFacilitator());
+
+    // Seed the task with a prior failure receipt that a retry would keep.
+    const task = newTask();
+    task.status = {
+      state: TaskState.INPUT_REQUIRED,
+      timestamp: new Date().toISOString(),
+      message: {
+        messageId: 'prior',
+        role: 'agent',
+        parts: [{ text: 'retry' }],
+        metadata: {
+          [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REQUIRED,
+          [X402_METADATA_KEYS.REQUIRED]: {
+            x402Version: 1,
+            accepts: [],
+          },
+          [X402_METADATA_KEYS.RECEIPTS]: [
+            {
+              success: false,
+              transaction: '',
+              network: 'base-sepolia',
+              errorReason: 'prior attempt failed',
+            },
+          ],
+        },
+      },
+    };
+
+    const { metadata } = await signAgainst(
+      await executor.execute(newTask(), newMessage()),
+    );
+    const completed = await executor.execute(
+      task,
+      newMessage({ messageId: 'm2', metadata }),
+    );
+
+    const receipts = (
+      completed.status.message?.metadata as Record<string, unknown>
+    )[X402_METADATA_KEYS.RECEIPTS] as X402SettleResponse[];
+    expect(receipts).toHaveLength(2);
+    expect(receipts[0]).toMatchObject({ success: false });
+    expect(receipts[1]).toMatchObject({ success: true });
+  });
+
+  it('re-issues payment-required with error field when retryOnFailure=true (spec §5.1 error field)', async () => {
+    const agent = new EchoAgent();
+    const runner = new InMemoryRunner({ agent, appName: 'test' });
+    const inner = new AgentExecutor({
+      runner,
+      runConfig: { streamingMode: StreamingMode.SSE },
+    });
+    const executor = new X402PaymentExecutor(inner, {
+      accepts: [DEFAULT_ACCEPT],
+      facilitator: mockFacilitator({
+        verify: async () => ({
+          isValid: false,
+          invalidReason: 'invalid_exact_evm_insufficient_balance',
+          payer: TEST_ACCOUNT.address,
+        }),
+      }),
+      retryOnFailure: true,
+    });
+
+    const first = await executor.execute(newTask(), newMessage());
+    const { metadata } = await signAgainst(first);
+    const result = await executor.execute(
+      newTask(),
+      newMessage({ messageId: 'm2', metadata }),
+    );
+
+    // retryOnFailure keeps the task alive in input-required with the
+    // failure reason carried on the new payment-required response.
+    expect(result.status.state).toBe(TaskState.INPUT_REQUIRED);
+    const meta = result.status.message?.metadata as Record<string, unknown>;
+    expect(meta[X402_METADATA_KEYS.STATUS]).toBe(X402_PAYMENT_STATUS.REQUIRED);
+    expect(meta[X402_METADATA_KEYS.ERROR]).toBe(X402_ERROR_CODES.INSUFFICIENT_FUNDS);
+    const required = meta[X402_METADATA_KEYS.REQUIRED] as {
+      error?: string;
+      accepts: unknown[];
+    };
+    expect(required.error).toContain('insufficient_balance');
+    expect(required.accepts).toHaveLength(1);
   });
 });
 
@@ -304,6 +445,61 @@ describe('X402PaymentExecutor — streaming', () => {
     const states = statusEvents.map((e) => e.status.state);
     expect(states).toContain(TaskState.WORKING);
     expect(states).toContain(TaskState.COMPLETED);
+  });
+
+  it('emits a payment-verified status event between submitted and completed (spec §7.1 lifecycle)', async () => {
+    const executor = makeExecutor(mockFacilitator());
+    const first = await executor.execute(newTask(), newMessage());
+    const { metadata } = await signAgainst(first);
+
+    const events: unknown[] = [];
+    for await (const event of executor.executeStream(
+      newTask(),
+      newMessage({ messageId: 'm2', metadata }),
+    )) {
+      events.push(event);
+    }
+
+    // Find the transient `working + payment-verified` event. It must
+    // occur before any COMPLETED event so streaming clients can show
+    // "settling on-chain…" progress.
+    const verifiedIdx = events.findIndex((e) => {
+      if (typeof e !== 'object' || e === null || !('status' in e)) return false;
+      const status = (e as { status: { state: TaskState; message?: { metadata?: Record<string, unknown> } } }).status;
+      return (
+        status.state === TaskState.WORKING &&
+        status.message?.metadata?.[X402_METADATA_KEYS.STATUS] ===
+          X402_PAYMENT_STATUS.VERIFIED
+      );
+    });
+    expect(verifiedIdx).toBeGreaterThanOrEqual(0);
+
+    const completedIdx = events.findIndex((e) => {
+      if (typeof e !== 'object' || e === null || !('status' in e)) return false;
+      return (e as { status: { state: TaskState } }).status.state === TaskState.COMPLETED;
+    });
+    expect(completedIdx).toBeGreaterThan(verifiedIdx);
+  });
+
+  it('emits a failed terminal when streaming client sends payment-rejected', async () => {
+    const executor = makeExecutor(mockFacilitator());
+    const events: unknown[] = [];
+    for await (const event of executor.executeStream(
+      newTask(),
+      newMessage({
+        metadata: { [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REJECTED },
+      }),
+    )) {
+      events.push(event);
+    }
+    expect(events).toHaveLength(1);
+    const evt = events[0] as {
+      status: { state: TaskState; message?: { metadata?: Record<string, unknown> } };
+    };
+    expect(evt.status.state).toBe(TaskState.FAILED);
+    expect(evt.status.message?.metadata?.[X402_METADATA_KEYS.STATUS]).toBe(
+      X402_PAYMENT_STATUS.REJECTED,
+    );
   });
 });
 

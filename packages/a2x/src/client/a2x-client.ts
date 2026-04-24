@@ -50,6 +50,17 @@ export interface A2XClientOptions {
   fetch?: typeof globalThis.fetch;
   headers?: Record<string, string>;
   authProvider?: AuthProvider;
+  /**
+   * A2A extension URIs the client wants to activate. Emitted as a
+   * comma-separated `X-A2A-Extensions` HTTP header on every JSON-RPC
+   * request per a2a-x402 v0.2 §8 and the A2A core extension activation
+   * convention.
+   *
+   * You can also register extensions at runtime via `registerExtension()`
+   * — this is how `X402Client` self-activates the x402 extension when
+   * wrapping an `A2XClient`.
+   */
+  extensions?: string[];
 }
 
 // ─── Error Code → Error Class Mapping ───
@@ -119,6 +130,7 @@ export class A2XClient {
   private readonly _fetchImpl: typeof globalThis.fetch;
   private readonly _headers: Record<string, string>;
   private readonly _authProvider?: AuthProvider;
+  private readonly _extensions: Set<string>;
   private _resolved: ResolvedAgentCard | null = null;
   private _parser: ResponseParser | null = null;
   private _endpointUrl: string | null = null;
@@ -133,6 +145,24 @@ export class A2XClient {
     this._fetchImpl = options?.fetch ?? globalThis.fetch;
     this._headers = options?.headers ?? {};
     this._authProvider = options?.authProvider;
+    this._extensions = new Set(options?.extensions ?? []);
+  }
+
+  /**
+   * Register an A2A extension URI to be included in the
+   * `X-A2A-Extensions` header on subsequent requests. Idempotent.
+   *
+   * Used by extension wrappers (e.g. `X402Client`) to self-activate
+   * without requiring the caller to remember to pass `extensions` into
+   * the `A2XClient` constructor.
+   */
+  registerExtension(uri: string): void {
+    this._extensions.add(uri);
+  }
+
+  /** Read-only view of currently activated extension URIs. */
+  get activatedExtensions(): readonly string[] {
+    return [...this._extensions];
   }
 
   // ─── Public Methods ───
@@ -363,11 +393,18 @@ export class A2XClient {
   private _buildHeaders(
     extra?: Record<string, string>,
   ): Record<string, string> {
-    return {
+    const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       ...extra,
       ...this._headers,
     };
+    if (this._extensions.size > 0) {
+      // Spec a2a-x402 v0.2 §8: clients MUST request activation via
+      // `X-A2A-Extensions`. Multiple active extensions are comma-separated
+      // per standard HTTP list-header convention.
+      headers['X-A2A-Extensions'] = [...this._extensions].join(', ');
+    }
+    return headers;
   }
 
   private _buildJsonRpcRequest(
