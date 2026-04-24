@@ -385,6 +385,15 @@ export class A2XAgent {
     return this._securityRequirements;
   }
 
+  /**
+   * Read-only view of declared A2A extensions. Transports use this to
+   * enforce the a2a-x402 v0.2 §8 `X-A2A-Extensions` activation header
+   * check for any extension declared with `required: true`.
+   */
+  get extensions(): readonly AgentExtension[] {
+    return this._capabilities.extensions ?? [];
+  }
+
   get pushNotificationConfigStore(): PushNotificationConfigStore | undefined {
     return this._pushNotificationConfigStore;
   }

@@ -40,19 +40,98 @@ export const X402_PAYMENT_STATUS = {
 export type X402PaymentStatus =
   (typeof X402_PAYMENT_STATUS)[keyof typeof X402_PAYMENT_STATUS];
 
-/** Error codes the SDK may emit via `X402_METADATA_KEYS.ERROR`. */
+/**
+ * Error codes the SDK emits via `X402_METADATA_KEYS.ERROR`.
+ *
+ * The codes from spec §9.1 "Common Error Codes" are wire-identical to the
+ * spec. Additional SDK-specific codes cover failure modes the SDK detects
+ * before or outside the facilitator's purview (payload shape problems,
+ * configuration mismatches) and are documented as proprietary extensions
+ * of §9.1's open list.
+ */
 export const X402_ERROR_CODES = {
-  INVALID_PAYLOAD: 'INVALID_PAYLOAD',
+  // ─── Spec §9.1 — use these verbatim for wire compatibility ───
+  INSUFFICIENT_FUNDS: 'INSUFFICIENT_FUNDS',
+  INVALID_SIGNATURE: 'INVALID_SIGNATURE',
+  EXPIRED_PAYMENT: 'EXPIRED_PAYMENT',
+  DUPLICATE_NONCE: 'DUPLICATE_NONCE',
   NETWORK_MISMATCH: 'NETWORK_MISMATCH',
+  INVALID_AMOUNT: 'INVALID_AMOUNT',
+  SETTLEMENT_FAILED: 'SETTLEMENT_FAILED',
+  // ─── SDK-specific (outside spec §9.1) ───
+  /** Payment payload is missing, unparseable, or structurally invalid. */
+  INVALID_PAYLOAD: 'INVALID_PAYLOAD',
+  /** Authorization target address does not match the advertised `payTo`. */
   INVALID_PAY_TO: 'INVALID_PAY_TO',
-  AMOUNT_EXCEEDED: 'AMOUNT_EXCEEDED',
+  /**
+   * Fallback for verify failures whose `invalidReason` doesn't map to a
+   * more specific spec §9.1 code. Prefer the specific code when possible.
+   */
   VERIFY_FAILED: 'VERIFY_FAILED',
-  SETTLE_FAILED: 'SETTLE_FAILED',
-  NO_REQUIREMENTS: 'NO_REQUIREMENTS',
 } as const;
 
 export type X402ErrorCode =
   (typeof X402_ERROR_CODES)[keyof typeof X402_ERROR_CODES];
+
+/**
+ * Map a facilitator's `invalidReason` string to a spec §9.1 error code.
+ *
+ * Facilitator implementations (including the Coinbase reference one)
+ * return free-form reason strings that embed the actual failure cause.
+ * We do best-effort substring matching so clients can branch on the
+ * well-known spec codes instead of scraping prose. When no substring
+ * matches, returns `VERIFY_FAILED` so the caller always has something.
+ */
+export function mapVerifyFailureToCode(
+  invalidReason: string | undefined,
+): X402ErrorCode {
+  if (!invalidReason) return X402_ERROR_CODES.VERIFY_FAILED;
+  const reason = invalidReason.toLowerCase();
+  if (
+    reason.includes('insufficient_funds') ||
+    reason.includes('insufficient_balance') ||
+    reason.includes('insufficient-balance')
+  ) {
+    return X402_ERROR_CODES.INSUFFICIENT_FUNDS;
+  }
+  if (
+    reason.includes('nonce_reused') ||
+    reason.includes('duplicate_nonce') ||
+    reason.includes('nonce_used') ||
+    reason.includes('used_nonce')
+  ) {
+    return X402_ERROR_CODES.DUPLICATE_NONCE;
+  }
+  if (
+    reason.includes('expired') ||
+    reason.includes('valid_before') ||
+    reason.includes('validbefore') ||
+    reason.includes('valid_after') ||
+    reason.includes('validafter')
+  ) {
+    return X402_ERROR_CODES.EXPIRED_PAYMENT;
+  }
+  if (
+    reason.includes('invalid_signature') ||
+    reason.includes('signature_invalid') ||
+    reason.includes('bad_signature')
+  ) {
+    return X402_ERROR_CODES.INVALID_SIGNATURE;
+  }
+  if (
+    reason.includes('network_mismatch') ||
+    reason.includes('wrong_network')
+  ) {
+    return X402_ERROR_CODES.NETWORK_MISMATCH;
+  }
+  if (
+    reason.includes('invalid_amount') ||
+    reason.includes('amount_mismatch')
+  ) {
+    return X402_ERROR_CODES.INVALID_AMOUNT;
+  }
+  return X402_ERROR_CODES.VERIFY_FAILED;
+}
 
 /** Default maximum payment completion window per `PaymentRequirements.maxTimeoutSeconds`. */
 export const X402_DEFAULT_TIMEOUT_SECONDS = 300;

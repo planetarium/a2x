@@ -48,6 +48,7 @@ export {
   X402_ERROR_CODES,
   X402_DEFAULT_TIMEOUT_SECONDS,
   X402_DEFAULT_RESOURCE,
+  mapVerifyFailureToCode,
   type X402PaymentStatus,
   type X402ErrorCode,
 } from './constants.js';
