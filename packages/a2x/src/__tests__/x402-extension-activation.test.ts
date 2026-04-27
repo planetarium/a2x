@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import { privateKeyToAccount } from 'viem/accounts';
 import { A2XClient } from '../client/a2x-client.js';
-import { X402Client, X402_EXTENSION_URI } from '../x402/index.js';
+import { X402_EXTENSION_URI } from '../x402/index.js';
 import { A2XAgent } from '../a2x/a2x-agent.js';
 import { AgentExecutor, StreamingMode } from '../a2x/agent-executor.js';
 import { InMemoryRunner } from '../runner/in-memory-runner.js';
@@ -127,11 +127,13 @@ describe('A2XClient — X-A2A-Extensions header (spec §8)', () => {
     expect(rpcCall.headers['x-a2a-extensions']).toContain('ext-b');
   });
 
-  it('X402Client auto-registers the x402 extension URI on the inner A2XClient', async () => {
+  it('auto-registers the x402 extension URI when the x402 option is supplied', async () => {
     const { fetch, calls } = recordingFetch();
-    const inner = new A2XClient('https://example.com', { fetch });
-    new X402Client(inner, { signer: TEST_ACCOUNT });
-    await inner.sendMessage({
+    const client = new A2XClient('https://example.com', {
+      fetch,
+      x402: { signer: TEST_ACCOUNT },
+    });
+    await client.sendMessage({
       message: {
         messageId: 'm1',
         role: 'user',
@@ -140,6 +142,7 @@ describe('A2XClient — X-A2A-Extensions header (spec §8)', () => {
     });
     const rpcCall = calls.find((c) => c.url.endsWith('/a2a'))!;
     expect(rpcCall.headers['x-a2a-extensions']).toBe(X402_EXTENSION_URI);
+    expect(client.activatedExtensions).toContain(X402_EXTENSION_URI);
   });
 });
 

@@ -1,17 +1,17 @@
 /**
  * Shared x402 helpers used by `a2x a2a send` and `a2x a2a stream`.
  *
- * The SDK exposes `X402Client.onPaymentRequired` and `selectRequirement`
- * as callbacks. The CLI wires them to a spend ceiling so an auto-signed
- * payment can never exceed `--max-amount` — if the server advertises
- * only expensive options we throw `X402BudgetExceededError` before any
- * EIP-3009 authorization gets signed.
+ * The SDK's `A2XClient` runs the x402 dance natively when given an
+ * `x402` option. This module wires the CLI's spend ceiling and friendly
+ * error messages onto that surface — so an auto-signed payment can never
+ * exceed `--max-amount` and a budget violation surfaces with a CLI-shaped
+ * message instead of the generic "no supported requirement" error.
  */
 
 import chalk from 'chalk';
 import type {
+  A2XClientX402Options,
   SignX402PaymentOptions,
-  X402ClientOptions,
   X402PaymentRequiredResponse,
   X402PaymentRequirements,
 } from '@a2x/sdk';
@@ -71,22 +71,30 @@ export function safeBigInt(raw: string): bigint {
 }
 
 /**
- * Build the `{ onPaymentRequired, selectRequirement }` pair that both
- * `X402Client` (used by send) and the manual payment dance in stream
- * should share. Takes the same `SignX402PaymentOptions.signer` shape
- * so callers can spread `{ signer, ...buildBudgetedX402ClientOptions }`
- * without repeating themselves.
+ * Build the `A2XClientX402Options` block the CLI hands to `A2XClient`.
+ *
+ * `maxAmount` is enforced twice: in the SDK's default selector (so a
+ * caller-supplied predicate also sees only affordable options) and in
+ * our `onPaymentRequired` hook, which prints the requirements and throws
+ * `X402BudgetExceededError` up-front when nothing fits — that gives a
+ * better CLI message than letting the SDK fall through to the generic
+ * "no supported requirement" error.
  */
-export function buildBudgetedX402ClientOptions(
-  maxAmount: bigint,
-): Pick<X402ClientOptions, 'onPaymentRequired' | 'selectRequirement'> {
+export function buildBudgetedX402ClientSettings(args: {
+  signer: SignX402PaymentOptions['signer'];
+  maxAmount: bigint;
+}): A2XClientX402Options {
+  const { signer, maxAmount } = args;
   return {
-    onPaymentRequired: (r) => {
-      const affordable = r.accepts.filter(
+    signer,
+    maxAmount,
+    onPaymentRequired: (required) => {
+      printPaymentRequirement(required, maxAmount);
+      const affordable = required.accepts.filter(
         (a) => safeBigInt(a.maxAmountRequired) <= maxAmount,
       );
       if (affordable.length === 0) {
-        const cheapest = r.accepts
+        const cheapest = required.accepts
           .map((a) => ({ v: safeBigInt(a.maxAmountRequired), asset: a.asset }))
           .sort((x, y) => (x.v < y.v ? -1 : 1))[0];
         throw new X402BudgetExceededError(
@@ -96,66 +104,7 @@ export function buildBudgetedX402ClientOptions(
         );
       }
     },
-    selectRequirement: (accepts) => {
-      const affordable = accepts
-        .filter((a) => safeBigInt(a.maxAmountRequired) <= maxAmount)
-        .sort((x, y) =>
-          safeBigInt(x.maxAmountRequired) < safeBigInt(y.maxAmountRequired)
-            ? -1
-            : 1,
-        );
-      return affordable.find((a) => a.scheme === 'exact') ?? affordable[0];
-    },
   };
-}
-
-/**
- * Combine `signer` + budget callbacks into a full `X402ClientOptions`
- * in one call.
- */
-export function buildBudgetedX402ClientSettings(args: {
-  signer: SignX402PaymentOptions['signer'];
-  maxAmount: bigint;
-}): X402ClientOptions {
-  return {
-    signer: args.signer,
-    ...buildBudgetedX402ClientOptions(args.maxAmount),
-  };
-}
-
-/** Enforce the budget without going through `X402Client` (stream path). */
-export function enforceBudget(
-  required: X402PaymentRequiredResponse,
-  maxAmount: bigint,
-): void {
-  const affordable = required.accepts.filter(
-    (a) => safeBigInt(a.maxAmountRequired) <= maxAmount,
-  );
-  if (affordable.length === 0) {
-    const cheapest = required.accepts
-      .map((a) => ({ v: safeBigInt(a.maxAmountRequired), asset: a.asset }))
-      .sort((x, y) => (x.v < y.v ? -1 : 1))[0];
-    throw new X402BudgetExceededError(
-      cheapest?.v ?? 0n,
-      maxAmount,
-      cheapest?.asset ?? 'unknown',
-    );
-  }
-}
-
-/** Pick the cheapest affordable "exact" requirement without X402Client. */
-export function pickAffordableRequirement(
-  required: X402PaymentRequiredResponse,
-  maxAmount: bigint,
-): X402PaymentRequirements | undefined {
-  const affordable = required.accepts
-    .filter((a) => safeBigInt(a.maxAmountRequired) <= maxAmount)
-    .sort((x, y) =>
-      safeBigInt(x.maxAmountRequired) < safeBigInt(y.maxAmountRequired)
-        ? -1
-        : 1,
-    );
-  return affordable.find((a) => a.scheme === 'exact') ?? affordable[0];
 }
 
 // ─── Display helpers ────────────────────────────────────────────────

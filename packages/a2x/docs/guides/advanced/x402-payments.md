@@ -156,21 +156,25 @@ When a client decides not to pay it can respond with `x402.payment.status: payme
 
 ## Client
 
-### High-level: `X402Client`
+### High-level: `A2XClient` with `x402`
+
+`A2XClient` itself runs the x402 dance when you pass an `x402` option. Whether the agent gates on x402 is a property of its AgentCard, not the caller — so you don't have to pick between two client classes. If the agent never asks for payment, the client behaves as a plain A2A client.
 
 ```ts
 import { A2XClient } from '@a2x/sdk/client';
-import { X402Client } from '@a2x/sdk/x402';
 import { privateKeyToAccount } from 'viem/accounts';
 
-const x402 = new X402Client(new A2XClient('https://agent.example.com'), {
-  signer: privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`),
-  onPaymentRequired: (required) => {
-    console.log('Merchant asks for', required.accepts);
+const client = new A2XClient('https://agent.example.com', {
+  x402: {
+    signer: privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`),
+    maxAmount: 10_000n,                          // optional; refuse anything above this
+    onPaymentRequired: (required) => {
+      console.log('Merchant asks for', required.accepts);
+    },
   },
 });
 
-const task = await x402.sendMessage({
+const task = await client.sendMessage({
   message: {
     messageId: crypto.randomUUID(),
     role: 'user',
@@ -181,17 +185,52 @@ const task = await x402.sendMessage({
 console.log(task.status.state); // "completed"
 ```
 
-If the merchant rejects the payment (verify or settle failed), `sendMessage` throws `X402PaymentFailedError` with the on-chain reason attached.
+The same call site works for streaming. The dance happens in-band — the generator yields the merchant's `payment-required` event and then continues with the followup stream's `payment-verified → working → artifacts → payment-completed` events:
+
+```ts
+for await (const event of client.sendMessageStream({ message: { … } })) {
+  console.log(event);
+}
+```
+
+If the merchant rejects the payment (verify or settle failed), the call throws `X402PaymentFailedError` with the on-chain reason attached. If every requirement in `accepts[]` exceeds `maxAmount`, signing throws `X402NoSupportedRequirementError` before any authorization is created.
+
+The full option surface:
+
+| Field | Default | Purpose |
+|---|---|---|
+| `signer` | required | viem `LocalAccount` used to produce the EIP-3009 authorization. |
+| `maxAmount` | no cap | Atomic-unit ceiling. Filters `accepts[]` before the selector runs, so a custom `selectRequirement` only sees the affordable subset. |
+| `selectRequirement` | first `scheme === 'exact'` | Predicate over the (already filtered) requirements. Return `undefined` to abort. |
+| `onPaymentRequired` | none | Hook that fires after `payment-required` and before signing. Throw to abort the dance — the caller observes the unmodified `payment-required` task (blocking) or a stream that closes after the `payment-required` event (streaming). |
+
+### Extension activation header
+
+Setting the `x402` option auto-registers `X402_EXTENSION_URI` so every JSON-RPC request carries the `X-A2A-Extensions` activation header (spec §8). You don't need to pass `extensions` separately for x402.
+
+To activate other extensions, list them in `extensions` or call `client.registerExtension(uri)` at runtime:
+
+```ts
+new A2XClient(url, {
+  extensions: ['https://example.org/some-extension'],
+  x402: { signer },                              // X402_EXTENSION_URI auto-added
+});
+```
 
 ### Low-level: `signX402Payment`
 
-Use this when you need to inspect the `payment-required` task before signing — e.g. to show the user a confirmation modal, to fetch the signer's balance, or to route across multiple wallets.
+When you need to inspect the `payment-required` task before signing — e.g. to show the user a confirmation modal, fetch the signer's balance, or route across multiple wallets — drive the dance manually using the primitives. `A2XClient` without the `x402` option will hand you the raw `payment-required` task, and `signX402Payment` produces the metadata block to attach to the followup `message/send` call.
 
 ```ts
+import { A2XClient } from '@a2x/sdk/client';
 import {
   signX402Payment,
   getX402PaymentRequirements,
 } from '@a2x/sdk/x402';
+
+const client = new A2XClient(url, {
+  extensions: [X402_EXTENSION_URI], // still required for header activation
+});
 
 const first = await client.sendMessage({ message: { … } });
 const required = getX402PaymentRequirements(first);
@@ -234,30 +273,17 @@ for (const receipt of receipts) {
 }
 ```
 
-## Extension activation
+## Server-side enforcement
 
-Per spec §8, x402-capable clients MUST include the extension URI in the `X-A2A-Extensions` HTTP header on every JSON-RPC request. `X402Client` does this automatically — wrapping an `A2XClient` registers `X402_EXTENSION_URI` on it so subsequent `sendMessage` / `sendMessageStream` calls emit the header:
+Per spec §8, x402-capable clients MUST include the extension URI in the `X-A2A-Extensions` HTTP header on every JSON-RPC request:
 
 ```
 X-A2A-Extensions: https://github.com/google-agentic-commerce/a2a-x402/blob/main/spec/v0.2
 ```
 
-If you're driving `A2XClient` directly (without `X402Client`), pass `extensions` to the constructor:
+When the merchant agent declares the extension with `required: true` on its AgentCard, `DefaultRequestHandler` rejects requests whose header doesn't list that URI (error `-32600`). The check only runs when a `RequestContext` is provided to `handler.handle()` — pure in-process invocations skip it.
 
-```ts
-new A2XClient(url, {
-  extensions: [X402_EXTENSION_URI],
-  // …other options
-});
-```
-
-Or register at runtime (the same mechanism `X402Client` uses internally):
-
-```ts
-client.registerExtension(X402_EXTENSION_URI);
-```
-
-**Server side.** When an agent declares an extension with `required: true`, `DefaultRequestHandler` rejects requests whose `X-A2A-Extensions` header doesn't list that URI (error `-32600`). The check is only applied when a `RequestContext` is provided to `handler.handle()` — pure in-process invocations skip it.
+The client side is covered for you when you set `A2XClientOptions.x402` — see the section above. If you drive the dance manually via `signX402Payment`, pass `extensions: [X402_EXTENSION_URI]` to the `A2XClient` constructor (or call `client.registerExtension(X402_EXTENSION_URI)`) so the header gets emitted on every request.
 
 ## Supported scope
 

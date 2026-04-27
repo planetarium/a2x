@@ -1,16 +1,13 @@
 /**
  * Client-side x402 helpers.
  *
- * Two patterns are exposed:
- *
- *  1. `signX402Payment(task, { signer })` — primitive. Takes a
- *     `payment-required` task, selects one of the requirements, signs it
- *     with the caller's wallet, and returns the metadata the caller
- *     should attach to the follow-up message.
- *
- *  2. `X402Client` — wrapper around `A2XClient` that runs the full
- *     payment dance automatically: sendMessage → detect payment-required →
- *     sign → resubmit → return completed task.
+ * The high-level Standalone Flow is built into `A2XClient` itself —
+ * pass `{ x402: { signer } }` to its constructor and it transparently
+ * handles `payment-required` → sign → resubmit. The helpers here are
+ * the lower-level primitives those built-ins compose, exposed for
+ * callers that need to drive the dance manually (e.g. inspect the
+ * `payment-required` task before signing, or build their own
+ * orchestration on top).
  *
  * We accept any viem-compatible `LocalAccount` as the signer, which keeps
  * the SDK wallet-agnostic (CLI, browser wallets, HSM-backed signers etc.
@@ -21,19 +18,14 @@ import type { LocalAccount } from 'viem';
 import { createPaymentHeader as createX402PaymentHeader } from 'x402/client';
 import { safeBase64Decode } from 'x402/shared';
 import { PaymentPayloadSchema } from 'x402/types';
-import { A2XClient } from '../client/a2x-client.js';
-import type { SendMessageParams } from '../types/jsonrpc.js';
 import type { Task } from '../types/task.js';
-import type { Message } from '../types/common.js';
 import {
-  X402_EXTENSION_URI,
   X402_METADATA_KEYS,
   X402_PAYMENT_STATUS,
   type X402PaymentStatus,
 } from './constants.js';
 import {
   X402NoSupportedRequirementError,
-  X402PaymentFailedError,
   X402PaymentRequiredError,
 } from './errors.js';
 import type {
@@ -107,7 +99,8 @@ export function getX402Status(task: Task): X402PaymentStatus | undefined {
 /**
  * Sign a payment for the given `payment-required` task. Callers
  * typically use this when they want fine-grained control of the
- * subsequent `message/send` call.
+ * subsequent `message/send` call. For a one-call API that handles the
+ * full dance, configure `A2XClient` with `{ x402: { signer } }`.
  */
 export async function signX402Payment(
   task: Task,
@@ -153,91 +146,4 @@ function defaultSelect(
   requirements: X402PaymentRequirements[],
 ): X402PaymentRequirements | undefined {
   return requirements.find((r) => r.scheme === 'exact') ?? requirements[0];
-}
-
-// ─── Convenience wrapper ────────────────────────────────────────────────
-
-export interface X402ClientOptions extends SignX402PaymentOptions {
-  /**
-   * Optional callback invoked after the merchant asks for payment and
-   * before the client signs. Useful for prompting the user to confirm.
-   * Throw from the callback to abort the payment flow.
-   */
-  onPaymentRequired?: (required: X402PaymentRequiredResponse) => void | Promise<void>;
-}
-
-/**
- * Thin wrapper around `A2XClient` that transparently handles x402
- * payment challenges. Use when the calling code doesn't need to inspect
- * the `payment-required` task itself.
- */
-export class X402Client {
-  constructor(
-    private readonly _client: A2XClient,
-    private readonly _options: X402ClientOptions,
-  ) {
-    // a2a-x402 v0.2 §8: clients MUST activate the extension via the
-    // `X-A2A-Extensions` header. Register on the wrapped A2XClient so
-    // callers don't have to remember to pass `extensions` themselves.
-    this._client.registerExtension(X402_EXTENSION_URI);
-  }
-
-  /**
-   * Send a message, resolving payment if the merchant asks for it.
-   * Returns the final completed (or failed) Task.
-   */
-  async sendMessage(params: SendMessageParams): Promise<Task> {
-    const first = await this._client.sendMessage(params);
-    if (first.status.state !== 'input-required') {
-      return first;
-    }
-    const required = getX402PaymentRequirements(first);
-    if (!required) {
-      return first;
-    }
-    if (this._options.onPaymentRequired) {
-      await this._options.onPaymentRequired(required);
-    }
-
-    const signed = await signX402Payment(first, this._options);
-    const followup: Message = {
-      ...params.message,
-      messageId: cryptoRandomId(),
-      taskId: first.id,
-      contextId: first.contextId,
-      metadata: {
-        ...(params.message.metadata ?? {}),
-        ...signed.metadata,
-      },
-    };
-
-    const second = await this._client.sendMessage({
-      ...params,
-      message: followup,
-    });
-
-    const receipts = getX402Receipts(second);
-    const failed = receipts.find((r) => !r.success);
-    if (failed) {
-      throw new X402PaymentFailedError(
-        failed.errorReason ?? 'Payment failed',
-        (second.status.message?.metadata as Record<string, unknown> | undefined)?.[
-          X402_METADATA_KEYS.ERROR
-        ] as string ?? 'UNKNOWN',
-        { transaction: failed.transaction, network: failed.network },
-      );
-    }
-
-    return second;
-  }
-
-  /** Access the underlying A2XClient for non-x402 operations. */
-  get client(): A2XClient {
-    return this._client;
-  }
-}
-
-function cryptoRandomId(): string {
-  // Node 18+ + modern browsers expose globalThis.crypto.randomUUID().
-  return globalThis.crypto.randomUUID();
 }

@@ -46,14 +46,13 @@ Using the SDK directly:
 
 ```ts
 import { A2XClient } from '@a2x/sdk/client';
-import { X402Client } from '@a2x/sdk/x402';
 import { privateKeyToAccount } from 'viem/accounts';
 
-const x402 = new X402Client(new A2XClient('http://localhost:3000/api/a2a'), {
-  signer: privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`),
+const client = new A2XClient('http://localhost:3000/api/a2a', {
+  x402: { signer: privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`) },
 });
 
-const task = await x402.sendMessage({
+const task = await client.sendMessage({
   message: {
     messageId: crypto.randomUUID(),
     role: 'user',

@@ -3,15 +3,8 @@ import chalk from 'chalk';
 import crypto from 'node:crypto';
 import type {
   SendMessageParams,
-  Task,
   TaskArtifactUpdateEvent,
   TaskStatusUpdateEvent,
-} from '@a2x/sdk';
-import {
-  getX402PaymentRequirements,
-  signX402Payment,
-  X402_METADATA_KEYS,
-  X402_PAYMENT_STATUS,
 } from '@a2x/sdk';
 import {
   printStatusUpdate,
@@ -22,10 +15,8 @@ import {
 import { activeWalletAccount } from '../../wallet-store.js';
 import {
   DEFAULT_MAX_AMOUNT_ATOMIC,
-  enforceBudget,
+  buildBudgetedX402ClientSettings,
   parseMaxAmount,
-  pickAffordableRequirement,
-  printPaymentRequirement,
   printX402Error,
 } from '../../x402-cli.js';
 
@@ -60,9 +51,23 @@ export const streamCommand = new Command('stream')
       },
     ) => {
       const maxAmount = parseMaxAmount(opts.maxAmount);
+      const noX402 = opts.x402 === false;
+      const signer = noX402 ? undefined : activeWalletAccount();
+
+      if (!noX402 && !signer && !opts.json) {
+        console.log(
+          chalk.gray(
+            '(no active wallet — paid agents will return payment-required without auto-signing)',
+          ),
+        );
+      }
 
       try {
-        const client = createClient(url, opts);
+        const client = createClient(url, opts, {
+          x402: signer
+            ? buildBudgetedX402ClientSettings({ signer, maxAmount })
+            : undefined,
+        });
 
         const params: SendMessageParams = {
           message: {
@@ -80,90 +85,7 @@ export const streamCommand = new Command('stream')
           console.log(chalk.gray('─'.repeat(40)));
         }
 
-        // First pass: consume the stream but pause as soon as a
-        // payment-required status-update arrives.
-        const paymentSignal = await consumeUntilPaymentRequired(
-          client.sendMessageStream(params),
-          opts,
-        );
-
-        if (!paymentSignal) {
-          // Stream finished without ever asking for payment — normal case.
-          finish(opts);
-          return;
-        }
-
-        if (opts.x402 === false) {
-          if (!opts.json) {
-            console.log();
-            console.log(
-              chalk.yellow(
-                'Stream paused for x402 payment; --no-x402 was set, exiting.',
-              ),
-            );
-          }
-          process.exit(2);
-        }
-
-        const signer = activeWalletAccount();
-        if (!signer) {
-          if (!opts.json) {
-            console.log();
-            console.error(
-              chalk.yellow(
-                'Agent is asking for an x402 payment but no wallet is active.',
-              ),
-            );
-            console.error(
-              chalk.yellow(
-                'Run `a2x wallet create` (or `a2x wallet use <name>`) to unlock paid calls.',
-              ),
-            );
-          }
-          process.exit(2);
-        }
-
-        // Budget check + display before signing.
-        enforceBudget(paymentSignal.required, maxAmount);
-        if (!opts.json) {
-          console.log();
-          printPaymentRequirement(paymentSignal.required, maxAmount);
-        }
-
-        const signed = await signX402Payment(paymentSignal.syntheticTask, {
-          signer,
-          selectRequirement: (accepts) =>
-            pickAffordableRequirement(
-              { x402Version: 1, accepts },
-              maxAmount,
-            ),
-        });
-
-        // Second pass: same content + taskId + payment metadata.
-        const followupParams: SendMessageParams = {
-          ...params,
-          message: {
-            ...params.message,
-            messageId: crypto.randomUUID(),
-            taskId: paymentSignal.taskId,
-            contextId: paymentSignal.contextId,
-            metadata: {
-              ...(params.message.metadata ?? {}),
-              ...signed.metadata,
-            },
-          },
-        };
-
-        if (!opts.json) {
-          console.log(
-            chalk.gray(
-              `  signed ${signed.requirement.maxAmountRequired} atomic → resuming stream`,
-            ),
-          );
-          console.log();
-        }
-
-        for await (const event of client.sendMessageStream(followupParams)) {
+        for await (const event of client.sendMessageStream(params)) {
           renderEvent(event, opts);
         }
 
@@ -176,59 +98,6 @@ export const streamCommand = new Command('stream')
       }
     },
   );
-
-/**
- * Iterate the first stream, printing events as they come in. As soon as
- * we see a TaskStatusUpdateEvent whose message carries the x402
- * payment-required status, we synthesize a minimal Task so the caller
- * can feed it to `signX402Payment` and stop consuming further events.
- *
- * Returns `undefined` when the stream ended naturally (no payment gate).
- */
-async function consumeUntilPaymentRequired(
-  stream: AsyncGenerator<StreamEvent>,
-  opts: { json?: boolean },
-): Promise<
-  | {
-      required: NonNullable<ReturnType<typeof getX402PaymentRequirements>>;
-      syntheticTask: Task;
-      taskId: string;
-      contextId: string;
-    }
-  | undefined
-> {
-  for await (const event of stream) {
-    if (!('status' in event)) {
-      renderEvent(event, opts);
-      continue;
-    }
-
-    const meta = (event.status.message?.metadata ?? {}) as Record<string, unknown>;
-    const x402Status = meta[X402_METADATA_KEYS.STATUS];
-    if (x402Status === X402_PAYMENT_STATUS.REQUIRED) {
-      // The SDK helpers expect a Task shape, not a status-update event.
-      const syntheticTask: Task = {
-        id: event.taskId,
-        contextId: event.contextId,
-        status: event.status,
-      };
-      const required = getX402PaymentRequirements(syntheticTask);
-      if (required) {
-        // Print the status update (so the user sees the pause) and stop.
-        renderEvent(event, opts);
-        return {
-          required,
-          syntheticTask,
-          taskId: event.taskId,
-          contextId: event.contextId,
-        };
-      }
-    }
-
-    renderEvent(event, opts);
-  }
-  return undefined;
-}
 
 /**
  * Whether the cursor is currently mid-line after a streaming artifact chunk

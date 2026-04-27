@@ -2,18 +2,13 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import crypto from 'node:crypto';
 import type { SendMessageParams, Task } from '@a2x/sdk';
-import {
-  X402Client,
-  getX402PaymentRequirements,
-  getX402Receipts,
-} from '@a2x/sdk';
+import { getX402PaymentRequirements, getX402Receipts } from '@a2x/sdk';
 import { printTask, printConnectionError, createClient } from '../../format.js';
 import { activeWalletAccount } from '../../wallet-store.js';
 import {
   DEFAULT_MAX_AMOUNT_ATOMIC,
   buildBudgetedX402ClientSettings,
   parseMaxAmount,
-  printPaymentRequirement,
   printX402Error,
 } from '../../x402-cli.js';
 
@@ -43,9 +38,15 @@ export const sendCommand = new Command('send')
       },
     ) => {
       const maxAmount = parseMaxAmount(opts.maxAmount);
+      const noX402 = opts.x402 === false;
+      const signer = noX402 ? undefined : activeWalletAccount();
 
       try {
-        const client = createClient(url, opts);
+        const client = createClient(url, opts, {
+          x402: signer
+            ? buildBudgetedX402ClientSettings({ signer, maxAmount })
+            : undefined,
+        });
 
         const params: SendMessageParams = {
           message: {
@@ -59,42 +60,28 @@ export const sendCommand = new Command('send')
           params.message.contextId = opts.contextId;
         }
 
-        let task: Task = await client.sendMessage(params);
+        const task: Task = await client.sendMessage(params);
 
-        // Handle x402 payment-required — unless the user opted out via --no-x402.
-        // commander maps --no-x402 to opts.x402 === false.
-        const required = getX402PaymentRequirements(task);
-        if (required && opts.x402 !== false) {
-          const signer = activeWalletAccount();
-          if (!signer) {
-            if (opts.json) {
-              console.log(JSON.stringify(task, null, 2));
-              return;
-            }
-            printTask(task);
-            console.log();
-            console.error(
-              chalk.yellow(
-                'Agent is asking for an x402 payment but no wallet is active.',
-              ),
-            );
-            console.error(
-              chalk.yellow(
-                'Run `a2x wallet create` (or `a2x wallet use <name>`) to unlock paid calls.',
-              ),
-            );
-            process.exit(2);
+        // If the agent asked for payment but we couldn't sign (no wallet
+        // and the user didn't pass --no-x402), surface a helpful error.
+        if (!noX402 && !signer && getX402PaymentRequirements(task)) {
+          if (opts.json) {
+            console.log(JSON.stringify(task, null, 2));
+            return;
           }
-
-          if (!opts.json) {
-            printPaymentRequirement(required, maxAmount);
-          }
-
-          const x402 = new X402Client(
-            client,
-            buildBudgetedX402ClientSettings({ signer, maxAmount }),
+          printTask(task);
+          console.log();
+          console.error(
+            chalk.yellow(
+              'Agent is asking for an x402 payment but no wallet is active.',
+            ),
           );
-          task = await x402.sendMessage(params);
+          console.error(
+            chalk.yellow(
+              'Run `a2x wallet create` (or `a2x wallet use <name>`) to unlock paid calls.',
+            ),
+          );
+          process.exit(2);
         }
 
         if (opts.json) {
