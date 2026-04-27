@@ -169,8 +169,7 @@ describe('Layer 1: SecurityScheme Classes', () => {
       scopes: { read: 'Read' },
     };
 
-    it('toV03Schema emits deviceCode as non-standard extension and warns', () => {
-      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    it('toV03Schema emits deviceCode as non-standard extension', () => {
       const scheme = new OAuth2DeviceCodeAuthorization({
         ...opts,
         refreshUrl: 'https://auth.example.com/refresh',
@@ -189,14 +188,9 @@ describe('Layer 1: SecurityScheme Classes', () => {
         },
         description: 'Device flow',
       });
-      expect(warnSpy).toHaveBeenCalledWith(
-        expect.stringContaining('non-standard extension'),
-      );
-      warnSpy.mockRestore();
     });
 
     it('toV03Schema omits refreshUrl and description when not provided', () => {
-      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
       const scheme = new OAuth2DeviceCodeAuthorization(opts);
       const v03 = scheme.toV03Schema() as Extract<
         ReturnType<typeof scheme.toV03Schema>,
@@ -208,7 +202,6 @@ describe('Layer 1: SecurityScheme Classes', () => {
         scopes: opts.scopes,
       });
       expect('description' in v03).toBe(false);
-      warnSpy.mockRestore();
     });
 
     it('toV10Schema should return oauth2 with deviceCode flow', () => {
