@@ -36,10 +36,20 @@ export interface ResolvedAgentCard {
 /**
  * Detect whether an AgentCard is v0.3 or v1.0.
  *
- * v0.3 cards have a top-level `url` field and `protocolVersion` string.
- * v1.0 cards have a `supportedInterfaces` array.
+ * Per spec, the card's own `protocolVersion` is authoritative:
+ *   - v0.3 (`a2a-v0.3.0.json`) requires a top-level `protocolVersion` (full semver, e.g. "0.3.0").
+ *   - v1.0 (`a2a-v1.0.0.json`) has no top-level `protocolVersion`; versions appear per-interface.
+ *
+ * Shape alone is ambiguous: a v0.3 agent may legally also expose `supportedInterfaces` to
+ * advertise additional transports, and would be misclassified as v1.0 if we ignored the
+ * declared version. Honor the declared field first, then fall back to shape heuristics.
  */
 export function detectProtocolVersion(card: Record<string, unknown>): ProtocolVersion {
+  const declared = card.protocolVersion;
+  if (typeof declared === 'string') {
+    if (declared.startsWith('0.3')) return '0.3';
+    if (declared.startsWith('1.')) return '1.0';
+  }
   if (
     Array.isArray(card.supportedInterfaces) &&
     card.supportedInterfaces.length > 0

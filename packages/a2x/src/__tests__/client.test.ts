@@ -107,6 +107,38 @@ describe('AgentCardResolver', () => {
         supportedInterfaces: [{ url: 'http://localhost' }],
       })).toBe('1.0');
     });
+
+    it('should detect v0.3 when card declares protocolVersion 0.3.x even if supportedInterfaces is present', () => {
+      // Regression: v0.3 cards may legally advertise supportedInterfaces for extra
+      // transports. The declared protocolVersion must win over shape inference.
+      expect(detectProtocolVersion({
+        protocolVersion: '0.3.0',
+        url: 'http://localhost',
+        supportedInterfaces: [
+          { url: 'http://localhost', protocolBinding: 'JSONRPC', protocolVersion: '0.3' },
+        ],
+      })).toBe('0.3');
+    });
+
+    it('should accept short major.minor protocolVersion strings', () => {
+      expect(detectProtocolVersion({ protocolVersion: '0.3' })).toBe('0.3');
+      expect(detectProtocolVersion({ protocolVersion: '1.0' })).toBe('1.0');
+    });
+
+    it('should detect v1.0 from declared protocolVersion 1.x', () => {
+      expect(detectProtocolVersion({ protocolVersion: '1.0.0' })).toBe('1.0');
+    });
+
+    it('should fall back to shape inference when protocolVersion is unrecognized', () => {
+      expect(detectProtocolVersion({
+        protocolVersion: '2.0.0',
+        url: 'http://localhost',
+      })).toBe('0.3');
+      expect(detectProtocolVersion({
+        protocolVersion: '',
+        supportedInterfaces: [{ url: 'http://localhost' }],
+      })).toBe('1.0');
+    });
   });
 
   describe('getAgentEndpointUrl', () => {
