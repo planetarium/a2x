@@ -1,7 +1,7 @@
 {
   "name": "@a2x/cli",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "CLI for the a2x A2A protocol SDK",
   "author": {
