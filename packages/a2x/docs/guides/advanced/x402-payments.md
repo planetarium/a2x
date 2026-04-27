@@ -106,25 +106,75 @@ On a successful payment, the completed task's status message carries:
 }
 ```
 
-Failures surface under `x402.payment.error` with one of `INVALID_PAYLOAD`, `NETWORK_MISMATCH`, `INVALID_PAY_TO`, `AMOUNT_EXCEEDED`, `VERIFY_FAILED`, `SETTLE_FAILED`.
+Failures surface under `x402.payment.error` with one of the codes below. The seven names listed first come straight from spec §9.1; the remaining three are SDK-specific codes covering failure modes the SDK detects outside the facilitator's purview.
+
+| Code | Source | Meaning |
+|---|---|---|
+| `INSUFFICIENT_FUNDS` | spec §9.1 | Wallet can't cover the payment. |
+| `INVALID_SIGNATURE` | spec §9.1 | Authorization signature failed verification. |
+| `EXPIRED_PAYMENT` | spec §9.1 | Authorization was submitted after its validity window. |
+| `DUPLICATE_NONCE` | spec §9.1 | Nonce has already been spent. |
+| `NETWORK_MISMATCH` | spec §9.1 | Payload's network doesn't match any advertised `accepts`. |
+| `INVALID_AMOUNT` | spec §9.1 | Authorization value doesn't match the required amount. |
+| `SETTLEMENT_FAILED` | spec §9.1 | On-chain settle call failed. |
+| `INVALID_PAYLOAD` | SDK | Payment payload is missing or structurally invalid. |
+| `INVALID_PAY_TO` | SDK | Authorization target address doesn't match `payTo`. |
+| `VERIFY_FAILED` | SDK | Facilitator rejected the signature, but the reason string didn't match any of the spec codes above. |
+
+The SDK uses the facilitator's `invalidReason` string to dispatch into the spec codes (`mapVerifyFailureToCode()` exports the same logic if you need it client-side). Clients SHOULD branch on the spec codes first and treat `VERIFY_FAILED` as an unmapped fallback.
+
+### Payment lifecycle
+
+Every paid task runs through the same state machine (spec §7.1):
+
+```
+PAYMENT_REQUIRED → PAYMENT_REJECTED           (client declined the challenge)
+PAYMENT_REQUIRED → PAYMENT_SUBMITTED          (client signed and resubmitted)
+PAYMENT_SUBMITTED → PAYMENT_VERIFIED          (facilitator verified the signature)
+PAYMENT_VERIFIED → PAYMENT_COMPLETED          (on-chain settlement succeeded)
+PAYMENT_VERIFIED → PAYMENT_FAILED             (settlement failed on-chain)
+```
+
+The SDK emits `payment-verified` as a transient `working`-state event between submit and completion when streaming, so clients can surface a "settling on-chain…" indicator. In the blocking `execute()` path the state is recorded on `task.status` but clients only observe the final value.
+
+### Retry-on-failure (opt-in)
+
+By default, verify/settle failures terminate the task with state `failed` and an error code. Spec §9 also allows the merchant to "request a payment requirement with input-required again"; set `retryOnFailure: true` on the executor to pick that strategy — failures will re-publish `payment-required` on the same task with the prior failure reason carried in `X402PaymentRequiredResponse.error`, letting the client top up the wallet (or refresh the nonce) and resubmit without creating a new task.
+
+```ts
+new X402PaymentExecutor(inner, {
+  accepts: [...],
+  retryOnFailure: true,
+});
+```
+
+`x402.payment.receipts` accumulates every settle attempt (success or failure) across the task's lifetime per spec §7's "complete history" requirement.
+
+### Rejection handling
+
+When a client decides not to pay it can respond with `x402.payment.status: payment-rejected` (spec §5.4.2). The executor terminates the task with state `failed` and status `payment-rejected` — no further challenges are published, the loop ends.
 
 ## Client
 
-### High-level: `X402Client`
+### High-level: `A2XClient` with `x402`
+
+`A2XClient` itself runs the x402 dance when you pass an `x402` option. Whether the agent gates on x402 is a property of its AgentCard, not the caller — so you don't have to pick between two client classes. If the agent never asks for payment, the client behaves as a plain A2A client.
 
 ```ts
 import { A2XClient } from '@a2x/sdk/client';
-import { X402Client } from '@a2x/sdk/x402';
 import { privateKeyToAccount } from 'viem/accounts';
 
-const x402 = new X402Client(new A2XClient('https://agent.example.com'), {
-  signer: privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`),
-  onPaymentRequired: (required) => {
-    console.log('Merchant asks for', required.accepts);
+const client = new A2XClient('https://agent.example.com', {
+  x402: {
+    signer: privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`),
+    maxAmount: 10_000n,                          // optional; refuse anything above this
+    onPaymentRequired: (required) => {
+      console.log('Merchant asks for', required.accepts);
+    },
   },
 });
 
-const task = await x402.sendMessage({
+const task = await client.sendMessage({
   message: {
     messageId: crypto.randomUUID(),
     role: 'user',
@@ -135,17 +185,52 @@ const task = await x402.sendMessage({
 console.log(task.status.state); // "completed"
 ```
 
-If the merchant rejects the payment (verify or settle failed), `sendMessage` throws `X402PaymentFailedError` with the on-chain reason attached.
+The same call site works for streaming. The dance happens in-band — the generator yields the merchant's `payment-required` event and then continues with the followup stream's `payment-verified → working → artifacts → payment-completed` events:
+
+```ts
+for await (const event of client.sendMessageStream({ message: { … } })) {
+  console.log(event);
+}
+```
+
+If the merchant rejects the payment (verify or settle failed), the call throws `X402PaymentFailedError` with the on-chain reason attached. If every requirement in `accepts[]` exceeds `maxAmount`, signing throws `X402NoSupportedRequirementError` before any authorization is created.
+
+The full option surface:
+
+| Field | Default | Purpose |
+|---|---|---|
+| `signer` | required | viem `LocalAccount` used to produce the EIP-3009 authorization. |
+| `maxAmount` | no cap | Atomic-unit ceiling. Filters `accepts[]` before the selector runs, so a custom `selectRequirement` only sees the affordable subset. |
+| `selectRequirement` | first `scheme === 'exact'` | Predicate over the (already filtered) requirements. Return `undefined` to abort. |
+| `onPaymentRequired` | none | Hook that fires after `payment-required` and before signing. Throw to abort the dance — the caller observes the unmodified `payment-required` task (blocking) or a stream that closes after the `payment-required` event (streaming). |
+
+### Extension activation header
+
+Setting the `x402` option auto-registers `X402_EXTENSION_URI` so every JSON-RPC request carries the `X-A2A-Extensions` activation header (spec §8). You don't need to pass `extensions` separately for x402.
+
+To activate other extensions, list them in `extensions` or call `client.registerExtension(uri)` at runtime:
+
+```ts
+new A2XClient(url, {
+  extensions: ['https://example.org/some-extension'],
+  x402: { signer },                              // X402_EXTENSION_URI auto-added
+});
+```
 
 ### Low-level: `signX402Payment`
 
-Use this when you need to inspect the `payment-required` task before signing — e.g. to show the user a confirmation modal, to fetch the signer's balance, or to route across multiple wallets.
+When you need to inspect the `payment-required` task before signing — e.g. to show the user a confirmation modal, fetch the signer's balance, or route across multiple wallets — drive the dance manually using the primitives. `A2XClient` without the `x402` option will hand you the raw `payment-required` task, and `signX402Payment` produces the metadata block to attach to the followup `message/send` call.
 
 ```ts
+import { A2XClient } from '@a2x/sdk/client';
 import {
   signX402Payment,
   getX402PaymentRequirements,
 } from '@a2x/sdk/x402';
+
+const client = new A2XClient(url, {
+  extensions: [X402_EXTENSION_URI], // still required for header activation
+});
 
 const first = await client.sendMessage({ message: { … } });
 const required = getX402PaymentRequirements(first);
@@ -187,6 +272,18 @@ for (const receipt of receipts) {
   console.log(receipt.success, receipt.transaction, receipt.network);
 }
 ```
+
+## Server-side enforcement
+
+Per spec §8, x402-capable clients MUST include the extension URI in the `X-A2A-Extensions` HTTP header on every JSON-RPC request:
+
+```
+X-A2A-Extensions: https://github.com/google-agentic-commerce/a2a-x402/blob/main/spec/v0.2
+```
+
+When the merchant agent declares the extension with `required: true` on its AgentCard, `DefaultRequestHandler` rejects requests whose header doesn't list that URI (error `-32600`). The check only runs when a `RequestContext` is provided to `handler.handle()` — pure in-process invocations skip it.
+
+The client side is covered for you when you set `A2XClientOptions.x402` — see the section above. If you drive the dance manually via `signX402Payment`, pass `extensions: [X402_EXTENSION_URI]` to the `A2XClient` constructor (or call `client.registerExtension(X402_EXTENSION_URI)`) so the header gets emitted on every request.
 
 ## Supported scope
 

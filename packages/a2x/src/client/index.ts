@@ -3,7 +3,10 @@
  */
 
 export { A2XClient } from './a2x-client.js';
-export type { A2XClientOptions } from './a2x-client.js';
+export type {
+  A2XClientOptions,
+  A2XClientX402Options,
+} from './a2x-client.js';
 
 export {
   resolveAgentCard,

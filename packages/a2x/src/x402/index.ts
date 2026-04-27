@@ -30,15 +30,21 @@
  *
  * ```ts
  * import { A2XClient } from '@a2x/sdk/client';
- * import { X402Client } from '@a2x/sdk/x402';
  * import { privateKeyToAccount } from 'viem/accounts';
  *
- * const x402 = new X402Client(new A2XClient(url), {
- *   signer: privateKeyToAccount(process.env.PRIVATE_KEY),
+ * const client = new A2XClient(url, {
+ *   x402: { signer: privateKeyToAccount(process.env.PRIVATE_KEY) },
  * });
  *
- * const task = await x402.sendMessage({ message: { … } });
+ * const task = await client.sendMessage({ message: { … } });
  * ```
+ *
+ * `A2XClient` runs the Standalone Flow transparently — detect
+ * `payment-required`, sign one of the merchant's `accepts[]`, resubmit
+ * with the signed payload, and return the final task. For
+ * fine-grained control (e.g. inspecting the `payment-required` task
+ * before signing) drop down to the `signX402Payment` primitive
+ * exported from this module.
  */
 
 export {
@@ -48,6 +54,7 @@ export {
   X402_ERROR_CODES,
   X402_DEFAULT_TIMEOUT_SECONDS,
   X402_DEFAULT_RESOURCE,
+  mapVerifyFailureToCode,
   type X402PaymentStatus,
   type X402ErrorCode,
 } from './constants.js';
@@ -77,12 +84,10 @@ export {
   getX402PaymentRequirements,
   getX402Receipts,
   getX402Status,
-  X402Client,
 } from './client.js';
 export type {
   SignX402PaymentOptions,
   SignedX402Payment,
-  X402ClientOptions,
 } from './client.js';
 
 export {

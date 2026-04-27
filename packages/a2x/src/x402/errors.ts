@@ -1,7 +1,7 @@
 /**
- * x402-specific error types. Thrown client-side by helpers like
- * `signX402Payment` and `X402Client` when the server or the x402 flow
- * itself produces something unactionable.
+ * x402-specific error types. Thrown client-side by `A2XClient` (when
+ * its `x402` option is configured) and the `signX402Payment` primitive
+ * when the server or the x402 flow itself produces something unactionable.
  *
  * Server-side the SDK doesn't throw — it emits a `payment-failed` task
  * status with an error code under `x402.payment.error`.

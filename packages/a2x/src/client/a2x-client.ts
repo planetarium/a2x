@@ -5,6 +5,7 @@
  * Protocol version is determined from the AgentCard structure.
  */
 
+import type { LocalAccount } from 'viem';
 import type { AgentCardV03, AgentCardV10 } from '../types/agent-card.js';
 import type { Task } from '../types/task.js';
 import type {
@@ -43,13 +44,89 @@ import { parseSSEStream } from './sse-parser.js';
 import type { AuthProvider } from './auth-provider.js';
 import type { AuthScheme, AuthRequestContext } from './auth-scheme.js';
 import { normalizeRequirements } from './auth-normalizer.js';
+import {
+  X402_EXTENSION_URI,
+  X402_METADATA_KEYS,
+  X402_PAYMENT_STATUS,
+} from '../x402/constants.js';
+import {
+  signX402Payment,
+  getX402PaymentRequirements,
+  getX402Receipts,
+  type SignedX402Payment,
+} from '../x402/client.js';
+import { X402PaymentFailedError } from '../x402/errors.js';
+import type {
+  X402PaymentRequirements,
+  X402PaymentRequiredResponse,
+} from '../x402/types.js';
 
 // ─── Types ───
+
+/**
+ * a2a-x402 v0.2 client options. When supplied to `A2XClientOptions.x402`,
+ * `A2XClient` transparently runs the Standalone Flow: when the agent
+ * returns `payment-required`, the client signs one of the merchant's
+ * `accepts[]` requirements and resubmits with the signed payload, then
+ * surfaces only the final task to the caller.
+ *
+ * Spec: `specification/a2a-x402-v0.2.md`.
+ */
+export interface A2XClientX402Options {
+  /** viem LocalAccount used to sign EIP-3009 authorizations. */
+  signer: LocalAccount;
+  /**
+   * Maximum atomic units the client is willing to authorize per
+   * requirement. Default: no cap.
+   *
+   * Always enforced — any requirement whose `maxAmountRequired` exceeds
+   * this is filtered out before the selector runs, so a custom
+   * `selectRequirement` only sees the affordable subset. If nothing
+   * remains, signing throws `X402NoSupportedRequirementError`.
+   */
+  maxAmount?: bigint;
+  /**
+   * Custom predicate to pick a requirement out of the merchant's
+   * `accepts[]` (already filtered by `maxAmount` if set). Default:
+   * prefer `scheme === 'exact'`, else first remaining.
+   */
+  selectRequirement?: (
+    requirements: X402PaymentRequirements[],
+  ) => X402PaymentRequirements | undefined;
+  /**
+   * Hook invoked after the merchant publishes `payment-required` and
+   * before the client signs. Useful for prompting the user to confirm.
+   * Throw to abort the flow — the caller observes the merchant's
+   * unmodified `payment-required` task (blocking) or a stream that
+   * closes after the `payment-required` event (streaming).
+   */
+  onPaymentRequired?: (
+    required: X402PaymentRequiredResponse,
+  ) => void | Promise<void>;
+}
 
 export interface A2XClientOptions {
   fetch?: typeof globalThis.fetch;
   headers?: Record<string, string>;
   authProvider?: AuthProvider;
+  /**
+   * A2A extension URIs the client wants to activate. Emitted as a
+   * comma-separated `X-A2A-Extensions` HTTP header on every JSON-RPC
+   * request per a2a-x402 v0.2 §8 and the A2A core extension activation
+   * convention.
+   *
+   * You can also register extensions at runtime via `registerExtension()`.
+   *
+   * When `x402` is supplied below, `X402_EXTENSION_URI` is added here
+   * automatically — there's no need to list it manually.
+   */
+  extensions?: string[];
+  /**
+   * Enables transparent a2a-x402 v0.2 payment handling. Omit when calling
+   * agents that don't gate on x402; the client behaves as a plain A2A
+   * client in that case.
+   */
+  x402?: A2XClientX402Options;
 }
 
 // ─── Error Code → Error Class Mapping ───
@@ -119,6 +196,8 @@ export class A2XClient {
   private readonly _fetchImpl: typeof globalThis.fetch;
   private readonly _headers: Record<string, string>;
   private readonly _authProvider?: AuthProvider;
+  private readonly _extensions: Set<string>;
+  private readonly _x402?: A2XClientX402Options;
   private _resolved: ResolvedAgentCard | null = null;
   private _parser: ResponseParser | null = null;
   private _endpointUrl: string | null = null;
@@ -133,6 +212,26 @@ export class A2XClient {
     this._fetchImpl = options?.fetch ?? globalThis.fetch;
     this._headers = options?.headers ?? {};
     this._authProvider = options?.authProvider;
+    this._extensions = new Set(options?.extensions ?? []);
+    this._x402 = options?.x402;
+    if (this._x402) {
+      // Spec a2a-x402 v0.2 §8: clients MUST activate the extension via
+      // `X-A2A-Extensions`. Auto-register so callers don't have to.
+      this._extensions.add(X402_EXTENSION_URI);
+    }
+  }
+
+  /**
+   * Register an A2A extension URI to be included in the
+   * `X-A2A-Extensions` header on subsequent requests. Idempotent.
+   */
+  registerExtension(uri: string): void {
+    this._extensions.add(uri);
+  }
+
+  /** Read-only view of currently activated extension URIs. */
+  get activatedExtensions(): readonly string[] {
+    return [...this._extensions];
   }
 
   // ─── Public Methods ───
@@ -140,8 +239,124 @@ export class A2XClient {
   /**
    * Send a message and wait for the complete response.
    * Uses JSON-RPC method `message/send`.
+   *
+   * When `options.x402` is set on this client and the agent responds with
+   * `payment-required`, the dance is run transparently — the returned
+   * task is the final settled task.
    */
   async sendMessage(params: SendMessageParams): Promise<Task> {
+    const first = await this._sendMessageOnce(params);
+    if (!this._x402) return first;
+    if (first.status.state !== 'input-required') return first;
+
+    const required = getX402PaymentRequirements(first);
+    if (!required) return first;
+
+    if (this._x402.onPaymentRequired) {
+      await this._x402.onPaymentRequired(required);
+    }
+
+    const signed = await this._signX402(first);
+
+    const followup: SendMessageParams = {
+      ...params,
+      message: {
+        ...params.message,
+        messageId: globalThis.crypto.randomUUID(),
+        taskId: first.id,
+        contextId: first.contextId,
+        metadata: {
+          ...(params.message.metadata ?? {}),
+          ...signed.metadata,
+        },
+      },
+    };
+
+    const second = await this._sendMessageOnce(followup);
+
+    const receipts = getX402Receipts(second);
+    const failed = receipts.find((r) => !r.success);
+    if (failed) {
+      const errorCode =
+        ((second.status.message?.metadata as Record<string, unknown> | undefined)?.[
+          X402_METADATA_KEYS.ERROR
+        ] as string | undefined) ?? 'UNKNOWN';
+      throw new X402PaymentFailedError(
+        failed.errorReason ?? 'Payment failed',
+        errorCode,
+        { transaction: failed.transaction, network: failed.network },
+      );
+    }
+
+    return second;
+  }
+
+  /**
+   * Send a message and stream the response via SSE.
+   * Uses JSON-RPC method `message/stream`.
+   *
+   * When `options.x402` is set on this client and the first stream emits
+   * `payment-required`, the dance runs transparently: that event is
+   * yielded to the caller, the first stream is abandoned, and the
+   * follow-up stream's events (`payment-verified` → `working` →
+   * artifacts → `payment-completed`) are yielded on the same generator.
+   */
+  async *sendMessageStream(
+    params: SendMessageParams,
+    signal?: AbortSignal,
+  ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
+    if (!this._x402) {
+      yield* this._sendMessageStreamOnce(params, signal);
+      return;
+    }
+
+    let firstTask: Task | undefined;
+    for await (const event of this._sendMessageStreamOnce(params, signal)) {
+      yield event;
+      if ('status' in event && event.status?.state === 'input-required') {
+        const meta = event.status.message?.metadata as
+          | Record<string, unknown>
+          | undefined;
+        if (meta?.[X402_METADATA_KEYS.STATUS] === X402_PAYMENT_STATUS.REQUIRED) {
+          firstTask = {
+            id: event.taskId,
+            contextId: event.contextId,
+            status: event.status,
+          } as Task;
+          break;
+        }
+      }
+    }
+
+    if (!firstTask) return;
+
+    const required = getX402PaymentRequirements(firstTask);
+    if (!required) return;
+
+    if (this._x402.onPaymentRequired) {
+      await this._x402.onPaymentRequired(required);
+    }
+
+    const signed = await this._signX402(firstTask);
+
+    const followup: SendMessageParams = {
+      ...params,
+      message: {
+        ...params.message,
+        messageId: globalThis.crypto.randomUUID(),
+        taskId: firstTask.id,
+        contextId: firstTask.contextId,
+        metadata: {
+          ...(params.message.metadata ?? {}),
+          ...signed.metadata,
+        },
+      },
+    };
+
+    yield* this._sendMessageStreamOnce(followup, signal);
+  }
+
+  private async _sendMessageOnce(params: SendMessageParams): Promise<Task> {
     await this._ensureResolved();
     await this._ensureAuthenticated();
     const formatted = this._formatParams(params);
@@ -150,11 +365,7 @@ export class A2XClient {
     return this._parser!.parseTask(result);
   }
 
-  /**
-   * Send a message and stream the response via SSE.
-   * Uses JSON-RPC method `message/stream`.
-   */
-  async *sendMessageStream(
+  private async *_sendMessageStreamOnce(
     params: SendMessageParams,
     signal?: AbortSignal,
   ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
@@ -200,6 +411,27 @@ export class A2XClient {
     }
 
     yield* parseSSEStream(response, this._parser!);
+  }
+
+  private async _signX402(task: Task): Promise<SignedX402Payment> {
+    const x402 = this._x402!;
+    const userSelect = x402.selectRequirement;
+    const select = (
+      reqs: X402PaymentRequirements[],
+    ): X402PaymentRequirements | undefined => {
+      // maxAmount is enforced first regardless of caller predicate, so a
+      // user-provided selectRequirement only sees the affordable subset.
+      const affordable =
+        x402.maxAmount === undefined
+          ? reqs
+          : reqs.filter((r) => isWithinBudget(r, x402.maxAmount!));
+      if (userSelect) return userSelect(affordable);
+      return affordable.find((r) => r.scheme === 'exact') ?? affordable[0];
+    };
+    return signX402Payment(task, {
+      signer: x402.signer,
+      selectRequirement: select,
+    });
   }
 
   /**
@@ -363,11 +595,18 @@ export class A2XClient {
   private _buildHeaders(
     extra?: Record<string, string>,
   ): Record<string, string> {
-    return {
+    const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       ...extra,
       ...this._headers,
     };
+    if (this._extensions.size > 0) {
+      // Spec a2a-x402 v0.2 §8: clients MUST request activation via
+      // `X-A2A-Extensions`. Multiple active extensions are comma-separated
+      // per standard HTTP list-header convention.
+      headers['X-A2A-Extensions'] = [...this._extensions].join(', ');
+    }
+    return headers;
   }
 
   private _buildJsonRpcRequest(
@@ -425,5 +664,18 @@ export class A2XClient {
     }
 
     return (jsonRpcResponse as { result: unknown }).result;
+  }
+}
+
+function isWithinBudget(
+  requirement: X402PaymentRequirements,
+  maxAmount: bigint,
+): boolean {
+  try {
+    return BigInt(requirement.maxAmountRequired) <= maxAmount;
+  } catch {
+    // Unparseable amount — defer to the signer to fail loudly rather
+    // than silently swallow the requirement.
+    return true;
   }
 }

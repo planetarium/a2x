@@ -338,13 +338,12 @@ Client:
 
 ```typescript
 import { A2XClient } from '@a2x/sdk/client';
-import { X402Client } from '@a2x/sdk/x402';
 import { privateKeyToAccount } from 'viem/accounts';
 
-const x402 = new X402Client(new A2XClient(url), {
-  signer: privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`),
+const client = new A2XClient(url, {
+  x402: { signer: privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`) },
 });
-const task = await x402.sendMessage({ message: { role: 'user', parts: [{ text: '...' }] } });
+const task = await client.sendMessage({ message: { role: 'user', parts: [{ text: '...' }] } });
 ```
 
 Full guide: [docs/guides/advanced/x402-payments.md](./docs/guides/advanced/x402-payments.md).

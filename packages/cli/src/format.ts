@@ -4,7 +4,13 @@
 
 import chalk from 'chalk';
 import { A2XClient } from '@a2x/sdk';
-import type { Task, TaskStatusUpdateEvent, TaskArtifactUpdateEvent, Part } from '@a2x/sdk';
+import type {
+  A2XClientX402Options,
+  Task,
+  TaskStatusUpdateEvent,
+  TaskArtifactUpdateEvent,
+  Part,
+} from '@a2x/sdk';
 import { CliAuthProvider } from './cli-auth-provider.js';
 
 // ─── Error Formatting ───
@@ -247,14 +253,21 @@ export function parseHeaders(headerArgs?: string[]): Record<string, string> | un
 /**
  * Create an A2XClient from CLI arguments.
  * Automatically wires up the interactive CLI auth provider with token persistence.
+ *
+ * Pass `x402` to enable transparent x402 payment handling — the call sites
+ * for `a2x a2a send` and `a2x a2a stream` build it via
+ * `buildBudgetedX402ClientSettings()` so the spend ceiling and the
+ * `--no-x402` opt-out are respected.
  */
 export function createClient(
   url: string,
   opts: { header?: string[] },
+  extra?: { x402?: A2XClientX402Options },
 ): A2XClient {
   const headers = parseHeaders(opts.header);
   return new A2XClient(url, {
     headers,
     authProvider: new CliAuthProvider(url),
+    x402: extra?.x402,
   });
 }
