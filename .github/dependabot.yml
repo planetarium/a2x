@@ -4,39 +4,62 @@ updates:
   - package-ecosystem: "npm"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
       day: "monday"
       time: "09:00"
       timezone: "Asia/Seoul"
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 5
     labels:
       - "dependencies"
     commit-message:
       prefix: "chore(deps)"
       include: "scope"
     groups:
+      # next-stack must come before typescript-toolchain so that
+      # eslint-config-next is grouped with next/react instead of eslint.
+      next-stack:
+        patterns:
+          - "next"
+          - "react"
+          - "react-dom"
+          - "eslint-config-next"
+          - "@types/react"
+          - "@types/react-dom"
+      tailwind:
+        patterns:
+          - "tailwindcss"
+          - "@tailwindcss/*"
       typescript-toolchain:
         patterns:
           - "typescript"
           - "tsup"
           - "@typescript-eslint/*"
           - "eslint"
+          - "eslint-*"
           - "vitest"
       llm-providers:
         patterns:
           - "@anthropic-ai/sdk"
           - "openai"
           - "@google/genai"
+      build-tools:
+        patterns:
+          - "@yao-pkg/pkg"
+          - "@changesets/*"
     ignore:
       # Major bumps are handled manually to avoid surprise breakages.
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
+      # Patch bumps are noise. Security advisories still fire via
+      # dependabot security-updates regardless of this filter.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-patch"]
 
   # GitHub Actions used by workflows under .github/workflows.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
       day: "monday"
       time: "09:00"
       timezone: "Asia/Seoul"
@@ -45,6 +68,10 @@ updates:
       - "github-actions"
     commit-message:
       prefix: "chore(ci)"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
     ignore:
       # Action major bumps are handled manually. A semver-valid major can
       # still be freshly released and unstable (see pnpm/action-setup v6
@@ -52,3 +79,6 @@ updates:
       # on install — pnpm/action-setup#227 and #228).
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
+      # Patch bumps for actions are noise; security advisories still fire.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-patch"]
