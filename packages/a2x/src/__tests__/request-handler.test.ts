@@ -1154,6 +1154,64 @@ describe('Layer 4: DefaultRequestHandler', () => {
         const stored = await pushStore.get('task-1', generatedId!);
         expect(stored?.pushNotificationConfig.id).toBe(generatedId);
       });
+
+      it('should accept v0.3 spec authentication shape with schemes array', async () => {
+        const { handler, pushStore } = createHandlerWithPushNotification('0.3');
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/set',
+          params: {
+            taskId: 'task-1',
+            pushNotificationConfig: {
+              id: 'config-1',
+              url: 'https://example.com/webhook',
+              authentication: { schemes: ['Bearer'], credentials: 'abc123' },
+            },
+          },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(false);
+        const result = (rpc as { result: { pushNotificationConfig: { authentication: unknown } } }).result;
+        expect(result.pushNotificationConfig.authentication).toEqual({
+          schemes: ['Bearer'],
+          credentials: 'abc123',
+        });
+
+        const stored = await pushStore.get('task-1', 'config-1');
+        expect(stored?.pushNotificationConfig.authentication).toEqual({
+          schemes: ['Bearer'],
+          credentials: 'abc123',
+        });
+      });
+
+      it('should return InvalidParams when v0.3 authentication.schemes is empty', async () => {
+        const { handler } = createHandlerWithPushNotification('0.3');
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/set',
+          params: {
+            taskId: 'task-1',
+            pushNotificationConfig: {
+              id: 'config-1',
+              url: 'https://example.com/webhook',
+              authentication: { schemes: [] },
+            },
+          },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(true);
+        expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+          A2A_ERROR_CODES.INVALID_PARAMS,
+        );
+      });
     });
 
     describe('v1.0 wire format (flattened response)', () => {
@@ -1277,7 +1335,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
         );
       });
 
-      it('should return InvalidParams when authentication.schemes is empty', async () => {
+      it('should return InvalidParams when authentication.scheme is missing', async () => {
         const { handler } = createHandlerWithPushNotification('1.0');
 
         const response = await handler.handle({
@@ -1289,7 +1347,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
             pushNotificationConfig: {
               id: 'config-1',
               url: 'https://example.com/webhook',
-              authentication: { schemes: [] },
+              authentication: { credentials: 'abc123' },
             },
           },
         });
@@ -1302,7 +1360,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
         );
       });
 
-      it('should accept valid authentication info', async () => {
+      it('should reject v0.3-shape authentication.schemes on a v1.0 wire', async () => {
         const { handler } = createHandlerWithPushNotification('1.0');
 
         const response = await handler.handle({
@@ -1314,7 +1372,32 @@ describe('Layer 4: DefaultRequestHandler', () => {
             pushNotificationConfig: {
               id: 'config-1',
               url: 'https://example.com/webhook',
-              authentication: { schemes: ['Bearer'], credentials: 'abc123' },
+              authentication: { schemes: ['Bearer'] },
+            },
+          },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(true);
+        expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+          A2A_ERROR_CODES.INVALID_PARAMS,
+        );
+      });
+
+      it('should accept v1.0 spec authentication shape and round-trip via internal v0.3 form', async () => {
+        const { handler, pushStore } = createHandlerWithPushNotification('1.0');
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/set',
+          params: {
+            taskId: 'task-1',
+            pushNotificationConfig: {
+              id: 'config-1',
+              url: 'https://example.com/webhook',
+              authentication: { scheme: 'Bearer', credentials: 'abc123' },
             },
           },
         });
@@ -1323,7 +1406,13 @@ describe('Layer 4: DefaultRequestHandler', () => {
         const rpc = response as JSONRPCResponse;
         expect('error' in rpc).toBe(false);
         const result = (rpc as { result: { authentication: unknown } }).result;
-        expect(result.authentication).toEqual({ schemes: ['Bearer'], credentials: 'abc123' });
+        expect(result.authentication).toEqual({ scheme: 'Bearer', credentials: 'abc123' });
+
+        const stored = await pushStore.get('task-1', 'config-1');
+        expect(stored?.pushNotificationConfig.authentication).toEqual({
+          schemes: ['Bearer'],
+          credentials: 'abc123',
+        });
       });
     });
   });
@@ -1376,6 +1465,32 @@ describe('Layer 4: DefaultRequestHandler', () => {
           url: 'https://example.com/webhook',
           token: 'tok-1',
         });
+      });
+
+      it('should translate stored authentication to v1.0 wire shape on read', async () => {
+        const { handler, pushStore } = createHandlerWithPushNotification('1.0');
+
+        await pushStore.set({
+          taskId: 'task-1',
+          pushNotificationConfig: {
+            id: 'config-1',
+            url: 'https://example.com/webhook',
+            authentication: { schemes: ['Bearer'], credentials: 'abc123' },
+          },
+        });
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/get',
+          params: { taskId: 'task-1', id: 'config-1' },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(false);
+        const result = (rpc as { result: { authentication: unknown } }).result;
+        expect(result.authentication).toEqual({ scheme: 'Bearer', credentials: 'abc123' });
       });
 
       it('should return TaskNotFound when config does not exist', async () => {
@@ -1633,6 +1748,36 @@ describe('Layer 4: DefaultRequestHandler', () => {
         const rpc = response as JSONRPCResponse;
         expect('error' in rpc).toBe(false);
         expect((rpc as { result: unknown }).result).toEqual({ configs: [], nextPageToken: '' });
+      });
+
+      it('should translate stored authentication to v1.0 wire shape on list', async () => {
+        const { handler, pushStore } = createHandlerWithPushNotification('1.0');
+
+        await pushStore.set({
+          taskId: 'task-1',
+          pushNotificationConfig: {
+            id: 'config-1',
+            url: 'https://example.com/webhook',
+            authentication: { schemes: ['Bearer'], credentials: 'abc123' },
+          },
+        });
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/list',
+          params: { taskId: 'task-1' },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(false);
+        const result = (rpc as { result: { configs: { authentication?: unknown }[] } }).result;
+        expect(result.configs).toHaveLength(1);
+        expect(result.configs[0].authentication).toEqual({
+          scheme: 'Bearer',
+          credentials: 'abc123',
+        });
       });
 
       it('should accept pageSize/pageToken params and ignore them', async () => {
