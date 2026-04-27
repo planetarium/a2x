@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { DefaultRequestHandler } from '../transport/request-handler.js';
+import { DefaultRequestHandler, getHttpStatus, getHttpHeaders } from '../transport/request-handler.js';
 import { A2XAgent } from '../a2x/a2x-agent.js';
 import type { ProtocolVersion } from '../a2x/a2x-agent.js';
 import { AgentExecutor, StreamingMode } from '../a2x/agent-executor.js';
@@ -76,11 +76,11 @@ function createHandlerWithPushNotification(protocolVersion?: ProtocolVersion): {
   return { handler: new DefaultRequestHandler(a2xAgent), pushStore };
 }
 
-function isAsyncGenerator(value: unknown): value is AsyncGenerator {
+function isAsyncGeneratorBody(body: unknown): body is AsyncGenerator {
   return (
-    value !== null &&
-    typeof value === 'object' &&
-    Symbol.asyncIterator in (value as object)
+    body !== null &&
+    typeof body === 'object' &&
+    Symbol.asyncIterator in (body as object)
   );
 }
 
@@ -88,10 +88,10 @@ describe('Layer 4: DefaultRequestHandler', () => {
   describe('JSON-RPC error handling', () => {
     it('should return parse error for invalid JSON string', async () => {
       const handler = createHandler();
-      const response = await handler.handle('not json');
+      const result = await handler.handle('not json');
 
-      expect(isAsyncGenerator(response)).toBe(false);
-      const rpc = response as JSONRPCResponse;
+      expect(isAsyncGeneratorBody(result.body)).toBe(false);
+      const rpc = result.body as JSONRPCResponse;
       expect(rpc.jsonrpc).toBe('2.0');
       expect(rpc.id).toBeNull();
       expect('error' in rpc).toBe(true);
@@ -102,14 +102,14 @@ describe('Layer 4: DefaultRequestHandler', () => {
 
     it('should return invalid request for missing jsonrpc version', async () => {
       const handler = createHandler();
-      const response = await handler.handle({
+      const result = await handler.handle({
         jsonrpc: '1.0' as '2.0',
         id: 1,
         method: 'test',
       });
 
-      expect(isAsyncGenerator(response)).toBe(false);
-      const rpc = response as JSONRPCResponse;
+      expect(isAsyncGeneratorBody(result.body)).toBe(false);
+      const rpc = result.body as JSONRPCResponse;
       expect('error' in rpc).toBe(true);
       expect((rpc as JSONRPCErrorResponse).error.code).toBe(
         A2A_ERROR_CODES.INVALID_REQUEST,
@@ -118,14 +118,14 @@ describe('Layer 4: DefaultRequestHandler', () => {
 
     it('should return method not found for unknown method', async () => {
       const handler = createHandler();
-      const response = await handler.handle({
+      const result = await handler.handle({
         jsonrpc: '2.0',
         id: 1,
         method: 'unknown/method',
       });
 
-      expect(isAsyncGenerator(response)).toBe(false);
-      const rpc = response as JSONRPCResponse;
+      expect(isAsyncGeneratorBody(result.body)).toBe(false);
+      const rpc = result.body as JSONRPCResponse;
       expect('error' in rpc).toBe(true);
       expect((rpc as JSONRPCErrorResponse).error.code).toBe(
         A2A_ERROR_CODES.METHOD_NOT_FOUND,
@@ -136,7 +136,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
   describe('message/send', () => {
     it('should process a message and return a task', async () => {
       const handler = createHandler();
-      const response = await handler.handle({
+      const result = await handler.handle({
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
@@ -149,8 +149,8 @@ describe('Layer 4: DefaultRequestHandler', () => {
         },
       });
 
-      expect(isAsyncGenerator(response)).toBe(false);
-      const rpc = response as JSONRPCResponse;
+      expect(isAsyncGeneratorBody(result.body)).toBe(false);
+      const rpc = result.body as JSONRPCResponse;
       expect('result' in rpc).toBe(true);
       const task = (rpc as { result: unknown }).result as { id: string; status: { state: string } };
       expect(task.id).toBeDefined();
@@ -160,15 +160,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
 
     it('should return invalid params when message is missing', async () => {
       const handler = createHandler();
-      const response = await handler.handle({
+      const result = await handler.handle({
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
         params: {},
       });
 
-      expect(isAsyncGenerator(response)).toBe(false);
-      const rpc = response as JSONRPCResponse;
+      expect(isAsyncGeneratorBody(result.body)).toBe(false);
+      const rpc = result.body as JSONRPCResponse;
       expect('error' in rpc).toBe(true);
       expect((rpc as JSONRPCErrorResponse).error.code).toBe(
         A2A_ERROR_CODES.INVALID_PARAMS,
@@ -179,7 +179,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
   describe('message/send - v0.3 response format', () => {
     it('should include kind discriminators in v0.3 mode', async () => {
       const handler = createHandler('0.3');
-      const response = await handler.handle({
+      const result = await handler.handle({
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
@@ -192,8 +192,8 @@ describe('Layer 4: DefaultRequestHandler', () => {
         },
       });
 
-      expect(isAsyncGenerator(response)).toBe(false);
-      const rpc = response as JSONRPCResponse;
+      expect(isAsyncGeneratorBody(result.body)).toBe(false);
+      const rpc = result.body as JSONRPCResponse;
       expect('result' in rpc).toBe(true);
       const task = (rpc as { result: unknown }).result as Record<string, unknown>;
 
@@ -216,7 +216,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
 
     it('should default artifact name to "response" in v0.3 mode', async () => {
       const handler = createHandler('0.3');
-      const response = await handler.handle({
+      const result = await handler.handle({
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
@@ -229,7 +229,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
         },
       });
 
-      const rpc = response as JSONRPCResponse;
+      const rpc = result.body as JSONRPCResponse;
       const task = (rpc as { result: unknown }).result as Record<string, unknown>;
       const artifacts = task.artifacts as Array<Record<string, unknown>> | undefined;
 
@@ -245,7 +245,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
   describe('message/send - v1.0 response format', () => {
     it('should NOT include kind discriminators in v1.0 mode', async () => {
       const handler = createHandler('1.0');
-      const response = await handler.handle({
+      const result = await handler.handle({
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
@@ -258,8 +258,8 @@ describe('Layer 4: DefaultRequestHandler', () => {
         },
       });
 
-      expect(isAsyncGenerator(response)).toBe(false);
-      const rpc = response as JSONRPCResponse;
+      expect(isAsyncGeneratorBody(result.body)).toBe(false);
+      const rpc = result.body as JSONRPCResponse;
       expect('result' in rpc).toBe(true);
       const task = (rpc as { result: unknown }).result as Record<string, unknown>;
 
@@ -277,15 +277,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
   describe('tasks/get', () => {
     it('should return task not found for non-existent task', async () => {
       const handler = createHandler();
-      const response = await handler.handle({
+      const result = await handler.handle({
         jsonrpc: '2.0',
         id: 1,
         method: 'tasks/get',
         params: { id: 'non-existent' },
       });
 
-      expect(isAsyncGenerator(response)).toBe(false);
-      const rpc = response as JSONRPCResponse;
+      expect(isAsyncGeneratorBody(result.body)).toBe(false);
+      const rpc = result.body as JSONRPCResponse;
       expect('error' in rpc).toBe(true);
       expect((rpc as JSONRPCErrorResponse).error.code).toBe(
         A2A_ERROR_CODES.TASK_NOT_FOUND,
@@ -296,7 +296,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
       const handler = createHandler();
 
       // Create a task first
-      const sendResponse = await handler.handle({
+      const sendResult = await handler.handle({
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
@@ -309,18 +309,18 @@ describe('Layer 4: DefaultRequestHandler', () => {
         },
       });
 
-      const task = ((sendResponse as JSONRPCResponse) as { result: unknown }).result as { id: string };
+      const task = ((sendResult.body as JSONRPCResponse) as { result: unknown }).result as { id: string };
 
       // Get the task
-      const getResponse = await handler.handle({
+      const getResult = await handler.handle({
         jsonrpc: '2.0',
         id: 2,
         method: 'tasks/get',
         params: { id: task.id },
       });
 
-      expect(isAsyncGenerator(getResponse)).toBe(false);
-      const rpc = getResponse as JSONRPCResponse;
+      expect(isAsyncGeneratorBody(getResult.body)).toBe(false);
+      const rpc = getResult.body as JSONRPCResponse;
       expect('result' in rpc).toBe(true);
       const retrieved = (rpc as { result: unknown }).result as { id: string };
       expect(retrieved.id).toBe(task.id);
@@ -330,7 +330,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
       const handler = createHandler('1.0');
 
       // Create a task
-      const sendResponse = await handler.handle({
+      const sendResult = await handler.handle({
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
@@ -343,17 +343,17 @@ describe('Layer 4: DefaultRequestHandler', () => {
         },
       });
 
-      const task = ((sendResponse as JSONRPCResponse) as { result: unknown }).result as { id: string };
+      const task = ((sendResult.body as JSONRPCResponse) as { result: unknown }).result as { id: string };
 
       // Get the task
-      const getResponse = await handler.handle({
+      const getResult = await handler.handle({
         jsonrpc: '2.0',
         id: 2,
         method: 'tasks/get',
         params: { id: task.id },
       });
 
-      const rpc = getResponse as JSONRPCResponse;
+      const rpc = getResult.body as JSONRPCResponse;
       const retrieved = (rpc as { result: unknown }).result as Record<string, unknown>;
 
       // v1.0: no kind, UPPER_SNAKE_CASE state
@@ -365,7 +365,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
       const handler = createHandler('0.3');
 
       // Create a task
-      const sendResponse = await handler.handle({
+      const sendResult = await handler.handle({
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
@@ -378,17 +378,17 @@ describe('Layer 4: DefaultRequestHandler', () => {
         },
       });
 
-      const task = ((sendResponse as JSONRPCResponse) as { result: unknown }).result as { id: string };
+      const task = ((sendResult.body as JSONRPCResponse) as { result: unknown }).result as { id: string };
 
       // Get the task
-      const getResponse = await handler.handle({
+      const getResult = await handler.handle({
         jsonrpc: '2.0',
         id: 2,
         method: 'tasks/get',
         params: { id: task.id },
       });
 
-      const rpc = getResponse as JSONRPCResponse;
+      const rpc = getResult.body as JSONRPCResponse;
       const retrieved = (rpc as { result: unknown }).result as Record<string, unknown>;
 
       // v0.3: has kind, lowercase state
@@ -400,15 +400,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
   describe('tasks/cancel', () => {
     it('should return task not found for non-existent task', async () => {
       const handler = createHandler();
-      const response = await handler.handle({
+      const result = await handler.handle({
         jsonrpc: '2.0',
         id: 1,
         method: 'tasks/cancel',
         params: { id: 'non-existent' },
       });
 
-      expect(isAsyncGenerator(response)).toBe(false);
-      const rpc = response as JSONRPCResponse;
+      expect(isAsyncGeneratorBody(result.body)).toBe(false);
+      const rpc = result.body as JSONRPCResponse;
       expect('error' in rpc).toBe(true);
       expect((rpc as JSONRPCErrorResponse).error.code).toBe(
         A2A_ERROR_CODES.TASK_NOT_FOUND,
@@ -442,15 +442,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
       // Cancel the WORKING task — this should NOT throw InternalError
       // Before fix: cancel() mutated task to CANCELED, then updateTask()
       // hit the terminal state guard and threw "Cannot update task in terminal state"
-      const cancelResponse = await handler.handle({
+      const cancelResult = await handler.handle({
         jsonrpc: '2.0',
         id: 1,
         method: 'tasks/cancel',
         params: { id: task.id },
       });
 
-      expect(isAsyncGenerator(cancelResponse)).toBe(false);
-      const rpc = cancelResponse as JSONRPCResponse;
+      expect(isAsyncGeneratorBody(cancelResult.body)).toBe(false);
+      const rpc = cancelResult.body as JSONRPCResponse;
       expect('error' in rpc).toBe(false);
       expect('result' in rpc).toBe(true);
     });
@@ -472,10 +472,10 @@ describe('Layer 4: DefaultRequestHandler', () => {
         },
       });
 
-      expect(isAsyncGenerator(result)).toBe(true);
+      expect(isAsyncGeneratorBody(result.body)).toBe(true);
 
       // Consume the async generator and collect events
-      const generator = result as AsyncGenerator<Record<string, unknown>>;
+      const generator = result.body as AsyncGenerator<Record<string, unknown>>;
       const events: unknown[] = [];
 
       for await (const event of generator) {
@@ -515,9 +515,9 @@ describe('Layer 4: DefaultRequestHandler', () => {
         },
       });
 
-      expect(isAsyncGenerator(result)).toBe(true);
+      expect(isAsyncGeneratorBody(result.body)).toBe(true);
 
-      const generator = result as AsyncGenerator<Record<string, unknown>>;
+      const generator = result.body as AsyncGenerator<Record<string, unknown>>;
       const events: Record<string, unknown>[] = [];
 
       for await (const event of generator) {
@@ -560,9 +560,9 @@ describe('Layer 4: DefaultRequestHandler', () => {
         },
       });
 
-      expect(isAsyncGenerator(result)).toBe(true);
+      expect(isAsyncGeneratorBody(result.body)).toBe(true);
 
-      const generator = result as AsyncGenerator<Record<string, unknown>>;
+      const generator = result.body as AsyncGenerator<Record<string, unknown>>;
       const events: Record<string, unknown>[] = [];
 
       for await (const event of generator) {
@@ -634,9 +634,9 @@ describe('Layer 4: DefaultRequestHandler', () => {
       });
 
       // No context → no auth check → should proceed
-      const response = await handler.handle(validRequest);
-      expect(isAsyncGenerator(response)).toBe(false);
-      const rpc = response as JSONRPCResponse;
+      const result = await handler.handle(validRequest);
+      expect(isAsyncGeneratorBody(result.body)).toBe(false);
+      const rpc = result.body as JSONRPCResponse;
       expect('result' in rpc).toBe(true);
     });
 
@@ -654,9 +654,9 @@ describe('Layer 4: DefaultRequestHandler', () => {
       const context: RequestContext = {
         headers: { 'x-api-key': 'secret-123' },
       };
-      const response = await handler.handle(validRequest, context);
-      expect(isAsyncGenerator(response)).toBe(false);
-      const rpc = response as JSONRPCResponse;
+      const result = await handler.handle(validRequest, context);
+      expect(isAsyncGeneratorBody(result.body)).toBe(false);
+      const rpc = result.body as JSONRPCResponse;
       expect('result' in rpc).toBe(true);
     });
 
@@ -674,9 +674,9 @@ describe('Layer 4: DefaultRequestHandler', () => {
       const context: RequestContext = {
         headers: { 'x-api-key': 'wrong-key' },
       };
-      const response = await handler.handle(validRequest, context);
-      expect(isAsyncGenerator(response)).toBe(false);
-      const rpc = response as JSONRPCResponse;
+      const result = await handler.handle(validRequest, context);
+      expect(isAsyncGeneratorBody(result.body)).toBe(false);
+      const rpc = result.body as JSONRPCResponse;
       expect('error' in rpc).toBe(true);
       expect((rpc as JSONRPCErrorResponse).error.code).toBe(
         A2A_ERROR_CODES.AUTHENTICATION_REQUIRED,
@@ -695,9 +695,9 @@ describe('Layer 4: DefaultRequestHandler', () => {
       });
 
       const context: RequestContext = { headers: {} };
-      const response = await handler.handle(validRequest, context);
-      expect(isAsyncGenerator(response)).toBe(false);
-      const rpc = response as JSONRPCResponse;
+      const result = await handler.handle(validRequest, context);
+      expect(isAsyncGeneratorBody(result.body)).toBe(false);
+      const rpc = result.body as JSONRPCResponse;
       expect('error' in rpc).toBe(true);
       expect((rpc as JSONRPCErrorResponse).error.code).toBe(
         A2A_ERROR_CODES.AUTHENTICATION_REQUIRED,
@@ -731,9 +731,9 @@ describe('Layer 4: DefaultRequestHandler', () => {
           authorization: 'Bearer valid-token',
         },
       };
-      const response = await handler.handle(validRequest, context);
-      expect(isAsyncGenerator(response)).toBe(false);
-      const rpc = response as JSONRPCResponse;
+      const result = await handler.handle(validRequest, context);
+      expect(isAsyncGeneratorBody(result.body)).toBe(false);
+      const rpc = result.body as JSONRPCResponse;
       expect('result' in rpc).toBe(true);
     });
 
@@ -763,9 +763,9 @@ describe('Layer 4: DefaultRequestHandler', () => {
           authorization: 'Bearer wrong-token',
         },
       };
-      const response = await handler.handle(validRequest, context);
-      expect(isAsyncGenerator(response)).toBe(false);
-      const rpc = response as JSONRPCResponse;
+      const result = await handler.handle(validRequest, context);
+      expect(isAsyncGeneratorBody(result.body)).toBe(false);
+      const rpc = result.body as JSONRPCResponse;
       expect('error' in rpc).toBe(true);
       expect((rpc as JSONRPCErrorResponse).error.code).toBe(
         A2A_ERROR_CODES.AUTHENTICATION_REQUIRED,
@@ -783,25 +783,76 @@ describe('Layer 4: DefaultRequestHandler', () => {
       });
 
       const context: RequestContext = { headers: {} };
-      const response = await handler.handle(validRequest, context);
-      expect(isAsyncGenerator(response)).toBe(false);
-      const rpc = response as JSONRPCResponse;
+      const result = await handler.handle(validRequest, context);
+      expect(isAsyncGeneratorBody(result.body)).toBe(false);
+      const rpc = result.body as JSONRPCResponse;
       expect('result' in rpc).toBe(true);
+    });
+
+    it('should return HTTP 401 status for auth failures', async () => {
+      const handler = createAuthHandler((agent) => {
+        agent
+          .addSecurityScheme('apiKey', new ApiKeyAuthorization({
+            in: 'header',
+            name: 'x-api-key',
+            keys: ['secret-123'],
+          }))
+          .addSecurityRequirement({ apiKey: [] });
+      });
+
+      const context: RequestContext = {
+        headers: { 'x-api-key': 'wrong-key' },
+      };
+      const result = await handler.handle(validRequest, context);
+      expect(result.http?.status).toBe(401);
+      expect(result.http?.headers?.['WWW-Authenticate']).toBe('Bearer');
+      const rpc = result.body as JSONRPCErrorResponse;
+      expect(rpc.error.code).toBe(A2A_ERROR_CODES.AUTHENTICATION_REQUIRED);
+    });
+
+    it('should not include HTTP metadata for non-auth errors', async () => {
+      const handler = createHandler();
+      const result = await handler.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'unknown/method',
+      });
+
+      expect(result.http).toBeUndefined();
+      expect(getHttpStatus(result)).toBe(200);
+    });
+
+    it('should not include HTTP metadata for successful responses', async () => {
+      const handler = createHandler();
+      const result = await handler.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: {
+          message: {
+            messageId: 'msg-1',
+            role: 'user',
+            parts: [{ text: 'Hello' }],
+          },
+        },
+      });
+
+      expect(result.http).toBeUndefined();
     });
   });
 
   describe('tasks/pushNotificationConfig/delete', () => {
     it('should return PushNotificationNotSupported when no store configured', async () => {
       const handler = createHandler();
-      const response = await handler.handle({
+      const result = await handler.handle({
         jsonrpc: '2.0',
         id: 1,
         method: 'tasks/pushNotificationConfig/delete',
         params: { taskId: 'task-1', id: 'config-1' },
       });
 
-      expect(isAsyncGenerator(response)).toBe(false);
-      const rpc = response as JSONRPCResponse;
+      expect(isAsyncGeneratorBody(result.body)).toBe(false);
+      const rpc = result.body as JSONRPCResponse;
       expect('error' in rpc).toBe(true);
       expect((rpc as JSONRPCErrorResponse).error.code).toBe(
         A2A_ERROR_CODES.PUSH_NOTIFICATION_NOT_SUPPORTED,
@@ -821,15 +872,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
         };
         await pushStore.set(config);
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/delete',
           params: { taskId: 'task-1', id: 'config-1' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(false);
         expect((rpc as { result: unknown }).result).toBeNull();
 
@@ -840,15 +891,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should return TaskNotFound when config does not exist', async () => {
         const { handler } = createHandlerWithPushNotification('1.0');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/delete',
           params: { taskId: 'task-1', id: 'non-existent' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(true);
         expect((rpc as JSONRPCErrorResponse).error.code).toBe(
           A2A_ERROR_CODES.TASK_NOT_FOUND,
@@ -858,15 +909,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should return InvalidParams when taskId is missing', async () => {
         const { handler } = createHandlerWithPushNotification('1.0');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/delete',
           params: { id: 'config-1' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(true);
         expect((rpc as JSONRPCErrorResponse).error.code).toBe(
           A2A_ERROR_CODES.INVALID_PARAMS,
@@ -876,15 +927,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should return InvalidParams when id is missing', async () => {
         const { handler } = createHandlerWithPushNotification('1.0');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/delete',
           params: { taskId: 'task-1' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(true);
         expect((rpc as JSONRPCErrorResponse).error.code).toBe(
           A2A_ERROR_CODES.INVALID_PARAMS,
@@ -905,15 +956,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
         };
         await pushStore.set(config);
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/delete',
           params: { id: 'task-1', pushNotificationConfigId: 'config-1' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(false);
         expect((rpc as { result: unknown }).result).toBeNull();
 
@@ -924,15 +975,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should return TaskNotFound when config does not exist', async () => {
         const { handler } = createHandlerWithPushNotification('0.3');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/delete',
           params: { id: 'task-1', pushNotificationConfigId: 'non-existent' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(true);
         expect((rpc as JSONRPCErrorResponse).error.code).toBe(
           A2A_ERROR_CODES.TASK_NOT_FOUND,
@@ -942,15 +993,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should return InvalidParams when id (task ID) is missing', async () => {
         const { handler } = createHandlerWithPushNotification('0.3');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/delete',
           params: { pushNotificationConfigId: 'config-1' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(true);
         expect((rpc as JSONRPCErrorResponse).error.code).toBe(
           A2A_ERROR_CODES.INVALID_PARAMS,
@@ -960,15 +1011,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should return InvalidParams when pushNotificationConfigId is missing', async () => {
         const { handler } = createHandlerWithPushNotification('0.3');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/delete',
           params: { id: 'task-1' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(true);
         expect((rpc as JSONRPCErrorResponse).error.code).toBe(
           A2A_ERROR_CODES.INVALID_PARAMS,
@@ -980,7 +1031,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
   describe('tasks/pushNotificationConfig/set', () => {
     it('should return PushNotificationNotSupported when no store configured', async () => {
       const handler = createHandler();
-      const response = await handler.handle({
+      const result = await handler.handle({
         jsonrpc: '2.0',
         id: 1,
         method: 'tasks/pushNotificationConfig/set',
@@ -993,8 +1044,8 @@ describe('Layer 4: DefaultRequestHandler', () => {
         },
       });
 
-      expect(isAsyncGenerator(response)).toBe(false);
-      const rpc = response as JSONRPCResponse;
+      expect(isAsyncGeneratorBody(result.body)).toBe(false);
+      const rpc = result.body as JSONRPCResponse;
       expect('error' in rpc).toBe(true);
       expect((rpc as JSONRPCErrorResponse).error.code).toBe(
         A2A_ERROR_CODES.PUSH_NOTIFICATION_NOT_SUPPORTED,
@@ -1005,7 +1056,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should store a new config and return the v0.3 nested shape', async () => {
         const { handler, pushStore } = createHandlerWithPushNotification('0.3');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/set',
@@ -1019,8 +1070,8 @@ describe('Layer 4: DefaultRequestHandler', () => {
           },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(false);
         expect((rpc as { result: unknown }).result).toEqual({
           taskId: 'task-1',
@@ -1045,7 +1096,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should auto-generate pushNotificationConfig.id when client omits it', async () => {
         const { handler, pushStore } = createHandlerWithPushNotification('0.3');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/set',
@@ -1055,11 +1106,11 @@ describe('Layer 4: DefaultRequestHandler', () => {
           },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(false);
-        const result = (rpc as { result: { pushNotificationConfig: { id?: string } } }).result;
-        const generatedId = result.pushNotificationConfig.id;
+        const rpcResult = (rpc as { result: { pushNotificationConfig: { id?: string } } }).result;
+        const generatedId = rpcResult.pushNotificationConfig.id;
         expect(typeof generatedId).toBe('string');
         expect(generatedId).not.toEqual('');
 
@@ -1071,7 +1122,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should treat empty-string pushNotificationConfig.id as absent and auto-generate', async () => {
         const { handler, pushStore } = createHandlerWithPushNotification('0.3');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/set',
@@ -1081,11 +1132,11 @@ describe('Layer 4: DefaultRequestHandler', () => {
           },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(false);
-        const result = (rpc as { result: { pushNotificationConfig: { id?: string } } }).result;
-        const generatedId = result.pushNotificationConfig.id;
+        const rpcResult = (rpc as { result: { pushNotificationConfig: { id?: string } } }).result;
+        const generatedId = rpcResult.pushNotificationConfig.id;
         expect(typeof generatedId).toBe('string');
         expect(generatedId).not.toEqual('');
 
@@ -1098,7 +1149,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should store a new config and return the v1.0 flattened shape', async () => {
         const { handler, pushStore } = createHandlerWithPushNotification('1.0');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/set',
@@ -1112,8 +1163,8 @@ describe('Layer 4: DefaultRequestHandler', () => {
           },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(false);
         expect((rpc as { result: unknown }).result).toEqual({
           id: 'config-1',
@@ -1138,15 +1189,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should return InvalidParams when params is not an object', async () => {
         const { handler } = createHandlerWithPushNotification('1.0');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/set',
           params: 'not-an-object',
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(true);
         expect((rpc as JSONRPCErrorResponse).error.code).toBe(
           A2A_ERROR_CODES.INVALID_PARAMS,
@@ -1156,7 +1207,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should return InvalidParams when taskId is missing', async () => {
         const { handler } = createHandlerWithPushNotification('1.0');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/set',
@@ -1168,8 +1219,8 @@ describe('Layer 4: DefaultRequestHandler', () => {
           },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(true);
         expect((rpc as JSONRPCErrorResponse).error.code).toBe(
           A2A_ERROR_CODES.INVALID_PARAMS,
@@ -1179,15 +1230,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should return InvalidParams when pushNotificationConfig is missing', async () => {
         const { handler } = createHandlerWithPushNotification('1.0');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/set',
           params: { taskId: 'task-1' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(true);
         expect((rpc as JSONRPCErrorResponse).error.code).toBe(
           A2A_ERROR_CODES.INVALID_PARAMS,
@@ -1197,7 +1248,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should return InvalidParams when pushNotificationConfig.url is missing', async () => {
         const { handler } = createHandlerWithPushNotification('1.0');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/set',
@@ -1207,8 +1258,8 @@ describe('Layer 4: DefaultRequestHandler', () => {
           },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(true);
         expect((rpc as JSONRPCErrorResponse).error.code).toBe(
           A2A_ERROR_CODES.INVALID_PARAMS,
@@ -1218,7 +1269,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should return InvalidParams when authentication.schemes is empty', async () => {
         const { handler } = createHandlerWithPushNotification('1.0');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/set',
@@ -1232,8 +1283,8 @@ describe('Layer 4: DefaultRequestHandler', () => {
           },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(true);
         expect((rpc as JSONRPCErrorResponse).error.code).toBe(
           A2A_ERROR_CODES.INVALID_PARAMS,
@@ -1243,7 +1294,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should accept valid authentication info', async () => {
         const { handler } = createHandlerWithPushNotification('1.0');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/set',
@@ -1257,11 +1308,11 @@ describe('Layer 4: DefaultRequestHandler', () => {
           },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(false);
-        const result = (rpc as { result: { authentication: unknown } }).result;
-        expect(result.authentication).toEqual({ schemes: ['Bearer'], credentials: 'abc123' });
+        const rpcResult = (rpc as { result: { authentication: unknown } }).result;
+        expect(rpcResult.authentication).toEqual({ schemes: ['Bearer'], credentials: 'abc123' });
       });
     });
   });
@@ -1269,15 +1320,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
   describe('tasks/pushNotificationConfig/get', () => {
     it('should return PushNotificationNotSupported when no store configured', async () => {
       const handler = createHandler();
-      const response = await handler.handle({
+      const result = await handler.handle({
         jsonrpc: '2.0',
         id: 1,
         method: 'tasks/pushNotificationConfig/get',
         params: { taskId: 'task-1', id: 'config-1' },
       });
 
-      expect(isAsyncGenerator(response)).toBe(false);
-      const rpc = response as JSONRPCResponse;
+      expect(isAsyncGeneratorBody(result.body)).toBe(false);
+      const rpc = result.body as JSONRPCResponse;
       expect('error' in rpc).toBe(true);
       expect((rpc as JSONRPCErrorResponse).error.code).toBe(
         A2A_ERROR_CODES.PUSH_NOTIFICATION_NOT_SUPPORTED,
@@ -1298,15 +1349,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
         };
         await pushStore.set(config);
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/get',
           params: { taskId: 'task-1', id: 'config-1' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(false);
         expect((rpc as { result: unknown }).result).toEqual({
           id: 'config-1',
@@ -1319,15 +1370,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should return TaskNotFound when config does not exist', async () => {
         const { handler } = createHandlerWithPushNotification('1.0');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/get',
           params: { taskId: 'task-1', id: 'non-existent' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(true);
         expect((rpc as JSONRPCErrorResponse).error.code).toBe(
           A2A_ERROR_CODES.TASK_NOT_FOUND,
@@ -1337,15 +1388,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should return InvalidParams when taskId is missing', async () => {
         const { handler } = createHandlerWithPushNotification('1.0');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/get',
           params: { id: 'config-1' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(true);
         expect((rpc as JSONRPCErrorResponse).error.code).toBe(
           A2A_ERROR_CODES.INVALID_PARAMS,
@@ -1355,15 +1406,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should return InvalidParams when id is missing', async () => {
         const { handler } = createHandlerWithPushNotification('1.0');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/get',
           params: { taskId: 'task-1' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(true);
         expect((rpc as JSONRPCErrorResponse).error.code).toBe(
           A2A_ERROR_CODES.INVALID_PARAMS,
@@ -1384,15 +1435,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
         };
         await pushStore.set(config);
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/get',
           params: { id: 'task-1', pushNotificationConfigId: 'config-1' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(false);
         expect((rpc as { result: unknown }).result).toEqual({
           taskId: 'task-1',
@@ -1406,15 +1457,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should return TaskNotFound when config does not exist', async () => {
         const { handler } = createHandlerWithPushNotification('0.3');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/get',
           params: { id: 'task-1', pushNotificationConfigId: 'nope' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(true);
         expect((rpc as JSONRPCErrorResponse).error.code).toBe(
           A2A_ERROR_CODES.TASK_NOT_FOUND,
@@ -1424,15 +1475,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should return InvalidParams when id (task ID) is missing', async () => {
         const { handler } = createHandlerWithPushNotification('0.3');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/get',
           params: { pushNotificationConfigId: 'config-1' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(true);
         expect((rpc as JSONRPCErrorResponse).error.code).toBe(
           A2A_ERROR_CODES.INVALID_PARAMS,
@@ -1451,15 +1502,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
         };
         await pushStore.set(first);
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/get',
           params: { id: 'task-1' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(false);
         expect((rpc as { result: unknown }).result).toEqual({
           taskId: 'task-1',
@@ -1473,15 +1524,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should return TaskNotFound when pushNotificationConfigId is omitted and no configs exist', async () => {
         const { handler } = createHandlerWithPushNotification('0.3');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/get',
           params: { id: 'task-without-configs' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(true);
         expect((rpc as JSONRPCErrorResponse).error.code).toBe(
           A2A_ERROR_CODES.TASK_NOT_FOUND,
@@ -1493,15 +1544,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
   describe('tasks/pushNotificationConfig/list', () => {
     it('should return PushNotificationNotSupported when no store configured', async () => {
       const handler = createHandler();
-      const response = await handler.handle({
+      const result = await handler.handle({
         jsonrpc: '2.0',
         id: 1,
         method: 'tasks/pushNotificationConfig/list',
         params: { taskId: 'task-1' },
       });
 
-      expect(isAsyncGenerator(response)).toBe(false);
-      const rpc = response as JSONRPCResponse;
+      expect(isAsyncGeneratorBody(result.body)).toBe(false);
+      const rpc = result.body as JSONRPCResponse;
       expect('error' in rpc).toBe(true);
       expect((rpc as JSONRPCErrorResponse).error.code).toBe(
         A2A_ERROR_CODES.PUSH_NOTIFICATION_NOT_SUPPORTED,
@@ -1527,21 +1578,21 @@ describe('Layer 4: DefaultRequestHandler', () => {
           },
         });
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/list',
           params: { taskId: 'task-1' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(false);
-        const result = (rpc as { result: { configs: unknown[]; nextPageToken: string } }).result;
-        expect(result.nextPageToken).toBe('');
-        expect(Array.isArray(result.configs)).toBe(true);
-        expect(result.configs).toHaveLength(2);
-        expect(result.configs).toEqual(
+        const rpcResult = (rpc as { result: { configs: unknown[]; nextPageToken: string } }).result;
+        expect(rpcResult.nextPageToken).toBe('');
+        expect(Array.isArray(rpcResult.configs)).toBe(true);
+        expect(rpcResult.configs).toHaveLength(2);
+        expect(rpcResult.configs).toEqual(
           expect.arrayContaining([
             {
               id: 'config-1',
@@ -1560,15 +1611,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should return { configs: [], nextPageToken: "" } when no configs exist', async () => {
         const { handler } = createHandlerWithPushNotification('1.0');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/list',
           params: { taskId: 'unknown-task' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(false);
         expect((rpc as { result: unknown }).result).toEqual({ configs: [], nextPageToken: '' });
       });
@@ -1581,33 +1632,33 @@ describe('Layer 4: DefaultRequestHandler', () => {
           pushNotificationConfig: { id: 'config-1', url: 'https://example.com/webhook' },
         });
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/list',
           params: { taskId: 'task-1', pageSize: 10, pageToken: 'ignored' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(false);
-        const result = (rpc as { result: { configs: unknown[]; nextPageToken: string } }).result;
-        expect(result.configs).toHaveLength(1);
-        expect(result.nextPageToken).toBe('');
+        const rpcResult = (rpc as { result: { configs: unknown[]; nextPageToken: string } }).result;
+        expect(rpcResult.configs).toHaveLength(1);
+        expect(rpcResult.nextPageToken).toBe('');
       });
 
       it('should return InvalidParams when taskId is missing', async () => {
         const { handler } = createHandlerWithPushNotification('1.0');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/list',
           params: {},
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(true);
         expect((rpc as JSONRPCErrorResponse).error.code).toBe(
           A2A_ERROR_CODES.INVALID_PARAMS,
@@ -1627,20 +1678,20 @@ describe('Layer 4: DefaultRequestHandler', () => {
           },
         });
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/list',
           params: { id: 'task-1' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(false);
-        const result = (rpc as { result: unknown }).result as unknown[];
-        expect(Array.isArray(result)).toBe(true);
-        expect(result).toHaveLength(1);
-        expect(result[0]).toEqual({
+        const rpcResult = (rpc as { result: unknown }).result as unknown[];
+        expect(Array.isArray(rpcResult)).toBe(true);
+        expect(rpcResult).toHaveLength(1);
+        expect(rpcResult[0]).toEqual({
           taskId: 'task-1',
           pushNotificationConfig: {
             id: 'config-1',
@@ -1652,15 +1703,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should return an empty bare array when no configs exist', async () => {
         const { handler } = createHandlerWithPushNotification('0.3');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/list',
           params: { id: 'unknown-task' },
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(false);
         expect((rpc as { result: unknown }).result).toEqual([]);
       });
@@ -1668,15 +1719,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
       it('should return InvalidParams when id is missing', async () => {
         const { handler } = createHandlerWithPushNotification('0.3');
 
-        const response = await handler.handle({
+        const result = await handler.handle({
           jsonrpc: '2.0',
           id: 1,
           method: 'tasks/pushNotificationConfig/list',
           params: {},
         });
 
-        expect(isAsyncGenerator(response)).toBe(false);
-        const rpc = response as JSONRPCResponse;
+        expect(isAsyncGeneratorBody(result.body)).toBe(false);
+        const rpc = result.body as JSONRPCResponse;
         expect('error' in rpc).toBe(true);
         expect((rpc as JSONRPCErrorResponse).error.code).toBe(
           A2A_ERROR_CODES.INVALID_PARAMS,

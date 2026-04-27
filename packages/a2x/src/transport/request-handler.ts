@@ -46,10 +46,36 @@ import type { ResponseMapper } from '../a2x/response-mapper.js';
 import { ResponseMapperFactory } from '../a2x/response-mapper.js';
 import type { RequestContext, AuthResult } from '../types/auth.js';
 
-/** Return type of `handle()`. */
+/**
+ * Return type of `handle()`.
+ * @deprecated Use {@link HandleHttpResult} instead — it wraps the response
+ * body and carries optional HTTP metadata (status, headers).
+ */
 export type HandleResult =
   | JSONRPCResponse
   | AsyncGenerator<unknown>;
+
+/** HTTP metadata attached to responses that require a non-200 status. */
+export interface HttpResponseMeta {
+  status: number;
+  headers?: Record<string, string>;
+}
+
+/** Extended result from handle() that carries optional HTTP metadata. */
+export interface HandleHttpResult {
+  body: JSONRPCResponse | AsyncGenerator<unknown>;
+  http?: HttpResponseMeta;
+}
+
+/** Extract the HTTP status code from a HandleHttpResult (defaults to 200). */
+export function getHttpStatus(result: HandleHttpResult): number {
+  return result.http?.status ?? 200;
+}
+
+/** Extract optional HTTP headers from a HandleHttpResult. */
+export function getHttpHeaders(result: HandleHttpResult): Record<string, string> {
+  return result.http?.headers ?? {};
+}
 
 export class DefaultRequestHandler {
   private readonly a2xAgent: A2XAgent;
@@ -66,9 +92,10 @@ export class DefaultRequestHandler {
   /**
    * Handle a JSON-RPC request body.
    *
-   * Returns a `JSONRPCResponse` for synchronous methods (`message/send`,
-   * `tasks/get`, `tasks/cancel`) or an `AsyncGenerator` for streaming
-   * methods (`message/stream`).
+   * Returns a `HandleHttpResult` whose `.body` is either a
+   * `JSONRPCResponse` (sync methods) or an `AsyncGenerator` (streaming).
+   * The optional `.http` field carries status/headers for non-200 cases
+   * (e.g. 401 for authentication failures).
    *
    * When `context` is provided and the agent has security requirements,
    * authentication is evaluated before routing. When omitted, no auth
@@ -77,17 +104,17 @@ export class DefaultRequestHandler {
    * The caller inspects the return value:
    * ```ts
    * const result = await handler.handle(body, { headers: req.headers });
-   * if (result && typeof result === 'object' && Symbol.asyncIterator in result) {
+   * if (result.body && typeof result.body === 'object' && Symbol.asyncIterator in result.body) {
    *   // stream → convert to SSE Response
    * } else {
-   *   // sync → return as JSON
+   *   // sync → return as JSON using getHttpStatus(result) / getHttpHeaders(result)
    * }
    * ```
    */
   async handle(
     body: JSONRPCRequest | string | unknown,
     context?: RequestContext,
-  ): Promise<HandleResult> {
+  ): Promise<HandleHttpResult> {
     let request: JSONRPCRequest;
 
     // Parse if string
@@ -97,9 +124,11 @@ export class DefaultRequestHandler {
       } catch {
         const error = new JSONParseError();
         return {
-          jsonrpc: '2.0',
-          id: null,
-          error: error.toJSONRPCError(),
+          body: {
+            jsonrpc: '2.0',
+            id: null,
+            error: error.toJSONRPCError(),
+          },
         };
       }
     } else {
@@ -115,9 +144,11 @@ export class DefaultRequestHandler {
     ) {
       const error = new InvalidRequestError('Invalid JSON-RPC 2.0 request');
       return {
-        jsonrpc: '2.0',
-        id: request?.id ?? null,
-        error: error.toJSONRPCError(),
+        body: {
+          jsonrpc: '2.0',
+          id: request?.id ?? null,
+          error: error.toJSONRPCError(),
+        },
       };
     }
 
@@ -132,9 +163,12 @@ export class DefaultRequestHandler {
           authResult.error ?? 'Authentication required',
         );
         return {
-          jsonrpc: '2.0',
-          id: request.id,
-          error: error.toJSONRPCError(),
+          body: {
+            jsonrpc: '2.0',
+            id: request.id,
+            error: error.toJSONRPCError(),
+          },
+          http: { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } },
         };
       }
     }
@@ -153,9 +187,11 @@ export class DefaultRequestHandler {
         }
         const card = await this.a2xAgent.getAuthenticatedExtendedCard(authResult);
         return {
-          jsonrpc: '2.0',
-          id: request.id,
-          result: card,
+          body: {
+            jsonrpc: '2.0',
+            id: request.id,
+            result: card,
+          },
         };
       } catch (err) {
         return this._toErrorResponse(request.id, err);
@@ -165,7 +201,7 @@ export class DefaultRequestHandler {
     // Streaming method → return AsyncGenerator
     if (this.router.isStreamMethod(request.method)) {
       try {
-        return this.router.routeStream(request) as AsyncGenerator<unknown>;
+        return { body: this.router.routeStream(request) as AsyncGenerator<unknown> };
       } catch (err) {
         return this._toErrorResponse(request.id, err);
       }
@@ -173,7 +209,7 @@ export class DefaultRequestHandler {
 
     // Synchronous method → return JSONRPCResponse
     try {
-      return await this.router.route(request);
+      return { body: await this.router.route(request) as JSONRPCResponse };
     } catch (err) {
       return this._toErrorResponse(request.id, err);
     }
@@ -586,21 +622,27 @@ export class DefaultRequestHandler {
   private _toErrorResponse(
     id: string | number | null,
     err: unknown,
-  ): JSONRPCResponse {
+  ): HandleHttpResult {
     if (err && typeof err === 'object' && 'toJSONRPCError' in err) {
+      const isAuthError = err instanceof AuthenticationRequiredError;
       return {
-        jsonrpc: '2.0',
-        id,
-        error: (err as A2AError).toJSONRPCError(),
+        body: {
+          jsonrpc: '2.0',
+          id,
+          error: (err as A2AError).toJSONRPCError(),
+        },
+        ...(isAuthError ? { http: { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } } } : {}),
       };
     }
     const internalError = new InternalError(
       err instanceof Error ? err.message : 'Internal error',
     );
     return {
-      jsonrpc: '2.0',
-      id,
-      error: internalError.toJSONRPCError(),
+      body: {
+        jsonrpc: '2.0',
+        id,
+        error: internalError.toJSONRPCError(),
+      },
     };
   }
 

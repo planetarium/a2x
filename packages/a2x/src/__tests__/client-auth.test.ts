@@ -15,6 +15,7 @@ import type { AuthProvider } from '../client/auth-provider.js';
 import type { AgentCardV10 } from '../types/agent-card.js';
 import type { SecuritySchemeV03, SecuritySchemeV10 } from '../types/security.js';
 import { TaskState } from '../types/task.js';
+import { A2A_ERROR_CODES, AuthenticationRequiredError } from '../types/errors.js';
 
 // ─── Test Fixtures ───
 
@@ -709,5 +710,122 @@ describe('A2XClient auth integration', () => {
         message: { role: 'user', parts: [{ text: 'Hello' }] },
       }),
     ).rejects.toThrow('Auth required');
+  });
+
+  it('JSON-RPC -32008 fallback triggers refresh and retries successfully', async () => {
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) {
+        // First call: HTTP 200 but JSON-RPC auth error
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          json: () =>
+            Promise.resolve({
+              jsonrpc: '2.0',
+              id: 1,
+              error: {
+                code: A2A_ERROR_CODES.AUTHENTICATION_REQUIRED,
+                message: 'Token expired',
+              },
+            }),
+          headers: new Headers({ 'content-type': 'application/json' }),
+        });
+      }
+      // Second call: success
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: () => Promise.resolve(createJsonRpcSuccess(TASK_RESULT)),
+        headers: new Headers({ 'content-type': 'application/json' }),
+      });
+    });
+
+    const refresh = vi.fn().mockImplementation(async (schemes: AuthScheme[]) => {
+      for (const scheme of schemes) {
+        if (scheme instanceof ApiKeyAuthScheme) {
+          scheme.setCredential('refreshed-key');
+        }
+      }
+      return schemes;
+    });
+
+    const authProvider: AuthProvider = {
+      async provide(requirements) {
+        for (const group of requirements) {
+          if (group[0] instanceof ApiKeyAuthScheme) {
+            return [group[0].setCredential('old-key')];
+          }
+        }
+        throw new Error('No supported scheme');
+      },
+      refresh,
+    };
+
+    const client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      authProvider,
+    });
+
+    const result = await client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    });
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(result.id).toBe(TASK_RESULT.id);
+    // Second call should have the refreshed key
+    const secondCallHeaders = mockFetch.mock.calls[1][1].headers;
+    expect(secondCallHeaders['x-api-key']).toBe('refreshed-key');
+  });
+
+  it('JSON-RPC -32008 fallback does not retry more than once', async () => {
+    const mockFetch = vi.fn().mockImplementation(() => {
+      // Always return HTTP 200 with JSON-RPC auth error
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: () =>
+          Promise.resolve({
+            jsonrpc: '2.0',
+            id: 1,
+            error: {
+              code: A2A_ERROR_CODES.AUTHENTICATION_REQUIRED,
+              message: 'Still expired',
+            },
+          }),
+        headers: new Headers({ 'content-type': 'application/json' }),
+      });
+    });
+
+    const refresh = vi.fn().mockImplementation(async (schemes: AuthScheme[]) => {
+      return schemes;
+    });
+
+    const authProvider: AuthProvider = {
+      async provide(requirements) {
+        return [requirements[0][0].setCredential('key')];
+      },
+      refresh,
+    };
+
+    const client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      authProvider,
+    });
+
+    await expect(
+      client.sendMessage({
+        message: { role: 'user', parts: [{ text: 'Hello' }] },
+      }),
+    ).rejects.toThrow(AuthenticationRequiredError);
+
+    // Once for initial, once for retry — no more
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(refresh).toHaveBeenCalledTimes(1);
   });
 });

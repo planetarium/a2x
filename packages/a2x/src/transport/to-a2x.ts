@@ -11,7 +11,7 @@ import { InMemoryRunner } from '../runner/in-memory-runner.js';
 import { AgentExecutor, StreamingMode } from '../a2x/agent-executor.js';
 import { InMemoryTaskStore } from '../a2x/task-store.js';
 import { A2XAgent } from '../a2x/a2x-agent.js';
-import { DefaultRequestHandler } from './request-handler.js';
+import { DefaultRequestHandler, getHttpStatus, getHttpHeaders } from './request-handler.js';
 import { createSSEStream } from './sse-handler.js';
 import type { RequestContext } from '../types/auth.js';
 
@@ -144,9 +144,9 @@ export function toA2x(
 
             // Streaming → AsyncGenerator → SSE
             if (
-              result &&
-              typeof result === 'object' &&
-              Symbol.asyncIterator in result
+              result.body &&
+              typeof result.body === 'object' &&
+              Symbol.asyncIterator in result.body
             ) {
               res.writeHead(200, {
                 'Content-Type': 'text/event-stream',
@@ -155,7 +155,7 @@ export function toA2x(
               });
 
               const stream = createSSEStream(
-                result as AsyncGenerator<never>,
+                result.body as AsyncGenerator<never>,
               );
               const reader = stream.getReader();
 
@@ -195,8 +195,10 @@ export function toA2x(
             }
 
             // Standard JSON-RPC response
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify(result));
+            const status = getHttpStatus(result);
+            const extraHeaders = getHttpHeaders(result);
+            res.writeHead(status, { 'Content-Type': 'application/json', ...extraHeaders });
+            res.end(JSON.stringify(result.body));
           } catch {
             res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(

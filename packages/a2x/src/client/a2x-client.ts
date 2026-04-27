@@ -123,6 +123,7 @@ export class A2XClient {
   private _parser: ResponseParser | null = null;
   private _endpointUrl: string | null = null;
   private _resolvedSchemes?: AuthScheme[];
+  private _streamAuthRetried = false;
   private _requestId = 0;
 
   constructor(
@@ -180,6 +181,25 @@ export class A2XClient {
       signal,
     });
 
+    // Token refresh on HTTP 401 (streaming path)
+    if (
+      !this._streamAuthRetried &&
+      response.status === 401 &&
+      this._authProvider?.refresh &&
+      this._resolvedSchemes
+    ) {
+      this._streamAuthRetried = true;
+      try {
+        this._resolvedSchemes = await this._authProvider.refresh(
+          this._resolvedSchemes,
+        );
+        yield* this.sendMessageStream(params, signal);
+      } finally {
+        this._streamAuthRetried = false;
+      }
+      return;
+    }
+
     if (!response.ok) {
       throw new InternalError(
         `HTTP ${response.status}: ${response.statusText}`,
@@ -193,6 +213,26 @@ export class A2XClient {
       const jsonRpcResponse = (await response.json()) as JSONRPCResponse;
       if ('error' in jsonRpcResponse && jsonRpcResponse.error) {
         const { code, message, data } = jsonRpcResponse.error;
+
+        // Fallback: refresh on JSON-RPC auth error (HTTP 200, older servers)
+        if (
+          !this._streamAuthRetried &&
+          code === A2A_ERROR_CODES.AUTHENTICATION_REQUIRED &&
+          this._authProvider?.refresh &&
+          this._resolvedSchemes
+        ) {
+          this._streamAuthRetried = true;
+          try {
+            this._resolvedSchemes = await this._authProvider.refresh(
+              this._resolvedSchemes,
+            );
+            yield* this.sendMessageStream(params, signal);
+          } finally {
+            this._streamAuthRetried = false;
+          }
+          return;
+        }
+
         const ErrorClass = ERROR_CODE_MAP[code] ?? InternalError;
         throw new ErrorClass(message, data);
       }
@@ -420,6 +460,21 @@ export class A2XClient {
 
     if ('error' in jsonRpcResponse && jsonRpcResponse.error) {
       const { code, message, data } = jsonRpcResponse.error;
+
+      // Fallback: trigger refresh on JSON-RPC auth error when server
+      // returned HTTP 200 instead of 401 (older server compatibility).
+      if (
+        !isRetry &&
+        code === A2A_ERROR_CODES.AUTHENTICATION_REQUIRED &&
+        this._authProvider?.refresh &&
+        this._resolvedSchemes
+      ) {
+        this._resolvedSchemes = await this._authProvider.refresh(
+          this._resolvedSchemes,
+        );
+        return this._postJsonRpc(request, true);
+      }
+
       const ErrorClass = ERROR_CODE_MAP[code] ?? InternalError;
       throw new ErrorClass(message, data);
     }

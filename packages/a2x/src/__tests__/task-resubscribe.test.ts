@@ -62,16 +62,16 @@ describe('tasks/resubscribe', () => {
       params: { id: 'nonexistent' },
     });
 
-    // Stream handlers return an AsyncGenerator; the TaskNotFoundError is
-    // thrown from within the generator when iteration starts.
+    // Stream handlers return an AsyncGenerator in result.body; the
+    // TaskNotFoundError is thrown from within the generator when iteration starts.
     expect(result).toBeDefined();
     expect(
-      result !== null &&
-        typeof result === 'object' &&
-        Symbol.asyncIterator in (result as object),
+      result.body !== null &&
+        typeof result.body === 'object' &&
+        Symbol.asyncIterator in (result.body as object),
     ).toBe(true);
 
-    const generator = result as AsyncGenerator<unknown>;
+    const generator = result.body as AsyncGenerator<unknown>;
     await expect(async () => {
       for await (const _ of generator) {
         // drain
@@ -98,7 +98,7 @@ describe('tasks/resubscribe', () => {
       params: { id: task.id },
     });
 
-    const generator = result as AsyncGenerator<Record<string, unknown>>;
+    const generator = result.body as AsyncGenerator<Record<string, unknown>>;
     const events: Record<string, unknown>[] = [];
     for await (const event of generator) {
       events.push(event);
@@ -136,7 +136,7 @@ describe('tasks/resubscribe', () => {
     const resubEvents: Record<string, unknown>[] = [];
     let taskId: string | undefined;
 
-    const originalIter = streamResult as AsyncGenerator<Record<string, unknown>>;
+    const originalIter = streamResult.body as AsyncGenerator<Record<string, unknown>>;
 
     const originalConsumer = (async () => {
       for await (const event of originalIter) {
@@ -161,7 +161,7 @@ describe('tasks/resubscribe', () => {
       method: 'tasks/resubscribe',
       params: { id: taskId! },
     });
-    const resubIter = resubResult as AsyncGenerator<Record<string, unknown>>;
+    const resubIter = resubResult.body as AsyncGenerator<Record<string, unknown>>;
 
     const resubConsumer = (async () => {
       for await (const event of resubIter) {
@@ -200,7 +200,7 @@ describe('tasks/resubscribe', () => {
       },
     });
 
-    const originalIter = streamResult as AsyncGenerator<Record<string, unknown>>;
+    const originalIter = streamResult.body as AsyncGenerator<Record<string, unknown>>;
     const originalEvents: Record<string, unknown>[] = [];
     let taskId: string | undefined;
 
@@ -222,7 +222,7 @@ describe('tasks/resubscribe', () => {
       method: 'tasks/resubscribe',
       params: { id: taskId! },
     });
-    const resubIter = resubResult as AsyncGenerator<Record<string, unknown>>;
+    const resubIter = resubResult.body as AsyncGenerator<Record<string, unknown>>;
 
     // Consume both streams; after the primary stream ends, the resubscriber
     // must also end (done: true).

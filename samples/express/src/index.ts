@@ -9,6 +9,8 @@ import {
   A2XAgent,
   DefaultRequestHandler,
   createSSEStream,
+  getHttpStatus,
+  getHttpHeaders,
   ApiKeyAuthorization,
   OAuth2DeviceCodeAuthorization,
 } from '@a2x/sdk';
@@ -122,15 +124,18 @@ app.post('/a2a', async (req, res) => {
 
   try {
     const result = await handler.handle(req.body, context);
+    const status = getHttpStatus(result);
+    const extraHeaders = getHttpHeaders(result);
 
     // Streaming → SSE
-    if (result && typeof result === 'object' && Symbol.asyncIterator in result) {
+    if (result.body && typeof result.body === 'object' && Symbol.asyncIterator in result.body) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
+      for (const [k, v] of Object.entries(extraHeaders)) res.setHeader(k, v);
 
       const stream = createSSEStream(
-        result as AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent>,
+        result.body as AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent>,
       );
       const reader = stream.getReader();
 
@@ -151,7 +156,7 @@ app.post('/a2a', async (req, res) => {
     }
 
     // Standard JSON-RPC response
-    res.json(result);
+    res.status(status).set(extraHeaders).json(result.body);
   } catch {
     res.status(400).json({
       jsonrpc: '2.0',

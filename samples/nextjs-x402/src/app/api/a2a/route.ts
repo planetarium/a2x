@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { handler } from '@/lib/a2x-setup';
-import { createSSEStream } from '@a2x/sdk';
+import { createSSEStream, getHttpStatus, getHttpHeaders } from '@a2x/sdk';
 import type { RequestContext } from '@a2x/sdk';
 
 const SSE_HEADERS = {
@@ -43,9 +43,11 @@ export async function POST(request: Request): Promise<Response> {
   };
 
   const result = await handler.handle(body, context);
+  const status = getHttpStatus(result);
+  const extraHeaders = getHttpHeaders(result);
 
-  if (result && typeof result === 'object' && Symbol.asyncIterator in result) {
-    const source = result as AsyncGenerator<unknown>;
+  if (result.body && typeof result.body === 'object' && Symbol.asyncIterator in result.body) {
+    const source = result.body as AsyncGenerator<unknown>;
     const logged: AsyncGenerator<unknown> = LOGGING
       ? (async function* () {
           let i = 0;
@@ -60,9 +62,9 @@ export async function POST(request: Request): Promise<Response> {
         })()
       : source;
     const stream = createSSEStream(logged as AsyncGenerator<never>);
-    return new Response(stream, { headers: SSE_HEADERS });
+    return new Response(stream, { headers: { ...SSE_HEADERS, ...extraHeaders } });
   }
 
-  log('response', result);
-  return NextResponse.json(result);
+  log('response', result.body);
+  return NextResponse.json(result.body, { status, headers: extraHeaders });
 }

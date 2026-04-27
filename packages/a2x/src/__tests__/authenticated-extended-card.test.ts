@@ -78,11 +78,11 @@ function createHandler(options: HandlerBuildOptions = {}): DefaultRequestHandler
   return new DefaultRequestHandler(a2xAgent);
 }
 
-function isAsyncGenerator(value: unknown): value is AsyncGenerator {
+function isAsyncGeneratorBody(result: { body: unknown }): boolean {
   return (
-    value !== null &&
-    typeof value === 'object' &&
-    Symbol.asyncIterator in (value as object)
+    result.body !== null &&
+    typeof result.body === 'object' &&
+    Symbol.asyncIterator in (result.body as object)
   );
 }
 
@@ -106,10 +106,10 @@ describe('agent/getAuthenticatedExtendedCard', () => {
   it('returns AuthenticatedExtendedCardNotConfiguredError when no provider is registered', async () => {
     const handler = createHandler({ withAuth: true });
 
-    const response = await handler.handle(extendedCardRequest, validContext);
+    const result = await handler.handle(extendedCardRequest, validContext);
 
-    expect(isAsyncGenerator(response)).toBe(false);
-    const rpc = response as JSONRPCResponse;
+    expect(isAsyncGeneratorBody(result)).toBe(false);
+    const rpc = result.body as JSONRPCResponse;
     expect('error' in rpc).toBe(true);
     expect((rpc as JSONRPCErrorResponse).error.code).toBe(
       A2A_ERROR_CODES.AUTHENTICATED_EXTENDED_CARD_NOT_CONFIGURED,
@@ -124,12 +124,12 @@ describe('agent/getAuthenticatedExtendedCard', () => {
 
     // Missing API key — auth will fail and the pre-dispatch block returns
     // AUTHENTICATION_REQUIRED before the special-case branch runs.
-    const response = await handler.handle(extendedCardRequest, {
+    const result = await handler.handle(extendedCardRequest, {
       headers: {},
     });
 
-    expect(isAsyncGenerator(response)).toBe(false);
-    const rpc = response as JSONRPCResponse;
+    expect(isAsyncGeneratorBody(result)).toBe(false);
+    const rpc = result.body as JSONRPCResponse;
     expect('error' in rpc).toBe(true);
     expect((rpc as JSONRPCErrorResponse).error.code).toBe(
       A2A_ERROR_CODES.AUTHENTICATION_REQUIRED,
@@ -145,10 +145,10 @@ describe('agent/getAuthenticatedExtendedCard', () => {
       withProvider: () => ({ description: 'Extended' }),
     });
 
-    const response = await handler.handle(extendedCardRequest);
+    const result = await handler.handle(extendedCardRequest);
 
-    expect(isAsyncGenerator(response)).toBe(false);
-    const rpc = response as JSONRPCResponse;
+    expect(isAsyncGeneratorBody(result)).toBe(false);
+    const rpc = result.body as JSONRPCResponse;
     expect('error' in rpc).toBe(true);
     expect((rpc as JSONRPCErrorResponse).error.code).toBe(
       A2A_ERROR_CODES.AUTHENTICATION_REQUIRED,
@@ -172,10 +172,10 @@ describe('agent/getAuthenticatedExtendedCard', () => {
       }),
     });
 
-    const response = await handler.handle(extendedCardRequest, validContext);
+    const result = await handler.handle(extendedCardRequest, validContext);
 
-    expect(isAsyncGenerator(response)).toBe(false);
-    const rpc = response as JSONRPCResponse;
+    expect(isAsyncGeneratorBody(result)).toBe(false);
+    const rpc = result.body as JSONRPCResponse;
     expect('result' in rpc).toBe(true);
     const card = (rpc as { result: unknown }).result as AgentCardV03;
 
@@ -203,10 +203,10 @@ describe('agent/getAuthenticatedExtendedCard', () => {
       }),
     });
 
-    const response = await handler.handle(extendedCardRequest, validContext);
+    const result = await handler.handle(extendedCardRequest, validContext);
 
-    expect(isAsyncGenerator(response)).toBe(false);
-    const rpc = response as JSONRPCResponse;
+    expect(isAsyncGeneratorBody(result)).toBe(false);
+    const rpc = result.body as JSONRPCResponse;
     expect('result' in rpc).toBe(true);
     const card = (rpc as { result: unknown }).result as AgentCardV10;
 
@@ -227,10 +227,10 @@ describe('agent/getAuthenticatedExtendedCard', () => {
       },
     });
 
-    const response = await handler.handle(extendedCardRequest, validContext);
+    const result = await handler.handle(extendedCardRequest, validContext);
 
-    expect(isAsyncGenerator(response)).toBe(false);
-    const rpc = response as JSONRPCResponse;
+    expect(isAsyncGeneratorBody(result)).toBe(false);
+    const rpc = result.body as JSONRPCResponse;
     expect('result' in rpc).toBe(true);
 
     expect(captured).toBeDefined();
