@@ -116,14 +116,16 @@ describe('agent/getAuthenticatedExtendedCard', () => {
     );
   });
 
-  it('returns AuthenticationRequiredError when the call is unauthenticated', async () => {
+  it('returns InvalidRequest when the call is unauthenticated', async () => {
     const handler = createHandler({
       withAuth: true,
       withProvider: () => ({ description: 'Extended' }),
     });
 
-    // Missing API key — auth will fail and the pre-dispatch block returns
-    // AUTHENTICATION_REQUIRED before the special-case branch runs.
+    // Missing API key — auth fails. The extended-card method has no
+    // task-shaped response, so the handler falls back to InvalidRequest
+    // (-32600). Spec a2a-v0.3 / v1.0 reserve the auth-required TaskState
+    // for task-creating methods only.
     const response = await handler.handle(extendedCardRequest, {
       headers: {},
     });
@@ -132,14 +134,14 @@ describe('agent/getAuthenticatedExtendedCard', () => {
     const rpc = response as JSONRPCResponse;
     expect('error' in rpc).toBe(true);
     expect((rpc as JSONRPCErrorResponse).error.code).toBe(
-      A2A_ERROR_CODES.AUTHENTICATION_REQUIRED,
+      A2A_ERROR_CODES.INVALID_REQUEST,
     );
   });
 
-  it('returns AuthenticationRequiredError when no context is provided but provider is configured', async () => {
+  it('returns InvalidRequest when no context is provided but provider is configured', async () => {
     // Provider configured but also requires auth. Without a context, the
     // pre-dispatch auth step is skipped, so the special-case branch trips
-    // on missing authResult and raises AUTHENTICATION_REQUIRED itself.
+    // on missing authResult and raises InvalidRequest itself.
     const handler = createHandler({
       withAuth: true,
       withProvider: () => ({ description: 'Extended' }),
@@ -151,7 +153,7 @@ describe('agent/getAuthenticatedExtendedCard', () => {
     const rpc = response as JSONRPCResponse;
     expect('error' in rpc).toBe(true);
     expect((rpc as JSONRPCErrorResponse).error.code).toBe(
-      A2A_ERROR_CODES.AUTHENTICATION_REQUIRED,
+      A2A_ERROR_CODES.INVALID_REQUEST,
     );
   });
 

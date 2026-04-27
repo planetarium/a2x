@@ -29,9 +29,9 @@ import {
   ContentTypeNotSupportedError,
   InvalidAgentResponseError,
   AuthenticatedExtendedCardNotConfiguredError,
-  AuthenticationRequiredError,
   A2A_ERROR_CODES,
 } from '../types/errors.js';
+import { TaskState } from '../types/task.js';
 import type { ResolvedAgentCard } from './agent-card-resolver.js';
 import {
   resolveAgentCard,
@@ -144,7 +144,6 @@ const ERROR_CODE_MAP: Record<number, new (message?: string, data?: unknown) => A
   [A2A_ERROR_CODES.CONTENT_TYPE_NOT_SUPPORTED]: ContentTypeNotSupportedError,
   [A2A_ERROR_CODES.INVALID_AGENT_RESPONSE]: InvalidAgentResponseError,
   [A2A_ERROR_CODES.AUTHENTICATED_EXTENDED_CARD_NOT_CONFIGURED]: AuthenticatedExtendedCardNotConfiguredError,
-  [A2A_ERROR_CODES.AUTHENTICATION_REQUIRED]: AuthenticationRequiredError,
 };
 
 // ─── v0.3 Request Formatting ───
@@ -362,7 +361,16 @@ export class A2XClient {
     const formatted = this._formatParams(params);
     const request = this._buildJsonRpcRequest(A2A_METHODS.SEND_MESSAGE, formatted);
     const result = await this._postJsonRpc(request);
-    return this._parser!.parseTask(result);
+    const task = this._parser!.parseTask(result);
+    // Spec a2a-v0.3 §TaskState / a2a-v1.0 §TASK_STATE_AUTH_REQUIRED:
+    // an auth failure surfaces as a Task in `auth-required` state.
+    // Refresh credentials once and retry; the same condition on the
+    // second response is propagated to the caller as-is.
+    if (task.status.state !== TaskState.AUTH_REQUIRED) return task;
+    if (!(await this._refreshAuth())) return task;
+    const retryRequest = this._buildJsonRpcRequest(A2A_METHODS.SEND_MESSAGE, formatted);
+    const retryResult = await this._postJsonRpc(retryRequest);
+    return this._parser!.parseTask(retryResult);
   }
 
   private async *_sendMessageStreamOnce(
@@ -371,6 +379,14 @@ export class A2XClient {
   ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
     await this._ensureResolved();
     await this._ensureAuthenticated();
+    yield* this._streamWithAuthRetry(params, signal, false);
+  }
+
+  private async *_streamWithAuthRetry(
+    params: SendMessageParams,
+    signal: AbortSignal | undefined,
+    isRetry: boolean,
+  ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
     const formatted = this._formatParams(params);
     const request = this._buildJsonRpcRequest(
       A2A_METHODS.STREAM_MESSAGE,
@@ -398,7 +414,7 @@ export class A2XClient {
     }
 
     // Server may return a JSON-RPC error instead of SSE
-    // (e.g., authentication failure, unsupported operation).
+    // (e.g., unsupported operation, invalid params).
     const contentType = response.headers.get('content-type') ?? '';
     if (!contentType.includes('text/event-stream')) {
       const jsonRpcResponse = (await response.json()) as JSONRPCResponse;
@@ -410,7 +426,23 @@ export class A2XClient {
       return;
     }
 
-    yield* parseSSEStream(response, this._parser!);
+    // Buffer the first event so we can inspect for auth-required without
+    // surfacing it to the caller before deciding to refresh+retry.
+    const events = parseSSEStream(response, this._parser!);
+    const firstResult = await events.next();
+    if (firstResult.done) return;
+    const firstEvent = firstResult.value;
+    if (
+      !isRetry &&
+      'status' in firstEvent &&
+      firstEvent.status?.state === TaskState.AUTH_REQUIRED &&
+      (await this._refreshAuth())
+    ) {
+      yield* this._streamWithAuthRetry(params, signal, true);
+      return;
+    }
+    yield firstEvent;
+    yield* events;
   }
 
   private async _signX402(task: Task): Promise<SignedX402Payment> {
@@ -621,10 +653,7 @@ export class A2XClient {
     };
   }
 
-  private async _postJsonRpc(
-    request: JSONRPCRequest,
-    isRetry = false,
-  ): Promise<unknown> {
+  private async _postJsonRpc(request: JSONRPCRequest): Promise<unknown> {
     const headers = this._buildHeaders();
     const url = new URL(this._endpointUrl!);
 
@@ -635,19 +664,6 @@ export class A2XClient {
       headers,
       body: JSON.stringify(request),
     });
-
-    // Token refresh on 401 (once)
-    if (
-      !isRetry &&
-      response.status === 401 &&
-      this._authProvider?.refresh &&
-      this._resolvedSchemes
-    ) {
-      this._resolvedSchemes = await this._authProvider.refresh(
-        this._resolvedSchemes,
-      );
-      return this._postJsonRpc(request, true);
-    }
 
     if (!response.ok) {
       throw new InternalError(
@@ -664,6 +680,20 @@ export class A2XClient {
     }
 
     return (jsonRpcResponse as { result: unknown }).result;
+  }
+
+  /**
+   * Per A2A spec, an auth failure on a task-creating call surfaces as a
+   * Task in `auth-required` state — not as a transport error and not as a
+   * JSON-RPC error code. When the AuthProvider supports `refresh()`, the
+   * client refreshes credentials once and retries the same call.
+   */
+  private async _refreshAuth(): Promise<boolean> {
+    if (!this._authProvider?.refresh || !this._resolvedSchemes) return false;
+    this._resolvedSchemes = await this._authProvider.refresh(
+      this._resolvedSchemes,
+    );
+    return true;
   }
 }
 

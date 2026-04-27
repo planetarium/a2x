@@ -139,6 +139,35 @@ a2xAgent.addSecurityScheme('mtls', new MutualTlsAuthorization({
 
 Your HTTP layer must terminate TLS with client-cert verification enabled and pass the cert through on `RequestContext.clientCertificate`.
 
+## How auth failures are surfaced
+
+A2A models authentication failure as a Task lifecycle state, not a transport-level error:
+
+- **v0.3** — `TaskState.auth-required` (`specification/a2a-v0.3.0.json:2450`).
+- **v1.0** — `TASK_STATE_AUTH_REQUIRED` (`specification/a2a-v1.0.0.proto:206-207`). Per the v1.0 `SendMessage` semantics, servers MUST wait for `AUTH_REQUIRED` (an interrupted state) before returning under `return_immediately=false`.
+
+The SDK follows this directly:
+
+| Method | Response on auth failure |
+|---|---|
+| `message/send` | `result` is a Task with `status.state === 'auth-required'`. HTTP `200`. |
+| `message/stream` | First (and only) SSE event is a `TaskStatusUpdateEvent` carrying `auth-required`, then the stream closes. HTTP `200`. |
+| `tasks/get`, `tasks/cancel`, `tasks/pushNotificationConfig/*`, `agent/getAuthenticatedExtendedCard` | These methods don't return a Task, so they fall back to JSON-RPC `-32600 InvalidRequest`. HTTP `200`. |
+
+`A2XClient` reacts to `auth-required` automatically:
+
+```ts
+const client = new A2XClient(url, { authProvider });
+
+// If the server returns auth-required and AuthProvider implements
+// refresh(), the client refreshes credentials and retries once before
+// returning. If refresh is not configured, the auth-required Task is
+// returned to the caller as-is.
+const task = await client.sendMessage({ message });
+```
+
+The streaming counterpart buffers the first event: when it observes `auth-required` and `AuthProvider.refresh()` is available, it refreshes, opens a new stream, and yields that stream's events to the caller.
+
 ## Client side: handling auth
 
 ### Static headers

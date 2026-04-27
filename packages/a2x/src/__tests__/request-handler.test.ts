@@ -8,7 +8,7 @@ import { InMemoryRunner } from '../runner/in-memory-runner.js';
 import { LlmAgent } from '../agent/llm-agent.js';
 import { BaseLlmProvider } from '../provider/base.js';
 import { A2A_ERROR_CODES } from '../types/errors.js';
-import { TaskState } from '../types/task.js';
+import { TaskState, TaskStateV10 } from '../types/task.js';
 import type { JSONRPCResponse, JSONRPCErrorResponse } from '../types/jsonrpc.js';
 import { InMemoryPushNotificationConfigStore } from '../a2x/push-notification-config-store.js';
 import type { TaskPushNotificationConfig } from '../types/jsonrpc.js';
@@ -660,7 +660,10 @@ describe('Layer 4: DefaultRequestHandler', () => {
       expect('result' in rpc).toBe(true);
     });
 
-    it('should reject with invalid API key', async () => {
+    // Per A2A spec (TaskState.auth-required in v0.3 / TASK_STATE_AUTH_REQUIRED
+    // in v1.0), an auth failure on a task-creating method surfaces as a Task
+    // in `auth-required` state, not a JSON-RPC error.
+    it('should surface auth failure as auth-required task for invalid API key', async () => {
       const handler = createAuthHandler((agent) => {
         agent
           .addSecurityScheme('apiKey', new ApiKeyAuthorization({
@@ -677,13 +680,14 @@ describe('Layer 4: DefaultRequestHandler', () => {
       const response = await handler.handle(validRequest, context);
       expect(isAsyncGenerator(response)).toBe(false);
       const rpc = response as JSONRPCResponse;
-      expect('error' in rpc).toBe(true);
-      expect((rpc as JSONRPCErrorResponse).error.code).toBe(
-        A2A_ERROR_CODES.AUTHENTICATION_REQUIRED,
-      );
+      expect('result' in rpc).toBe(true);
+      const task = (rpc as { result: { status: { state: string } } }).result;
+      // createAuthHandler defaults to protocol v1.0 → wire form is the
+      // proto enum name, not the v0.3 kebab string.
+      expect(task.status.state).toBe(TaskStateV10.TASK_STATE_AUTH_REQUIRED);
     });
 
-    it('should reject with missing API key', async () => {
+    it('should surface auth failure as auth-required task for missing API key', async () => {
       const handler = createAuthHandler((agent) => {
         agent
           .addSecurityScheme('apiKey', new ApiKeyAuthorization({
@@ -698,10 +702,11 @@ describe('Layer 4: DefaultRequestHandler', () => {
       const response = await handler.handle(validRequest, context);
       expect(isAsyncGenerator(response)).toBe(false);
       const rpc = response as JSONRPCResponse;
-      expect('error' in rpc).toBe(true);
-      expect((rpc as JSONRPCErrorResponse).error.code).toBe(
-        A2A_ERROR_CODES.AUTHENTICATION_REQUIRED,
-      );
+      expect('result' in rpc).toBe(true);
+      const task = (rpc as { result: { status: { state: string } } }).result;
+      // createAuthHandler defaults to protocol v1.0 → wire form is the
+      // proto enum name, not the v0.3 kebab string.
+      expect(task.status.state).toBe(TaskStateV10.TASK_STATE_AUTH_REQUIRED);
     });
 
     it('should support OR logic: pass if any requirement group succeeds', async () => {
@@ -766,10 +771,11 @@ describe('Layer 4: DefaultRequestHandler', () => {
       const response = await handler.handle(validRequest, context);
       expect(isAsyncGenerator(response)).toBe(false);
       const rpc = response as JSONRPCResponse;
-      expect('error' in rpc).toBe(true);
-      expect((rpc as JSONRPCErrorResponse).error.code).toBe(
-        A2A_ERROR_CODES.AUTHENTICATION_REQUIRED,
-      );
+      expect('result' in rpc).toBe(true);
+      const task = (rpc as { result: { status: { state: string } } }).result;
+      // createAuthHandler defaults to protocol v1.0 → wire form is the
+      // proto enum name, not the v0.3 kebab string.
+      expect(task.status.state).toBe(TaskStateV10.TASK_STATE_AUTH_REQUIRED);
     });
 
     it('should skip auth when no security requirements are set', async () => {
@@ -787,6 +793,62 @@ describe('Layer 4: DefaultRequestHandler', () => {
       expect(isAsyncGenerator(response)).toBe(false);
       const rpc = response as JSONRPCResponse;
       expect('result' in rpc).toBe(true);
+    });
+
+    it('should emit an auth-required status event for message/stream auth failure', async () => {
+      const handler = createAuthHandler((agent) => {
+        agent
+          .addSecurityScheme('apiKey', new ApiKeyAuthorization({
+            in: 'header',
+            name: 'x-api-key',
+            keys: ['secret'],
+          }))
+          .addSecurityRequirement({ apiKey: [] });
+      });
+
+      const streamRequest = {
+        jsonrpc: '2.0' as const,
+        id: 2,
+        method: 'message/stream',
+        params: validRequest.params,
+      };
+      const context: RequestContext = { headers: {} };
+      const response = await handler.handle(streamRequest, context);
+      expect(isAsyncGenerator(response)).toBe(true);
+      const events: unknown[] = [];
+      for await (const ev of response as AsyncGenerator<unknown>) {
+        events.push(ev);
+      }
+      expect(events).toHaveLength(1);
+      const status = (events[0] as { status: { state: string } }).status;
+      expect(status.state).toBe(TaskStateV10.TASK_STATE_AUTH_REQUIRED);
+    });
+
+    it('should fall back to InvalidRequest for non-task-shaped methods on auth failure', async () => {
+      const handler = createAuthHandler((agent) => {
+        agent
+          .addSecurityScheme('apiKey', new ApiKeyAuthorization({
+            in: 'header',
+            name: 'x-api-key',
+            keys: ['secret'],
+          }))
+          .addSecurityRequirement({ apiKey: [] });
+      });
+
+      const getTaskRequest = {
+        jsonrpc: '2.0' as const,
+        id: 3,
+        method: 'tasks/get',
+        params: { id: 'task-id' },
+      };
+      const context: RequestContext = { headers: {} };
+      const response = await handler.handle(getTaskRequest, context);
+      expect(isAsyncGenerator(response)).toBe(false);
+      const rpc = response as JSONRPCResponse;
+      expect('error' in rpc).toBe(true);
+      expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+        A2A_ERROR_CODES.INVALID_REQUEST,
+      );
     });
   });
 

@@ -561,26 +561,26 @@ describe('A2XClient auth integration', () => {
     expect(headers['Authorization']).toBeUndefined();
   });
 
-  it('calls refresh on 401 and retries', async () => {
+  it('calls refresh and retries when first response is auth-required', async () => {
+    // Spec a2a-v0.3 / v1.0: an auth failure surfaces as a Task whose
+    // status.state === 'auth-required'. The client refreshes credentials
+    // once and re-sends the same request.
+    const authRequiredTask = {
+      id: 'task-auth',
+      contextId: 'ctx-auth',
+      status: { state: TaskState.AUTH_REQUIRED, timestamp: new Date().toISOString() },
+    };
     let callCount = 0;
     const mockFetch = vi.fn().mockImplementation(() => {
       callCount++;
-      if (callCount === 1) {
-        // First call: 401
-        return Promise.resolve({
-          ok: false,
-          status: 401,
-          statusText: 'Unauthorized',
-          json: () => Promise.resolve({}),
-          headers: new Headers(),
-        });
-      }
-      // Second call: success
+      const body = callCount === 1
+        ? createJsonRpcSuccess(authRequiredTask)
+        : createJsonRpcSuccess(TASK_RESULT);
       return Promise.resolve({
         ok: true,
         status: 200,
         statusText: 'OK',
-        json: () => Promise.resolve(createJsonRpcSuccess(TASK_RESULT)),
+        json: () => Promise.resolve(body),
         headers: new Headers({ 'content-type': 'application/json' }),
       });
     });
@@ -595,7 +595,6 @@ describe('A2XClient auth integration', () => {
         throw new Error('No supported scheme');
       },
       async refresh(schemes) {
-        // Replace with new credential
         for (const scheme of schemes) {
           if (scheme instanceof ApiKeyAuthScheme) {
             scheme.setCredential('new-key');
@@ -615,27 +614,23 @@ describe('A2XClient auth integration', () => {
     });
 
     expect(mockFetch).toHaveBeenCalledTimes(2);
-    // Second call should have the new key
     const secondCallHeaders = mockFetch.mock.calls[1][1].headers;
     expect(secondCallHeaders['x-api-key']).toBe('new-key');
   });
 
-  it('does not retry more than once on 401', async () => {
-    const mockFetch = vi.fn().mockResolvedValue({
-      ok: false,
-      status: 401,
-      statusText: 'Unauthorized',
-      json: () => Promise.resolve({}),
-      headers: new Headers(),
-    });
+  it('returns the auth-required task when refresh is unsupported', async () => {
+    const authRequiredTask = {
+      id: 'task-auth',
+      contextId: 'ctx-auth',
+      status: { state: TaskState.AUTH_REQUIRED, timestamp: new Date().toISOString() },
+    };
+    const mockFetch = createMockFetch(createJsonRpcSuccess(authRequiredTask));
 
     const authProvider: AuthProvider = {
       async provide(requirements) {
         return [requirements[0][0].setCredential('key')];
       },
-      async refresh(schemes) {
-        return schemes;
-      },
+      // No refresh() — caller is expected to inspect the task state.
     };
 
     const client = new A2XClient(V10_CARD_WITH_AUTH, {
@@ -643,14 +638,12 @@ describe('A2XClient auth integration', () => {
       authProvider,
     });
 
-    await expect(
-      client.sendMessage({
-        message: { role: 'user', parts: [{ text: 'Hello' }] },
-      }),
-    ).rejects.toThrow('HTTP 401');
+    const task = await client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    });
 
-    // Once for initial, once for retry — no more
-    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(task.status.state).toBe(TaskState.AUTH_REQUIRED);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 
   it('propagates authProvider.provide() errors', async () => {
@@ -697,17 +690,4 @@ describe('A2XClient auth integration', () => {
     expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 
-  it('maps AUTHENTICATION_REQUIRED error code correctly', async () => {
-    const mockFetch = createMockFetch(
-      { jsonrpc: '2.0', id: 1, error: { code: -32008, message: 'Auth required' } },
-    );
-
-    const client = new A2XClient(V10_CARD_WITH_AUTH, { fetch: mockFetch });
-
-    await expect(
-      client.sendMessage({
-        message: { role: 'user', parts: [{ text: 'Hello' }] },
-      }),
-    ).rejects.toThrow('Auth required');
-  });
 });
