@@ -24,8 +24,10 @@ const a2xAgent = new A2XAgent({ taskStore, executor })
   .setDefaultUrl('https://agent.example.com/a2a')
   .setName('acme-agent')
   .setDescription('Public description of Acme Agent.')
-  // Auth is required — the handler returns AuthenticationRequiredError
-  // on unauthenticated calls to the extended-card method.
+  // Auth is required — the handler returns -32600 InvalidRequest on
+  // unauthenticated calls to the extended-card method (this method has
+  // no task-shaped response, so it cannot use the `auth-required`
+  // TaskState path).
   .addSecurityScheme('apiKey', new ApiKeyAuthorization({
     in: 'header',
     name: 'x-api-key',
@@ -78,7 +80,7 @@ If you only want to *add* skills rather than replace them, build the merged arra
 | Situation | JSON-RPC error | Code |
 |---|---|---|
 | Provider never registered | `AuthenticatedExtendedCardNotConfiguredError` | `-32007` |
-| Call arrives without auth (no `context`, failed auth, missing required scope) | `AuthenticationRequiredError` | `-32008` |
+| Call arrives without auth (no `context`, failed auth, missing required scope) | `InvalidRequestError` | `-32600` |
 | Resolved name / description missing after merge | Internal error (your provider stripped required fields) | `-32603` |
 
 The auth check runs at the `DefaultRequestHandler` level via the normal security-scheme flow — you don't need to re-implement it inside the provider. The provider only runs **after** `AuthResult.authenticated === true`.

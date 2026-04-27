@@ -29,7 +29,6 @@ import type {
 import { TERMINAL_STATES } from '../types/task.js';
 import {
   AuthenticatedExtendedCardNotConfiguredError,
-  AuthenticationRequiredError,
   InternalError,
   InvalidParamsError,
   InvalidRequestError,
@@ -45,6 +44,8 @@ import { JsonRpcRouter } from './jsonrpc-router.js';
 import type { ResponseMapper } from '../a2x/response-mapper.js';
 import { ResponseMapperFactory } from '../a2x/response-mapper.js';
 import type { RequestContext, AuthResult } from '../types/auth.js';
+import type { Task } from '../types/task.js';
+import { TaskState } from '../types/task.js';
 
 /** Return type of `handle()`. */
 export type HandleResult =
@@ -124,13 +125,24 @@ export class DefaultRequestHandler {
     // Authenticate if context is provided and security requirements exist.
     // Capture authResult so special-case handlers (e.g. the authenticated
     // extended card) can consume the resolved principal/scopes.
+    //
+    // Spec a2a-v0.3 / v1.0 model auth failure as a Task lifecycle state
+    // (`TaskState.AUTH_REQUIRED`), not as a JSON-RPC error. For methods
+    // whose response shape is a Task (`message/send`, `message/stream`),
+    // emit an auth-required task. Other methods don't have a task-shaped
+    // response, so they fall back to `-32600 InvalidRequest`.
     let authResult: AuthResult | undefined;
     if (context && this.a2xAgent.securityRequirements.length > 0) {
       authResult = await this._authenticate(context);
       if (!authResult.authenticated) {
-        const error = new AuthenticationRequiredError(
-          authResult.error ?? 'Authentication required',
-        );
+        const reason = authResult.error ?? 'Authentication required';
+        if (request.method === A2A_METHODS.SEND_MESSAGE) {
+          return this._buildAuthRequiredResponse(request, reason);
+        }
+        if (request.method === A2A_METHODS.STREAM_MESSAGE) {
+          return this._buildAuthRequiredStream(request, reason);
+        }
+        const error = new InvalidRequestError(reason);
         return {
           jsonrpc: '2.0',
           id: request.id,
@@ -163,7 +175,7 @@ export class DefaultRequestHandler {
           throw new AuthenticatedExtendedCardNotConfiguredError();
         }
         if (!authResult || !authResult.authenticated) {
-          throw new AuthenticationRequiredError(
+          throw new InvalidRequestError(
             'Authentication is required for the authenticated extended card',
           );
         }
@@ -200,6 +212,78 @@ export class DefaultRequestHandler {
    */
   getAgentCard(version?: string): AgentCardV03 | AgentCardV10 {
     return this.a2xAgent.getAgentCard(version);
+  }
+
+  // ─── Private: auth-required Task synthesis ───
+
+  /**
+   * Build an ephemeral Task in `auth-required` state for a single
+   * `message/send` request that failed authentication. Per A2A spec
+   * (`TaskState.auth-required` in v0.3 / `TASK_STATE_AUTH_REQUIRED` in
+   * v1.0), this is the protocol-level signal that prompts the client to
+   * acquire credentials and retry. The task is NOT persisted to the
+   * store — unauthenticated callers must not be able to allocate task
+   * IDs at will.
+   */
+  private _buildAuthRequiredResponse(
+    request: JSONRPCRequest,
+    reason: string,
+  ): JSONRPCResponse {
+    const userMessage = (request.params as { message?: unknown } | undefined)
+      ?.message;
+    const task = this._buildAuthRequiredTask(request, reason);
+    return {
+      jsonrpc: '2.0',
+      id: request.id,
+      result: this.responseMapper.mapTask(
+        task,
+        userMessage as Parameters<ResponseMapper['mapTask']>[1],
+      ),
+    };
+  }
+
+  /**
+   * Streaming counterpart to `_buildAuthRequiredResponse`. Emits a single
+   * `TaskStatusUpdateEvent` carrying `auth-required` and closes — clients
+   * react to the state and refresh their credentials before retrying via
+   * a fresh `message/stream`.
+   */
+  private async *_buildAuthRequiredStream(
+    request: JSONRPCRequest,
+    reason: string,
+  ): AsyncGenerator<unknown> {
+    const task = this._buildAuthRequiredTask(request, reason);
+    yield this.responseMapper.mapStatusUpdateEvent({
+      taskId: task.id,
+      contextId: task.contextId ?? '',
+      status: task.status,
+      // Spec a2a-v0.3 §TaskStatusUpdateEvent: `final: true` marks the last
+      // event for the stream. v1.0 dropped the field — the mapper handles
+      // both cases.
+      final: true,
+    });
+  }
+
+  private _buildAuthRequiredTask(
+    request: JSONRPCRequest,
+    reason: string,
+  ): Task {
+    const params = request.params as
+      | { message?: { contextId?: string } }
+      | undefined;
+    return {
+      id: randomUUID(),
+      contextId: params?.message?.contextId ?? randomUUID(),
+      status: {
+        state: TaskState.AUTH_REQUIRED,
+        message: {
+          messageId: randomUUID(),
+          role: 'agent',
+          parts: [{ text: reason }],
+        },
+        timestamp: new Date().toISOString(),
+      },
+    };
   }
 
   // ─── Private: Authentication ───
