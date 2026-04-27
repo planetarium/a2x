@@ -257,7 +257,10 @@ export class DefaultRequestHandler {
       taskId: task.id,
       contextId: task.contextId ?? '',
       status: task.status,
-      metadata: { final: true },
+      // Spec a2a-v0.3 §TaskStatusUpdateEvent: `final: true` marks the last
+      // event for the stream. v1.0 dropped the field — the mapper handles
+      // both cases.
+      final: true,
     });
   }
 

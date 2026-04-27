@@ -59,6 +59,10 @@ export class V03ResponseMapper implements ResponseMapper {
       status: this._mapStatus(event.status),
     };
 
+    // Spec a2a-v0.3 §TaskStatusUpdateEvent.final
+    if (event.final !== undefined) {
+      mapped.final = event.final;
+    }
     if (event.metadata !== undefined) {
       mapped.metadata = event.metadata;
     }

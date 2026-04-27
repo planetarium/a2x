@@ -77,6 +77,13 @@ export interface TaskStatusUpdateEvent {
   taskId: string;
   contextId: string;
   status: TaskStatus;
+  /**
+   * If true, this is the last status update expected for this task in the
+   * stream. Spec a2a-v0.3 §TaskStatusUpdateEvent (top-level `final` field).
+   * v1.0 dropped this field in favor of relying on the transport's
+   * end-of-stream signal — the v1.0 response mapper omits it on the wire.
+   */
+  final?: boolean;
   metadata?: Record<string, unknown>;
 }
 
