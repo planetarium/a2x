@@ -17,6 +17,7 @@ import type {
   DeletePushNotificationConfigParams,
   GetPushNotificationConfigParams,
   ListPushNotificationConfigsParams,
+  PushNotificationAuthenticationInfo,
   PushNotificationConfig,
   TaskPushNotificationConfig,
 } from '../types/jsonrpc.js';
@@ -882,13 +883,64 @@ export class DefaultRequestHandler {
         'SetPushNotificationConfig: "pushNotificationConfig.token" must be a string when provided',
       );
     }
-    if (n.authentication !== undefined) {
-      if (n.authentication === null || typeof n.authentication !== 'object') {
+    const authentication =
+      n.authentication !== undefined
+        ? this._validatePushNotificationAuthentication(n.authentication)
+        : undefined;
+
+    // Empty-string id is treated as absent (v1.0 proto-default semantic);
+    // the server assigns a UUID so the store can key the entry.
+    const clientId = typeof n.id === 'string' && n.id.length > 0 ? n.id : undefined;
+    const innerConfig: PushNotificationConfig = {
+      id: clientId ?? randomUUID(),
+      url: n.url,
+      ...(n.token !== undefined ? { token: n.token as string } : {}),
+      ...(authentication !== undefined ? { authentication } : {}),
+    };
+
+    return {
+      taskId: p.taskId,
+      pushNotificationConfig: innerConfig,
+    };
+  }
+
+  /**
+   * Validate and normalize the inbound `authentication` block of a
+   * `pushNotificationConfig` to the internal v0.3 shape
+   * `{ schemes: string[], credentials? }`.
+   *
+   * - v0.3 (`a2a-v0.3.0.json:1879-1897`): `{ schemes: string[], credentials? }`
+   *   with `schemes` required and non-empty.
+   * - v1.0 (`a2a-v1.0.0.json:466-483`, `a2a-v1.0.0.proto:325-329`):
+   *   `{ scheme: string, credentials? }` with `scheme` REQUIRED and
+   *   `additionalProperties: false`. Promote `scheme` to `[scheme]` for
+   *   storage so `tasks/pushNotificationConfig/{set,get,list}` round-trip
+   *   through the same internal shape regardless of wire version.
+   */
+  private _validatePushNotificationAuthentication(
+    raw: unknown,
+  ): PushNotificationAuthenticationInfo {
+    if (raw === null || typeof raw !== 'object') {
+      throw new InvalidParamsError(
+        'SetPushNotificationConfig: "pushNotificationConfig.authentication" must be an object when provided',
+      );
+    }
+    const auth = raw as Record<string, unknown>;
+    if (auth.credentials !== undefined && typeof auth.credentials !== 'string') {
+      throw new InvalidParamsError(
+        'SetPushNotificationConfig: "pushNotificationConfig.authentication.credentials" must be a string when provided',
+      );
+    }
+
+    let schemes: string[];
+    if (this.a2xAgent.protocolVersion === '1.0') {
+      if (typeof auth.scheme !== 'string' || auth.scheme.trim() === '') {
         throw new InvalidParamsError(
-          'SetPushNotificationConfig: "pushNotificationConfig.authentication" must be an object when provided',
+          'SetPushNotificationConfig: "pushNotificationConfig.authentication.scheme" must be a non-empty string',
         );
       }
-      const auth = n.authentication as Record<string, unknown>;
+      schemes = [auth.scheme];
+    } else {
       if (!Array.isArray(auth.schemes) || auth.schemes.length === 0) {
         throw new InvalidParamsError(
           'SetPushNotificationConfig: "pushNotificationConfig.authentication.schemes" must be a non-empty array of strings',
@@ -901,28 +953,12 @@ export class DefaultRequestHandler {
           );
         }
       }
-      if (auth.credentials !== undefined && typeof auth.credentials !== 'string') {
-        throw new InvalidParamsError(
-          'SetPushNotificationConfig: "pushNotificationConfig.authentication.credentials" must be a string when provided',
-        );
-      }
+      schemes = auth.schemes as string[];
     }
 
-    // Empty-string id is treated as absent (v1.0 proto-default semantic);
-    // the server assigns a UUID so the store can key the entry.
-    const clientId = typeof n.id === 'string' && n.id.length > 0 ? n.id : undefined;
-    const innerConfig: PushNotificationConfig = {
-      id: clientId ?? randomUUID(),
-      url: n.url,
-      ...(n.token !== undefined ? { token: n.token as string } : {}),
-      ...(n.authentication !== undefined
-        ? { authentication: n.authentication as PushNotificationConfig['authentication'] }
-        : {}),
-    };
-
     return {
-      taskId: p.taskId,
-      pushNotificationConfig: innerConfig,
+      schemes,
+      ...(auth.credentials !== undefined ? { credentials: auth.credentials as string } : {}),
     };
   }
 

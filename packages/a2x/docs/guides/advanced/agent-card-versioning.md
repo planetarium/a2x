@@ -74,3 +74,14 @@ const client = new A2XClient(url, { preferredVersion: '1.0' });
 - **Serve v1.0 as primary**, let A2X down-convert for v0.3 consumers. This is the default; you don't have to do anything.
 - **Pin your own clients to v1.0** when calling agents that support both. Future-facing.
 - **Only override defaults** when you need cross-version compatibility for a specific deployment target.
+
+## Beyond the AgentCard: push notification authentication
+
+`tasks/pushNotificationConfig/{set,get,list}` carries an optional `authentication` block whose shape diverges between specs:
+
+| Version | Shape | Notes |
+|---|---|---|
+| v0.3 | `{ schemes: string[], credentials? }` | `schemes` required and non-empty |
+| v1.0 | `{ scheme: string, credentials? }` | `scheme` required; `additionalProperties: false` |
+
+A2X stores the v0.3 shape internally and translates at the v1.0 boundary: `scheme = schemes[0]` outbound, `schemes = [scheme]` inbound. The conversion is lossy when v0.3 lists more than one scheme — only the first is preserved on a v1.0 wire. Configure your agent's `protocolVersion` to match the wire your clients speak; the SDK handles the rest.

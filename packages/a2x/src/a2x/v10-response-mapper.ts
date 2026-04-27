@@ -18,7 +18,10 @@ import type { TaskState } from '../types/task.js';
 import type { Message, Part, Artifact, Role } from '../types/common.js';
 import { ROLE_TO_V10 } from '../types/common.js';
 import type { ResponseMapper } from './response-mapper.js';
-import type { TaskPushNotificationConfig } from '../types/jsonrpc.js';
+import type {
+  PushNotificationAuthenticationInfo,
+  TaskPushNotificationConfig,
+} from '../types/jsonrpc.js';
 
 export class V10ResponseMapper implements ResponseMapper {
   readonly version = '1.0';
@@ -89,7 +92,9 @@ export class V10ResponseMapper implements ResponseMapper {
       url: inner.url,
     };
     if (inner.token !== undefined) flat.token = inner.token;
-    if (inner.authentication !== undefined) flat.authentication = inner.authentication;
+    if (inner.authentication !== undefined) {
+      flat.authentication = this._mapAuthentication(inner.authentication);
+    }
     return flat;
   }
 
@@ -101,6 +106,22 @@ export class V10ResponseMapper implements ResponseMapper {
   }
 
   // ─── Private Helpers ───
+
+  // v0.3 stores `{ schemes: string[], credentials? }` but v1.0
+  // (`a2a-v1.0.0.json:466-483`, `a2a-v1.0.0.proto:325-329`) requires
+  // `{ scheme: string, credentials? }` with `additionalProperties: false`.
+  // Collapse to the first scheme on the wire — round-trip is lossy when v0.3
+  // listed more than one, and the validator rejects empty arrays so
+  // `schemes[0]` is always defined here.
+  private _mapAuthentication(
+    auth: PushNotificationAuthenticationInfo,
+  ): Record<string, unknown> {
+    const mapped: Record<string, unknown> = { scheme: auth.schemes[0] };
+    if (auth.credentials !== undefined) {
+      mapped.credentials = auth.credentials;
+    }
+    return mapped;
+  }
 
   private _mapStateToV10(state: TaskState): string {
     const v10State = TASK_STATE_TO_V10.get(state);
