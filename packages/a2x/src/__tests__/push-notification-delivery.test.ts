@@ -90,6 +90,52 @@ describe('Push notification delivery (issue #119)', () => {
     expect(send).not.toHaveBeenCalled();
   });
 
+  it('webhook body is the spec-mapped Task wire shape, not the internal Task (issue #142 fix 1)', async () => {
+    // v1.0 mapper produces UPPER_CASE state and role; v0.3 produces
+    // lowercase with `kind` discriminators. Either way, the body must
+    // match the agent's protocolVersion wire shape — never the raw
+    // internal Task that would otherwise leak `state: "completed"`
+    // (lowercase) when the peer is a v1.0 receiver.
+    const send = vi.fn(async () => {});
+    const { handler, pushStore } = createTestAgent({ send }); // v1.0 agent
+
+    const streamResult = await handler.handle({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'message/stream',
+      params: {
+        message: {
+          messageId: 'msg-1',
+          role: 'user',
+          parts: [{ text: 'hi' }],
+        },
+      },
+    });
+
+    const generator = streamResult as AsyncGenerator<Record<string, unknown>>;
+    for await (const event of generator) {
+      const id = extractTaskId(event);
+      if (id) {
+        await pushStore.set({
+          taskId: id,
+          pushNotificationConfig: {
+            id: 'cfg-1',
+            url: 'https://hook.example.com/notify',
+          },
+        });
+      }
+    }
+
+    await flushDeliveries();
+
+    expect(send).toHaveBeenCalledTimes(1);
+    const [, body] = send.mock.calls[0]! as [unknown, Record<string, unknown>];
+    const status = body.status as Record<string, unknown>;
+    // v1.0 wire requires UPPER_CASE state. The pre-fix code would have
+    // delivered the internal lowercase `"completed"` here.
+    expect(status.state).toBe('TASK_STATE_COMPLETED');
+  });
+
   it('POSTs every registered webhook on terminal state with multiple configs', async () => {
     const send = vi.fn(async () => {});
     const { handler, pushStore } = createTestAgent({ send });

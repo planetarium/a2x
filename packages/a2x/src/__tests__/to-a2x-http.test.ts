@@ -73,6 +73,20 @@ describe('toA2x() HTTP wrapper — JSON-RPC over HTTP error convention', () => {
     expect(body.error.code).toBe(-32700);
   });
 
+  // Both `/.well-known/agent.json` (v0.3 spec) and
+  // `/.well-known/agent-card.json` (modern spec / our own client tries
+  // this first) must serve the AgentCard. Issue #142 fix 3.
+  it.each([
+    '/.well-known/agent.json',
+    '/.well-known/agent-card.json',
+  ])('serves the AgentCard at %s', async (path) => {
+    const res = await fetch(`${baseUrl}${path}`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('application/json');
+    const card = (await res.json()) as { name: string };
+    expect(card.name).toBe('noop-agent');
+  });
+
   it('returns HTTP 200 with a JSON-RPC error body for an unrecognized method', async () => {
     // The handler returns a JSON-RPC error response (it does not throw)
     // for an unknown method; the wrapper passes that through with HTTP

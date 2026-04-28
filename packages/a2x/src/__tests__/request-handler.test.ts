@@ -1419,6 +1419,74 @@ describe('Layer 4: DefaultRequestHandler', () => {
           },
         });
       });
+
+      // a2a-v1.0.0.proto:464 — TaskPushNotificationConfig is flat on the
+      // wire: { task_id, id?, url, token?, authentication? }. The mapper
+      // already returns this shape; the validator must accept it back so
+      // a v1.0 client can round-trip the response it just received
+      // (issue #142 fix 2).
+      it('accepts the v1.0 flat input shape and round-trips via internal nested form', async () => {
+        const { handler, pushStore } = createHandlerWithPushNotification('1.0');
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/set',
+          params: {
+            taskId: 'task-1',
+            id: 'config-1',
+            url: 'https://example.com/webhook',
+            token: 't1',
+          },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(false);
+        expect((rpc as { result: unknown }).result).toEqual({
+          id: 'config-1',
+          taskId: 'task-1',
+          url: 'https://example.com/webhook',
+          token: 't1',
+        });
+
+        const stored = await pushStore.get('task-1', 'config-1');
+        expect(stored).toEqual({
+          taskId: 'task-1',
+          pushNotificationConfig: {
+            id: 'config-1',
+            url: 'https://example.com/webhook',
+            token: 't1',
+          },
+        });
+      });
+
+      it('accepts the v1.0 flat input with authentication and auto-generates id when omitted', async () => {
+        const { handler, pushStore } = createHandlerWithPushNotification('1.0');
+
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/pushNotificationConfig/set',
+          params: {
+            taskId: 'task-1',
+            url: 'https://example.com/webhook',
+            authentication: { scheme: 'Bearer', credentials: 'abc' },
+          },
+        });
+
+        expect(isAsyncGenerator(response)).toBe(false);
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(false);
+        const result = (rpc as { result: { id?: string } }).result;
+        expect(typeof result.id).toBe('string');
+        expect(result.id).not.toEqual('');
+        const stored = await pushStore.get('task-1', result.id!);
+        expect(stored?.pushNotificationConfig.authentication).toEqual({
+          schemes: ['Bearer'],
+          credentials: 'abc',
+        });
+      });
     });
 
     describe('validation', () => {

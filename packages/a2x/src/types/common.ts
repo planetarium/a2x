@@ -33,8 +33,24 @@ export function isTextPart(part: Part): part is TextPart {
   return 'text' in part;
 }
 
+/**
+ * Recognize either the SDK-internal flat `FilePart` (`raw` / `url`) or
+ * the v0.3 spec wire shape (`{ kind: 'file', file: { bytes | uri, … } }`,
+ * `a2a-v0.3.0.json:828-861`). The `Part` type only models the flat
+ * form, but a value coming off the wire can be the nested form — and a
+ * guard that returned `false` for spec-conformant input would silently
+ * mis-classify it (issue #142 fix 5).
+ */
 export function isFilePart(part: Part): part is FilePart {
-  return 'raw' in part || ('url' in part && !('text' in part) && !('data' in part));
+  if ('text' in part || 'data' in part) return false;
+  if ('raw' in part || 'url' in part) return true;
+  // v0.3 spec nested shape: `{ kind: 'file', file: { bytes | uri, … } }`.
+  const candidate = part as Record<string, unknown>;
+  return (
+    candidate.kind === 'file' &&
+    typeof candidate.file === 'object' &&
+    candidate.file !== null
+  );
 }
 
 export function isDataPart(part: Part): part is DataPart {

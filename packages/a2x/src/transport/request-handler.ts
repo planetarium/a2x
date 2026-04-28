@@ -584,6 +584,11 @@ export class DefaultRequestHandler {
    * Look up every config registered for the task and hand each off to
    * the configured `PushNotificationSender`. Best-effort and fire-and-
    * forget — a slow or broken webhook must not stall the response path.
+   *
+   * The webhook body is the spec-mapped Task wire payload (v0.3 `kind`
+   * discriminators / v1.0 UPPER_CASE state and role) so receivers see
+   * exactly the same shape they would from `tasks/get`. The internal
+   * `Task` is only used inside the SDK and must not leak onto the wire.
    */
   private async _dispatchPushNotifications(task: Task): Promise<void> {
     const store = this.a2xAgent.pushNotificationConfigStore;
@@ -595,8 +600,9 @@ export class DefaultRequestHandler {
     } catch {
       return;
     }
+    const body = this.responseMapper.mapTask(task);
     for (const config of configs) {
-      void sender.send(config, task);
+      void sender.send(config, body);
     }
   }
 
@@ -963,20 +969,24 @@ export class DefaultRequestHandler {
   /**
    * Validate set push notification config params.
    *
-   * Per v0.3 spec `SetTaskPushNotificationConfigRequest.params` is a
+   * v0.3 spec `SetTaskPushNotificationConfigRequest.params` is a
    * `TaskPushNotificationConfig` with shape `{ taskId, pushNotificationConfig }`
-   * (no top-level `id`). `pushNotificationConfig.id` is optional per spec; the
-   * server assigns a UUID when the client omits it so the store can key it.
-   * v1.0 does not define a Set method; the SDK exposes the same JSON-RPC
-   * method name for both protocol versions as an extension and accepts the
-   * same nested shape.
+   * (nested). v1.0 (`a2a-v1.0.0.proto:464`) flattens the same fields onto
+   * the request: `{ taskId, id?, url, token?, authentication?, tenant? }`.
+   * Branch on `protocolVersion` so a v1.0 client can round-trip the shape
+   * the response mapper produces — `V10ResponseMapper.mapPushNotificationConfig`
+   * already returns the flat shape, so the validator must accept it back.
+   *
+   * `pushNotificationConfig.id` (v0.3) and top-level `id` (v1.0) are
+   * optional per spec; the server assigns a UUID when the client omits
+   * it so the store can key the entry.
    */
   private _validateSetPushNotificationConfigParams(
     params: unknown,
   ): TaskPushNotificationConfig {
     if (!params || typeof params !== 'object') {
       throw new InvalidParamsError(
-        'SetPushNotificationConfig requires a "taskId" and "pushNotificationConfig" parameter',
+        'SetPushNotificationConfig requires a "taskId" and push notification fields',
       );
     }
 
@@ -988,41 +998,56 @@ export class DefaultRequestHandler {
       );
     }
 
-    const nested = p.pushNotificationConfig;
-    if (!nested || typeof nested !== 'object') {
-      throw new InvalidParamsError(
-        'SetPushNotificationConfig: "pushNotificationConfig" must be an object',
-      );
-    }
+    // v1.0 flat shape: read fields from the top level. The presence of a
+    // top-level `url` is what disambiguates flat from nested — a v0.3
+    // request never has top-level `url`, only `pushNotificationConfig`.
+    const isFlat =
+      this.a2xAgent.protocolVersion === '1.0' &&
+      typeof p.url === 'string';
 
-    const n = nested as Record<string, unknown>;
-    if (typeof n.url !== 'string' || (n.url as string).trim() === '') {
+    const source: Record<string, unknown> = isFlat
+      ? p
+      : ((): Record<string, unknown> => {
+          const nested = p.pushNotificationConfig;
+          if (!nested || typeof nested !== 'object') {
+            throw new InvalidParamsError(
+              'SetPushNotificationConfig: "pushNotificationConfig" must be an object',
+            );
+          }
+          return nested as Record<string, unknown>;
+        })();
+
+    if (typeof source.url !== 'string' || (source.url as string).trim() === '') {
+      const where = isFlat ? '"url"' : '"pushNotificationConfig.url"';
       throw new InvalidParamsError(
-        'SetPushNotificationConfig: "pushNotificationConfig.url" must be a non-empty string',
+        `SetPushNotificationConfig: ${where} must be a non-empty string`,
       );
     }
-    if (n.id !== undefined && typeof n.id !== 'string') {
+    if (source.id !== undefined && typeof source.id !== 'string') {
+      const where = isFlat ? '"id"' : '"pushNotificationConfig.id"';
       throw new InvalidParamsError(
-        'SetPushNotificationConfig: "pushNotificationConfig.id" must be a string when provided',
+        `SetPushNotificationConfig: ${where} must be a string when provided`,
       );
     }
-    if (n.token !== undefined && typeof n.token !== 'string') {
+    if (source.token !== undefined && typeof source.token !== 'string') {
+      const where = isFlat ? '"token"' : '"pushNotificationConfig.token"';
       throw new InvalidParamsError(
-        'SetPushNotificationConfig: "pushNotificationConfig.token" must be a string when provided',
+        `SetPushNotificationConfig: ${where} must be a string when provided`,
       );
     }
     const authentication =
-      n.authentication !== undefined
-        ? this._validatePushNotificationAuthentication(n.authentication)
+      source.authentication !== undefined
+        ? this._validatePushNotificationAuthentication(source.authentication)
         : undefined;
 
     // Empty-string id is treated as absent (v1.0 proto-default semantic);
     // the server assigns a UUID so the store can key the entry.
-    const clientId = typeof n.id === 'string' && n.id.length > 0 ? n.id : undefined;
+    const clientId =
+      typeof source.id === 'string' && source.id.length > 0 ? source.id : undefined;
     const innerConfig: PushNotificationConfig = {
       id: clientId ?? randomUUID(),
-      url: n.url,
-      ...(n.token !== undefined ? { token: n.token as string } : {}),
+      url: source.url,
+      ...(source.token !== undefined ? { token: source.token as string } : {}),
       ...(authentication !== undefined ? { authentication } : {}),
     };
 

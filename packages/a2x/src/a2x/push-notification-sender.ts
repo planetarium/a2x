@@ -5,8 +5,9 @@
  * `PushNotificationConfigStore` only persists configs; it doesn't
  * actually call the webhook URL when a task transitions. The sender is
  * the missing half: given a stored `TaskPushNotificationConfig` and the
- * current `Task`, it POSTs the task body to `config.url` so the client
- * receives an out-of-band lifecycle notification.
+ * spec-mapped wire body of the current task, it POSTs the body to
+ * `config.url` so the client receives an out-of-band lifecycle
+ * notification.
  *
  * Wire one in via `A2XAgentOptions.pushNotificationSender`. Without it,
  * `capabilities.pushNotifications` stays `false` even when a config
@@ -14,26 +15,31 @@
  * delivery would be a false promise. See issue #119.
  */
 
-import type { Task } from '../types/task.js';
 import type { TaskPushNotificationConfig } from '../types/jsonrpc.js';
 
 // ─── PushNotificationSender Interface ───
 
 export interface PushNotificationSender {
   /**
-   * Deliver a single push notification for `task` to the webhook
-   * registered in `config`. Implementations should NOT throw on
-   * delivery failure (best-effort): a webhook the client mis-configured
-   * shouldn't break the task pipeline. Log + drop is fine; queue + retry
-   * is also fine if the implementation owns durable retries.
+   * Deliver a single push notification to the webhook registered in
+   * `config`. `body` is the already version-mapped Task wire payload
+   * (v0.3 `kind` discriminators / v1.0 UPPER_CASE state and role) — the
+   * caller is responsible for mapping the internal Task through a
+   * `ResponseMapper` so the bytes on the wire match the spec for the
+   * agent's declared `protocolVersion`.
+   *
+   * Implementations should NOT throw on delivery failure (best-effort):
+   * a webhook the client mis-configured shouldn't break the task
+   * pipeline. Log + drop is fine; queue + retry is also fine if the
+   * implementation owns durable retries.
    */
-  send(config: TaskPushNotificationConfig, task: Task): Promise<void>;
+  send(config: TaskPushNotificationConfig, body: unknown): Promise<void>;
 }
 
 // ─── FetchPushNotificationSender ───
 
 /**
- * Default sender: POSTs the JSON-encoded `task` body to `config.url`.
+ * Default sender: POSTs the JSON-encoded wire `body` to `config.url`.
  *
  * Authentication is best-effort by spec — `PushNotificationConfig.token`
  * is included as `X-A2A-Notification-Token` for symmetric secret
@@ -82,7 +88,7 @@ export class FetchPushNotificationSender implements PushNotificationSender {
       });
   }
 
-  async send(config: TaskPushNotificationConfig, task: Task): Promise<void> {
+  async send(config: TaskPushNotificationConfig, body: unknown): Promise<void> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
     };
@@ -109,7 +115,7 @@ export class FetchPushNotificationSender implements PushNotificationSender {
       const response = await this._fetch(inner.url, {
         method: 'POST',
         headers,
-        body: JSON.stringify(task),
+        body: JSON.stringify(body),
         signal: controller.signal,
       });
       if (!response.ok) {

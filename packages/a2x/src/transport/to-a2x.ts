@@ -133,10 +133,16 @@ export function createA2xRequestListener(
 
     const parsedUrl = new URL(req.url ?? '/', defaultOrigin);
 
-    // GET /.well-known/agent.json
+    // GET /.well-known/agent.json or /.well-known/agent-card.json.
+    // Both paths are valid agent-card discovery endpoints — the v0.3
+    // spec uses `agent.json`, the modern spec and our own client
+    // (`agent-card-resolver.ts:15-18`) try `agent-card.json` first.
+    // Serving both means a client that hits the modern path doesn't
+    // get a 404 before it can fall back.
     if (
       req.method === 'GET' &&
-      parsedUrl.pathname === '/.well-known/agent.json'
+      (parsedUrl.pathname === '/.well-known/agent.json' ||
+        parsedUrl.pathname === '/.well-known/agent-card.json')
     ) {
       try {
         const card = handler.getAgentCard();
