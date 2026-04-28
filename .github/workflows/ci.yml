@@ -19,12 +19,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # Opt in to the Node.js 24 default early to silence per-step
-  # deprecation warnings for `pnpm/action-setup@v4`. Forced for everyone
-  # on June 2nd, 2026.
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-
 jobs:
   ci:
     runs-on: ubuntu-latest
@@ -38,7 +32,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: pnpm/action-setup@v4
+      # Pinned to v4.4.0 (rather than the floating @v4 tag) because the
+      # floating @v4 was reverted to a Node 20 manifest after the v4 → v5
+      # cut. v4.4.0 keeps the v4 codebase but declares `using: node24` in
+      # its manifest, eliminating the per-run deprecation warning without
+      # taking on v6's known regressions (see dependabot.yml comment).
+      - uses: pnpm/action-setup@v4.4.0
 
       - uses: actions/setup-node@v6
         with:
