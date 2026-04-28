@@ -2,16 +2,19 @@
  * Client-side SSE (Server-Sent Events) stream parser.
  * Counterpart to server-side src/transport/sse-handler.ts.
  *
- * Supports two SSE formats:
+ * Spec format (a2a-v0.3 §SendStreamingMessageSuccessResponse — every
+ * chunk is a full JSON-RPC success response):
  *
- * Format A (a2x server — has event: field):
+ *   data: {"jsonrpc":"2.0","id":1,"result":<TaskStatusUpdateEvent|TaskArtifactUpdateEvent>}\n\n
+ *
+ * a2x and ADK-based servers both emit this shape today.
+ *
+ * Legacy format A (pre-#118 a2x server output, kept for one minor for
+ * upgrade compatibility — emits a one-time deprecation warning):
  *   event: status_update\ndata: {event object}\n\n
  *   event: artifact_update\ndata: {event object}\n\n
  *   event: done\ndata: {}\n\n
  *   event: error\ndata: {error message}\n\n
- *
- * Format B (ADK-based servers — data-only, JSON-RPC wrapped):
- *   data: {"jsonrpc":"2.0","id":1,"result":{event object with "kind" field}}\n\n
  */
 
 import type {
@@ -138,6 +141,7 @@ export async function* parseSSEStream(
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let warnedLegacyFormat = false;
 
   try {
     while (true) {
@@ -150,8 +154,20 @@ export async function* parseSSEStream(
       buffer = remaining;
 
       for (const sseEvent of events) {
-        // Format A: explicit event: field from a2x server
+        // Legacy format A: explicit event: field. Emitted by pre-#118
+        // a2x servers; surface a one-time deprecation warning so users
+        // notice they're talking to an old server. Drop in next minor.
         if (sseEvent.event) {
+          if (!warnedLegacyFormat) {
+            warnedLegacyFormat = true;
+            console.warn(
+              '[@a2x/sdk] Streaming peer emitted the legacy SSE format ' +
+                "(`event: status_update` / `event: artifact_update`). The A2A spec " +
+                'requires `data:`-only chunks wrapped in a JSON-RPC envelope ' +
+                "(`{ jsonrpc, id, result }`). Upgrade the server (a2x ≥ next) " +
+                'to drop this warning. See issue #118.',
+            );
+          }
           switch (sseEvent.event) {
             case SSE_EVENT.STATUS_UPDATE: {
               const raw = JSON.parse(sseEvent.data);

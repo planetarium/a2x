@@ -141,7 +141,10 @@ export class DefaultRequestHandler {
           return this._buildAuthRequiredResponse(request, reason);
         }
         if (request.method === A2A_METHODS.STREAM_MESSAGE) {
-          return this._buildAuthRequiredStream(request, reason);
+          return this._wrapStreamInJsonRpc(
+            request.id,
+            this._buildAuthRequiredStream(request, reason),
+          );
         }
         const error = new InvalidRequestError(reason);
         return {
@@ -191,10 +194,14 @@ export class DefaultRequestHandler {
       }
     }
 
-    // Streaming method → return AsyncGenerator
+    // Streaming method → return AsyncGenerator. Each chunk is wrapped
+    // in a JSON-RPC success envelope keyed by `request.id`, per spec
+    // a2a-v0.3 §SendStreamingMessageSuccessResponse — every frame on
+    // the stream is a full JSONRPCResponse, not a bare event object.
     if (this.router.isStreamMethod(request.method)) {
       try {
-        return this.router.routeStream(request) as AsyncGenerator<unknown>;
+        const inner = this.router.routeStream(request) as AsyncGenerator<unknown>;
+        return this._wrapStreamInJsonRpc(request.id, inner);
       } catch (err) {
         return this._toErrorResponse(request.id, err);
       }
@@ -709,6 +716,25 @@ export class DefaultRequestHandler {
   }
 
   // ─── Private: Helpers ───
+
+  /**
+   * Wrap each chunk of an inner stream generator into a JSON-RPC success
+   * envelope (`{ jsonrpc, id, result }`). Mid-stream errors are surfaced
+   * as a single trailing JSON-RPC error envelope, then the stream closes
+   * — clients keyed on the request id can correlate the failure.
+   */
+  private async *_wrapStreamInJsonRpc(
+    id: string | number | null,
+    inner: AsyncGenerator<unknown>,
+  ): AsyncGenerator<JSONRPCResponse> {
+    try {
+      for await (const event of inner) {
+        yield { jsonrpc: '2.0', id, result: event };
+      }
+    } catch (err) {
+      yield this._toErrorResponse(id, err);
+    }
+  }
 
   private _toErrorResponse(
     id: string | number | null,

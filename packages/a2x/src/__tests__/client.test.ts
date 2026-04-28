@@ -355,11 +355,12 @@ describe('ResponseParser', () => {
 describe('SSE Parser', () => {
   const parser = getResponseParser('0.3');
 
-  it('should parse status_update and artifact_update events', async () => {
+  it('parses spec-shaped JSON-RPC envelopes for status and artifact updates', async () => {
+    // Spec a2a-v0.3 §SendStreamingMessageSuccessResponse: each chunk is
+    // a full JSON-RPC success response with the event under `result`.
     const sse = [
-      'event: status_update\ndata: {"kind":"status-update","taskId":"t1","contextId":"c1","status":{"state":"working"}}\n\n',
-      'event: artifact_update\ndata: {"kind":"artifact-update","taskId":"t1","contextId":"c1","artifact":{"artifactId":"a1","parts":[{"kind":"text","text":"hello"}]}}\n\n',
-      'event: done\ndata: {}\n\n',
+      'data: {"jsonrpc":"2.0","id":1,"result":{"kind":"status-update","taskId":"t1","contextId":"c1","status":{"state":"working"}}}\n\n',
+      'data: {"jsonrpc":"2.0","id":1,"result":{"kind":"artifact-update","taskId":"t1","contextId":"c1","artifact":{"artifactId":"a1","parts":[{"kind":"text","text":"hello"}]}}}\n\n',
     ].join('');
 
     const response = createSSEResponse(sse);
@@ -373,11 +374,13 @@ describe('SSE Parser', () => {
     expect((events[1] as Record<string, unknown>).taskId).toBe('t1');
   });
 
-  it('should stop on done event', async () => {
+  it('stops at terminal status with final=true (no `event: done` terminator needed)', async () => {
+    // Spec a2a-v0.3 §TaskStatusUpdateEvent: `final: true` on a terminal
+    // state marks the last event for the stream. Connection close after
+    // it ends the SSE stream.
     const sse = [
-      'event: status_update\ndata: {"taskId":"t1","contextId":"c1","status":{"state":"working"}}\n\n',
-      'event: done\ndata: {}\n\n',
-      'event: artifact_update\ndata: {"taskId":"t1","contextId":"c1","artifact":{"artifactId":"a1","parts":[]}}\n\n',
+      'data: {"jsonrpc":"2.0","id":1,"result":{"kind":"status-update","taskId":"t1","contextId":"c1","status":{"state":"working"}}}\n\n',
+      'data: {"jsonrpc":"2.0","id":1,"result":{"kind":"status-update","taskId":"t1","contextId":"c1","status":{"state":"completed"},"final":true}}\n\n',
     ].join('');
 
     const response = createSSEResponse(sse);
@@ -386,32 +389,19 @@ describe('SSE Parser', () => {
       events.push(event);
     }
 
-    // Should only get 1 event (before done)
-    expect(events).toHaveLength(1);
+    expect(events).toHaveLength(2);
   });
 
-  it('should throw on error event', async () => {
-    const sse = 'event: error\ndata: {"error":"Something went wrong"}\n\n';
-    const response = createSSEResponse(sse);
-
-    await expect(async () => {
-      for await (const _event of parseSSEStream(response, parser)) {
-        // should not reach here
-      }
-    }).rejects.toThrow('Something went wrong');
-  });
-
-  it('should handle chunked SSE delivery', async () => {
+  it('handles chunked SSE delivery for spec-shaped envelopes', async () => {
     const encoder = new TextEncoder();
-    const chunk1 = 'event: status_upd';
-    const chunk2 = 'ate\ndata: {"taskId":"t1","contextId":"c1","status":{"state":"working"}}\n\n';
-    const chunk3 = 'event: done\ndata: {}\n\n';
+    const chunk1 = 'data: {"jsonrpc":"2.0","id":1,"result":{"kind":"status-upda';
+    const chunk2 =
+      'te","taskId":"t1","contextId":"c1","status":{"state":"working"}}}\n\n';
 
     const stream = new ReadableStream({
       start(controller) {
         controller.enqueue(encoder.encode(chunk1));
         controller.enqueue(encoder.encode(chunk2));
-        controller.enqueue(encoder.encode(chunk3));
         controller.close();
       },
     });
@@ -424,6 +414,31 @@ describe('SSE Parser', () => {
 
     expect(events).toHaveLength(1);
     expect((events[0] as Record<string, unknown>).taskId).toBe('t1');
+  });
+
+  it('still parses the legacy `event: status_update` / `event: done` format with a deprecation warning', async () => {
+    // Backward-compat: pre-#118 a2x servers emitted `event: ` framed
+    // chunks. Keep parsing them for one minor so users don't break on
+    // an old server, but log once so they notice the upgrade.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const sse = [
+        'event: status_update\ndata: {"kind":"status-update","taskId":"t1","contextId":"c1","status":{"state":"working"}}\n\n',
+        'event: done\ndata: {}\n\n',
+      ].join('');
+
+      const response = createSSEResponse(sse);
+      const events: unknown[] = [];
+      for await (const event of parseSSEStream(response, parser)) {
+        events.push(event);
+      }
+
+      expect(events).toHaveLength(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]?.[0]).toContain('legacy SSE format');
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('should throw if response body is null', async () => {
