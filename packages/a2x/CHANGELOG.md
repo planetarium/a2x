@@ -1,5 +1,284 @@
 # @a2x/sdk
 
+## 0.11.0
+
+### Minor Changes
+
+- [#138](https://github.com/planetarium/a2x/pull/138) [`b687ae2`](https://github.com/planetarium/a2x/commit/b687ae2212ada1eff33bfcffbca0a7ac6cef5b64) Thanks [@ost006](https://github.com/ost006)! - Remove the `version` parameter from `A2XAgent.getAgentCard()` and
+  `DefaultRequestHandler.getAgentCard()`. The card is now always rendered in the
+  agent's configured `protocolVersion` — the same wire format the server actually
+  speaks.
+
+  Closes [#133](https://github.com/planetarium/a2x/issues/133).
+
+  **Why.** The server's wire format is fixed at construction time (the
+  `protocolVersion` chosen on `new A2XAgent({...})` selects a single
+  `responseMapper`). Letting `getAgentCard(version)` render a card in a different
+  version published a contract the server could not honor: response shapes
+  (`TASK_STATE_COMPLETED` vs `'completed'`), role/part encoding (`ROLE_USER` vs
+  `'user'`, `kind` discriminator presence), and `pushNotificationConfig/{set,delete}`
+  param shape are all bound to the configured version. A v1.0 agent serving a
+  v0.3 card silently broke every call from a conforming v0.3 client, because
+  `A2XClient.detectProtocolVersion()` honors the card's declared version
+  absolutely.
+
+  **Breaking — removals.**
+
+  - `A2XAgent.getAgentCard(version?)` — the `version` parameter is removed.
+  - `DefaultRequestHandler.getAgentCard(version?)` — the `version` parameter is
+    removed.
+  - The `?version=` query string on `GET /.well-known/agent.json` (built-in
+    `to-a2x` HTTP server) is no longer honored.
+
+  In-tree callers that already passed no argument (`samples/express`,
+  `samples/nextjs`, `samples/nextjs-skill`, `samples/nextjs-x402`) are
+  unaffected. Callers that previously did `getAgentCard('0.3')` against a v1.0
+  agent (or vice versa) were creating the foot-gun this fix removes — the
+  correct migration is to construct a separate `A2XAgent` with the desired
+  `protocolVersion`:
+
+  ```ts
+  // Before — silently broken: card said v0.3, wire still spoke v1.0
+  const card03 = a2xAgent.getAgentCard("0.3");
+
+  // After — one agent per wire format
+  const a2xAgentV03 = new A2XAgent({
+    taskStore,
+    executor,
+    protocolVersion: "0.3",
+  });
+  const card03 = a2xAgentV03.getAgentCard();
+  ```
+
+- [#138](https://github.com/planetarium/a2x/pull/138) [`ac24460`](https://github.com/planetarium/a2x/commit/ac24460bd24b96c640786f9a023b9a77be910688) Thanks [@ost006](https://github.com/ost006)! - Align `MessageSendConfiguration` and `TaskQueryParams` with spec a2a-v0.3.
+  Three drift fixes plus an `A2XClient` ergonomic gap.
+
+  Closes [#120](https://github.com/planetarium/a2x/issues/120).
+
+  **Breaking — renames.** `SendMessageConfiguration.returnImmediately`
+  (SDK-private, inverted) is replaced with `blocking` (spec-canonical). The
+  client's wire-emit path used to translate `returnImmediately → blocking`; that
+  translation is now a no-op passthrough.
+
+  ```ts
+  // Before
+  client.sendMessage({ message, configuration: { returnImmediately: true } });
+
+  // After
+  client.sendMessage({ message, configuration: { blocking: false } });
+  ```
+
+  **New — inline push-notification config.**
+  `SendMessageConfiguration.pushNotificationConfig` is now honored. The request
+  handler registers the inline config in the configured
+  `PushNotificationConfigStore` before kicking off execution, so clients can
+  subscribe in a single round-trip. Throws `PushNotificationNotSupported` when
+  no store is configured. Pairs with the actual delivery wiring shipping in this
+  release.
+
+  **Fix — `tasks/get` honors `historyLength`.** The method was wired to
+  `_validateTaskIdParams` and silently ignored the spec's
+  `TaskQueryParams.historyLength`. Added a dedicated `_validateTaskQueryParams`
+  validator (rejects non-integer / negative values) and a `sliceHistory()`
+  helper that trims the response Task's `history` to the requested bound. The
+  same slicing applies on the unary `message/send` response.
+
+  **New — `A2XClient.getTask({ historyLength?, metadata? })`.** The spec's bound
+  is now reachable from the public client API.
+
+  Spec refs:
+
+  - v0.3 §`MessageSendConfiguration` (`a2a-v0.3.0.json:1669-1693`)
+  - v0.3 §`TaskQueryParams` (`a2a-v0.3.0.json:2385-2406`)
+  - v0.3 §`GetTaskRequest.params` (`a2a-v0.3.0.json:1090`) — uses
+    `TaskQueryParams`, not `TaskIdParams`.
+
+- [#138](https://github.com/planetarium/a2x/pull/138) [`ac24460`](https://github.com/planetarium/a2x/commit/ac24460bd24b96c640786f9a023b9a77be910688) Thanks [@ost006](https://github.com/ost006)! - Deliver push-notification webhooks on terminal task state, and stop falsely
+  advertising the capability when no sender is wired.
+
+  Closes [#119](https://github.com/planetarium/a2x/issues/119).
+
+  **Why.** The SDK accepted `tasks/pushNotificationConfig/{set,get,list,delete}`
+  calls and persisted configs to the store, but no code ever POSTed to the
+  webhook URL when a task transitioned. Worse, the AgentCard auto-flipped
+  `capabilities.pushNotifications: true` as soon as a config store was wired —
+  spec-aware clients that read the capability and skipped polling never received
+  any notification, and the task appeared stuck.
+
+  **New — `PushNotificationSender` interface.** Pluggable sender abstraction
+  plus a default `FetchPushNotificationSender` that POSTs the JSON-encoded task
+  body to `config.url`. Forwards `token` as `X-A2A-Notification-Token` and
+  `Bearer` credentials from `authentication`. Best-effort by spec — delivery
+  failures are logged via an injectable `onError` callback, never thrown into
+  the task pipeline.
+
+  ```ts
+  import { A2XAgent, FetchPushNotificationSender } from "@a2x/sdk";
+
+  const a2xAgent = new A2XAgent({
+    taskStore,
+    executor,
+    pushNotificationConfigStore, // existing
+    pushNotificationSender: new FetchPushNotificationSender(), // new
+  });
+  ```
+
+  **Behavior change — capability auto-derivation tightened.**
+  `capabilities.pushNotifications` now flips to `true` only when **both** a
+  `PushNotificationConfigStore` **and** a `PushNotificationSender` are wired. An
+  explicit value via `setPushNotifications()` still wins. This stops the SDK
+  from shipping a false-positive AgentCard. Existing deployments that wired only
+  a store will see the capability flip from `true` (incorrect, never delivered)
+  to `false` (correct) until a sender is added.
+
+  **Wiring.** `DefaultRequestHandler` invokes the sender on terminal state
+  (after `message/send` completes and after the streaming generator yields a
+  terminal event). Fire-and-forget so a slow webhook can't stall the response
+  path.
+
+  Tests cover capability auto-derivation in both directions, webhook fire on
+  terminal state from both `message/send` and `message/stream`,
+  `FetchPushNotificationSender` headers (token, Bearer auth), and
+  transport-failure resilience.
+
+- [#138](https://github.com/planetarium/a2x/pull/138) [`ac24460`](https://github.com/planetarium/a2x/commit/ac24460bd24b96c640786f9a023b9a77be910688) Thanks [@ost006](https://github.com/ost006)! - Make `resource` and `description` required on `X402Accept`. The x402 executor
+  used to fabricate two `PaymentRequirements` MUST-fields when the merchant
+  omitted them — defaults that violated the spec.
+
+  Closes [#123](https://github.com/planetarium/a2x/issues/123).
+
+  **Why.** Per x402 v1 §`PaymentRequirements`:
+
+  - `resource` MUST be a URL identifying what is being paid for. The SDK
+    defaulted it to the literal string `'a2a-x402/access'` (not a URL). Strict
+    facilitators reject this.
+  - `description` MUST describe the purchase. The SDK defaulted it to `''`,
+    which surfaces in wallet UIs as the consent prompt — users were being asked
+    to sign for a payment whose purpose is "(empty)".
+
+  **Breaking — type tightening.**
+
+  - `X402Accept.resource: string` (was `string | undefined`).
+  - `X402Accept.description: string` (was `string | undefined`).
+  - `X402_DEFAULT_RESOURCE` export is removed.
+  - `description ?? ''` fallback inside `normalizeAccept` is removed.
+
+  The TypeScript compiler now forces merchants to supply spec-conformant values.
+  Existing code that relied on the defaults must pass real values:
+
+  ```ts
+  // Before — silently shipped non-URL resource and empty description
+  agent.addExtension(
+    { uri: X402_EXTENSION_URI },
+    {
+      accepts: [{ scheme: "exact", network: "base", maxAmountRequired: "..." }],
+    }
+  );
+
+  // After — required fields enforced at compile time
+  agent.addExtension(
+    { uri: X402_EXTENSION_URI },
+    {
+      accepts: [
+        {
+          scheme: "exact",
+          network: "base",
+          maxAmountRequired: "...",
+          resource: "https://api.example.com/premium",
+          description: "Premium agent access",
+        },
+      ],
+    }
+  );
+  ```
+
+  Samples, docs, and test fixtures are updated to pass real values.
+
+### Patch Changes
+
+- [#138](https://github.com/planetarium/a2x/pull/138) [`ac24460`](https://github.com/planetarium/a2x/commit/ac24460bd24b96c640786f9a023b9a77be910688) Thanks [@ost006](https://github.com/ost006)! - Return HTTP 200 with a JSON-RPC error body for parse failures and handler
+  exceptions in the bundled HTTP wrappers (`toA2x()` and the four samples). The
+  JSON-RPC over HTTP convention is to keep the HTTP layer at `200` and surface
+  the error code in the response body — clients that skip body parsing on `4xx`
+  never see the JSON-RPC code otherwise.
+
+  Closes [#122](https://github.com/planetarium/a2x/issues/122).
+
+  **Why.** `DefaultRequestHandler.handle()` already followed this convention for
+  string bodies (it returned a `JSONParseError` JSON-RPC response, not a thrown
+  error). The bug was confined to the HTTP wrappers above it: `toA2x()`, the
+  Express sample, and the three Next.js samples all returned HTTP `400` for
+  malformed JSON and any handler exception. A spec-conforming client that read
+  status code as "no body to parse" would miss the `-32700 Parse error` /
+  `-32603 Internal error` payload.
+
+  **Changes.**
+
+  - `transport/to-a2x.ts`: narrows the parse-error catch to `JSON.parse` only,
+    adds a separate handler-exception catch that emits `-32603` with the
+    request id (or `null` when params are unparseable). Both paths return HTTP
+    `200`.
+  - `transport/to-a2x.ts`: extracts the request listener into the new exported
+    `createA2xRequestListener()` so the dispatch can be unit-tested without
+    going through `listen()`.
+  - `samples/express`, `samples/nextjs`, `samples/nextjs-skill`,
+    `samples/nextjs-x402`: same treatment, mirrored for the App Router shape.
+
+  Adds `to-a2x-http.test.ts` covering the malformed-body and unknown-method
+  paths to lock the HTTP-200 contract in.
+
+- [#117](https://github.com/planetarium/a2x/pull/117) [`45463f8`](https://github.com/planetarium/a2x/commit/45463f8079cc2c3a48823e015e5add1d6b70d5ea) Thanks [@ost006](https://github.com/ost006)! - Stop logging a `console.warn` from
+  `OAuth2DeviceCodeAuthorization.toV03Schema()`. The warning fired on every v0.3
+  AgentCard render — i.e. on every `GET /.well-known/agent.json?version=0.3` and
+  every `agent/getAuthenticatedExtendedCard` call — even though emitting Device
+  Code as a non-standard `oauth2.flows.deviceCode` extension is the SDK's
+  intentional behavior. The non-standard nature is already documented on the
+  method's JSDoc and in the authentication guide; the per-render log was pure
+  noise.
+
+- [#138](https://github.com/planetarium/a2x/pull/138) [`ac24460`](https://github.com/planetarium/a2x/commit/ac24460bd24b96c640786f9a023b9a77be910688) Thanks [@ost006](https://github.com/ost006)! - Wrap each SSE chunk in a JSON-RPC success envelope keyed by the originating
+  request id, per spec a2a-v0.3 §`SendStreamingMessageSuccessResponse`. The
+  previous wire shape (`event: status_update` / `event: artifact_update` framing
+  plus a non-spec `event: done` terminator) was interop-broken with any
+  non-a2x peer (Python ADK, official samples, third-party gateways) — it
+  worked only because the a2x client parser tolerated both formats.
+
+  Closes [#118](https://github.com/planetarium/a2x/issues/118).
+
+  **Wire shape — before:**
+
+  ```
+  event: status_update
+  data: {"taskId":"...","status":{...}}
+
+  event: done
+  ```
+
+  **Wire shape — after:**
+
+  ```
+  data: {"jsonrpc":"2.0","id":<request-id>,"result":{"taskId":"...","status":{...}}}
+  ```
+
+  Stream end is signalled by connection close after the terminal status
+  (`final: true` in v0.3); the non-spec `event: done` chunk is gone.
+
+  **Changes.**
+
+  - `DefaultRequestHandler.handle()` now wraps the streaming generator in
+    JSON-RPC envelopes (`_wrapStreamInJsonRpc`) for both the routed stream
+    methods and the auth-required stream synthesis. Mid-stream errors yield a
+    single trailing JSON-RPC error envelope instead of throwing, so clients
+    keyed on the request id can correlate the failure.
+  - `createSSEStream()` is now a generic `data:`-only encoder — drops the
+    `event:` field and the trailing `event: done` terminator.
+  - The client SSE parser keeps tolerating the legacy framed shape for one
+    minor for upgrade compatibility, but emits a one-time deprecation warning
+    when it sees it. **The legacy path will be removed in the next minor.**
+
+  Tests, fixtures, and the streaming guides are updated to consume the new
+  shape.
+
 ## 0.10.1
 
 ### Patch Changes
