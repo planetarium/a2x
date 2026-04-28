@@ -14,6 +14,7 @@ import type {
   JSONRPCResponse,
   SendMessageParams,
   TaskIdParams,
+  TaskQueryParams,
   DeletePushNotificationConfigParams,
   GetPushNotificationConfigParams,
   ListPushNotificationConfigsParams,
@@ -438,11 +439,12 @@ export class DefaultRequestHandler {
       },
     );
 
-    // tasks/get
+    // tasks/get — uses TaskQueryParams (id + optional historyLength) per
+    // spec a2a-v0.3 §GetTaskRequest, not the bare TaskIdParams.
     this.router.registerMethod(
       A2A_METHODS.GET_TASK,
       async (params) => {
-        const taskParams = this._validateTaskIdParams(params);
+        const taskParams = this._validateTaskQueryParams(params);
         return this._handleGetTask(taskParams);
       },
     );
@@ -524,12 +526,41 @@ export class DefaultRequestHandler {
   private async _handleSendMessage(params: SendMessageParams): Promise<unknown> {
     const task = await this._resolveTaskForMessage(params);
 
+    // Spec a2a-v0.3 §MessageSendConfiguration: clients can register a
+    // push notification config in the same call that creates the task.
+    // Honor it before kicking off execution so the agent's lifecycle
+    // events can find the config when delivery is wired.
+    await this._registerInlinePushConfig(task.id, params.configuration);
+
     const completedTask = await this.a2xAgent.agentExecutor.execute(
       task,
       params.message,
     );
 
-    return this.responseMapper.mapTask(completedTask, params.message);
+    const sliced = sliceHistory(
+      completedTask,
+      params.configuration?.historyLength,
+    );
+    return this.responseMapper.mapTask(sliced, params.message);
+  }
+
+  private async _registerInlinePushConfig(
+    taskId: string,
+    config: SendMessageParams['configuration'],
+  ): Promise<void> {
+    const pushConfig = config?.pushNotificationConfig;
+    if (!pushConfig) return;
+
+    const store = this.a2xAgent.pushNotificationConfigStore;
+    if (!store) {
+      throw new PushNotificationNotSupportedError();
+    }
+
+    const id = pushConfig.id ?? randomUUID();
+    await store.set({
+      taskId,
+      pushNotificationConfig: { ...pushConfig, id },
+    });
   }
 
   private async *_handleStreamMessage(
@@ -545,6 +576,11 @@ export class DefaultRequestHandler {
     }
 
     const task = await this._resolveTaskForMessage(params);
+
+    // Register the inline pushNotificationConfig (if any) before kicking
+    // off execution, mirroring `_handleSendMessage`. See spec a2a-v0.3
+    // §MessageSendConfiguration.
+    await this._registerInlinePushConfig(task.id, params.configuration);
 
     const eventStream = this.a2xAgent.agentExecutor.executeStream(
       task,
@@ -610,12 +646,13 @@ export class DefaultRequestHandler {
     }
   }
 
-  private async _handleGetTask(params: TaskIdParams): Promise<unknown> {
+  private async _handleGetTask(params: TaskQueryParams): Promise<unknown> {
     const task = await this.a2xAgent.taskStore.getTask(params.id);
     if (!task) {
       throw new TaskNotFoundError(`Task not found: ${params.id}`);
     }
-    return this.responseMapper.mapTask(task);
+    const sliced = sliceHistory(task, params.historyLength);
+    return this.responseMapper.mapTask(sliced);
   }
 
   private async _handleCancelTask(params: TaskIdParams): Promise<unknown> {
@@ -769,6 +806,32 @@ export class DefaultRequestHandler {
     }
 
     return params as TaskIdParams;
+  }
+
+  /**
+   * Validate `tasks/get` params per spec a2a-v0.3 §TaskQueryParams.
+   * Same shape as `TaskIdParams` plus an optional non-negative integer
+   * `historyLength` and an optional `metadata` bag.
+   */
+  private _validateTaskQueryParams(params: unknown): TaskQueryParams {
+    const base = this._validateTaskIdParams(params);
+    const p = params as Record<string, unknown>;
+    if ('historyLength' in p && p.historyLength !== undefined) {
+      if (
+        typeof p.historyLength !== 'number' ||
+        !Number.isInteger(p.historyLength) ||
+        p.historyLength < 0
+      ) {
+        throw new InvalidParamsError(
+          'TaskQueryParams "historyLength" must be a non-negative integer',
+        );
+      }
+    }
+    return {
+      id: base.id,
+      historyLength: p.historyLength as number | undefined,
+      metadata: p.metadata as Record<string, unknown> | undefined,
+    };
   }
 
   /**
@@ -1072,6 +1135,23 @@ export class DefaultRequestHandler {
       metadata: p.metadata as Record<string, unknown> | undefined,
     };
   }
+}
+
+/**
+ * Trim a Task's `history` to the last `limit` entries without mutating
+ * the underlying store entry. Returns the same Task reference when no
+ * trimming is needed (limit is undefined or already short enough), so
+ * downstream mappers can rely on identity equality where they used to.
+ */
+function sliceHistory(task: Task, limit?: number): Task {
+  if (limit === undefined) return task;
+  const history = task.history;
+  if (!history) return task;
+  if (limit === 0) {
+    return { ...task, history: [] };
+  }
+  if (history.length <= limit) return task;
+  return { ...task, history: history.slice(-limit) };
 }
 
 /**

@@ -28,6 +28,13 @@ const mockProvider = new (class extends BaseLlmProvider {
 })();
 
 function createHandler(protocolVersion?: ProtocolVersion): DefaultRequestHandler {
+  return createHandlerWithStore(protocolVersion).handler;
+}
+
+function createHandlerWithStore(protocolVersion?: ProtocolVersion): {
+  handler: DefaultRequestHandler;
+  taskStore: InMemoryTaskStore;
+} {
   const agent = new LlmAgent({
     name: 'test-agent',
     provider: mockProvider,
@@ -44,7 +51,7 @@ function createHandler(protocolVersion?: ProtocolVersion): DefaultRequestHandler
   const a2xAgent = new A2XAgent({ taskStore, executor, protocolVersion });
   a2xAgent.setDefaultUrl('https://example.com/a2a');
 
-  return new DefaultRequestHandler(a2xAgent);
+  return { handler: new DefaultRequestHandler(a2xAgent), taskStore };
 }
 
 function createHandlerWithPushNotification(protocolVersion?: ProtocolVersion): {
@@ -394,6 +401,81 @@ describe('Layer 4: DefaultRequestHandler', () => {
       // v0.3: has kind, lowercase state
       expect(retrieved.kind).toBe('task');
       expect((retrieved.status as Record<string, unknown>).state).toBe('completed');
+    });
+
+    it('honors TaskQueryParams.historyLength on tasks/get', async () => {
+      // Spec a2a-v0.3 §TaskQueryParams: clients can bound how many history
+      // entries the server returns to avoid pulling the full transcript on
+      // every poll. See issue #120.
+      const { handler, taskStore } = createHandlerWithStore('0.3');
+
+      // Seed a task with a 3-entry history directly so we don't depend on
+      // the executor's accumulation behavior (which is out of scope here).
+      const seeded = await taskStore.createTask({});
+      await taskStore.updateTask(seeded.id, {
+        history: ['one', 'two', 'three'].map((t, i) => ({
+          messageId: `msg-${i}`,
+          role: 'user' as const,
+          parts: [{ text: t }],
+        })),
+      });
+
+      // Without historyLength: full history.
+      const fullResponse = await handler.handle({
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tasks/get',
+        params: { id: seeded.id },
+      });
+      const fullTask = ((fullResponse as JSONRPCResponse) as {
+        result: { history: unknown[] };
+      }).result;
+      expect(fullTask.history).toHaveLength(3);
+
+      // historyLength=1: server slices to the most recent entry.
+      const slicedResponse = await handler.handle({
+        jsonrpc: '2.0',
+        id: 4,
+        method: 'tasks/get',
+        params: { id: seeded.id, historyLength: 1 },
+      });
+      const slicedTask = ((slicedResponse as JSONRPCResponse) as {
+        result: { history: { parts: { text: string }[] }[] };
+      }).result;
+      expect(slicedTask.history).toHaveLength(1);
+      // The most recent entry survives.
+      expect(slicedTask.history[0].parts[0].text).toBe('three');
+
+      // historyLength=0: empty array, history field present.
+      const emptyResponse = await handler.handle({
+        jsonrpc: '2.0',
+        id: 5,
+        method: 'tasks/get',
+        params: { id: seeded.id, historyLength: 0 },
+      });
+      const emptyTask = ((emptyResponse as JSONRPCResponse) as {
+        result: { history?: unknown[] };
+      }).result;
+      // Mapper omits empty history; either is acceptable so long as we
+      // didn't return more than 0 entries.
+      expect(emptyTask.history === undefined || emptyTask.history.length === 0).toBe(true);
+    });
+
+    it('rejects negative or non-integer historyLength on tasks/get', async () => {
+      const handler = createHandler();
+      for (const bad of [-1, 1.5, 'two']) {
+        const response = await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tasks/get',
+          params: { id: 'whatever', historyLength: bad },
+        });
+        const rpc = response as JSONRPCResponse;
+        expect('error' in rpc).toBe(true);
+        expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+          A2A_ERROR_CODES.INVALID_PARAMS,
+        );
+      }
     });
   });
 
@@ -1036,6 +1118,73 @@ describe('Layer 4: DefaultRequestHandler', () => {
           A2A_ERROR_CODES.INVALID_PARAMS,
         );
       });
+    });
+  });
+
+  describe('message/send — inline pushNotificationConfig (issue #120)', () => {
+    it('registers configuration.pushNotificationConfig in the store before execution', async () => {
+      // Spec a2a-v0.3 §MessageSendConfiguration: clients can register a
+      // webhook config in the same call that creates the task — no
+      // follow-up tasks/pushNotificationConfig/set round-trip needed.
+      const { handler, pushStore } = createHandlerWithPushNotification('1.0');
+
+      const response = await handler.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: {
+          message: {
+            messageId: 'msg-1',
+            role: 'user',
+            parts: [{ text: 'Hello' }],
+          },
+          configuration: {
+            pushNotificationConfig: {
+              id: 'inline-cfg-1',
+              url: 'https://example.com/webhook',
+              token: 't1',
+            },
+          },
+        },
+      });
+
+      const taskId = ((response as JSONRPCResponse) as { result: { id: string } }).result.id;
+      const stored = await pushStore.get(taskId, 'inline-cfg-1');
+      expect(stored).toEqual({
+        taskId,
+        pushNotificationConfig: {
+          id: 'inline-cfg-1',
+          url: 'https://example.com/webhook',
+          token: 't1',
+        },
+      });
+    });
+
+    it('errors PushNotificationNotSupported when configuration.pushNotificationConfig is sent to a no-store agent', async () => {
+      const handler = createHandler('1.0');
+      const response = await handler.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: {
+          message: {
+            messageId: 'msg-1',
+            role: 'user',
+            parts: [{ text: 'Hello' }],
+          },
+          configuration: {
+            pushNotificationConfig: {
+              id: 'inline-cfg-1',
+              url: 'https://example.com/webhook',
+            },
+          },
+        },
+      });
+      const rpc = response as JSONRPCResponse;
+      expect('error' in rpc).toBe(true);
+      expect((rpc as JSONRPCErrorResponse).error.code).toBe(
+        A2A_ERROR_CODES.PUSH_NOTIFICATION_NOT_SUPPORTED,
+      );
     });
   });
 
