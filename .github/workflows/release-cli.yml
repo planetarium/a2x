@@ -19,14 +19,6 @@ concurrency:
   group: release-cli
   cancel-in-progress: false
 
-env:
-  # `actions/upload-artifact@v4`, `actions/download-artifact@v4`, and
-  # `softprops/action-gh-release@v2` still declare Node 20 in their
-  # manifests. Force them onto Node 24 until they're bumped to their
-  # respective Node-24-native majors (separate PR — major bumps require
-  # validation against an actual CLI release).
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-
 jobs:
   check-version:
     runs-on: ubuntu-latest
@@ -101,7 +93,7 @@ jobs:
             fi
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: packages/cli/binaries/a2x-*
@@ -132,15 +124,18 @@ jobs:
       - name: Pack CLI tarball
         run: pnpm --filter @a2x/cli pack --pack-destination packages/cli
 
+      # Pinned to v7 (not v8) — v8 changes `digest-mismatch` default to
+      # `error` (was warn-only). v7 is Node 24 native with no behavior
+      # break for our `path` / `pattern` / `merge-multiple` usage.
       - name: Download binary artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: packages/cli/binaries
           pattern: binaries-*
           merge-multiple: true
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.check-version.outputs.tag }}
           name: CLI ${{ needs.check-version.outputs.version }}
