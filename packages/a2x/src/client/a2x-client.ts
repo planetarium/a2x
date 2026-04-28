@@ -469,13 +469,25 @@ export class A2XClient {
   /**
    * Retrieve the current state of a task.
    * Uses JSON-RPC method `tasks/get`.
+   *
+   * Spec a2a-v0.3 §TaskQueryParams: pass `historyLength` to bound the
+   * size of the `history` slice the server returns. Useful for polling
+   * long-running conversations without pulling the whole transcript.
    */
-  async getTask(taskId: string): Promise<Task> {
+  async getTask(
+    taskId: string,
+    options?: { historyLength?: number; metadata?: Record<string, unknown> },
+  ): Promise<Task> {
     await this._ensureResolved();
     await this._ensureAuthenticated();
-    const request = this._buildJsonRpcRequest(A2A_METHODS.GET_TASK, {
-      id: taskId,
-    });
+    const params: Record<string, unknown> = { id: taskId };
+    if (options?.historyLength !== undefined) {
+      params.historyLength = options.historyLength;
+    }
+    if (options?.metadata !== undefined) {
+      params.metadata = options.metadata;
+    }
+    const request = this._buildJsonRpcRequest(A2A_METHODS.GET_TASK, params);
     const result = await this._postJsonRpc(request);
     return this._parser!.parseTask(result);
   }
@@ -614,13 +626,8 @@ export class A2XClient {
       }
     }
 
-    // Format configuration: returnImmediately → blocking (inverted semantics)
-    const config = formatted.configuration as Record<string, unknown> | undefined;
-    if (config && 'returnImmediately' in config) {
-      config.blocking = !config.returnImmediately;
-      delete config.returnImmediately;
-    }
-
+    // configuration is now spec-shaped on the public API surface
+    // (`blocking`, `pushNotificationConfig`, …) — passthrough.
     return formatted;
   }
 

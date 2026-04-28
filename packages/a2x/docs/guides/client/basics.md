@@ -43,6 +43,36 @@ const canceled = await client.cancelTask('task-abc123');
 
 `task-abc123` is the `id` from the task you previously submitted. This is how you poll long-running work or abort something the user changed their mind about.
 
+## Bounding history and registering a webhook in one call
+
+`SendMessageConfiguration` (the optional `configuration` field on `sendMessage()`) follows the v0.3 spec verbatim:
+
+```ts
+await client.sendMessage({
+  message: { role: 'user', parts: [{ text: 'Hello' }] },
+  configuration: {
+    // Wait for the task to reach a terminal state before resolving.
+    // false → return as soon as the agent picks the task up.
+    blocking: true,
+    // Cap the history slice the server returns on the response Task.
+    historyLength: 10,
+    // Register a webhook for this task in the same round-trip — no
+    // follow-up tasks/pushNotificationConfig/set call needed.
+    pushNotificationConfig: {
+      id: 'cfg-1',
+      url: 'https://my-app.example.com/a2a-webhook',
+      token: 'secret',
+    },
+  },
+});
+```
+
+`tasks/get` accepts the same `historyLength` (as a top-level param):
+
+```ts
+await client.getTask('task-abc123', { historyLength: 1 });
+```
+
 ## Message parts
 
 `parts` is an array — you can send text plus other modalities:
