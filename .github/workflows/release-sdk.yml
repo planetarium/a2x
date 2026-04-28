@@ -3,6 +3,11 @@ name: Release SDK
 on:
   push:
     branches: [main]
+    # Only fire when SDK source / changesets actually move. Docs-only or
+    # CLI-only commits no longer kick off a no-op publish run.
+    paths:
+      - 'packages/a2x/**'
+      - '.changeset/**'
 
 permissions:
   contents: write
@@ -38,3 +43,30 @@ jobs:
           # Enables npm supply-chain provenance for published packages
           # (requires `id-token: write` permission above).
           NPM_CONFIG_PROVENANCE: "true"
+
+      # Folded in from the previous notify-docs.yml workflow so the
+      # dispatch only fires when changesets actually published — not
+      # on every push to main.
+      - name: Mint GitHub App installation token
+        if: steps.changesets.outputs.published == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.A2X_WEB_DISPATCHER_APP_ID }}
+          private-key: ${{ secrets.A2X_WEB_DISPATCHER_PRIVATE_KEY }}
+          owner: planetarium
+          repositories: a2x-web
+
+      - name: Notify a2x-web of SDK publish
+        if: steps.changesets.outputs.published == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh api repos/planetarium/a2x-web/dispatches \
+            --method POST \
+            --header "Accept: application/vnd.github+json" \
+            --raw-field event_type=a2x-sdk-updated \
+            --raw-field "client_payload[sha]=${{ github.sha }}" \
+            --raw-field "client_payload[run_id]=${{ github.run_id }}" \
+            --raw-field "client_payload[source]=planetarium/a2x"
+          echo "Dispatched a2x-sdk-updated to planetarium/a2x-web"

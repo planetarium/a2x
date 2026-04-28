@@ -3,6 +3,12 @@ name: Release CLI
 on:
   push:
     branches: [main]
+    # CLI is in the changesets `ignore` list — only the manual
+    # `chore/cli-release-X.Y.Z` PR (which bumps packages/cli/package.json)
+    # should kick off a release. SDK / docs / sample changes no longer fire
+    # the version-check job on every push.
+    paths:
+      - 'packages/cli/**'
 
 permissions:
   contents: write
