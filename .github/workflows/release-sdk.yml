@@ -14,9 +14,19 @@ permissions:
   pull-requests: write
   id-token: write
 
+# Serialize releases on main: queue subsequent pushes behind the
+# in-flight publish rather than cancelling it (npm half-state risk).
+concurrency:
+  group: release-sdk
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
 

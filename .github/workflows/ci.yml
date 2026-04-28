@@ -5,10 +5,30 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # Pure docs PRs need no validation — lint / build / typecheck / test
+    # don't touch markdown. The push: main run still validates end-to-end.
+    paths-ignore:
+      - '**.md'
+
+permissions:
+  contents: read
+
+# Cancel in-progress runs when newer commits land on the same ref. Saves
+# CI minutes when a PR is iterated with multiple consecutive pushes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Opt in to the Node.js 24 default early to silence per-step
+  # deprecation warnings for `pnpm/action-setup@v4`. Forced for everyone
+  # on June 2nd, 2026.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
   ci:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
