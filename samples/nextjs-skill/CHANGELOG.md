@@ -1,5 +1,12 @@
 # sample-nextjs-skill
 
+## 0.0.7
+
+### Patch Changes
+
+- Updated dependencies [[`45463f8`](https://github.com/planetarium/a2x/commit/45463f8079cc2c3a48823e015e5add1d6b70d5ea)]:
+  - @a2x/sdk@0.10.2
+
 ## 0.0.6
 
 ### Patch Changes
