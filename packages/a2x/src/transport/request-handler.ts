@@ -14,6 +14,7 @@ import type {
   JSONRPCResponse,
   SendMessageParams,
   TaskIdParams,
+  TaskQueryParams,
   DeletePushNotificationConfigParams,
   GetPushNotificationConfigParams,
   ListPushNotificationConfigsParams,
@@ -141,7 +142,10 @@ export class DefaultRequestHandler {
           return this._buildAuthRequiredResponse(request, reason);
         }
         if (request.method === A2A_METHODS.STREAM_MESSAGE) {
-          return this._buildAuthRequiredStream(request, reason);
+          return this._wrapStreamInJsonRpc(
+            request.id,
+            this._buildAuthRequiredStream(request, reason),
+          );
         }
         const error = new InvalidRequestError(reason);
         return {
@@ -191,10 +195,14 @@ export class DefaultRequestHandler {
       }
     }
 
-    // Streaming method → return AsyncGenerator
+    // Streaming method → return AsyncGenerator. Each chunk is wrapped
+    // in a JSON-RPC success envelope keyed by `request.id`, per spec
+    // a2a-v0.3 §SendStreamingMessageSuccessResponse — every frame on
+    // the stream is a full JSONRPCResponse, not a bare event object.
     if (this.router.isStreamMethod(request.method)) {
       try {
-        return this.router.routeStream(request) as AsyncGenerator<unknown>;
+        const inner = this.router.routeStream(request) as AsyncGenerator<unknown>;
+        return this._wrapStreamInJsonRpc(request.id, inner);
       } catch (err) {
         return this._toErrorResponse(request.id, err);
       }
@@ -209,10 +217,11 @@ export class DefaultRequestHandler {
   }
 
   /**
-   * Get the AgentCard for a specific protocol version.
+   * Get the AgentCard. Always rendered in the agent's configured
+   * `protocolVersion` to match the wire format the server actually speaks.
    */
-  getAgentCard(version?: string): AgentCardV03 | AgentCardV10 {
-    return this.a2xAgent.getAgentCard(version);
+  getAgentCard(): AgentCardV03 | AgentCardV10 {
+    return this.a2xAgent.getAgentCard();
   }
 
   // ─── Private: auth-required Task synthesis ───
@@ -438,11 +447,12 @@ export class DefaultRequestHandler {
       },
     );
 
-    // tasks/get
+    // tasks/get — uses TaskQueryParams (id + optional historyLength) per
+    // spec a2a-v0.3 §GetTaskRequest, not the bare TaskIdParams.
     this.router.registerMethod(
       A2A_METHODS.GET_TASK,
       async (params) => {
-        const taskParams = this._validateTaskIdParams(params);
+        const taskParams = this._validateTaskQueryParams(params);
         return this._handleGetTask(taskParams);
       },
     );
@@ -524,12 +534,70 @@ export class DefaultRequestHandler {
   private async _handleSendMessage(params: SendMessageParams): Promise<unknown> {
     const task = await this._resolveTaskForMessage(params);
 
+    // Spec a2a-v0.3 §MessageSendConfiguration: clients can register a
+    // push notification config in the same call that creates the task.
+    // Honor it before kicking off execution so the agent's lifecycle
+    // events can find the config when delivery is wired.
+    await this._registerInlinePushConfig(task.id, params.configuration);
+
     const completedTask = await this.a2xAgent.agentExecutor.execute(
       task,
       params.message,
     );
 
-    return this.responseMapper.mapTask(completedTask, params.message);
+    const sliced = sliceHistory(
+      completedTask,
+      params.configuration?.historyLength,
+    );
+
+    // Spec a2a-v0.3 §AgentCapabilities.pushNotifications: deliver
+    // webhook callbacks for tasks that the client subscribed to. We fire
+    // on terminal state (the most common subscription point); embedders
+    // that want non-terminal pings can wrap PushNotificationSender.
+    if (TERMINAL_STATES.has(completedTask.status.state)) {
+      void this._dispatchPushNotifications(completedTask);
+    }
+
+    return this.responseMapper.mapTask(sliced, params.message);
+  }
+
+  private async _registerInlinePushConfig(
+    taskId: string,
+    config: SendMessageParams['configuration'],
+  ): Promise<void> {
+    const pushConfig = config?.pushNotificationConfig;
+    if (!pushConfig) return;
+
+    const store = this.a2xAgent.pushNotificationConfigStore;
+    if (!store) {
+      throw new PushNotificationNotSupportedError();
+    }
+
+    const id = pushConfig.id ?? randomUUID();
+    await store.set({
+      taskId,
+      pushNotificationConfig: { ...pushConfig, id },
+    });
+  }
+
+  /**
+   * Look up every config registered for the task and hand each off to
+   * the configured `PushNotificationSender`. Best-effort and fire-and-
+   * forget — a slow or broken webhook must not stall the response path.
+   */
+  private async _dispatchPushNotifications(task: Task): Promise<void> {
+    const store = this.a2xAgent.pushNotificationConfigStore;
+    const sender = this.a2xAgent.pushNotificationSender;
+    if (!store || !sender) return;
+    let configs;
+    try {
+      configs = await store.list(task.id);
+    } catch {
+      return;
+    }
+    for (const config of configs) {
+      void sender.send(config, task);
+    }
   }
 
   private async *_handleStreamMessage(
@@ -546,12 +614,19 @@ export class DefaultRequestHandler {
 
     const task = await this._resolveTaskForMessage(params);
 
+    // Register the inline pushNotificationConfig (if any) before kicking
+    // off execution, mirroring `_handleSendMessage`. See spec a2a-v0.3
+    // §MessageSendConfiguration.
+    await this._registerInlinePushConfig(task.id, params.configuration);
+
     const eventStream = this.a2xAgent.agentExecutor.executeStream(
       task,
       params.message,
     );
 
     const bus = this.a2xAgent.taskEventBus;
+
+    let reachedTerminal = false;
 
     // finally closes the bus so resubscribers see the stream end regardless
     // of how the primary stream terminates (normal, error, cancel via return).
@@ -560,13 +635,14 @@ export class DefaultRequestHandler {
         // Update task in store for non-terminal status events.
         // Terminal states are already applied by AgentExecutor (same object
         // reference), so calling updateTask would hit the guard.
-        if (
-          'status' in event &&
-          !TERMINAL_STATES.has(event.status.state)
-        ) {
-          await this.a2xAgent.taskStore.updateTask(task.id, {
-            status: event.status,
-          });
+        if ('status' in event) {
+          if (TERMINAL_STATES.has(event.status.state)) {
+            reachedTerminal = true;
+          } else {
+            await this.a2xAgent.taskStore.updateTask(task.id, {
+              status: event.status,
+            });
+          }
         }
         bus.publish(task.id, event);
         if ('status' in event) {
@@ -577,6 +653,12 @@ export class DefaultRequestHandler {
       }
     } finally {
       bus.close(task.id);
+      if (reachedTerminal) {
+        // Re-fetch the task so the webhook body reflects the final
+        // store state (artifacts accumulated during streaming, etc).
+        const final = await this.a2xAgent.taskStore.getTask(task.id);
+        if (final) void this._dispatchPushNotifications(final);
+      }
     }
   }
 
@@ -610,12 +692,13 @@ export class DefaultRequestHandler {
     }
   }
 
-  private async _handleGetTask(params: TaskIdParams): Promise<unknown> {
+  private async _handleGetTask(params: TaskQueryParams): Promise<unknown> {
     const task = await this.a2xAgent.taskStore.getTask(params.id);
     if (!task) {
       throw new TaskNotFoundError(`Task not found: ${params.id}`);
     }
-    return this.responseMapper.mapTask(task);
+    const sliced = sliceHistory(task, params.historyLength);
+    return this.responseMapper.mapTask(sliced);
   }
 
   private async _handleCancelTask(params: TaskIdParams): Promise<unknown> {
@@ -710,6 +793,25 @@ export class DefaultRequestHandler {
 
   // ─── Private: Helpers ───
 
+  /**
+   * Wrap each chunk of an inner stream generator into a JSON-RPC success
+   * envelope (`{ jsonrpc, id, result }`). Mid-stream errors are surfaced
+   * as a single trailing JSON-RPC error envelope, then the stream closes
+   * — clients keyed on the request id can correlate the failure.
+   */
+  private async *_wrapStreamInJsonRpc(
+    id: string | number | null,
+    inner: AsyncGenerator<unknown>,
+  ): AsyncGenerator<JSONRPCResponse> {
+    try {
+      for await (const event of inner) {
+        yield { jsonrpc: '2.0', id, result: event };
+      }
+    } catch (err) {
+      yield this._toErrorResponse(id, err);
+    }
+  }
+
   private _toErrorResponse(
     id: string | number | null,
     err: unknown,
@@ -769,6 +871,32 @@ export class DefaultRequestHandler {
     }
 
     return params as TaskIdParams;
+  }
+
+  /**
+   * Validate `tasks/get` params per spec a2a-v0.3 §TaskQueryParams.
+   * Same shape as `TaskIdParams` plus an optional non-negative integer
+   * `historyLength` and an optional `metadata` bag.
+   */
+  private _validateTaskQueryParams(params: unknown): TaskQueryParams {
+    const base = this._validateTaskIdParams(params);
+    const p = params as Record<string, unknown>;
+    if ('historyLength' in p && p.historyLength !== undefined) {
+      if (
+        typeof p.historyLength !== 'number' ||
+        !Number.isInteger(p.historyLength) ||
+        p.historyLength < 0
+      ) {
+        throw new InvalidParamsError(
+          'TaskQueryParams "historyLength" must be a non-negative integer',
+        );
+      }
+    }
+    return {
+      id: base.id,
+      historyLength: p.historyLength as number | undefined,
+      metadata: p.metadata as Record<string, unknown> | undefined,
+    };
   }
 
   /**
@@ -1072,6 +1200,23 @@ export class DefaultRequestHandler {
       metadata: p.metadata as Record<string, unknown> | undefined,
     };
   }
+}
+
+/**
+ * Trim a Task's `history` to the last `limit` entries without mutating
+ * the underlying store entry. Returns the same Task reference when no
+ * trimming is needed (limit is undefined or already short enough), so
+ * downstream mappers can rely on identity equality where they used to.
+ */
+function sliceHistory(task: Task, limit?: number): Task {
+  if (limit === undefined) return task;
+  const history = task.history;
+  if (!history) return task;
+  if (limit === 0) {
+    return { ...task, history: [] };
+  }
+  if (history.length <= limit) return task;
+  return { ...task, history: history.slice(-limit) };
 }
 
 /**

@@ -26,6 +26,13 @@ export { InMemoryPushNotificationConfigStore } from './push-notification-config-
 export type {
   PushNotificationConfigStore,
 } from './push-notification-config-store.js';
+export {
+  FetchPushNotificationSender,
+} from './push-notification-sender.js';
+export type {
+  PushNotificationSender,
+  FetchPushNotificationSenderOptions,
+} from './push-notification-sender.js';
 
 // ─── Register default agent-card mappers ───
 

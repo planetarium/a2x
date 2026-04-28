@@ -20,6 +20,7 @@ import { AgentExecutor, StreamingMode } from './agent-executor.js';
 import { AgentCardMapperFactory } from './agent-card-mapper.js';
 import type { TaskStore } from './task-store.js';
 import type { PushNotificationConfigStore } from './push-notification-config-store.js';
+import type { PushNotificationSender } from './push-notification-sender.js';
 import type { TaskEventBus } from './task-event-bus.js';
 import { InMemoryTaskEventBus } from './task-event-bus.js';
 
@@ -37,6 +38,14 @@ export interface A2XAgentOptions {
   executor: AgentExecutor;
   protocolVersion?: ProtocolVersion;
   pushNotificationConfigStore?: PushNotificationConfigStore;
+  /**
+   * Optional webhook delivery for `tasks/pushNotificationConfig/*`.
+   * Without it, `capabilities.pushNotifications` defaults to `false`
+   * even when a config store is wired — advertising the capability
+   * without delivery would falsely promise webhook callbacks. See
+   * issue #119.
+   */
+  pushNotificationSender?: PushNotificationSender;
   taskEventBus?: TaskEventBus;
 }
 
@@ -45,6 +54,7 @@ export class A2XAgent {
   private readonly _agentExecutor: AgentExecutor;
   private readonly _protocolVersion: ProtocolVersion;
   private readonly _pushNotificationConfigStore?: PushNotificationConfigStore;
+  private readonly _pushNotificationSender?: PushNotificationSender;
   private readonly _taskEventBus: TaskEventBus;
 
   // ─── Internal mutable state (builder pattern) ───
@@ -68,7 +78,11 @@ export class A2XAgent {
   ) => Partial<A2XAgentState> | Promise<Partial<A2XAgentState>>;
 
   // ─── AgentCard cache ───
-  private _cardCache = new Map<string, AgentCardV03 | AgentCardV10>();
+  // Single slot: the agent's wire format is fixed at construction time, so
+  // there is only ever one card to render. Rendering any other version
+  // would publish a card that lies about what the server actually speaks
+  // (see issue #133).
+  private _cachedCard?: AgentCardV03 | AgentCardV10;
 
   constructor(options: A2XAgentOptions) {
     if (!options.taskStore) {
@@ -90,6 +104,7 @@ export class A2XAgent {
     this._agentExecutor = options.executor;
     this._protocolVersion = options.protocolVersion ?? '1.0';
     this._pushNotificationConfigStore = options.pushNotificationConfigStore;
+    this._pushNotificationSender = options.pushNotificationSender;
     this._taskEventBus = options.taskEventBus ?? new InMemoryTaskEventBus();
   }
 
@@ -303,13 +318,19 @@ export class A2XAgent {
 
   // ─── Core Method ───
 
-  getAgentCard(version?: string): AgentCardV03 | AgentCardV10 {
-    const resolvedVersion = version ?? this._protocolVersion;
-
-    // Check cache
-    const cached = this._cardCache.get(resolvedVersion);
-    if (cached) {
-      return cached;
+  /**
+   * Render the AgentCard for this agent.
+   *
+   * The card is always rendered in `this._protocolVersion` — the same wire
+   * format the server speaks. Publishing a card in any other version would
+   * give clients a false contract: the response shapes, role/part encoding,
+   * and `pushNotificationConfig` param shape are all bound to the
+   * configured protocol version. To serve a different version, construct a
+   * separate `A2XAgent` with that `protocolVersion`.
+   */
+  getAgentCard(): AgentCardV03 | AgentCardV10 {
+    if (this._cachedCard) {
+      return this._cachedCard;
     }
 
     // Build the internal normalized state
@@ -353,14 +374,12 @@ export class A2XAgent {
       }
     }
 
-    // Map to the requested version
-    const mapper = AgentCardMapperFactory.getMapper(resolvedVersion);
-    const card = mapper.map(state);
+    const mapper = AgentCardMapperFactory.getMapper(this._protocolVersion);
+    const card = mapper.map(state) as AgentCardV03 | AgentCardV10;
 
-    // Cache the result
-    this._cardCache.set(resolvedVersion, card as AgentCardV03 | AgentCardV10);
+    this._cachedCard = card;
 
-    return card as AgentCardV03 | AgentCardV10;
+    return card;
   }
 
   // ─── Accessors ───
@@ -396,6 +415,10 @@ export class A2XAgent {
 
   get pushNotificationConfigStore(): PushNotificationConfigStore | undefined {
     return this._pushNotificationConfigStore;
+  }
+
+  get pushNotificationSender(): PushNotificationSender | undefined {
+    return this._pushNotificationSender;
   }
 
   get taskEventBus(): TaskEventBus {
@@ -460,7 +483,7 @@ export class A2XAgent {
   // ─── Private Methods ───
 
   private _invalidateCache(): void {
-    this._cardCache.clear();
+    this._cachedCard = undefined;
   }
 
   /**
@@ -493,12 +516,21 @@ export class A2XAgent {
       this._capabilities.streaming ??
       this._agentExecutor.runConfig.streamingMode === StreamingMode.SSE;
 
-    // Auto-derive push-notification capability from the presence of a
-    // configured store. An explicit value set via setPushNotifications() or
-    // the deprecated setCapabilities() still wins.
+    // Auto-derive push-notification capability. The flag promises
+    // webhook delivery (spec a2a-v0.3 §AgentCapabilities.pushNotifications:
+    // "supports sending push notifications"), so it only flips to true
+    // when a `PushNotificationSender` is wired AND a config store is
+    // available — both are needed for an actual end-to-end delivery.
+    // Without the sender, advertising the capability would be a false
+    // promise (the SDK would accept config-management calls but never
+    // POST to the configured URL). See issue #119.
+    //
+    // An explicit value set via setPushNotifications() or the
+    // deprecated setCapabilities() still wins.
     const pushNotifications =
       this._capabilities.pushNotifications ??
-      this._pushNotificationConfigStore !== undefined;
+      (this._pushNotificationConfigStore !== undefined &&
+        this._pushNotificationSender !== undefined);
 
     return {
       name,

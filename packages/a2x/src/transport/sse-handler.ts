@@ -1,17 +1,31 @@
 /**
  * Layer 4: SSE (Server-Sent Events) streaming handler.
+ *
+ * Per A2A spec a2a-v0.3 §SendStreamingMessageSuccessResponse, every
+ * chunk in a `message/stream` or `tasks/resubscribe` SSE response is a
+ * full JSON-RPC success response keyed by the request id:
+ *
+ *   { "jsonrpc": "2.0", "id": <correlation id>, "result": <event> }
+ *
+ * The wrapping into that envelope is done upstream — in
+ * DefaultRequestHandler's stream methods, where the request id is in
+ * scope. This file is the transport-level SSE encoder: it takes
+ * already-shaped values and emits them as data-only SSE chunks (no
+ * `event:` field, no terminator chunk). Stream end is signalled by
+ * connection close after the last event, which the spec already
+ * requires the handler to mark with `final: true` (v0.3) or by simply
+ * stopping (v1.0).
  */
-
-import type {
-  TaskStatusUpdateEvent,
-  TaskArtifactUpdateEvent,
-} from '../types/task.js';
 
 /**
- * Create a ReadableStream that emits SSE-formatted events from an async generator.
+ * Create a ReadableStream that JSON-encodes each value yielded by the
+ * generator as an SSE `data:` chunk.
+ *
+ * The caller is responsible for shaping each yielded value into a
+ * JSON-RPC frame. See the file header for why.
  */
 export function createSSEStream(
-  events: AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent>,
+  events: AsyncGenerator<unknown>,
 ): ReadableStream {
   const encoder = new TextEncoder();
 
@@ -19,30 +33,21 @@ export function createSSEStream(
     async start(controller) {
       try {
         for await (const event of events) {
-          const eventType = isStatusEvent(event)
-            ? 'status_update'
-            : 'artifact_update';
-
           const data = JSON.stringify(event);
-          const sseMessage = `event: ${eventType}\ndata: ${data}\n\n`;
-
-          controller.enqueue(encoder.encode(sseMessage));
+          controller.enqueue(encoder.encode(`data: ${data}\n\n`));
         }
-
-        // Send a final "done" event
-        controller.enqueue(
-          encoder.encode('event: done\ndata: {}\n\n'),
-        );
         controller.close();
       } catch (error) {
-        // Send error as SSE event before closing
+        // Mid-stream errors are spec-undefined for SSE A2A streaming.
+        // We emit a single transport-level error chunk (data-only, not
+        // a JSON-RPC envelope — we no longer hold the request id at
+        // this layer) and close. Handlers that want the spec-shaped
+        // {jsonrpc, id, error} body should yield it themselves before
+        // returning instead of throwing.
         const errorData = JSON.stringify({
-          error:
-            error instanceof Error ? error.message : 'Unknown error',
+          error: error instanceof Error ? error.message : 'Unknown error',
         });
-        controller.enqueue(
-          encoder.encode(`event: error\ndata: ${errorData}\n\n`),
-        );
+        controller.enqueue(encoder.encode(`data: ${errorData}\n\n`));
         controller.close();
       }
     },
@@ -53,10 +58,4 @@ export function createSSEStream(
       void events.return(undefined).catch(() => {});
     },
   });
-}
-
-function isStatusEvent(
-  event: TaskStatusUpdateEvent | TaskArtifactUpdateEvent,
-): event is TaskStatusUpdateEvent {
-  return 'status' in event;
 }

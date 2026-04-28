@@ -27,7 +27,6 @@ import { TaskState } from '../types/task.js';
 import { AgentExecutor } from '../a2x/agent-executor.js';
 import {
   X402_ERROR_CODES,
-  X402_DEFAULT_RESOURCE,
   X402_DEFAULT_TIMEOUT_SECONDS,
   X402_METADATA_KEYS,
   X402_PAYMENT_STATUS,
@@ -368,12 +367,16 @@ function resolveOptions(options: X402PaymentExecutorOptions): ResolvedConfig {
 }
 
 function normalizeAccept(entry: X402Accept): X402PaymentRequirements {
+  // x402 v1 §PaymentRequirements requires `resource` (URL of the
+  // protected resource) and `description` (human-readable). The
+  // X402Accept type now requires both at the API boundary, so this
+  // mapping is a straight passthrough — no fabricated defaults.
   return {
     scheme: entry.scheme ?? 'exact',
     network: entry.network,
     maxAmountRequired: entry.amount,
-    resource: (entry.resource ?? X402_DEFAULT_RESOURCE) as X402PaymentRequirements['resource'],
-    description: entry.description ?? '',
+    resource: entry.resource as X402PaymentRequirements['resource'],
+    description: entry.description,
     mimeType: entry.mimeType ?? 'application/json',
     payTo: entry.payTo,
     maxTimeoutSeconds: entry.maxTimeoutSeconds ?? X402_DEFAULT_TIMEOUT_SECONDS,

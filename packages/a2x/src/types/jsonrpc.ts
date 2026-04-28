@@ -56,16 +56,37 @@ export interface SendMessageParams {
   metadata?: Record<string, unknown>;
 }
 
+/**
+ * Spec a2a-v0.3 §MessageSendConfiguration. Field names match the spec
+ * verbatim. `blocking` (true → wait for terminal state) replaces the
+ * old SDK-private `returnImmediately` (which was the inverse). The
+ * `pushNotificationConfig` field lets clients register a webhook in
+ * the same call that creates the task — no follow-up
+ * `tasks/pushNotificationConfig/set` round-trip needed.
+ */
 export interface SendMessageConfiguration {
   acceptedOutputModes?: string[];
   historyLength?: number;
-  returnImmediately?: boolean;
+  blocking?: boolean;
+  pushNotificationConfig?: PushNotificationConfig;
 }
 
 // ─── Task Query Parameters ───
 
 export interface TaskIdParams {
   id: string;
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Spec a2a-v0.3 §TaskQueryParams — the params shape for `tasks/get`.
+ * Adds `historyLength` to bound how many history entries the server
+ * returns; clients use this to avoid pulling the full history on every
+ * poll of a long-running conversation.
+ */
+export interface TaskQueryParams {
+  id: string;
+  historyLength?: number;
   metadata?: Record<string, unknown>;
 }
 

@@ -29,6 +29,11 @@ const executor = new X402PaymentExecutor(inner, {
     amount: '10000',                                   // 0.01 USDC (6 decimals)
     asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e', // USDC on Base Sepolia
     payTo: process.env.MERCHANT_ADDRESS!,
+    // x402 v1 §PaymentRequirements requires both `resource` (a URL of
+    // the protected resource) and `description` (human-readable). The
+    // wallet UI surfaces `description` to the user as the consent
+    // prompt; strict facilitators reject non-URL `resource` values.
+    resource: 'https://api.example.com/premium',
     description: 'Premium agent access',
   }],
   // Facilitator defaults to https://x402.org/facilitator.
@@ -46,9 +51,11 @@ const agent = new A2XAgent({ taskStore: new InMemoryTaskStore(), executor })
 Put more than one entry in `accepts[]` and the client picks one. Use this for multi-network support:
 
 ```ts
+const RESOURCE = 'https://api.example.com/premium';
+
 accepts: [
-  { network: 'base-sepolia', amount: '10000', asset: USDC_BASE_SEPOLIA, payTo, description: 'Testnet' },
-  { network: 'base',         amount: '10000', asset: USDC_BASE,         payTo, description: 'Mainnet' },
+  { network: 'base-sepolia', amount: '10000', asset: USDC_BASE_SEPOLIA, payTo, resource: RESOURCE, description: 'Testnet' },
+  { network: 'base',         amount: '10000', asset: USDC_BASE,         payTo, resource: RESOURCE, description: 'Mainnet' },
 ],
 ```
 

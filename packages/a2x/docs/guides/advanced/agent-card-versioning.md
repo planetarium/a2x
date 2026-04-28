@@ -1,8 +1,8 @@
 # AgentCard v0.3 vs v1.0
 
-A2A has two spec versions in active use. The **AgentCard** — the JSON your agent serves at `/.well-known/agent.json` — differs in shape between them. A2X hides most of the difference behind a single `A2XAgent` instance that can emit either version.
+A2A has two spec versions in active use. The **AgentCard** — the JSON your agent serves at `/.well-known/agent.json` — differs in shape between them. Each `A2XAgent` instance is bound to one wire format, chosen at construction time via `protocolVersion` (default `'1.0'`).
 
-You usually don't pick. `toA2x()` and `DefaultRequestHandler.getAgentCard()` default to **v1.0**. If a client specifically asks for v0.3 (via `Accept` header or protocol negotiation), A2X transparently emits the v0.3 shape from the same underlying state.
+You usually don't pick. `toA2x()` and `DefaultRequestHandler.getAgentCard()` render whatever `protocolVersion` was configured. The card shape, the JSON-RPC response shape, and the `pushNotificationConfig` param shape always match — so clients reading the card get a faithful contract for the wire underneath.
 
 ## The key differences
 
@@ -13,20 +13,25 @@ You usually don't pick. `toA2x()` and `DefaultRequestHandler.getAgentCard()` def
 | Security declarations | `security` array + `securitySchemes` map | `securityRequirements` array + `securitySchemes` map |
 | Multiple transports on one agent | not supported | supported via multiple `supportedInterfaces` |
 
-A2X models everything internally in the v1.0 shape and down-converts to v0.3 on demand. This means:
+A2X models everything internally in a version-neutral shape and renders it through the configured wire format. This means:
 
 - Every declaration you make on `A2XAgent` (skills, security, default URL) works for both versions.
-- Consumers on either spec see a valid card.
+- The card and the wire are always consistent — the SDK never publishes a card whose `protocolVersion` disagrees with what the server actually emits.
 - You don't write version branches in your own code.
 
-## Emitting a specific version
+## Picking the wire format
+
+Pass `protocolVersion` to the constructor. The choice is fixed for the life of the agent:
 
 ```ts
-const v10 = a2xAgent.getAgentCard();          // v1.0 (default)
-const v03 = a2xAgent.getAgentCard('0.3');      // v0.3 explicit
+const a2xAgentV10 = new A2XAgent({ taskStore, executor }); // v1.0 (default)
+const a2xAgentV03 = new A2XAgent({ taskStore, executor, protocolVersion: '0.3' });
+
+a2xAgentV10.getAgentCard(); // → v1.0 card
+a2xAgentV03.getAgentCard(); // → v0.3 card
 ```
 
-Both paths are pre-wired when you use `toA2x()` or `DefaultRequestHandler` — callers negotiating over HTTP get the version they asked for.
+To serve both versions from one deployment, run two `A2XAgent` instances behind separate URLs and advertise each in the other's `additionalInterfaces`. One instance cannot lie about its wire format.
 
 ## When this matters to you
 
@@ -34,7 +39,7 @@ Three scenarios where you actually need to care:
 
 ### 1. Deploying alongside legacy v0.3 clients
 
-If you have CLI tools or third-party agents still pinned to v0.3, they read `url` and `preferredTransport` — not `supportedInterfaces`. A2X's v0.3 emission handles this automatically.
+If you have CLI tools or third-party agents still pinned to v0.3, they read `url` and `preferredTransport` — not `supportedInterfaces`. Construct the agent with `protocolVersion: '0.3'` and the SDK will speak v0.3 end-to-end (card + wire). For deployments that need to serve both at once, see [Multi-transport agents](#3-multi-transport-agents) below.
 
 ### 2. Emitting a non-standard scheme on v0.3
 
@@ -71,9 +76,9 @@ const client = new A2XClient(url, { preferredVersion: '1.0' });
 
 ## Recommendation
 
-- **Serve v1.0 as primary**, let A2X down-convert for v0.3 consumers. This is the default; you don't have to do anything.
+- **Serve v1.0 as primary** — the constructor default. New clients should target v1.0.
 - **Pin your own clients to v1.0** when calling agents that support both. Future-facing.
-- **Only override defaults** when you need cross-version compatibility for a specific deployment target.
+- **Spin up a dedicated v0.3 instance** only when a deployment target needs it. Configure it with `protocolVersion: '0.3'` rather than trying to coax a v1.0 agent into pretending.
 
 ## Beyond the AgentCard: push notification authentication
 

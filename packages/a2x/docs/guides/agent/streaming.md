@@ -45,6 +45,14 @@ For a `message/stream` call, the client gets an SSE stream of typed events. Each
 | `status-update` | Task state transition (`submitted` → `working` → `completed`/`failed`/`canceled`). |
 | `artifact-update` | A chunk of output (message parts, tool calls, tool results). |
 
+Per spec a2a-v0.3 §SendStreamingMessageSuccessResponse, every chunk on the wire is a full JSON-RPC success response keyed by the request id:
+
+```
+data: {"jsonrpc":"2.0","id":1,"result":{"kind":"status-update", …}}
+```
+
+`createSSEStream()` and `DefaultRequestHandler` handle the wrapping for you — your agent code yields the raw event objects (`status-update` / `artifact-update`) as before.
+
 See [Consuming Streams](../client/streaming.md) for the client-side iteration pattern.
 
 ## Client disconnect stops the work

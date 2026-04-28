@@ -327,6 +327,8 @@ const executor = new X402PaymentExecutor(innerExecutor, {
     amount: '10000',                                   // 0.01 USDC (6 decimals)
     asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e', // USDC on Base Sepolia
     payTo: process.env.MERCHANT_ADDRESS!,
+    resource: 'https://api.example.com/premium',
+    description: 'Premium agent access',
   }],
 });
 
@@ -350,11 +352,14 @@ Full guide: [docs/guides/advanced/x402-payments.md](./docs/guides/advanced/x402-
 
 ## AgentCard Versions
 
-a2x handles the structural differences between A2A protocol versions transparently:
+a2x handles the structural differences between A2A protocol versions transparently. Each agent is bound to one wire format at construction:
 
 ```typescript
-const cardV10 = a2xAgent.getAgentCard();       // v1.0 (default)
-const cardV03 = a2xAgent.getAgentCard('0.3');   // v0.3
+const a2xAgentV10 = new A2XAgent({ taskStore, executor });                          // v1.0 (default)
+const a2xAgentV03 = new A2XAgent({ taskStore, executor, protocolVersion: '0.3' });  // v0.3
+
+a2xAgentV10.getAgentCard(); // v1.0 card
+a2xAgentV03.getAgentCard(); // v0.3 card
 ```
 
 | Field | v0.3 | v1.0 |
