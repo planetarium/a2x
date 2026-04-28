@@ -80,6 +80,24 @@ A changeset is a deliberate "release now" signal. Each one bumps `@a2x/sdk` and 
 
 Any new or modified JSON-RPC behavior must match `specification/a2a-v0.3.0.json` and, where defined, `specification/a2a-v1.0.0.json`. When the two disagree, implement v0.3 faithfully, and treat v1.0 divergences as SDK extensions documented in the relevant guide. Constant names in `packages/a2x/src/types/jsonrpc.ts` must match the spec's `method` strings exactly.
 
+## PR scope
+
+Audit your domain fully before opening a PR, then bundle every related issue into that PR. Splitting cohesive work into N PRs costs N× the merge fanout (CI matrix on `main`, Release SDK, Release CLI) for the same work, and creates churn for reviewers.
+
+Bundle:
+
+- All known issues in one domain — all CI / repo tooling tuning, all v0.3 conformance fixes, all related refactor steps.
+- Follow-ups discovered while writing the PR ("oh and that lint warning"). They belong in the same PR, not the next one.
+- Tooling / workflow / config changes especially. Merge cost is high (every push to `main` fans out across CI + Release SDK + Release CLI), and most workflow behavior is decidable from the YAML — there's rarely a reason to "merge and see".
+
+Don't bundle:
+
+- Unrelated domains. An SDK fix, a CLI fix, and a sample fix should land as separate PRs so each can bisect / revert independently.
+- Genuinely unforeseen findings discovered after merge — those are new PRs.
+- Drive-by cleanup unrelated to the PR's stated purpose. ("Style: keep diffs minimal" still applies *across* domains.)
+
+A small focused PR is correct when the audit genuinely found one thing. The discipline is **audit completeness before opening**, not making every PR big.
+
 ## Commands
 
 From the repo root:

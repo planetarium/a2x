@@ -14,13 +14,20 @@ permissions:
   pull-requests: write
   id-token: write
 
+# Serialize releases on main: queue subsequent pushes behind the
+# in-flight publish rather than cancelling it (npm half-state risk).
+concurrency:
+  group: release-sdk
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v4.4.0
 
       - uses: actions/setup-node@v6
         with:

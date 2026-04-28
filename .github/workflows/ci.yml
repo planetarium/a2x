@@ -5,10 +5,24 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # Pure docs PRs need no validation — lint / build / typecheck / test
+    # don't touch markdown. The push: main run still validates end-to-end.
+    paths-ignore:
+      - '**.md'
+
+permissions:
+  contents: read
+
+# Cancel in-progress runs when newer commits land on the same ref. Saves
+# CI minutes when a PR is iterated with multiple consecutive pushes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   ci:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -18,7 +32,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: pnpm/action-setup@v4
+      # Pinned to v4.4.0 (rather than the floating @v4 tag) because the
+      # floating @v4 was reverted to a Node 20 manifest after the v4 → v5
+      # cut. v4.4.0 keeps the v4 codebase but declares `using: node24` in
+      # its manifest, eliminating the per-run deprecation warning without
+      # taking on v6's known regressions (see dependabot.yml comment).
+      - uses: pnpm/action-setup@v4.4.0
 
       - uses: actions/setup-node@v6
         with:

@@ -6,7 +6,7 @@
  * that a newline is inserted between artifact text and status headers.
  */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import type { TaskArtifactUpdateEvent, TaskStatusUpdateEvent } from '@a2x/sdk';
 import { printStatusUpdate, printArtifactChunk } from '../format.js';
 

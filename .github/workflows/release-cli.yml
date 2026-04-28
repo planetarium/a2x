@@ -13,9 +13,24 @@ on:
 permissions:
   contents: write
 
+# Never cancel an in-flight binary build / GitHub Release; queue
+# subsequent pushes serially instead.
+concurrency:
+  group: release-cli
+  cancel-in-progress: false
+
+env:
+  # `actions/upload-artifact@v4`, `actions/download-artifact@v4`, and
+  # `softprops/action-gh-release@v2` still declare Node 20 in their
+  # manifests. Force them onto Node 24 until they're bumped to their
+  # respective Node-24-native majors (separate PR — major bumps require
+  # validation against an actual CLI release).
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
   check-version:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
@@ -57,10 +72,11 @@ jobs:
             script: binaries:macos
             artifact: binaries-macos
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v4.4.0
 
       - uses: actions/setup-node@v6
         with:
@@ -96,12 +112,13 @@ jobs:
     needs: [check-version, build-binaries]
     if: needs.check-version.outputs.changed == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v4.4.0
 
       - uses: actions/setup-node@v6
         with:
