@@ -6,6 +6,10 @@ import {
   TASK_STATE_TO_V10,
   A2A_METHODS,
   A2A_ERROR_CODES,
+  isTextPart,
+  isFilePart,
+  isDataPart,
+  type Part,
 } from '../types/index.js';
 
 describe('Layer 1: Types', () => {
@@ -61,6 +65,46 @@ describe('Layer 1: Types', () => {
       expect(A2A_METHODS.GET_TASK).toBe('tasks/get');
       expect(A2A_METHODS.CANCEL_TASK).toBe('tasks/cancel');
       expect(A2A_METHODS.RESUBSCRIBE).toBe('tasks/resubscribe');
+    });
+  });
+
+  describe('Part type guards', () => {
+    it('isTextPart matches text-bearing parts only', () => {
+      expect(isTextPart({ text: 'hi' } as Part)).toBe(true);
+      expect(isTextPart({ raw: 'aGk=' } as Part)).toBe(false);
+      expect(isTextPart({ data: { x: 1 } } as Part)).toBe(false);
+    });
+
+    it('isDataPart matches data-bearing parts only', () => {
+      expect(isDataPart({ data: { x: 1 } } as Part)).toBe(true);
+      expect(isDataPart({ text: 'hi' } as Part)).toBe(false);
+    });
+
+    // Issue #142 fix 5: a v0.3-spec FilePart is `{ kind: 'file', file: {...} }`
+    // (a2a-v0.3.0.json:828-861). The pre-fix guard only recognized the
+    // SDK's flat `{ raw | url }` form, so a spec-conformant input fell
+    // through every guard as `none`.
+    it('isFilePart recognizes both the SDK flat shape and the v0.3 nested wire shape', () => {
+      // Flat / internal
+      expect(isFilePart({ raw: 'aGk=' } as Part)).toBe(true);
+      expect(isFilePart({ url: 'https://example.com/x' } as Part)).toBe(true);
+      // v0.3 nested wire shape
+      expect(
+        isFilePart({
+          kind: 'file',
+          file: { bytes: 'aGk=', mimeType: 'text/plain' },
+        } as unknown as Part),
+      ).toBe(true);
+      expect(
+        isFilePart({
+          kind: 'file',
+          file: { uri: 'https://example.com/x' },
+        } as unknown as Part),
+      ).toBe(true);
+      // Negatives
+      expect(isFilePart({ text: 'hi' } as Part)).toBe(false);
+      expect(isFilePart({ data: { x: 1 } } as Part)).toBe(false);
+      expect(isFilePart({ kind: 'file' } as unknown as Part)).toBe(false);
     });
   });
 

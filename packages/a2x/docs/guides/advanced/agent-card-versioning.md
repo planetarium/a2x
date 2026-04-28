@@ -90,3 +90,12 @@ const client = new A2XClient(url, { preferredVersion: '1.0' });
 | v1.0 | `{ scheme: string, credentials? }` | `scheme` required; `additionalProperties: false` |
 
 A2X stores the v0.3 shape internally and translates at the v1.0 boundary: `scheme = schemes[0]` outbound, `schemes = [scheme]` inbound. The conversion is lossy when v0.3 lists more than one scheme — only the first is preserved on a v1.0 wire. Configure your agent's `protocolVersion` to match the wire your clients speak; the SDK handles the rest.
+
+The wrapping `TaskPushNotificationConfig` itself also differs between specs:
+
+| Version | Shape | Notes |
+|---|---|---|
+| v0.3 | `{ taskId, pushNotificationConfig: { id?, url, token?, authentication? } }` | Nested |
+| v1.0 | `{ taskId, id?, url, token?, authentication?, tenant? }` | Flat (proto `TaskPushNotificationConfig`) |
+
+A v1.0-configured `tasks/pushNotificationConfig/set` accepts the flat input shape so a client can round-trip the response it just received. The internal storage is always the nested form; the response mapper flattens for v1.0 wires.

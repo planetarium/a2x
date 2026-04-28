@@ -82,8 +82,29 @@ function extractSSEEvents(buffer: string): {
 }
 
 /**
+ * Mid-stream JSON-RPC error envelope, surfaced as a thrown error so
+ * `parseSSEStream` can convert it into a stream-terminating exception
+ * — see `unwrapData` below.
+ */
+class StreamErrorEnvelopeError extends Error {
+  readonly code: number | undefined;
+  readonly data: unknown;
+  constructor(message: string, code: number | undefined, data: unknown) {
+    super(message);
+    this.name = 'StreamErrorEnvelopeError';
+    this.code = code;
+    this.data = data;
+  }
+}
+
+/**
  * Unwrap data payload. Handles both raw event objects and JSON-RPC wrapped format.
  * Returns the actual event object.
+ *
+ * The server can also yield a JSON-RPC error envelope mid-stream
+ * (`request-handler.ts:_wrapStreamInJsonRpc` does this when a handler
+ * throws). Surface those as a thrown error so `parseSSEStream`
+ * terminates the stream instead of silently dropping the chunk.
  */
 function unwrapData(data: string): Record<string, unknown> {
   const parsed = JSON.parse(data) as Record<string, unknown>;
@@ -91,6 +112,19 @@ function unwrapData(data: string): Record<string, unknown> {
   // JSON-RPC wrapper: { jsonrpc: "2.0", id: ..., result: { ... } }
   if (parsed.jsonrpc && parsed.result && typeof parsed.result === 'object') {
     return parsed.result as Record<string, unknown>;
+  }
+
+  // JSON-RPC error envelope: `{ jsonrpc, id, error: { code, message, data? } }`.
+  // Issue #142 fix 6 — the pre-fix parser had no branch for this
+  // envelope and silently dropped it.
+  if (parsed.jsonrpc && parsed.error && typeof parsed.error === 'object') {
+    const err = parsed.error as Record<string, unknown>;
+    const message =
+      typeof err.message === 'string' && err.message.length > 0
+        ? err.message
+        : 'Remote agent error';
+    const code = typeof err.code === 'number' ? err.code : undefined;
+    throw new StreamErrorEnvelopeError(message, code, err.data);
   }
 
   return parsed;

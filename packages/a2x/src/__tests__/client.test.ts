@@ -458,6 +458,30 @@ describe('SSE Parser', () => {
       for await (const _event of parseSSEStream(response, parser)) { /* */ }
     }).rejects.toThrow('Response body is null');
   });
+
+  // Issue #142 fix 6: a server that yields a JSON-RPC error envelope
+  // mid-stream (request-handler.ts:_wrapStreamInJsonRpc) was previously
+  // treated as `MESSAGE` event with no switch arm — silently dropped.
+  // The parser must surface it as a thrown error so the caller knows
+  // the stream failed.
+  it('throws when the server yields a mid-stream JSON-RPC error envelope', async () => {
+    const sse = [
+      'data: {"jsonrpc":"2.0","id":1,"result":{"kind":"status-update","taskId":"t1","contextId":"c1","status":{"state":"working"}}}\n\n',
+      'data: {"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"executor exploded"}}\n\n',
+    ].join('');
+
+    const response = createSSEResponse(sse);
+    const events: unknown[] = [];
+    await expect(async () => {
+      for await (const event of parseSSEStream(response, parser)) {
+        events.push(event);
+      }
+    }).rejects.toThrow('executor exploded');
+
+    // The first chunk is a normal status update — the parser must yield
+    // it before the error terminates the stream.
+    expect(events).toHaveLength(1);
+  });
 });
 
 // ═══ A2XClient Tests ═══
