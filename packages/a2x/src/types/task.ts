@@ -15,6 +15,11 @@ export enum TaskState {
   REJECTED = 'rejected',
   INPUT_REQUIRED = 'input-required',
   AUTH_REQUIRED = 'auth-required',
+  // Spec a2a-v0.3 §TaskState lists `unknown` as a first-class state for
+  // peers that have lost track of a task's true state (e.g. resubscribe
+  // after a crash, gateways that missed a transition). Non-terminal — it
+  // signals "I don't know yet", not a finalized outcome.
+  UNKNOWN = 'unknown',
 }
 
 // ─── v1.0 Protocol Constants (for output mapping) ───
@@ -28,6 +33,7 @@ export enum TaskStateV10 {
   TASK_STATE_INPUT_REQUIRED = 'TASK_STATE_INPUT_REQUIRED',
   TASK_STATE_REJECTED = 'TASK_STATE_REJECTED',
   TASK_STATE_AUTH_REQUIRED = 'TASK_STATE_AUTH_REQUIRED',
+  TASK_STATE_UNKNOWN = 'TASK_STATE_UNKNOWN',
 }
 
 // ─── Terminal States ───
@@ -50,6 +56,7 @@ export const TASK_STATE_TO_V10: ReadonlyMap<TaskState, TaskStateV10> = new Map([
   [TaskState.INPUT_REQUIRED, TaskStateV10.TASK_STATE_INPUT_REQUIRED],
   [TaskState.REJECTED, TaskStateV10.TASK_STATE_REJECTED],
   [TaskState.AUTH_REQUIRED, TaskStateV10.TASK_STATE_AUTH_REQUIRED],
+  [TaskState.UNKNOWN, TaskStateV10.TASK_STATE_UNKNOWN],
 ]);
 
 // ─── TaskStatus ───

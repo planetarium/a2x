@@ -19,11 +19,13 @@ describe('Layer 1: Types', () => {
       expect(TaskState.REJECTED).toBe('rejected');
       expect(TaskState.INPUT_REQUIRED).toBe('input-required');
       expect(TaskState.AUTH_REQUIRED).toBe('auth-required');
+      expect(TaskState.UNKNOWN).toBe('unknown');
     });
 
     it('should define v1.0 task state mappings', () => {
       expect(TaskStateV10.TASK_STATE_SUBMITTED).toBe('TASK_STATE_SUBMITTED');
       expect(TaskStateV10.TASK_STATE_WORKING).toBe('TASK_STATE_WORKING');
+      expect(TaskStateV10.TASK_STATE_UNKNOWN).toBe('TASK_STATE_UNKNOWN');
     });
 
     it('should define terminal states', () => {
@@ -33,6 +35,9 @@ describe('Layer 1: Types', () => {
       expect(TERMINAL_STATES.has(TaskState.REJECTED)).toBe(true);
       expect(TERMINAL_STATES.has(TaskState.WORKING)).toBe(false);
       expect(TERMINAL_STATES.has(TaskState.SUBMITTED)).toBe(false);
+      // `unknown` is non-terminal — it signals "lost track", not a
+      // finalized outcome, and the task may transition once the peer resyncs.
+      expect(TERMINAL_STATES.has(TaskState.UNKNOWN)).toBe(false);
     });
 
     it('should map internal states to v1.0 constants', () => {
@@ -41,6 +46,9 @@ describe('Layer 1: Types', () => {
       );
       expect(TASK_STATE_TO_V10.get(TaskState.WORKING)).toBe(
         TaskStateV10.TASK_STATE_WORKING,
+      );
+      expect(TASK_STATE_TO_V10.get(TaskState.UNKNOWN)).toBe(
+        TaskStateV10.TASK_STATE_UNKNOWN,
       );
     });
   });

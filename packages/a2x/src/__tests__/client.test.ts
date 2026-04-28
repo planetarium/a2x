@@ -325,6 +325,15 @@ describe('ResponseParser', () => {
       expect(task.status.state).toBe(TaskState.FAILED);
     });
 
+    it('should convert TASK_STATE_UNKNOWN to unknown', () => {
+      // Spec a2a-v0.3 §TaskState includes `unknown` as a first-class state.
+      // A v1.0 server emitting TASK_STATE_UNKNOWN must round-trip cleanly,
+      // not throw — see #121.
+      const raw = { id: 'task-1', status: { state: 'TASK_STATE_UNKNOWN' } };
+      const task = parser.parseTask(raw);
+      expect(task.status.state).toBe(TaskState.UNKNOWN);
+    });
+
     it('should pass through already lowercase states', () => {
       const raw = { id: 'task-1', status: { state: 'completed' } };
       const task = parser.parseTask(raw);
