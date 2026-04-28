@@ -83,6 +83,14 @@ export interface X402Facilitator {
  * What the caller gives the SDK when configuring x402 support. A single
  * `network`/`asset`/`amount`/`payTo` triple with sensible defaults for
  * everything else the spec demands (scheme, mime type, timeout, extra).
+ *
+ * `resource` and `description` are required by the x402 v1
+ * `PaymentRequirements` schema — facilitators that validate strictly
+ * reject non-URL `resource` and wallet UIs surface `description` as the
+ * consent prompt for the user. The SDK fabricated these as
+ * `'a2a-x402/access'` and `''` before #123, which shipped invalid wire
+ * output to every paying client. They're now required at the API
+ * boundary.
  */
 export interface X402Accept {
   /** Blockchain network id (e.g. `"base-sepolia"`, `"base"`). */
@@ -93,10 +101,17 @@ export interface X402Accept {
   asset: string;
   /** Wallet address that should receive the payment. */
   payTo: string;
-  /** Human-readable description shown to the paying client. */
-  description?: string;
-  /** URL or opaque identifier of the protected resource. */
-  resource?: string;
+  /**
+   * Human-readable description of the resource — shown to the paying
+   * client, often as a wallet consent prompt. Required by x402 v1.
+   */
+  description: string;
+  /**
+   * URL of the protected resource. Required by x402 v1; strict
+   * facilitators reject non-URL values. Use the public URL the client
+   * is paying to access (e.g. `https://api.example.com/premium-data`).
+   */
+  resource: string;
   /** MIME type of the expected response. Defaults to `"application/json"`. */
   mimeType?: string;
   /** Payment expiry window in seconds. Defaults to 300. */

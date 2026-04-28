@@ -327,6 +327,8 @@ const executor = new X402PaymentExecutor(innerExecutor, {
     amount: '10000',                                   // 0.01 USDC (6 decimals)
     asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e', // USDC on Base Sepolia
     payTo: process.env.MERCHANT_ADDRESS!,
+    resource: 'https://api.example.com/premium',
+    description: 'Premium agent access',
   }],
 });
 

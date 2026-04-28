@@ -56,7 +56,7 @@ const BASE_ACCEPT = {
   scheme: 'exact' as const,
   network: 'base-sepolia',
   maxAmountRequired: '1000',
-  resource: 'a2a-x402/access',
+  resource: 'https://example.com/protected',
   description: 'Test',
   mimeType: 'application/json',
   payTo: PAY_TO,
