@@ -51,6 +51,7 @@ import {
 } from '../x402/constants.js';
 import {
   signX402Payment,
+  rejectX402Payment,
   getX402PaymentRequirements,
   getX402Receipts,
   type SignedX402Payment,
@@ -95,14 +96,44 @@ export interface A2XClientX402Options {
   ) => X402PaymentRequirements | undefined;
   /**
    * Hook invoked after the merchant publishes `payment-required` and
-   * before the client signs. Useful for prompting the user to confirm.
-   * Throw to abort the flow — the caller observes the merchant's
-   * unmodified `payment-required` task (blocking) or a stream that
-   * closes after the `payment-required` event (streaming).
+   * before the client signs. Useful for prompting the user to confirm,
+   * declining the challenge, or recording the prompt for audit.
+   *
+   * Return value semantics:
+   *  - `void` / `undefined` / `true` — proceed: sign and resubmit (default).
+   *  - `false` — decline: send `x402.payment.status: payment-rejected`
+   *    on the same task per a2a-x402 v0.2 §5.4.2 / §7.1, then return
+   *    the merchant's terminal task to the caller. The merchant sees the
+   *    decline; the caller does not have to construct the rejection
+   *    message itself.
+   *
+   * Throw to abort *locally* without telling the merchant — the caller
+   * observes the unmodified `payment-required` task (blocking) or a
+   * stream that closes after the `payment-required` event (streaming).
+   * Use `false` instead when you want the merchant's task to terminate
+   * cleanly rather than be left stranded in `input-required`.
    */
   onPaymentRequired?: (
     required: X402PaymentRequiredResponse,
-  ) => void | Promise<void>;
+  ) => void | boolean | Promise<void | boolean>;
+  /**
+   * Maximum number of *additional* sign+resubmit attempts after the
+   * first one when the merchant runs `retryOnFailure: true` and re-issues
+   * `payment-required` on the same task (a2a-x402 v0.2 §9; see also the
+   * server-side `retryOnFailure` in `X402PaymentExecutor`).
+   *
+   * Default `0` — the SDK signs once and surfaces whatever comes back.
+   * Set to `1` or more to opt into automatic retries; the dance bails
+   * out when the merchant returns a terminal state (`completed` /
+   * `failed`) or when the budget is exhausted (in which case the most
+   * recent retry-required task is returned to the caller).
+   *
+   * Each retry signs a fresh authorization with a fresh nonce, so this
+   * is the right knob for failures the wallet can recover from on its
+   * own (network blip, transient nonce reuse) — anything that needs
+   * user interaction (top-up, wallet switch) should still surface.
+   */
+  maxRetries?: number;
 }
 
 export interface A2XClientOptions {
@@ -247,47 +278,41 @@ export class A2XClient {
     const first = await this._sendMessageOnce(params);
     if (!this._x402) return first;
     if (first.status.state !== 'input-required') return first;
+    if (!getX402PaymentRequirements(first)) return first;
 
-    const required = getX402PaymentRequirements(first);
-    if (!required) return first;
+    const maxRetries = this._x402.maxRetries ?? 0;
+    let task = first;
 
-    if (this._x402.onPaymentRequired) {
-      await this._x402.onPaymentRequired(required);
-    }
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const required = getX402PaymentRequirements(task);
+      if (!required) break;
 
-    const signed = await this._signX402(first);
+      const decision = await this._x402.onPaymentRequired?.(required);
 
-    const followup: SendMessageParams = {
-      ...params,
-      message: {
-        ...params.message,
-        messageId: globalThis.crypto.randomUUID(),
-        taskId: first.id,
-        contextId: first.contextId,
-        metadata: {
-          ...(params.message.metadata ?? {}),
-          ...signed.metadata,
-        },
-      },
-    };
+      if (decision === false) {
+        return this._sendMessageOnce(this._buildRejectFollowup(params, task));
+      }
 
-    const second = await this._sendMessageOnce(followup);
-
-    const receipts = getX402Receipts(second);
-    const failed = receipts.find((r) => !r.success);
-    if (failed) {
-      const errorCode =
-        ((second.status.message?.metadata as Record<string, unknown> | undefined)?.[
-          X402_METADATA_KEYS.ERROR
-        ] as string | undefined) ?? 'UNKNOWN';
-      throw new X402PaymentFailedError(
-        failed.errorReason ?? 'Payment failed',
-        errorCode,
-        { transaction: failed.transaction, network: failed.network },
+      const signed = await this._signX402(task);
+      task = await this._sendMessageOnce(
+        this._buildSubmitFollowup(params, task, signed.metadata),
       );
+
+      // Server may re-issue payment-required when running with
+      // retryOnFailure (a2a-x402 v0.2 §9). Loop within the budget; once
+      // exhausted (or on any non-payment-required terminal), fall through
+      // to the receipt-scan decision.
+      if (
+        task.status.state === 'input-required' &&
+        getX402PaymentRequirements(task)
+      ) {
+        continue;
+      }
+      break;
     }
 
-    return second;
+    this._throwIfX402Failure(task);
+    return task;
   }
 
   /**
@@ -309,15 +334,24 @@ export class A2XClient {
       return;
     }
 
-    let firstTask: Task | undefined;
-    for await (const event of this._sendMessageStreamOnce(params, signal)) {
-      yield event;
-      if ('status' in event && event.status?.state === 'input-required') {
-        const meta = event.status.message?.metadata as
-          | Record<string, unknown>
-          | undefined;
-        if (meta?.[X402_METADATA_KEYS.STATUS] === X402_PAYMENT_STATUS.REQUIRED) {
-          firstTask = {
+    let currentParams = params;
+    // First sign attempt + N additional retries on `retryOnFailure`
+    // re-prompts (a2a-x402 v0.2 §9). Default 0 retries → exactly one
+    // sign+resubmit, matching the long-standing client behavior.
+    let signsRemaining = (this._x402.maxRetries ?? 0) + 1;
+
+    while (true) {
+      let pendingTask: Task | undefined;
+      for await (const event of this._sendMessageStreamOnce(currentParams, signal)) {
+        yield event;
+        if (
+          'status' in event &&
+          event.status?.state === 'input-required' &&
+          (event.status.message?.metadata as Record<string, unknown> | undefined)?.[
+            X402_METADATA_KEYS.STATUS
+          ] === X402_PAYMENT_STATUS.REQUIRED
+        ) {
+          pendingTask = {
             id: event.taskId,
             contextId: event.contextId,
             status: event.status,
@@ -325,34 +359,34 @@ export class A2XClient {
           break;
         }
       }
+
+      if (!pendingTask) return;
+
+      const required = getX402PaymentRequirements(pendingTask);
+      if (!required) return;
+
+      const decision = await this._x402.onPaymentRequired?.(required);
+      if (decision === false) {
+        // Decline cleanly: surface the rejection follow-up's events to
+        // the caller (typically a single `failed` + payment-rejected
+        // status update from the merchant).
+        yield* this._sendMessageStreamOnce(
+          this._buildRejectFollowup(params, pendingTask),
+          signal,
+        );
+        return;
+      }
+
+      if (signsRemaining <= 0) return;
+      signsRemaining -= 1;
+
+      const signed = await this._signX402(pendingTask);
+      currentParams = this._buildSubmitFollowup(
+        params,
+        pendingTask,
+        signed.metadata,
+      );
     }
-
-    if (!firstTask) return;
-
-    const required = getX402PaymentRequirements(firstTask);
-    if (!required) return;
-
-    if (this._x402.onPaymentRequired) {
-      await this._x402.onPaymentRequired(required);
-    }
-
-    const signed = await this._signX402(firstTask);
-
-    const followup: SendMessageParams = {
-      ...params,
-      message: {
-        ...params.message,
-        messageId: globalThis.crypto.randomUUID(),
-        taskId: firstTask.id,
-        contextId: firstTask.contextId,
-        metadata: {
-          ...(params.message.metadata ?? {}),
-          ...signed.metadata,
-        },
-      },
-    };
-
-    yield* this._sendMessageStreamOnce(followup, signal);
   }
 
   private async _sendMessageOnce(params: SendMessageParams): Promise<Task> {
@@ -443,6 +477,62 @@ export class A2XClient {
     }
     yield firstEvent;
     yield* events;
+  }
+
+  /**
+   * Construct a follow-up `message/send` payload that resubmits the
+   * caller's original message on the same task with the supplied x402
+   * metadata block (signed payload or rejection marker).
+   */
+  private _buildSubmitFollowup(
+    original: SendMessageParams,
+    task: Task,
+    x402Metadata: Record<string, unknown>,
+  ): SendMessageParams {
+    return {
+      ...original,
+      message: {
+        ...original.message,
+        messageId: globalThis.crypto.randomUUID(),
+        taskId: task.id,
+        contextId: task.contextId,
+        metadata: {
+          ...(original.message.metadata ?? {}),
+          ...x402Metadata,
+        },
+      },
+    };
+  }
+
+  private _buildRejectFollowup(
+    original: SendMessageParams,
+    task: Task,
+  ): SendMessageParams {
+    return this._buildSubmitFollowup(original, task, rejectX402Payment(task).metadata);
+  }
+
+  /**
+   * Decide on the *latest* receipt + final task state, not "any historical
+   * failure". The receipts array is the complete history per spec §7, so
+   * a successful retry on a task that previously failed must still be
+   * surfaced as success (issue #143). Conversely, a task that ends in
+   * `failed` with the most recent receipt unsuccessful is a terminal
+   * payment failure and should throw.
+   */
+  private _throwIfX402Failure(task: Task): void {
+    if (task.status.state !== 'failed') return;
+    const receipts = getX402Receipts(task);
+    const latest = receipts[receipts.length - 1];
+    if (!latest || latest.success) return;
+    const errorCode =
+      ((task.status.message?.metadata as Record<string, unknown> | undefined)?.[
+        X402_METADATA_KEYS.ERROR
+      ] as string | undefined) ?? 'UNKNOWN';
+    throw new X402PaymentFailedError(
+      latest.errorReason ?? 'Payment failed',
+      errorCode,
+      { transaction: latest.transaction, network: latest.network },
+    );
   }
 
   private async _signX402(task: Task): Promise<SignedX402Payment> {

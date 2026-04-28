@@ -58,6 +58,20 @@ export const X402_ERROR_CODES = {
   NETWORK_MISMATCH: 'NETWORK_MISMATCH',
   INVALID_AMOUNT: 'INVALID_AMOUNT',
   SETTLEMENT_FAILED: 'SETTLEMENT_FAILED',
+  /**
+   * x402-v1 §9 `invalid_x402_version`: protocol version is not supported.
+   * Emitted client-side when the merchant publishes `x402Version` ≠ 1;
+   * the x402 npm package pins `x402Versions: [1]`, so anything else is
+   * unsigned-and-rejected before we hand the requirement to
+   * `createPaymentHeader()`.
+   *
+   * The wire value is intentionally lowercase: a2a-x402 v0.2 §9.1 only
+   * defines seven UPPERCASE codes (INSUFFICIENT_FUNDS, …, SETTLEMENT_FAILED)
+   * — `invalid_x402_version` isn't one of them. Following x402-v1 §9
+   * verbatim is more correct than coining an upper-cased a2a-x402
+   * variant that no spec defines.
+   */
+  INVALID_X402_VERSION: 'invalid_x402_version',
   // ─── SDK-specific (outside spec §9.1) ───
   /** Payment payload is missing, unparseable, or structurally invalid. */
   INVALID_PAYLOAD: 'INVALID_PAYLOAD',

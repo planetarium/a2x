@@ -80,6 +80,7 @@ export type { FacilitatorUrlConfig } from './facilitator.js';
 
 export {
   signX402Payment,
+  rejectX402Payment,
   getX402PaymentRequirements,
   getX402Receipts,
   getX402Status,
@@ -94,4 +95,5 @@ export {
   X402PaymentRequiredError,
   X402PaymentFailedError,
   X402NoSupportedRequirementError,
+  X402InvalidVersionError,
 } from './errors.js';

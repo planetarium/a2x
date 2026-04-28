@@ -46,7 +46,8 @@ export interface X402PaymentRequiredResponse {
 
 /**
  * Settlement receipt attached to `message.metadata['x402.payment.receipts']`
- * on the task's final message. Matches spec section 5.5.
+ * on the task's final message. Matches x402-v1 §5.3 (SettlementResponse) +
+ * a2a-x402 v0.2 §5.5 (the trimmed wire shape attached to A2A tasks).
  */
 export interface X402SettleResponse {
   success: boolean;
@@ -54,6 +55,14 @@ export interface X402SettleResponse {
   transaction: string;
   /** Network the settlement occurred on. */
   network: string;
+  /**
+   * Address of the payer's wallet. Required by x402-v1 §5.3.2 on every
+   * SettlementResponse — including failure rows, since post-settlement
+   * audits / multi-wallet bookkeeping branch on this field. The SDK
+   * propagates whatever the facilitator returns; for EVM "exact" payloads
+   * it falls back to `authorization.from` if the facilitator omits it.
+   */
+  payer: string;
   /** Short error code (e.g. `VERIFY_FAILED`) when `success` is false. */
   errorReason?: string;
 }
