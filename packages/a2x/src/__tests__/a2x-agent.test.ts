@@ -442,7 +442,34 @@ describe('Layer 3: A2XAgent', () => {
       ]);
     });
 
-    it('auto-derives pushNotifications=true when the store is provided', () => {
+    it('auto-derives pushNotifications=true when both a store and a sender are wired', () => {
+      // Spec a2a-v0.3 §AgentCapabilities.pushNotifications: the flag
+      // promises the agent "supports sending push notifications", so it
+      // requires actual delivery wiring — not just a config store. See
+      // issue #119.
+      const agent = new LlmAgent({
+        name: 'test',
+        provider: mockProvider,
+        description: 'test',
+        instruction: 'test',
+      });
+      const runner = new InMemoryRunner({ agent, appName: 'test' });
+      const executor = new AgentExecutor({
+        runner,
+        runConfig: { streamingMode: StreamingMode.NONE },
+      });
+      const a2x = new A2XAgent({
+        taskStore: new InMemoryTaskStore(),
+        executor,
+        pushNotificationConfigStore: new InMemoryPushNotificationConfigStore(),
+        pushNotificationSender: { send: async () => {} },
+      }).setDefaultUrl('https://example.com/a2a');
+
+      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      expect(card.capabilities.pushNotifications).toBe(true);
+    });
+
+    it('auto-derives pushNotifications=false when only a store is provided (no sender means no delivery)', () => {
       const agent = new LlmAgent({
         name: 'test',
         provider: mockProvider,
@@ -461,7 +488,7 @@ describe('Layer 3: A2XAgent', () => {
       }).setDefaultUrl('https://example.com/a2a');
 
       const card = a2x.getAgentCard('1.0') as AgentCardV10;
-      expect(card.capabilities.pushNotifications).toBe(true);
+      expect(card.capabilities.pushNotifications).toBe(false);
     });
 
     it('auto-derives pushNotifications=false when no store is provided', () => {

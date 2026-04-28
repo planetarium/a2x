@@ -20,6 +20,7 @@ import { AgentExecutor, StreamingMode } from './agent-executor.js';
 import { AgentCardMapperFactory } from './agent-card-mapper.js';
 import type { TaskStore } from './task-store.js';
 import type { PushNotificationConfigStore } from './push-notification-config-store.js';
+import type { PushNotificationSender } from './push-notification-sender.js';
 import type { TaskEventBus } from './task-event-bus.js';
 import { InMemoryTaskEventBus } from './task-event-bus.js';
 
@@ -37,6 +38,14 @@ export interface A2XAgentOptions {
   executor: AgentExecutor;
   protocolVersion?: ProtocolVersion;
   pushNotificationConfigStore?: PushNotificationConfigStore;
+  /**
+   * Optional webhook delivery for `tasks/pushNotificationConfig/*`.
+   * Without it, `capabilities.pushNotifications` defaults to `false`
+   * even when a config store is wired — advertising the capability
+   * without delivery would falsely promise webhook callbacks. See
+   * issue #119.
+   */
+  pushNotificationSender?: PushNotificationSender;
   taskEventBus?: TaskEventBus;
 }
 
@@ -45,6 +54,7 @@ export class A2XAgent {
   private readonly _agentExecutor: AgentExecutor;
   private readonly _protocolVersion: ProtocolVersion;
   private readonly _pushNotificationConfigStore?: PushNotificationConfigStore;
+  private readonly _pushNotificationSender?: PushNotificationSender;
   private readonly _taskEventBus: TaskEventBus;
 
   // ─── Internal mutable state (builder pattern) ───
@@ -90,6 +100,7 @@ export class A2XAgent {
     this._agentExecutor = options.executor;
     this._protocolVersion = options.protocolVersion ?? '1.0';
     this._pushNotificationConfigStore = options.pushNotificationConfigStore;
+    this._pushNotificationSender = options.pushNotificationSender;
     this._taskEventBus = options.taskEventBus ?? new InMemoryTaskEventBus();
   }
 
@@ -398,6 +409,10 @@ export class A2XAgent {
     return this._pushNotificationConfigStore;
   }
 
+  get pushNotificationSender(): PushNotificationSender | undefined {
+    return this._pushNotificationSender;
+  }
+
   get taskEventBus(): TaskEventBus {
     return this._taskEventBus;
   }
@@ -493,12 +508,21 @@ export class A2XAgent {
       this._capabilities.streaming ??
       this._agentExecutor.runConfig.streamingMode === StreamingMode.SSE;
 
-    // Auto-derive push-notification capability from the presence of a
-    // configured store. An explicit value set via setPushNotifications() or
-    // the deprecated setCapabilities() still wins.
+    // Auto-derive push-notification capability. The flag promises
+    // webhook delivery (spec a2a-v0.3 §AgentCapabilities.pushNotifications:
+    // "supports sending push notifications"), so it only flips to true
+    // when a `PushNotificationSender` is wired AND a config store is
+    // available — both are needed for an actual end-to-end delivery.
+    // Without the sender, advertising the capability would be a false
+    // promise (the SDK would accept config-management calls but never
+    // POST to the configured URL). See issue #119.
+    //
+    // An explicit value set via setPushNotifications() or the
+    // deprecated setCapabilities() still wins.
     const pushNotifications =
       this._capabilities.pushNotifications ??
-      this._pushNotificationConfigStore !== undefined;
+      (this._pushNotificationConfigStore !== undefined &&
+        this._pushNotificationSender !== undefined);
 
     return {
       name,

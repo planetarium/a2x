@@ -529,7 +529,35 @@ export class DefaultRequestHandler {
       params.message,
     );
 
+    // Spec a2a-v0.3 §AgentCapabilities.pushNotifications: deliver
+    // webhook callbacks for tasks that the client subscribed to. We fire
+    // on terminal state (the most common subscription point); embedders
+    // that want non-terminal pings can wrap PushNotificationSender.
+    if (TERMINAL_STATES.has(completedTask.status.state)) {
+      void this._dispatchPushNotifications(completedTask);
+    }
+
     return this.responseMapper.mapTask(completedTask, params.message);
+  }
+
+  /**
+   * Look up every config registered for the task and hand each off to
+   * the configured `PushNotificationSender`. Best-effort and fire-and-
+   * forget — a slow or broken webhook must not stall the response path.
+   */
+  private async _dispatchPushNotifications(task: Task): Promise<void> {
+    const store = this.a2xAgent.pushNotificationConfigStore;
+    const sender = this.a2xAgent.pushNotificationSender;
+    if (!store || !sender) return;
+    let configs;
+    try {
+      configs = await store.list(task.id);
+    } catch {
+      return;
+    }
+    for (const config of configs) {
+      void sender.send(config, task);
+    }
   }
 
   private async *_handleStreamMessage(
@@ -553,6 +581,8 @@ export class DefaultRequestHandler {
 
     const bus = this.a2xAgent.taskEventBus;
 
+    let reachedTerminal = false;
+
     // finally closes the bus so resubscribers see the stream end regardless
     // of how the primary stream terminates (normal, error, cancel via return).
     try {
@@ -560,13 +590,14 @@ export class DefaultRequestHandler {
         // Update task in store for non-terminal status events.
         // Terminal states are already applied by AgentExecutor (same object
         // reference), so calling updateTask would hit the guard.
-        if (
-          'status' in event &&
-          !TERMINAL_STATES.has(event.status.state)
-        ) {
-          await this.a2xAgent.taskStore.updateTask(task.id, {
-            status: event.status,
-          });
+        if ('status' in event) {
+          if (TERMINAL_STATES.has(event.status.state)) {
+            reachedTerminal = true;
+          } else {
+            await this.a2xAgent.taskStore.updateTask(task.id, {
+              status: event.status,
+            });
+          }
         }
         bus.publish(task.id, event);
         if ('status' in event) {
@@ -577,6 +608,12 @@ export class DefaultRequestHandler {
       }
     } finally {
       bus.close(task.id);
+      if (reachedTerminal) {
+        // Re-fetch the task so the webhook body reflects the final
+        // store state (artifacts accumulated during streaming, etc).
+        const final = await this.a2xAgent.taskStore.getTask(task.id);
+        if (final) void this._dispatchPushNotifications(final);
+      }
     }
   }
 
