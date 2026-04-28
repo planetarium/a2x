@@ -95,6 +95,10 @@ const paymentExecutor = new X402PaymentExecutor(innerExecutor, {
       amount: '1000',
       asset: USDC_BASE_SEPOLIA,
       payTo: resolveMerchantAddress(),
+      // x402 v1 §PaymentRequirements: `resource` MUST be a URL and
+      // `description` MUST be human-readable. Wallet UIs surface
+      // `description` to the user as the consent prompt.
+      resource: `${process.env.NEXT_PUBLIC_BASE_URL ?? 'http://localhost:3000'}/api/a2a`,
       description: 'Per-call echo',
     },
   ],

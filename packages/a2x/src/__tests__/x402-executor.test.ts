@@ -35,6 +35,7 @@ const DEFAULT_ACCEPT: X402Accept = {
   amount: '10000',
   asset: USDC_BASE_SEPOLIA,
   payTo: PAY_TO,
+  resource: 'https://example.com/protected',
   description: 'Test access',
 };
 
@@ -114,6 +115,25 @@ describe('X402PaymentExecutor — request/submit flow', () => {
       x402Version: 1,
       accepts: expect.any(Array),
     });
+  });
+
+  it('emits the merchant-supplied resource and description verbatim (no fabricated defaults — issue #123)', async () => {
+    // x402 v1 §PaymentRequirements requires both fields; the SDK used to
+    // fill them with `'a2a-x402/access'` / `''` when callers omitted
+    // them. The X402Accept type now requires both, so this just verifies
+    // the values flow through to the wire untouched.
+    const accept: X402Accept = {
+      ...DEFAULT_ACCEPT,
+      resource: 'https://api.example.com/premium-feed',
+      description: 'Premium market data',
+    };
+    const executor = makeExecutor(mockFacilitator(), [accept]);
+    const result = await executor.execute(newTask(), newMessage());
+    const required = (
+      result.status.message?.metadata as Record<string, unknown>
+    )[X402_METADATA_KEYS.REQUIRED] as { accepts: { resource: string; description: string }[] };
+    expect(required.accepts[0].resource).toBe('https://api.example.com/premium-feed');
+    expect(required.accepts[0].description).toBe('Premium market data');
   });
 
   it('verifies, settles, and executes the inner agent on payment-submitted', async () => {

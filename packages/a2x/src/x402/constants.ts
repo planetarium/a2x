@@ -135,6 +135,3 @@ export function mapVerifyFailureToCode(
 
 /** Default maximum payment completion window per `PaymentRequirements.maxTimeoutSeconds`. */
 export const X402_DEFAULT_TIMEOUT_SECONDS = 300;
-
-/** Sentinel resource tag the SDK uses when the caller doesn't specify one. */
-export const X402_DEFAULT_RESOURCE = 'a2a-x402/access';
