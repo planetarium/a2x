@@ -1,5 +1,12 @@
 # sample-nextjs-x402
 
+## 0.1.6
+
+### Patch Changes
+
+- Updated dependencies [[`45463f8`](https://github.com/planetarium/a2x/commit/45463f8079cc2c3a48823e015e5add1d6b70d5ea)]:
+  - @a2x/sdk@0.10.2
+
 ## 0.1.5
 
 ### Patch Changes

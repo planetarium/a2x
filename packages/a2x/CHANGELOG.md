@@ -1,5 +1,18 @@
 # @a2x/sdk
 
+## 0.10.2
+
+### Patch Changes
+
+- [#117](https://github.com/planetarium/a2x/pull/117) [`45463f8`](https://github.com/planetarium/a2x/commit/45463f8079cc2c3a48823e015e5add1d6b70d5ea) Thanks [@ost006](https://github.com/ost006)! - Stop logging a `console.warn` from
+  `OAuth2DeviceCodeAuthorization.toV03Schema()`. The warning fired on every v0.3
+  AgentCard render — i.e. on every `GET /.well-known/agent.json?version=0.3` and
+  every `agent/getAuthenticatedExtendedCard` call — even though emitting Device
+  Code as a non-standard `oauth2.flows.deviceCode` extension is the SDK's
+  intentional behavior. The non-standard nature is already documented on the
+  method's JSDoc and in the authentication guide; the per-render log was pure
+  noise.
+
 ## 0.10.1
 
 ### Patch Changes
