@@ -29,7 +29,7 @@ npm install @a2x/sdk
 ## Key Features
 
 - **Auto-extraction** — `A2XAgent` infers AgentCard fields (`name`, `description`, `capabilities.streaming`) from your runtime objects. No manual duplication.
-- **Multi-version AgentCard** — Generate v0.3 and v1.0 AgentCards from the same `A2XAgent` instance with `getAgentCard('0.3')` / `getAgentCard('1.0')`.
+- **Multi-version AgentCard** — Speak A2A v0.3 or v1.0 by constructing `new A2XAgent({ ..., protocolVersion: '0.3' | '1.0' })`. Card and wire stay consistent for the chosen version.
 - **Builder pattern** — Override any auto-extracted value with chainable methods (`setName()`, `addSkill()`, `addSecurityScheme()`, etc.).
 - **ADK-compatible patterns** — Familiar `LlmAgent`, `SequentialAgent`, `ParallelAgent`, `LoopAgent`, `FunctionTool`, `AgentTool`, `Runner`, and `Session` APIs.
 - **Client SDK** — `A2XClient` for interacting with any A2A-compliant agent, with built-in auth scheme support.
@@ -83,9 +83,9 @@ const a2xAgent = new A2XAgent({ taskStore, executor })
 // 4. Wire up the request handler
 const handler = new DefaultRequestHandler(a2xAgent);
 
-// 5. Get AgentCards for any protocol version
-const cardV10 = a2xAgent.getAgentCard();        // v1.0 (default)
-const cardV03 = a2xAgent.getAgentCard('0.3');    // v0.3
+// 5. Render the AgentCard in the configured wire format
+const card = a2xAgent.getAgentCard();
+//   To serve v0.3 instead, construct with `protocolVersion: '0.3'`.
 ```
 
 ## How It Works
@@ -101,9 +101,8 @@ A2XAgent
     └── runConfig
         └── streamingMode    → capabilities.streaming (auto-extracted)
 
-getAgentCard(version?)
-├── "0.3" → v0.3 Mapper → AgentCard (v0.3 JSON)
-└── "1.0" → v1.0 Mapper → AgentCard (v1.0 JSON)
+getAgentCard()
+└── A2XAgent.protocolVersion → matching mapper → AgentCard JSON
 ```
 
 **Value resolution priority:**

@@ -674,7 +674,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
   describe('getAgentCard', () => {
     it('should return agent card', () => {
       const handler = createHandler();
-      const card = handler.getAgentCard('1.0');
+      const card = handler.getAgentCard();
       expect(card).toBeDefined();
       expect((card as { name: string }).name).toBe('test-agent');
     });

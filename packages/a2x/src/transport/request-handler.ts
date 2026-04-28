@@ -217,10 +217,11 @@ export class DefaultRequestHandler {
   }
 
   /**
-   * Get the AgentCard for a specific protocol version.
+   * Get the AgentCard. Always rendered in the agent's configured
+   * `protocolVersion` to match the wire format the server actually speaks.
    */
-  getAgentCard(version?: string): AgentCardV03 | AgentCardV10 {
-    return this.a2xAgent.getAgentCard(version);
+  getAgentCard(): AgentCardV03 | AgentCardV10 {
+    return this.a2xAgent.getAgentCard();
   }
 
   // ─── Private: auth-required Task synthesis ───

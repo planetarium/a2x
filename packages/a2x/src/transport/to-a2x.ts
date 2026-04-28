@@ -138,9 +138,8 @@ export function createA2xRequestListener(
       req.method === 'GET' &&
       parsedUrl.pathname === '/.well-known/agent.json'
     ) {
-      const version = parsedUrl.searchParams.get('version') ?? undefined;
       try {
-        const card = handler.getAgentCard(version);
+        const card = handler.getAgentCard();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(card));
       } catch (error) {
