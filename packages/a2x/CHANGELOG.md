@@ -1,5 +1,27 @@
 # @a2x/sdk
 
+## 0.10.1
+
+### Patch Changes
+
+- [#115](https://github.com/planetarium/a2x/pull/115) [`ab17555`](https://github.com/planetarium/a2x/commit/ab1755510d973d8ef1ffdb80fd1403e9e499ee27) Thanks [@ost006](https://github.com/ost006)! - Fix `detectProtocolVersion` (and therefore `A2XClient`) to honor the AgentCard's
+  declared top-level `protocolVersion` field before falling back to shape
+  heuristics. Per `a2a-v0.3.0.json`, `protocolVersion` is required on v0.3 cards;
+  per `a2a-v1.0.0.json`, it does not exist at the top level. The previous
+  shape-only check misclassified v0.3 agents that legally advertise
+  `supportedInterfaces` for additional transports as v1.0, which skipped the v0.3
+  wire transform and shipped message parts without the required `kind`
+  discriminator. The server then dropped the parts and rejected the request.
+
+- [#111](https://github.com/planetarium/a2x/pull/111) [`994da9c`](https://github.com/planetarium/a2x/commit/994da9cae3fcf9453b4285dfc79ab844a7165b2d) Thanks [@ost006](https://github.com/ost006)! - Fix `PushNotificationAuthenticationInfo` to match the v1.0 spec on the wire. The
+  SDK previously emitted (and accepted) the v0.3 shape `{ schemes: string[] }` even
+  on v1.0 transports, which violates `a2a-v1.0.0.json` (`{ scheme: string,
+credentials? }`, `additionalProperties: false`). The internal store still keeps
+  the v0.3 shape; the v1.0 response mapper now collapses `schemes` to `scheme` on
+  output, and the inbound validator on a v1.0 agent now requires the `scheme`
+  field and normalizes it back to `[scheme]` for storage. v0.3 agents are
+  unchanged.
+
 ## 0.10.0
 
 ### Minor Changes
