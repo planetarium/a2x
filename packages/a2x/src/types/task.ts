@@ -15,11 +15,21 @@ export enum TaskState {
   REJECTED = 'rejected',
   INPUT_REQUIRED = 'input-required',
   AUTH_REQUIRED = 'auth-required',
+  // Spec a2a-v0.3 §TaskState (specification/a2a-v0.3.0.json:2440-2453) lists
+  // `unknown` as a first-class state for peers that have lost track of a
+  // task's true state (resubscribe after a crash, gateway that missed a
+  // transition). Non-terminal — it signals "I don't know yet", not a
+  // finalized outcome. Round-trips with v1.0's TASK_STATE_UNSPECIFIED.
+  UNKNOWN = 'unknown',
 }
 
 // ─── v1.0 Protocol Constants (for output mapping) ───
 
 export enum TaskStateV10 {
+  // Proto default (value 0). v1.0 spec calls this "unknown or indeterminate
+  // state" (a2a-v1.0.0.proto:188-189, a2a-v1.0.0.json:1885-1898) — semantic
+  // match for v0.3's `unknown`, so the SDK rounds-trips them as a pair.
+  TASK_STATE_UNSPECIFIED = 'TASK_STATE_UNSPECIFIED',
   TASK_STATE_SUBMITTED = 'TASK_STATE_SUBMITTED',
   TASK_STATE_WORKING = 'TASK_STATE_WORKING',
   TASK_STATE_COMPLETED = 'TASK_STATE_COMPLETED',
@@ -50,6 +60,7 @@ export const TASK_STATE_TO_V10: ReadonlyMap<TaskState, TaskStateV10> = new Map([
   [TaskState.INPUT_REQUIRED, TaskStateV10.TASK_STATE_INPUT_REQUIRED],
   [TaskState.REJECTED, TaskStateV10.TASK_STATE_REJECTED],
   [TaskState.AUTH_REQUIRED, TaskStateV10.TASK_STATE_AUTH_REQUIRED],
+  [TaskState.UNKNOWN, TaskStateV10.TASK_STATE_UNSPECIFIED],
 ]);
 
 // ─── TaskStatus ───
