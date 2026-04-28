@@ -474,28 +474,33 @@ describe('Layer 4: DefaultRequestHandler', () => {
 
       expect(isAsyncGenerator(result)).toBe(true);
 
-      // Consume the async generator and collect events
-      const generator = result as AsyncGenerator<Record<string, unknown>>;
-      const events: unknown[] = [];
+      // Each chunk is a JSON-RPC success envelope
+      // ({ jsonrpc, id, result }) per spec §SendStreamingMessageSuccessResponse.
+      const generator = result as AsyncGenerator<{
+        jsonrpc: '2.0';
+        id: number;
+        result: Record<string, unknown>;
+      }>;
+      const events: Record<string, unknown>[] = [];
 
-      for await (const event of generator) {
-        events.push(event);
+      for await (const envelope of generator) {
+        expect(envelope.jsonrpc).toBe('2.0');
+        expect(envelope.id).toBe(1);
+        events.push(envelope.result);
       }
 
       // Should have received events (status_update + artifact_updates + final status)
       expect(events.length).toBeGreaterThan(0);
 
       // Default is v1.0: status state should be UPPER_SNAKE_CASE
-      const first = events[0] as Record<string, unknown>;
+      const first = events[0];
       const firstStatus = first.status as Record<string, unknown> | undefined;
       if (firstStatus) {
         expect(firstStatus.state).toBe('TASK_STATE_WORKING');
       }
 
       // Last status event should be completed
-      const statusEvents = events.filter(
-        (e) => (e as Record<string, unknown>).status !== undefined,
-      );
+      const statusEvents = events.filter((e) => e.status !== undefined);
       const lastStatus = statusEvents[statusEvents.length - 1] as { status: { state: string } };
       expect(lastStatus.status.state).toBe('TASK_STATE_COMPLETED');
     });
@@ -517,11 +522,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
 
       expect(isAsyncGenerator(result)).toBe(true);
 
-      const generator = result as AsyncGenerator<Record<string, unknown>>;
+      const generator = result as AsyncGenerator<{
+        jsonrpc: '2.0';
+        id: number;
+        result: Record<string, unknown>;
+      }>;
       const events: Record<string, unknown>[] = [];
 
-      for await (const event of generator) {
-        events.push(event as Record<string, unknown>);
+      for await (const envelope of generator) {
+        events.push(envelope.result);
       }
 
       expect(events.length).toBeGreaterThan(0);
@@ -562,11 +571,15 @@ describe('Layer 4: DefaultRequestHandler', () => {
 
       expect(isAsyncGenerator(result)).toBe(true);
 
-      const generator = result as AsyncGenerator<Record<string, unknown>>;
+      const generator = result as AsyncGenerator<{
+        jsonrpc: '2.0';
+        id: number;
+        result: Record<string, unknown>;
+      }>;
       const events: Record<string, unknown>[] = [];
 
-      for await (const event of generator) {
-        events.push(event as Record<string, unknown>);
+      for await (const envelope of generator) {
+        events.push(envelope.result);
       }
 
       // No event should have a kind field
@@ -815,12 +828,17 @@ describe('Layer 4: DefaultRequestHandler', () => {
       const context: RequestContext = { headers: {} };
       const response = await handler.handle(streamRequest, context);
       expect(isAsyncGenerator(response)).toBe(true);
-      const events: unknown[] = [];
-      for await (const ev of response as AsyncGenerator<unknown>) {
-        events.push(ev);
+      const events: { jsonrpc: '2.0'; id: number; result: Record<string, unknown> }[] = [];
+      for await (const envelope of response as AsyncGenerator<{
+        jsonrpc: '2.0';
+        id: number;
+        result: Record<string, unknown>;
+      }>) {
+        events.push(envelope);
       }
       expect(events).toHaveLength(1);
-      const status = (events[0] as { status: { state: string } }).status;
+      expect(events[0].id).toBe(2);
+      const status = events[0].result.status as { state: string };
       expect(status.state).toBe(TaskStateV10.TASK_STATE_AUTH_REQUIRED);
     });
 

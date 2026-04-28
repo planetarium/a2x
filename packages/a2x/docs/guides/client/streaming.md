@@ -94,7 +94,19 @@ Behavior to know:
 
 - **Forward-only.** Events that fired before the resubscribe call are not replayed — you see what the server publishes from that point on.
 - **Terminal replay.** If the task already completed, you receive a single `status-update` event with the final state, then the stream ends.
-- **Unknown task.** The server emits an SSE `error` event carrying `TaskNotFoundError` (JSON-RPC code `-32001`).
+- **Unknown task.** The server emits a single JSON-RPC error envelope (`{ jsonrpc: "2.0", id: <request id>, error: { code: -32001, ... } }`) on the same SSE stream and closes — same shape as a non-streaming error response, just delivered over `data:` SSE chunks.
+
+### SSE wire shape
+
+Every SSE chunk is a full JSON-RPC success response (per A2A spec a2a-v0.3 §SendStreamingMessageSuccessResponse), keyed by the original request id:
+
+```
+data: {"jsonrpc":"2.0","id":1,"result":{"kind":"status-update","taskId":"…","status":{"state":"working"}}}
+
+data: {"jsonrpc":"2.0","id":1,"result":{"kind":"artifact-update","taskId":"…","artifact":{ … }}}
+```
+
+There is no `event:` field, no `event: done` terminator. Stream end is signalled by the server closing the connection after a terminal status (`final: true` in v0.3, or simply the last yielded event in v1.0). Servers from before this release may still emit the legacy `event: status_update`/`event: done` shape; the SDK parser keeps tolerating it for one minor and logs a one-time deprecation warning when it sees it.
 
 ## Accumulating output
 

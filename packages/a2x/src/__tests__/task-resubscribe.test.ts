@@ -9,7 +9,6 @@ import { BaseAgent } from '../agent/base-agent.js';
 import type { AgentEvent } from '../agent/base-agent.js';
 import type { InvocationContext } from '../runner/context.js';
 import { TaskState } from '../types/task.js';
-import { TaskNotFoundError } from '../types/errors.js';
 
 // Ensure mappers are registered
 import '../a2x/index.js';
@@ -51,8 +50,30 @@ function createSlowHandler(
   return { handler: new DefaultRequestHandler(a2xAgent), taskStore };
 }
 
+// Each chunk in a streaming response is a JSON-RPC success envelope per
+// spec a2a-v0.3 §SendStreamingMessageSuccessResponse. Tests pull events
+// out of `result` (or surface the error envelope as a fail).
+type StreamEnvelope = {
+  jsonrpc: '2.0';
+  id: string | number | null;
+  result?: Record<string, unknown>;
+  error?: { code: number; message: string };
+};
+
+function unwrapResult(envelope: StreamEnvelope): Record<string, unknown> {
+  if (envelope.error) {
+    throw new Error(
+      `Stream yielded JSON-RPC error: ${envelope.error.code} ${envelope.error.message}`,
+    );
+  }
+  if (!envelope.result) {
+    throw new Error(`Stream envelope has neither result nor error: ${JSON.stringify(envelope)}`);
+  }
+  return envelope.result;
+}
+
 describe('tasks/resubscribe', () => {
-  it('returns TaskNotFoundError when task does not exist', async () => {
+  it('emits a JSON-RPC error envelope when the task does not exist', async () => {
     const { handler } = createSlowHandler(['hi'], 5);
 
     const result = await handler.handle({
@@ -62,8 +83,6 @@ describe('tasks/resubscribe', () => {
       params: { id: 'nonexistent' },
     });
 
-    // Stream handlers return an AsyncGenerator; the TaskNotFoundError is
-    // thrown from within the generator when iteration starts.
     expect(result).toBeDefined();
     expect(
       result !== null &&
@@ -71,12 +90,16 @@ describe('tasks/resubscribe', () => {
         Symbol.asyncIterator in (result as object),
     ).toBe(true);
 
-    const generator = result as AsyncGenerator<unknown>;
-    await expect(async () => {
-      for await (const _ of generator) {
-        // drain
-      }
-    }).rejects.toThrow(TaskNotFoundError);
+    const generator = result as AsyncGenerator<StreamEnvelope>;
+    const envelopes: StreamEnvelope[] = [];
+    for await (const envelope of generator) {
+      envelopes.push(envelope);
+    }
+
+    expect(envelopes).toHaveLength(1);
+    expect(envelopes[0].id).toBe(1);
+    // TaskNotFoundError → JSON-RPC -32001 per A2A error code table.
+    expect(envelopes[0].error?.code).toBe(-32001);
   });
 
   it('replays terminal status event when task is already completed', async () => {
@@ -98,10 +121,11 @@ describe('tasks/resubscribe', () => {
       params: { id: task.id },
     });
 
-    const generator = result as AsyncGenerator<Record<string, unknown>>;
+    const generator = result as AsyncGenerator<StreamEnvelope>;
     const events: Record<string, unknown>[] = [];
-    for await (const event of generator) {
-      events.push(event);
+    for await (const envelope of generator) {
+      expect(envelope.id).toBe(1);
+      events.push(unwrapResult(envelope));
     }
 
     expect(events).toHaveLength(1);
@@ -136,10 +160,11 @@ describe('tasks/resubscribe', () => {
     const resubEvents: Record<string, unknown>[] = [];
     let taskId: string | undefined;
 
-    const originalIter = streamResult as AsyncGenerator<Record<string, unknown>>;
+    const originalIter = streamResult as AsyncGenerator<StreamEnvelope>;
 
     const originalConsumer = (async () => {
-      for await (const event of originalIter) {
+      for await (const envelope of originalIter) {
+        const event = unwrapResult(envelope);
         originalEvents.push(event);
         if (!taskId && typeof event.taskId === 'string') {
           taskId = event.taskId;
@@ -161,11 +186,13 @@ describe('tasks/resubscribe', () => {
       method: 'tasks/resubscribe',
       params: { id: taskId! },
     });
-    const resubIter = resubResult as AsyncGenerator<Record<string, unknown>>;
+    const resubIter = resubResult as AsyncGenerator<StreamEnvelope>;
 
     const resubConsumer = (async () => {
-      for await (const event of resubIter) {
-        resubEvents.push(event);
+      for await (const envelope of resubIter) {
+        // Resub stream's envelopes are correlated by the resub request id.
+        expect(envelope.id).toBe(2);
+        resubEvents.push(unwrapResult(envelope));
       }
     })();
 
@@ -200,7 +227,7 @@ describe('tasks/resubscribe', () => {
       },
     });
 
-    const originalIter = streamResult as AsyncGenerator<Record<string, unknown>>;
+    const originalIter = streamResult as AsyncGenerator<StreamEnvelope>;
     const originalEvents: Record<string, unknown>[] = [];
     let taskId: string | undefined;
 
@@ -208,9 +235,10 @@ describe('tasks/resubscribe', () => {
     // while the stream is still live.
     const first = await originalIter.next();
     if (!first.done) {
-      originalEvents.push(first.value);
-      if (typeof first.value.taskId === 'string') {
-        taskId = first.value.taskId;
+      const event = unwrapResult(first.value);
+      originalEvents.push(event);
+      if (typeof event.taskId === 'string') {
+        taskId = event.taskId;
       }
     }
 
@@ -222,20 +250,20 @@ describe('tasks/resubscribe', () => {
       method: 'tasks/resubscribe',
       params: { id: taskId! },
     });
-    const resubIter = resubResult as AsyncGenerator<Record<string, unknown>>;
+    const resubIter = resubResult as AsyncGenerator<StreamEnvelope>;
 
     // Consume both streams; after the primary stream ends, the resubscriber
     // must also end (done: true).
     const originalConsumer = (async () => {
-      for await (const event of originalIter) {
-        originalEvents.push(event);
+      for await (const envelope of originalIter) {
+        originalEvents.push(unwrapResult(envelope));
       }
     })();
 
     const resubEvents: Record<string, unknown>[] = [];
     const resubConsumer = (async () => {
-      for await (const event of resubIter) {
-        resubEvents.push(event);
+      for await (const envelope of resubIter) {
+        resubEvents.push(unwrapResult(envelope));
       }
     })();
 
