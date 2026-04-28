@@ -25,6 +25,7 @@ const mockProvider = new (class extends BaseLlmProvider {
 function createA2XAgent(
   agentOpts?: { name?: string; description?: string; instruction?: string },
   streamingMode: StreamingMode = StreamingMode.SSE,
+  protocolVersion?: '0.3' | '1.0',
 ) {
   const agent = new LlmAgent({
     name: agentOpts?.name ?? 'my-agent',
@@ -40,7 +41,7 @@ function createA2XAgent(
   });
   const taskStore = new InMemoryTaskStore();
 
-  return new A2XAgent({ taskStore, executor });
+  return new A2XAgent({ taskStore, executor, protocolVersion });
 }
 
 describe('Layer 3: A2XAgent', () => {
@@ -154,7 +155,7 @@ describe('Layer 3: A2XAgent', () => {
       const a2x = createA2XAgent({ name: 'auto-name' });
       a2x.setDefaultUrl('https://example.com/a2a');
 
-      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      const card = a2x.getAgentCard() as AgentCardV10;
       expect(card.name).toBe('auto-name');
     });
 
@@ -162,7 +163,7 @@ describe('Layer 3: A2XAgent', () => {
       const a2x = createA2XAgent({ description: 'Auto description' });
       a2x.setDefaultUrl('https://example.com/a2a');
 
-      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      const card = a2x.getAgentCard() as AgentCardV10;
       expect(card.description).toBe('Auto description');
     });
 
@@ -170,7 +171,7 @@ describe('Layer 3: A2XAgent', () => {
       const a2x = createA2XAgent(undefined, StreamingMode.SSE);
       a2x.setDefaultUrl('https://example.com/a2a');
 
-      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      const card = a2x.getAgentCard() as AgentCardV10;
       expect(card.capabilities.streaming).toBe(true);
     });
 
@@ -181,7 +182,7 @@ describe('Layer 3: A2XAgent', () => {
         .setDescription('Override desc')
         .setDefaultUrl('https://example.com/a2a');
 
-      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      const card = a2x.getAgentCard() as AgentCardV10;
       expect(card.name).toBe('override');
       expect(card.description).toBe('Override desc');
     });
@@ -200,7 +201,7 @@ describe('Layer 3: A2XAgent', () => {
           tags: ['code'],
         });
 
-      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      const card = a2x.getAgentCard() as AgentCardV10;
 
       expect(card.name).toBe('my-agent');
       expect(card.description).toBe('A test agent');
@@ -225,7 +226,7 @@ describe('Layer 3: A2XAgent', () => {
           protocolVersion: '1.0',
         });
 
-      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      const card = a2x.getAgentCard() as AgentCardV10;
       expect(card.supportedInterfaces).toHaveLength(2);
       expect(card.supportedInterfaces[1].protocolBinding).toBe('GRPC');
     });
@@ -240,7 +241,7 @@ describe('Layer 3: A2XAgent', () => {
         )
         .addSecurityRequirement({ bearer: [] });
 
-      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      const card = a2x.getAgentCard() as AgentCardV10;
       expect(card.securitySchemes).toBeDefined();
       expect(card.securitySchemes!['bearer']).toEqual({
         httpAuthSecurityScheme: { scheme: 'bearer' },
@@ -253,7 +254,7 @@ describe('Layer 3: A2XAgent', () => {
 
   describe('getAgentCard - v0.3', () => {
     it('should generate v0.3 AgentCard', () => {
-      const a2x = createA2XAgent();
+      const a2x = createA2XAgent(undefined, undefined, '0.3');
       a2x
         .setDefaultUrl('https://example.com/a2a')
         .addSkill({
@@ -268,7 +269,7 @@ describe('Layer 3: A2XAgent', () => {
           new ApiKeyAuthorization({ in: 'header', name: 'X-API-Key' }),
         );
 
-      const card = a2x.getAgentCard('0.3') as AgentCardV03;
+      const card = a2x.getAgentCard() as AgentCardV03;
 
       expect(card.name).toBe('my-agent');
       expect(card.url).toBe('https://example.com/a2a');
@@ -279,7 +280,7 @@ describe('Layer 3: A2XAgent', () => {
     });
 
     it('should emit DeviceCode as non-standard v0.3 extension', () => {
-      const a2x = createA2XAgent();
+      const a2x = createA2XAgent(undefined, undefined, '0.3');
       a2x
         .setDefaultUrl('https://example.com/a2a')
         .addSecurityScheme(
@@ -291,7 +292,7 @@ describe('Layer 3: A2XAgent', () => {
           }),
         );
 
-      const card = a2x.getAgentCard('0.3') as AgentCardV03;
+      const card = a2x.getAgentCard() as AgentCardV03;
       expect(card.securitySchemes).toBeDefined();
       expect(card.securitySchemes!['device']).toEqual({
         type: 'oauth2',
@@ -306,8 +307,8 @@ describe('Layer 3: A2XAgent', () => {
     });
   });
 
-  describe('getAgentCard - default version from config', () => {
-    it('should use configured protocolVersion when no argument is given', () => {
+  describe('getAgentCard - version is fixed at construction', () => {
+    it('renders the configured v0.3 wire format', () => {
       const agent = new LlmAgent({
         name: 'test',
         provider: mockProvider,
@@ -328,7 +329,7 @@ describe('Layer 3: A2XAgent', () => {
       expect(card.protocolVersion).toBe('0.3.0');
     });
 
-    it('should allow explicit version to override configured protocolVersion', () => {
+    it('renders the configured v1.0 wire format', () => {
       const agent = new LlmAgent({
         name: 'test',
         provider: mockProvider,
@@ -342,10 +343,10 @@ describe('Layer 3: A2XAgent', () => {
       });
       const taskStore = new InMemoryTaskStore();
 
-      const a2x = new A2XAgent({ taskStore, executor, protocolVersion: '0.3' });
+      const a2x = new A2XAgent({ taskStore, executor, protocolVersion: '1.0' });
       a2x.setDefaultUrl('https://example.com/a2a');
 
-      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      const card = a2x.getAgentCard() as AgentCardV10;
       expect(card.supportedInterfaces).toBeDefined();
     });
   });
@@ -405,7 +406,7 @@ describe('Layer 3: A2XAgent', () => {
         .addExtension({ uri: 'https://example.com/ext/a', required: true })
         .addExtension('https://example.com/ext/b', { description: 'B' });
 
-      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      const card = a2x.getAgentCard() as AgentCardV10;
       expect(card.capabilities.extensions).toEqual([
         { uri: 'https://example.com/ext/a', required: true },
         { uri: 'https://example.com/ext/b', description: 'B' },
@@ -419,7 +420,7 @@ describe('Layer 3: A2XAgent', () => {
         .setCapabilities({ extensions: [{ uri: 'ext-a' }] })
         .setCapabilities({ extensions: [{ uri: 'ext-b' }] });
 
-      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      const card = a2x.getAgentCard() as AgentCardV10;
       expect(card.capabilities.extensions).toEqual([
         { uri: 'ext-a' },
         { uri: 'ext-b' },
@@ -434,7 +435,7 @@ describe('Layer 3: A2XAgent', () => {
         .setCapabilities({ extensions: [{ uri: 'ext-b' }] })
         .addExtension('ext-c');
 
-      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      const card = a2x.getAgentCard() as AgentCardV10;
       expect(card.capabilities.extensions).toEqual([
         { uri: 'ext-a' },
         { uri: 'ext-b' },
@@ -460,7 +461,7 @@ describe('Layer 3: A2XAgent', () => {
         pushNotificationConfigStore: new InMemoryPushNotificationConfigStore(),
       }).setDefaultUrl('https://example.com/a2a');
 
-      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      const card = a2x.getAgentCard() as AgentCardV10;
       expect(card.capabilities.pushNotifications).toBe(true);
     });
 
@@ -468,7 +469,7 @@ describe('Layer 3: A2XAgent', () => {
       const a2x = createA2XAgent();
       a2x.setDefaultUrl('https://example.com/a2a');
 
-      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      const card = a2x.getAgentCard() as AgentCardV10;
       expect(card.capabilities.pushNotifications).toBe(false);
     });
 
@@ -492,7 +493,7 @@ describe('Layer 3: A2XAgent', () => {
         .setDefaultUrl('https://example.com/a2a')
         .setPushNotifications(false);
 
-      const card = a2x.getAgentCard('1.0') as AgentCardV10;
+      const card = a2x.getAgentCard() as AgentCardV10;
       expect(card.capabilities.pushNotifications).toBe(false);
     });
 
@@ -516,7 +517,7 @@ describe('Layer 3: A2XAgent', () => {
         .setDefaultUrl('https://example.com/a2a')
         .setStateTransitionHistory(true);
 
-      const card = a2x.getAgentCard('0.3') as AgentCardV03;
+      const card = a2x.getAgentCard() as AgentCardV03;
       expect(card.capabilities.stateTransitionHistory).toBe(true);
     });
   });
@@ -526,12 +527,12 @@ describe('Layer 3: A2XAgent', () => {
       const a2x = createA2XAgent();
       a2x.setDefaultUrl('https://example.com/a2a');
 
-      const card1 = a2x.getAgentCard('1.0');
-      const card2 = a2x.getAgentCard('1.0');
+      const card1 = a2x.getAgentCard();
+      const card2 = a2x.getAgentCard();
       expect(card1).toBe(card2); // Same reference (cached)
 
       a2x.setVersion('2.0.0');
-      const card3 = a2x.getAgentCard('1.0');
+      const card3 = a2x.getAgentCard();
       expect(card3).not.toBe(card1); // New object (cache invalidated)
       expect((card3 as AgentCardV10).version).toBe('2.0.0');
     });

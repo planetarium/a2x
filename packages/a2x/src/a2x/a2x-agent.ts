@@ -68,7 +68,11 @@ export class A2XAgent {
   ) => Partial<A2XAgentState> | Promise<Partial<A2XAgentState>>;
 
   // ─── AgentCard cache ───
-  private _cardCache = new Map<string, AgentCardV03 | AgentCardV10>();
+  // Single slot: the agent's wire format is fixed at construction time, so
+  // there is only ever one card to render. Rendering any other version
+  // would publish a card that lies about what the server actually speaks
+  // (see issue #133).
+  private _cachedCard?: AgentCardV03 | AgentCardV10;
 
   constructor(options: A2XAgentOptions) {
     if (!options.taskStore) {
@@ -303,13 +307,19 @@ export class A2XAgent {
 
   // ─── Core Method ───
 
-  getAgentCard(version?: string): AgentCardV03 | AgentCardV10 {
-    const resolvedVersion = version ?? this._protocolVersion;
-
-    // Check cache
-    const cached = this._cardCache.get(resolvedVersion);
-    if (cached) {
-      return cached;
+  /**
+   * Render the AgentCard for this agent.
+   *
+   * The card is always rendered in `this._protocolVersion` — the same wire
+   * format the server speaks. Publishing a card in any other version would
+   * give clients a false contract: the response shapes, role/part encoding,
+   * and `pushNotificationConfig` param shape are all bound to the
+   * configured protocol version. To serve a different version, construct a
+   * separate `A2XAgent` with that `protocolVersion`.
+   */
+  getAgentCard(): AgentCardV03 | AgentCardV10 {
+    if (this._cachedCard) {
+      return this._cachedCard;
     }
 
     // Build the internal normalized state
@@ -353,14 +363,12 @@ export class A2XAgent {
       }
     }
 
-    // Map to the requested version
-    const mapper = AgentCardMapperFactory.getMapper(resolvedVersion);
-    const card = mapper.map(state);
+    const mapper = AgentCardMapperFactory.getMapper(this._protocolVersion);
+    const card = mapper.map(state) as AgentCardV03 | AgentCardV10;
 
-    // Cache the result
-    this._cardCache.set(resolvedVersion, card as AgentCardV03 | AgentCardV10);
+    this._cachedCard = card;
 
-    return card as AgentCardV03 | AgentCardV10;
+    return card;
   }
 
   // ─── Accessors ───
@@ -460,7 +468,7 @@ export class A2XAgent {
   // ─── Private Methods ───
 
   private _invalidateCache(): void {
-    this._cardCache.clear();
+    this._cachedCard = undefined;
   }
 
   /**

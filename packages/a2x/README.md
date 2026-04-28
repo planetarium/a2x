@@ -350,11 +350,14 @@ Full guide: [docs/guides/advanced/x402-payments.md](./docs/guides/advanced/x402-
 
 ## AgentCard Versions
 
-a2x handles the structural differences between A2A protocol versions transparently:
+a2x handles the structural differences between A2A protocol versions transparently. Each agent is bound to one wire format at construction:
 
 ```typescript
-const cardV10 = a2xAgent.getAgentCard();       // v1.0 (default)
-const cardV03 = a2xAgent.getAgentCard('0.3');   // v0.3
+const a2xAgentV10 = new A2XAgent({ taskStore, executor });                          // v1.0 (default)
+const a2xAgentV03 = new A2XAgent({ taskStore, executor, protocolVersion: '0.3' });  // v0.3
+
+a2xAgentV10.getAgentCard(); // v1.0 card
+a2xAgentV03.getAgentCard(); // v0.3 card
 ```
 
 | Field | v0.3 | v1.0 |
