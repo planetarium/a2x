@@ -325,6 +325,16 @@ describe('ResponseParser', () => {
       expect(task.status.state).toBe(TaskState.FAILED);
     });
 
+    it('should convert TASK_STATE_UNSPECIFIED to unknown', () => {
+      // v0.3 `unknown` ↔ v1.0 `TASK_STATE_UNSPECIFIED` (proto default,
+      // documented as "unknown or indeterminate state"). A v1.0 server
+      // emitting the default value must round-trip cleanly, not throw.
+      // See #121.
+      const raw = { id: 'task-1', status: { state: 'TASK_STATE_UNSPECIFIED' } };
+      const task = parser.parseTask(raw);
+      expect(task.status.state).toBe(TaskState.UNKNOWN);
+    });
+
     it('should pass through already lowercase states', () => {
       const raw = { id: 'task-1', status: { state: 'completed' } };
       const task = parser.parseTask(raw);
