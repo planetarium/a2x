@@ -117,6 +117,7 @@ export class X402PaymentExecutor extends AgentExecutor {
         X402_ERROR_CODES.INVALID_PAYLOAD,
         'Payment payload is missing or malformed.',
         payload?.network,
+        resolvePayer(payload, undefined, undefined),
       );
       return task;
     }
@@ -129,6 +130,7 @@ export class X402PaymentExecutor extends AgentExecutor {
         validationErr.code,
         validationErr.reason,
         payload.network,
+        resolvePayer(payload, undefined, undefined),
       );
       return task;
     }
@@ -140,6 +142,7 @@ export class X402PaymentExecutor extends AgentExecutor {
         mapVerifyFailureToCode(verifyResult.invalidReason),
         verifyResult.invalidReason ?? 'Payment verification failed.',
         payload.network,
+        resolvePayer(payload, verifyResult, undefined),
       );
       return task;
     }
@@ -160,6 +163,7 @@ export class X402PaymentExecutor extends AgentExecutor {
         X402_ERROR_CODES.SETTLEMENT_FAILED,
         settleResult.errorReason ?? 'Payment settlement failed.',
         payload.network,
+        resolvePayer(payload, verifyResult, settleResult),
         priorReceipts,
       );
       return task;
@@ -169,6 +173,7 @@ export class X402PaymentExecutor extends AgentExecutor {
       success: true,
       transaction: settleResult.transaction ?? '',
       network: payload.network,
+      payer: resolvePayer(payload, verifyResult, settleResult),
     };
 
     const result = await this._inner.execute(task, message);
@@ -208,6 +213,7 @@ export class X402PaymentExecutor extends AgentExecutor {
         X402_ERROR_CODES.INVALID_PAYLOAD,
         'Payment payload is missing or malformed.',
         payload?.network,
+        resolvePayer(payload, undefined, undefined),
       );
       yield { taskId: task.id, contextId, status: task.status };
       return;
@@ -221,6 +227,7 @@ export class X402PaymentExecutor extends AgentExecutor {
         validationErr.code,
         validationErr.reason,
         payload.network,
+        resolvePayer(payload, undefined, undefined),
       );
       yield { taskId: task.id, contextId, status: task.status };
       return;
@@ -238,6 +245,7 @@ export class X402PaymentExecutor extends AgentExecutor {
         mapVerifyFailureToCode(verifyResult.invalidReason),
         verifyResult.invalidReason ?? 'Payment verification failed.',
         payload.network,
+        resolvePayer(payload, verifyResult, undefined),
         priorReceipts,
       );
       yield { taskId: task.id, contextId, status: task.status };
@@ -257,6 +265,7 @@ export class X402PaymentExecutor extends AgentExecutor {
         X402_ERROR_CODES.SETTLEMENT_FAILED,
         settleResult.errorReason ?? 'Payment settlement failed.',
         payload.network,
+        resolvePayer(payload, verifyResult, settleResult),
         priorReceipts,
       );
       yield { taskId: task.id, contextId, status: task.status };
@@ -267,6 +276,7 @@ export class X402PaymentExecutor extends AgentExecutor {
       success: true,
       transaction: settleResult.transaction ?? '',
       network: payload.network,
+      payer: resolvePayer(payload, verifyResult, settleResult),
     };
 
     let lastStatusEvent: TaskStatusUpdateEvent | undefined;
@@ -321,18 +331,26 @@ export class X402PaymentExecutor extends AgentExecutor {
    * `explicitPrior` lets the caller pass in receipts captured before a
    * downstream step (e.g. `_inner.execute`) rewrote `task.status`. When
    * omitted, prior receipts are read from the current `task.status`.
+   *
+   * `payer` is the caller-resolved payer wallet address — required by
+   * x402-v1 §5.3.2 on every receipt, including failure rows. Pass the
+   * facilitator-supplied address when available, falling back to the
+   * EVM authorization's `from` for shape-failure cases where verify
+   * never ran.
    */
   private _handlePaymentFailure(
     task: Task,
     code: X402ErrorCode,
     reason: string,
     network: string | undefined,
+    payer: string,
     explicitPrior?: X402SettleResponse[],
   ): void {
     const receipt: X402SettleResponse = {
       success: false,
       transaction: '',
       network: network ?? 'unknown',
+      payer,
       errorReason: reason,
     };
     const prior = explicitPrior ?? getExistingReceipts(task);
@@ -571,6 +589,24 @@ function getEvmAuthorization(
   return inner && typeof inner === 'object' && 'authorization' in inner
     ? inner.authorization
     : undefined;
+}
+
+/**
+ * Pick the payer wallet address for a receipt. Spec §5.3.2 requires this
+ * on every settlement response, including failure rows, so we always
+ * have to produce a string — fall back through facilitator → payload →
+ * `'unknown'` rather than dropping the field.
+ */
+function resolvePayer(
+  payload: X402PaymentPayload | undefined,
+  verifyResult: { payer?: string } | undefined,
+  settleResult: { payer?: string } | undefined,
+): string {
+  if (settleResult?.payer) return settleResult.payer;
+  if (verifyResult?.payer) return verifyResult.payer;
+  const authorization = getEvmAuthorization(payload);
+  if (authorization?.from) return authorization.from;
+  return 'unknown';
 }
 
 function validatePayloadAgainstRequirement(

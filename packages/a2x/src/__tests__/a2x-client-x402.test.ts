@@ -111,6 +111,7 @@ function completedTaskWithReceipt(): unknown {
               success: true,
               transaction: '0xabc',
               network: 'base-sepolia',
+              payer: '0x9999999999999999999999999999999999999999',
             },
           ],
         },
@@ -141,6 +142,7 @@ function failedTaskWithReceipt(reason: string, code: string): unknown {
               success: false,
               transaction: '',
               network: 'base-sepolia',
+              payer: '0x9999999999999999999999999999999999999999',
               errorReason: reason,
             },
           ],
@@ -324,6 +326,213 @@ describe('A2XClient.sendMessage — native x402 dance', () => {
     expect(rpcRequests).toHaveLength(1);
     expect(rpcRequests[0]!.headers['x-a2a-extensions']).toBeUndefined();
   });
+
+  it('sends payment-rejected when onPaymentRequired returns false (spec §5.4.2)', async () => {
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(paymentRequiredTask()),
+      () =>
+        jsonRpcOk({
+          kind: 'task',
+          id: 't1',
+          contextId: 'c1',
+          status: {
+            state: 'failed',
+            timestamp: new Date().toISOString(),
+            message: {
+              messageId: 'rj',
+              role: 'agent',
+              parts: [{ kind: 'text', text: 'declined' }],
+              metadata: {
+                [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REJECTED,
+              },
+            },
+          },
+          artifacts: [],
+          history: [],
+        }),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: { signer: TEST_ACCOUNT, onPaymentRequired: () => false },
+    });
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    expect(task.status.state).toBe('failed');
+    expect(rpcRequests).toHaveLength(2);
+    const followup = (rpcRequests[1]!.body as { params: { message: { metadata: Record<string, unknown> } } }).params;
+    expect(followup.message.metadata[X402_METADATA_KEYS.STATUS]).toBe(
+      X402_PAYMENT_STATUS.REJECTED,
+    );
+    // Reject path must NOT send a signed payload — the merchant only
+    // gets the rejection marker on the same task.
+    expect(followup.message.metadata[X402_METADATA_KEYS.PAYLOAD]).toBeUndefined();
+  });
+
+  it('does not throw when the latest receipt is success despite historical failures (issue #143.4)', async () => {
+    // Caller resumes a task that previously had a failed attempt. The
+    // receipts array carries the complete history per spec §7. A
+    // `find(!r.success)` scan would falsely throw on the stale failure
+    // even though the most recent receipt is success.
+    const { fetch } = scriptedFetch([
+      () => jsonRpcOk(paymentRequiredTask()),
+      () =>
+        jsonRpcOk({
+          kind: 'task',
+          id: 't1',
+          contextId: 'c1',
+          status: {
+            state: 'completed',
+            timestamp: new Date().toISOString(),
+            message: {
+              messageId: 'final',
+              role: 'agent',
+              parts: [{ kind: 'text', text: 'ok' }],
+              metadata: {
+                [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.COMPLETED,
+                [X402_METADATA_KEYS.RECEIPTS]: [
+                  { success: false, transaction: '', network: 'base-sepolia', payer: '0xpayer', errorReason: 'old' },
+                  { success: true, transaction: '0xabc', network: 'base-sepolia', payer: '0xpayer' },
+                ],
+              },
+            },
+          },
+          artifacts: [],
+          history: [],
+        }),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: { signer: TEST_ACCOUNT },
+    });
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    expect(task.status.state).toBe('completed');
+  });
+
+  it('surfaces a server-side retry signal (input-required + payment-required) without throwing', async () => {
+    // `retryOnFailure: true` on the executor re-issues `payment-required`
+    // after a failed verify/settle. The default client (maxRetries: 0)
+    // signs once, sees the retry prompt, and surfaces the task — does
+    // not throw on the failure receipt that came along for the ride.
+    const retryTask = {
+      kind: 'task',
+      id: 't1',
+      contextId: 'c1',
+      status: {
+        state: 'input-required',
+        timestamp: new Date().toISOString(),
+        message: {
+          messageId: 'retry',
+          role: 'agent',
+          parts: [{ kind: 'text', text: 'try again' }],
+          metadata: {
+            [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REQUIRED,
+            [X402_METADATA_KEYS.REQUIRED]: {
+              x402Version: 1,
+              accepts: [
+                {
+                  scheme: 'exact',
+                  network: 'base-sepolia',
+                  maxAmountRequired: '1000',
+                  resource: 'https://example.com/protected',
+                  description: 'Per-call',
+                  mimeType: 'application/json',
+                  payTo: '0x000000000000000000000000000000000000dEaD',
+                  maxTimeoutSeconds: 300,
+                  asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+                  extra: { name: 'USDC', version: '2' },
+                },
+              ],
+              error: 'insufficient_balance',
+            },
+            [X402_METADATA_KEYS.ERROR]: 'INSUFFICIENT_FUNDS',
+            [X402_METADATA_KEYS.RECEIPTS]: [
+              { success: false, transaction: '', network: 'base-sepolia', payer: '0xpayer', errorReason: 'insufficient_balance' },
+            ],
+          },
+        },
+      },
+      artifacts: [],
+      history: [],
+    };
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(paymentRequiredTask()),
+      () => jsonRpcOk(retryTask),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: { signer: TEST_ACCOUNT },
+    });
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    expect(task.status.state).toBe('input-required');
+    expect(rpcRequests).toHaveLength(2);
+  });
+
+  it('auto-retries up to maxRetries times when the server keeps re-issuing payment-required', async () => {
+    const retryTask = (): unknown => ({
+      kind: 'task',
+      id: 't1',
+      contextId: 'c1',
+      status: {
+        state: 'input-required',
+        timestamp: new Date().toISOString(),
+        message: {
+          messageId: 'retry',
+          role: 'agent',
+          parts: [{ kind: 'text', text: 'try again' }],
+          metadata: {
+            [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REQUIRED,
+            [X402_METADATA_KEYS.REQUIRED]: {
+              x402Version: 1,
+              accepts: [
+                {
+                  scheme: 'exact',
+                  network: 'base-sepolia',
+                  maxAmountRequired: '1000',
+                  resource: 'https://example.com/protected',
+                  description: 'Per-call',
+                  mimeType: 'application/json',
+                  payTo: '0x000000000000000000000000000000000000dEaD',
+                  maxTimeoutSeconds: 300,
+                  asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+                  extra: { name: 'USDC', version: '2' },
+                },
+              ],
+              error: 'transient',
+            },
+          },
+        },
+      },
+      artifacts: [],
+      history: [],
+    });
+    // initial → first sign → retry-required → second sign → completed
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(paymentRequiredTask()),
+      () => jsonRpcOk(retryTask()),
+      () => jsonRpcOk(completedTaskWithReceipt()),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: { signer: TEST_ACCOUNT, maxRetries: 1 },
+    });
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    expect(task.status.state).toBe('completed');
+    expect(rpcRequests).toHaveLength(3);
+    // Both follow-ups must carry signed payload metadata, not the same
+    // signature reused — fresh nonce per attempt is the whole point of
+    // retry-on-failure.
+    const followup1 = (rpcRequests[1]!.body as { params: { message: { metadata: Record<string, unknown> } } }).params.message.metadata;
+    const followup2 = (rpcRequests[2]!.body as { params: { message: { metadata: Record<string, unknown> } } }).params.message.metadata;
+    expect(followup1[X402_METADATA_KEYS.STATUS]).toBe(X402_PAYMENT_STATUS.SUBMITTED);
+    expect(followup2[X402_METADATA_KEYS.STATUS]).toBe(X402_PAYMENT_STATUS.SUBMITTED);
+  });
 });
 
 describe('A2XClient.sendMessageStream — native x402 dance', () => {
@@ -412,7 +621,7 @@ describe('A2XClient.sendMessageStream — native x402 dance', () => {
         {
           [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.COMPLETED,
           [X402_METADATA_KEYS.RECEIPTS]: [
-            { success: true, transaction: '0xabc', network: 'base-sepolia' },
+            { success: true, transaction: '0xabc', network: 'base-sepolia', payer: '0x9999999999999999999999999999999999999999' },
           ],
         },
         true,

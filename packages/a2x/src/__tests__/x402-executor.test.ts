@@ -343,6 +343,59 @@ describe('X402PaymentExecutor — request/submit flow', () => {
     expect(meta[X402_METADATA_KEYS.STATUS]).toBe(X402_PAYMENT_STATUS.REJECTED);
   });
 
+  it('populates payer on success receipts (x402-v1 §5.3.2)', async () => {
+    const FACILITATOR_PAYER = '0x9999999999999999999999999999999999999999';
+    const executor = makeExecutor(
+      mockFacilitator({
+        verify: async () => ({ isValid: true, invalidReason: undefined, payer: FACILITATOR_PAYER }),
+        settle: async () => ({
+          success: true,
+          transaction: '0xdeadbeef',
+          network: 'base-sepolia',
+          payer: FACILITATOR_PAYER,
+        }),
+      }),
+    );
+    const first = await executor.execute(newTask(), newMessage());
+    const { metadata } = await signAgainst(first);
+    const completed = await executor.execute(
+      newTask(),
+      newMessage({ messageId: 'm2', metadata }),
+    );
+    const receipts = (
+      completed.status.message?.metadata as Record<string, unknown>
+    )[X402_METADATA_KEYS.RECEIPTS] as X402SettleResponse[];
+    expect(receipts[0]).toMatchObject({
+      success: true,
+      payer: FACILITATOR_PAYER,
+    });
+  });
+
+  it('populates payer on failure receipts even when the facilitator omits it', async () => {
+    // Some facilitator implementations drop `payer` on failure; spec
+    // §5.3.2 still requires the field, so the SDK must fall back to
+    // the EVM authorization's `from` (or `'unknown'` for SVM/non-EVM).
+    const executor = makeExecutor(
+      mockFacilitator({
+        verify: async () => ({
+          isValid: false,
+          invalidReason: 'invalid_signature',
+          payer: undefined as unknown as string,
+        }),
+      }),
+    );
+    const first = await executor.execute(newTask(), newMessage());
+    const { metadata } = await signAgainst(first);
+    const result = await executor.execute(
+      newTask(),
+      newMessage({ messageId: 'm2', metadata }),
+    );
+    const receipts = (
+      result.status.message?.metadata as Record<string, unknown>
+    )[X402_METADATA_KEYS.RECEIPTS] as X402SettleResponse[];
+    expect(receipts[0]?.payer).toBe(TEST_ACCOUNT.address);
+  });
+
   it('preserves prior receipts when payment completes after a previous failure (spec §7 history)', async () => {
     const executor = makeExecutor(mockFacilitator());
 

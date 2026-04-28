@@ -6,6 +6,7 @@ import {
   X402_PAYMENT_STATUS,
 } from '../x402/constants.js';
 import {
+  X402InvalidVersionError,
   X402NoSupportedRequirementError,
   X402PaymentRequiredError,
 } from '../x402/errors.js';
@@ -13,6 +14,7 @@ import {
   getX402PaymentRequirements,
   getX402Receipts,
   getX402Status,
+  rejectX402Payment,
   signX402Payment,
 } from '../x402/client.js';
 import type {
@@ -89,6 +91,7 @@ describe('getX402Status / getX402Receipts', () => {
       success: true,
       transaction: '0xabc',
       network: 'base-sepolia',
+      payer: '0x9999999999999999999999999999999999999999',
     };
     const task: Task = {
       id: 't1',
@@ -171,5 +174,36 @@ describe('signX402Payment', () => {
         selectRequirement: () => undefined,
       }),
     ).rejects.toBeInstanceOf(X402NoSupportedRequirementError);
+  });
+
+  it('throws X402InvalidVersionError when the merchant claims a non-1 x402Version (spec §6/§9)', async () => {
+    // x402-v1 §9 lists `invalid_x402_version`; the x402 npm package
+    // pins `x402Versions: [1]`, so signing a non-1 requirement would
+    // crash deep inside `createPaymentHeader`. We reject early so callers
+    // see the spec error code.
+    const task = paymentRequiredTask([BASE_ACCEPT]);
+    const meta = task.status.message!.metadata as Record<string, unknown>;
+    (meta[X402_METADATA_KEYS.REQUIRED] as { x402Version: number }).x402Version = 999;
+    await expect(
+      signX402Payment(task, { signer: TEST_ACCOUNT }),
+    ).rejects.toBeInstanceOf(X402InvalidVersionError);
+  });
+});
+
+describe('rejectX402Payment', () => {
+  it('produces a payment-rejected metadata block from a payment-required task', () => {
+    const task = paymentRequiredTask([BASE_ACCEPT]);
+    const rejection = rejectX402Payment(task);
+    expect(rejection.metadata[X402_METADATA_KEYS.STATUS]).toBe(
+      X402_PAYMENT_STATUS.REJECTED,
+    );
+  });
+
+  it('throws X402PaymentRequiredError when the task is not asking for payment', () => {
+    const task: Task = {
+      id: 't1',
+      status: { state: TaskState.COMPLETED, timestamp: new Date().toISOString() },
+    };
+    expect(() => rejectX402Payment(task)).toThrowError(X402PaymentRequiredError);
   });
 });

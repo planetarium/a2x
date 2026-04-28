@@ -10,7 +10,7 @@ The flow: the merchant agent responds to an unpaid request with `input-required`
 pnpm add @a2x/sdk x402 viem
 ```
 
-`x402` and `viem` are **optional peer dependencies** — only install them if you actually enable x402 on your agent or client.
+`x402` and `viem` are **optional peer dependencies** — only install them if you actually enable x402 on your agent or client. The SDK lazy-loads the `x402` runtime helpers on the first call to `signX402Payment` (or the first time `A2XClient.sendMessage` enters the dance), so non-x402 consumers can omit the dep without breaking bundlers.
 
 ## Server
 
@@ -108,10 +108,17 @@ On a successful payment, the completed task's status message carries:
 {
   "x402.payment.status": "payment-completed",
   "x402.payment.receipts": [
-    { "success": true, "transaction": "0x…", "network": "base-sepolia" }
+    {
+      "success": true,
+      "transaction": "0x…",
+      "network": "base-sepolia",
+      "payer": "0x857b06519E91e3A54538791bDbb0E22373e36b66"
+    }
   ]
 }
 ```
+
+Every receipt — success or failure — carries a `payer` field per x402-v1 §5.3.2. Multi-wallet auditing and post-settlement bookkeeping branch on this; the SDK propagates the address the facilitator returned, falling back to the EVM authorization's `from` for shape-failure receipts where verify never ran.
 
 Failures surface under `x402.payment.error` with one of the codes below. The seven names listed first come straight from spec §9.1; the remaining three are SDK-specific codes covering failure modes the SDK detects outside the facilitator's purview.
 
@@ -124,6 +131,7 @@ Failures surface under `x402.payment.error` with one of the codes below. The sev
 | `NETWORK_MISMATCH` | spec §9.1 | Payload's network doesn't match any advertised `accepts`. |
 | `INVALID_AMOUNT` | spec §9.1 | Authorization value doesn't match the required amount. |
 | `SETTLEMENT_FAILED` | spec §9.1 | On-chain settle call failed. |
+| `invalid_x402_version` | x402-v1 §6 / §9 | Merchant published a non-1 `x402Version`; the SDK only speaks x402 v1. Surfaced client-side as `X402InvalidVersionError` before any authorization is signed. Wire value stays lowercase because a2a-x402 v0.2 §9.1 doesn't redefine it — x402-v1 §9 is the source of truth for this code. |
 | `INVALID_PAYLOAD` | SDK | Payment payload is missing or structurally invalid. |
 | `INVALID_PAY_TO` | SDK | Authorization target address doesn't match `payTo`. |
 | `VERIFY_FAILED` | SDK | Facilitator rejected the signature, but the reason string didn't match any of the spec codes above. |
@@ -160,6 +168,8 @@ new X402PaymentExecutor(inner, {
 ### Rejection handling
 
 When a client decides not to pay it can respond with `x402.payment.status: payment-rejected` (spec §5.4.2). The executor terminates the task with state `failed` and status `payment-rejected` — no further challenges are published, the loop ends.
+
+On the client side, return `false` from `onPaymentRequired` to send `payment-rejected` cleanly; throwing aborts locally and leaves the merchant's task stranded in `input-required`. `rejectX402Payment(task)` is the lower-level primitive that produces the metadata block if you drive the dance manually.
 
 ## Client
 
@@ -200,7 +210,7 @@ for await (const event of client.sendMessageStream({ message: { … } })) {
 }
 ```
 
-If the merchant rejects the payment (verify or settle failed), the call throws `X402PaymentFailedError` with the on-chain reason attached. If every requirement in `accepts[]` exceeds `maxAmount`, signing throws `X402NoSupportedRequirementError` before any authorization is created.
+If the merchant's terminal task records a payment failure (verify or settle failed and the most recent receipt is unsuccessful), the call throws `X402PaymentFailedError` with the on-chain reason attached. The decision uses the *latest* receipt — resuming a task that has historical failure receipts but completed successfully (e.g. server-side retry) returns the task without throwing. If every requirement in `accepts[]` exceeds `maxAmount`, signing throws `X402NoSupportedRequirementError` before any authorization is created. If the merchant publishes an unsupported `x402Version`, signing throws `X402InvalidVersionError` (wire code `invalid_x402_version`, per x402-v1 §9).
 
 The full option surface:
 
@@ -209,7 +219,8 @@ The full option surface:
 | `signer` | required | viem `LocalAccount` used to produce the EIP-3009 authorization. |
 | `maxAmount` | no cap | Atomic-unit ceiling. Filters `accepts[]` before the selector runs, so a custom `selectRequirement` only sees the affordable subset. |
 | `selectRequirement` | first `scheme === 'exact'` | Predicate over the (already filtered) requirements. Return `undefined` to abort. |
-| `onPaymentRequired` | none | Hook that fires after `payment-required` and before signing. Throw to abort the dance — the caller observes the unmodified `payment-required` task (blocking) or a stream that closes after the `payment-required` event (streaming). |
+| `onPaymentRequired` | none | Hook that fires after `payment-required` and before signing. Return `false` to send `payment-rejected` cleanly so the merchant's task terminates per spec §5.4.2; return `void`/`true` (or omit) to proceed; throw to abort *locally* without telling the merchant (the caller observes the unmodified `payment-required` task). |
+| `maxRetries` | `0` | Maximum *additional* sign+resubmit attempts when the merchant runs `retryOnFailure: true` and re-issues `payment-required` on the same task. Set to `1` or more to opt into automatic retries; the dance bails on any non-`payment-required` terminal or when the budget is exhausted. |
 
 ### Extension activation header
 
@@ -266,6 +277,23 @@ const signed = await signX402Payment(first, {
   signer,
   selectRequirement: (accepts) =>
     accepts.find((r) => r.network === 'base-sepolia'),
+});
+```
+
+Declining a payment manually — produces the metadata block to attach to a follow-up `message/send` call so the merchant terminates the task per spec §5.4.2 instead of leaving it stranded in `input-required`:
+
+```ts
+import { rejectX402Payment } from '@a2x/sdk/x402';
+
+const rejection = rejectX402Payment(first);
+await client.sendMessage({
+  message: {
+    messageId: crypto.randomUUID(),
+    role: 'user',
+    taskId: first.id,
+    parts: [{ text: '' }],
+    metadata: rejection.metadata,
+  },
 });
 ```
 

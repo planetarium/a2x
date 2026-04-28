@@ -15,9 +15,6 @@
  */
 
 import type { LocalAccount } from 'viem';
-import { createPaymentHeader as createX402PaymentHeader } from 'x402/client';
-import { safeBase64Decode } from 'x402/shared';
-import { PaymentPayloadSchema } from 'x402/types';
 import type { Task } from '../types/task.js';
 import {
   X402_METADATA_KEYS,
@@ -25,6 +22,7 @@ import {
   type X402PaymentStatus,
 } from './constants.js';
 import {
+  X402InvalidVersionError,
   X402NoSupportedRequirementError,
   X402PaymentRequiredError,
 } from './errors.js';
@@ -34,6 +32,33 @@ import type {
   X402PaymentRequiredResponse,
   X402SettleResponse,
 } from './types.js';
+
+// x402 is declared as an `optional` peer dep. Importing its runtime
+// helpers at the top level pulls them into the `@a2x/sdk/client` chunk
+// even on code paths that never touch x402, which breaks bundlers when
+// users haven't installed it (issue #134). Lazy-import inside the only
+// function that needs them so non-x402 consumers stay unaffected.
+let _x402Runtime:
+  | Promise<{
+      createPaymentHeader: typeof import('x402/client').createPaymentHeader;
+      safeBase64Decode: typeof import('x402/shared').safeBase64Decode;
+      PaymentPayloadSchema: typeof import('x402/types').PaymentPayloadSchema;
+    }>
+  | undefined;
+async function _loadX402Runtime() {
+  if (!_x402Runtime) {
+    _x402Runtime = (async () => {
+      const [{ createPaymentHeader }, { safeBase64Decode }, { PaymentPayloadSchema }] =
+        await Promise.all([
+          import('x402/client'),
+          import('x402/shared'),
+          import('x402/types'),
+        ]);
+      return { createPaymentHeader, safeBase64Decode, PaymentPayloadSchema };
+    })();
+  }
+  return _x402Runtime;
+}
 
 export interface SignX402PaymentOptions {
   /** viem LocalAccount (or any compatible signer with a `privateKey` + `address`). */
@@ -113,16 +138,28 @@ export async function signX402Payment(
     );
   }
 
+  // x402-v1 §6/§9: only x402Version 1 is defined. The x402 npm package
+  // pins `x402Versions: [1]`; signing a non-1 requirement would let a
+  // malformed/forward-versioned payload reach the wire (or crash deep
+  // inside `createPaymentHeader`). Reject early so callers see the spec
+  // error code (`invalid_x402_version`) instead of an opaque exception.
+  if (required.x402Version !== 1) {
+    throw new X402InvalidVersionError(required.x402Version as unknown as number);
+  }
+
   const select = options.selectRequirement ?? defaultSelect;
   const requirement = select(required.accepts);
   if (!requirement) {
     throw new X402NoSupportedRequirementError();
   }
 
-  const header = await createX402PaymentHeader(
-    options.signer as unknown as Parameters<typeof createX402PaymentHeader>[0],
+  const { createPaymentHeader, safeBase64Decode, PaymentPayloadSchema } =
+    await _loadX402Runtime();
+
+  const header = await createPaymentHeader(
+    options.signer as unknown as Parameters<typeof createPaymentHeader>[0],
     required.x402Version,
-    requirement as unknown as Parameters<typeof createX402PaymentHeader>[2],
+    requirement as unknown as Parameters<typeof createPaymentHeader>[2],
   );
 
   // `createPaymentHeader` returns a base64-encoded PaymentPayload for HTTP
@@ -138,6 +175,36 @@ export async function signX402Payment(
     metadata: {
       [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.SUBMITTED,
       [X402_METADATA_KEYS.PAYLOAD]: payload,
+    },
+  };
+}
+
+/**
+ * Build the `payment-rejected` follow-up metadata for a task the merchant
+ * left in `payment-required`. Resending the original message with this
+ * metadata block (and the same `taskId` / `contextId`) tells the merchant
+ * the client declined the challenge — the server-side `X402PaymentExecutor`
+ * terminates the task on receipt, closing the `payment-required` round
+ * trip per a2a-x402 v0.2 §5.4.2 / §7.1.
+ *
+ * `signX402Payment` is the "yes, here's a signed payload" half of the
+ * dance; `rejectX402Payment` is the "no, not at this price" half. Throwing
+ * from `onPaymentRequired` in `A2XClient` aborts locally without telling
+ * the merchant — use this primitive (or return `false` from
+ * `onPaymentRequired`) when you want the merchant to know.
+ */
+export function rejectX402Payment(task: Task): {
+  metadata: Record<string, unknown>;
+} {
+  const required = getX402PaymentRequirements(task);
+  if (!required) {
+    throw new X402PaymentRequiredError(
+      'Task is not in a payment-required state.',
+    );
+  }
+  return {
+    metadata: {
+      [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REJECTED,
     },
   };
 }
