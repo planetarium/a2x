@@ -100,6 +100,24 @@ const handler = new DefaultRequestHandler(a2xAgent);
 const app = express();
 app.use(express.json());
 
+// Parse-error handler: convert SyntaxError raised by express.json()
+// into a JSON-RPC -32700 response with HTTP 200, matching the
+// JSON-RPC over HTTP convention used by the SDK's own to-a2x wrapper.
+// Express invokes this with 4 args when it sees a SyntaxError.
+app.use(
+  (err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (err instanceof SyntaxError && 'body' in err) {
+      res.status(200).json({
+        jsonrpc: '2.0',
+        id: null,
+        error: { code: -32700, message: 'Parse error' },
+      });
+      return;
+    }
+    next(err);
+  },
+);
+
 // Agent Card
 app.get('/.well-known/agent.json', (req, res) => {
   try {
@@ -120,45 +138,54 @@ app.post('/a2a', async (req, res) => {
     query: req.query as Record<string, string | string[] | undefined>,
   };
 
+  // JSON-RPC over HTTP convention: handler exceptions are surfaced as
+  // JSON-RPC error responses with HTTP 200, not as 4xx/5xx, so clients
+  // that skip body parsing on transport errors still see the code.
+  let result: Awaited<ReturnType<typeof handler.handle>>;
   try {
-    const result = await handler.handle(req.body, context);
-
-    // Streaming → SSE
-    if (result && typeof result === 'object' && Symbol.asyncIterator in result) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-
-      const stream = createSSEStream(
-        result as AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent>,
-      );
-      const reader = stream.getReader();
-
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          res.write(typeof value === 'string' ? value : new TextDecoder().decode(value));
-        }
-      } catch (error) {
-        const errorData = JSON.stringify({
-          error: error instanceof Error ? error.message : 'Internal error',
-        });
-        res.write(`event: error\ndata: ${errorData}\n\n`);
-      }
-      res.end();
-      return;
-    }
-
-    // Standard JSON-RPC response
-    res.json(result);
-  } catch {
-    res.status(400).json({
+    result = await handler.handle(req.body, context);
+  } catch (err) {
+    const id = (req.body as { id?: unknown } | undefined)?.id ?? null;
+    res.status(200).json({
       jsonrpc: '2.0',
-      id: null,
-      error: { code: -32700, message: 'Parse error' },
+      id,
+      error: {
+        code: -32603,
+        message: err instanceof Error ? err.message : 'Internal error',
+      },
     });
+    return;
   }
+
+  // Streaming → SSE
+  if (result && typeof result === 'object' && Symbol.asyncIterator in result) {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    const stream = createSSEStream(
+      result as AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent>,
+    );
+    const reader = stream.getReader();
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        res.write(typeof value === 'string' ? value : new TextDecoder().decode(value));
+      }
+    } catch (error) {
+      const errorData = JSON.stringify({
+        error: error instanceof Error ? error.message : 'Internal error',
+      });
+      res.write(`event: error\ndata: ${errorData}\n\n`);
+    }
+    res.end();
+    return;
+  }
+
+  // Standard JSON-RPC response
+  res.json(result);
 });
 
 // ─── 5. Start ───
