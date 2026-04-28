@@ -65,9 +65,6 @@ export class OAuth2DeviceCodeAuthorization extends BaseSecurityScheme {
    * v0.3 parsers may ignore this flow. `@a2x/sdk` clients consume it natively.
    */
   toV03Schema(): SecuritySchemeV03 {
-    console.warn(
-      'OAuth2DeviceCodeAuthorization: Device Code flow is emitted as a non-standard extension on the v0.3 AgentCard. Strict third-party v0.3 parsers may ignore it.',
-    );
     const flow: DeviceCodeFlowV03 = {
       deviceAuthorizationUrl: this.deviceAuthorizationUrl,
       tokenUrl: this.tokenUrl,

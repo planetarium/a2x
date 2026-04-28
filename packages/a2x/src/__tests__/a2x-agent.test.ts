@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { A2XAgent } from '../a2x/a2x-agent.js';
 import { AgentExecutor, StreamingMode } from '../a2x/agent-executor.js';
 import { InMemoryTaskStore } from '../a2x/task-store.js';
@@ -278,8 +278,7 @@ describe('Layer 3: A2XAgent', () => {
       expect(card.skills[0].security).toEqual([{ api_key: [] }]);
     });
 
-    it('should emit DeviceCode as non-standard v0.3 extension with warning', () => {
-      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    it('should emit DeviceCode as non-standard v0.3 extension', () => {
       const a2x = createA2XAgent();
       a2x
         .setDefaultUrl('https://example.com/a2a')
@@ -304,10 +303,6 @@ describe('Layer 3: A2XAgent', () => {
           },
         },
       });
-      expect(warnSpy).toHaveBeenCalledWith(
-        expect.stringContaining('non-standard extension'),
-      );
-      warnSpy.mockRestore();
     });
   });
 
