@@ -11,8 +11,8 @@ import type {
   ModelResponse,
   ToolDeclaration,
 } from './llm-provider.js';
-import type { Part, Message } from '../types/common.js';
-import { isTextPart } from '../types/common.js';
+import type { Part, Message, FilePart, DataPart } from '../types/common.js';
+import { isTextPart, isFilePart, isDataPart } from '../types/common.js';
 import { BaseAgent } from './base-agent.js';
 import type { AgentEvent } from './base-agent.js';
 import { eventsToContents } from '../runner/event-history.js';
@@ -278,11 +278,43 @@ export class LlmAgent extends BaseAgent {
         return;
       }
 
-      // 5. Yield text content
+      // 5. Yield content parts. Text/file/data are emitted as discrete
+      // AgentEvents so multi-modal LLMs (image gen, structured output, …)
+      // can stay on the BaseAgent path. Non-text parts are still kept out of
+      // the LLM conversation history below — that history remains text-only.
       const textParts = response.content.filter(isTextPart);
-      for (const part of textParts) {
-        if (part.text) {
-          yield { type: 'text', text: part.text, role: 'agent' };
+      for (const part of response.content) {
+        if (isTextPart(part)) {
+          if (part.text) {
+            yield {
+              type: 'text',
+              text: part.text,
+              role: 'agent',
+              ...(part.mediaType ? { mediaType: part.mediaType } : {}),
+            };
+          }
+        } else if (isFilePart(part)) {
+          const filePart = part as FilePart;
+          yield {
+            type: 'file',
+            file: {
+              ...(filePart.raw !== undefined ? { raw: filePart.raw } : {}),
+              ...(filePart.url !== undefined ? { url: filePart.url } : {}),
+              ...(filePart.mediaType !== undefined
+                ? { mediaType: filePart.mediaType }
+                : {}),
+              ...(filePart.filename !== undefined
+                ? { filename: filePart.filename }
+                : {}),
+            },
+          };
+        } else if (isDataPart(part)) {
+          const dataPart = part as DataPart;
+          yield {
+            type: 'data',
+            data: dataPart.data,
+            ...(dataPart.mediaType ? { mediaType: dataPart.mediaType } : {}),
+          };
         }
       }
 

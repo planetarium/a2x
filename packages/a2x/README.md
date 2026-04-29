@@ -12,6 +12,7 @@ A self-contained TypeScript SDK for building [A2A (Agent-to-Agent)](https://a2a-
 - **Multi-provider** — Anthropic Claude, OpenAI GPT, and Google Gemini out of the box.
 - **Framework-agnostic** — Works with Express, Fastify, Hono, Next.js, or any HTTP framework.
 - **SSE streaming** — First-class `message/stream` support via Server-Sent Events.
+- **Multi-modal artifacts** — Agents can yield `text`, `file`, and `data` events; the default executor maps each into A2A `TextPart` / `FilePart` / `DataPart` artifacts.
 - **Built-in auth** — API Key, Bearer, OAuth 2.0 (Authorization Code, Client Credentials, Device Code), OpenID Connect, and Mutual TLS.
 - **x402 payments** — Charge per call via the [a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402) extension. On-chain verify + settle through any x402 facilitator.
 - **Zero runtime dependencies** — Core module uses only Node.js built-in APIs.

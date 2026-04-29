@@ -7,7 +7,12 @@ import type { InvocationContext } from '../runner/context.js';
 // ─── AgentEvent (events yielded by agents to the Runner) ───
 
 export type AgentEvent =
-  | { type: 'text'; text: string; role?: 'user' | 'agent' }
+  | { type: 'text'; text: string; role?: 'user' | 'agent'; mediaType?: string }
+  | {
+    type: 'file';
+    file: { raw?: string; url?: string; mediaType?: string; filename?: string };
+  }
+  | { type: 'data'; data: unknown; mediaType?: string }
   | { type: 'toolCall'; toolName: string; args: Record<string, unknown>; toolCallId?: string }
   | { type: 'toolResult'; toolName: string; result: unknown; toolCallId?: string }
   | { type: 'done'; output?: unknown }

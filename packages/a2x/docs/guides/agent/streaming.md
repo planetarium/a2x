@@ -72,6 +72,53 @@ res.on('close', () => {
 
 See [Framework Integration](./framework-integration.md) for the full per-framework recipe.
 
+## Multi-modal output: file and data artifacts
+
+A2A's wire format already supports non-text parts (`FilePart`, `DataPart`) alongside the familiar `TextPart`. A2X surfaces this on the agent side via three `AgentEvent` data variants — agents that extend `BaseAgent` (or are wrapped by `LlmAgent`) can yield any of them and the executor takes care of the artifact mapping.
+
+```ts
+import { BaseAgent } from '@a2x/sdk';
+import type { AgentEvent } from '@a2x/sdk';
+
+class ImageAgent extends BaseAgent {
+  constructor() {
+    super({ name: 'image_agent' });
+  }
+
+  async *run(): AsyncGenerator<AgentEvent> {
+    yield { type: 'text', text: 'Here is your image:', role: 'agent' };
+    yield {
+      type: 'file',
+      file: {
+        url: 'https://cdn.example.com/out.png',
+        mediaType: 'image/png',
+        filename: 'out.png',
+      },
+    };
+    yield {
+      type: 'data',
+      data: { score: 0.92, label: 'cat' },
+      mediaType: 'application/json',
+    };
+    yield { type: 'done' };
+  }
+}
+```
+
+How the default `AgentExecutor` maps each event to a `TaskArtifactUpdateEvent`:
+
+| Event | Mapping |
+|---|---|
+| `text` | Appended to a single text artifact (`artifact-${taskId}-text`). Emitted incrementally with `append: true`, finalized with `lastChunk: true` on `done`. |
+| `file` | A new artifact (`artifact-${taskId}-file-${n}`) carrying a single `FilePart`. Emitted inline with `append: false`, `lastChunk: true`. |
+| `data` | A new artifact (`artifact-${taskId}-data-${n}`) carrying a single `DataPart`. Emitted inline with `append: false`, `lastChunk: true`. |
+
+The "one logical output = one artifact" mapping matches A2A's intuition and lets clients render each non-text result independently. Mixed runs work as expected: text accumulates into a single artifact, while each `file` / `data` event spawns its own.
+
+If you need progressive streaming for a single non-text artifact (e.g. chunked image generation), drop down to a custom `AgentExecutor` and emit `TaskArtifactUpdateEvent`s directly with `append: true`. The `AgentEvent` abstraction intentionally stays simple — one event = one artifact.
+
+> **Note on LLM provider responses.** `LlmAgent` propagates whatever `Part` shapes the configured `LlmProvider` returns. The bundled providers (Anthropic, OpenAI, Google) currently only emit text parts from chat-completion responses; non-text parts are most useful today when you implement a custom `BaseAgent` that calls an image-generation or structured-output API directly.
+
 ## Resuming a dropped SSE stream
 
 If a client loses connection mid-task, it can re-attach via the A2A `tasks/resubscribe` method without restarting the agent. A2X keeps an in-memory **task event bus** that fans events from the original `message/stream` to every live subscriber; a resubscriber catches the tail of the same execution.
