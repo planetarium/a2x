@@ -1,5 +1,204 @@
 # @a2x/sdk
 
+## 0.11.1
+
+### Patch Changes
+
+- [#146](https://github.com/planetarium/a2x/pull/146) [`94dffb5`](https://github.com/planetarium/a2x/commit/94dffb5254a450945a021963b023407fb9fecaba) Thanks [@ost006](https://github.com/ost006)! - `isFilePart()` now recognizes the v0.3 spec FilePart wire shape in
+  addition to the SDK's flat internal shape.
+
+  Closes [#142](https://github.com/planetarium/a2x/issues/142) (fix 4 of 5).
+
+  **Why.** v0.3 `FilePart` (`a2a-v0.3.0.json:828`) is nested:
+  `{ kind: 'file', file: { bytes | uri, mimeType?, name? } }`. The
+  pre-fix guard only matched the SDK's internal flat shape (`{ raw }` /
+  `{ url }`), so a spec-conformant FilePart coming off the wire fell
+  through every part type guard and was silently classified as none. The
+  v0.3 response mapper output already produced the nested shape
+  correctly — only input classification was asymmetric.
+
+  **Fix.** The guard now also returns `true` for
+  `{ kind: 'file', file: { ... } }`. `isTextPart` and `isDataPart`
+  already handled their respective shapes correctly and are unchanged.
+
+- [#146](https://github.com/planetarium/a2x/pull/146) [`94dffb5`](https://github.com/planetarium/a2x/commit/94dffb5254a450945a021963b023407fb9fecaba) Thanks [@ost006](https://github.com/ost006)! - Push notification webhooks now POST the spec-mapped Task wire shape, not
+  the internal `Task` object.
+
+  Closes [#142](https://github.com/planetarium/a2x/issues/142) (fix 1 of 5).
+
+  **Why.** `DefaultRequestHandler._dispatchPushNotifications` handed the
+  raw internal `Task` to `PushNotificationSender.send`, which
+  `JSON.stringify`d it straight onto the wire. v1.0 receivers got
+  `state: "completed"` / `role: "agent"` (lowercase) instead of
+  `TASK_STATE_COMPLETED` / `ROLE_AGENT`, and v0.3 receivers got Task /
+  Message / Part objects without the required `kind` discriminator. The
+  body never matched what the same task served via `tasks/get` would
+  have looked like.
+
+  **Fix.** The dispatcher now runs the task through the same
+  `ResponseMapper` that produces the JSON-RPC response (v0.3 `kind` /
+  v1.0 UPPER_CASE) before handing the body to the sender.
+
+  **Public surface.** `PushNotificationSender.send(config, body: unknown)`
+  replaces `send(config, task: Task)` — the second parameter is now the
+  already-version-mapped wire payload. Custom sender implementations
+  should update their parameter type; the runtime semantics
+  (`JSON.stringify(value)`) are unchanged. The default
+  `FetchPushNotificationSender` is updated in place.
+
+- [#146](https://github.com/planetarium/a2x/pull/146) [`94dffb5`](https://github.com/planetarium/a2x/commit/94dffb5254a450945a021963b023407fb9fecaba) Thanks [@ost006](https://github.com/ost006)! - `tasks/pushNotificationConfig/set` now accepts the v1.0 flat input
+  shape so clients can round-trip the response the server just gave
+  them.
+
+  Closes [#142](https://github.com/planetarium/a2x/issues/142) (fix 2 of 5).
+
+  **Why.** `V10ResponseMapper.mapPushNotificationConfig` returns the flat
+  shape defined by `a2a-v1.0.0.proto:464`
+  (`{ taskId, id, url, token?, authentication?, tenant? }`), but the
+  validator on `tasks/pushNotificationConfig/set` required the v0.3
+  nested `pushNotificationConfig` field on every protocol version. A
+  v1.0 client that received a config from `get`/`list` and tried to send
+  it back to `set` would be rejected with `InvalidParams`.
+
+  **Fix.** The validator branches on `protocolVersion`. On `1.0` it
+  accepts the flat shape (top-level `url`/`id`/`token`/`authentication`);
+  on `0.3` it continues to require the nested form. The internal storage
+  representation is unchanged — the validator normalizes both inputs
+  into the same `{ taskId, pushNotificationConfig: { ... } }` value the
+  store keys on.
+
+  `get`, `list`, and `delete` already branched on protocol version; only
+  `set` was missing the v1.0 path.
+
+- [#146](https://github.com/planetarium/a2x/pull/146) [`94dffb5`](https://github.com/planetarium/a2x/commit/94dffb5254a450945a021963b023407fb9fecaba) Thanks [@ost006](https://github.com/ost006)! - The SSE stream parser now surfaces mid-stream JSON-RPC error envelopes
+  as thrown errors instead of silently dropping them.
+
+  Closes [#142](https://github.com/planetarium/a2x/issues/142) (fix 5 of 5).
+
+  **Why.** When a server-side handler threw mid-stream,
+  `DefaultRequestHandler._wrapStreamInJsonRpc` yielded a single JSON-RPC
+  error envelope (`{ jsonrpc, id, error: { code, message, data? } }`)
+  before closing the connection — exactly as the streaming guide already
+  documents. But `parseSSEStream`'s `unwrapData` only unwrapped `result`;
+  the `error` envelope was classified as a generic `MESSAGE` event, and
+  the switch in `parseSSEStream` had no `MESSAGE` arm, so the chunk was
+  dropped without ever being yielded or thrown. Clients saw the stream
+  end as though the task had completed silently.
+
+  **Fix.** `unwrapData` now detects a JSON-RPC error envelope and throws
+  an `Error` with the server's `message` and `code`. The thrown error
+  propagates out of `parseSSEStream`, terminating the iterator with a
+  meaningful message — matching what the streaming guide already
+  promises.
+
+- [#146](https://github.com/planetarium/a2x/pull/146) [`94dffb5`](https://github.com/planetarium/a2x/commit/94dffb5254a450945a021963b023407fb9fecaba) Thanks [@ost006](https://github.com/ost006)! - `toA2x()` and `createA2xRequestListener()` now serve the AgentCard at
+  both `/.well-known/agent.json` and `/.well-known/agent-card.json`.
+
+  Closes [#142](https://github.com/planetarium/a2x/issues/142) (fix 3 of 5).
+
+  **Why.** The SDK's own `resolveAgentCard()` tries the modern
+  `/.well-known/agent-card.json` first and falls back to the v0.3
+  `/.well-known/agent.json`. The Next.js samples already expose both
+  routes, but plain `toA2x()` users only got the legacy path — a client
+  that hit the modern path first received a 404 and only saw the card
+  after a fallback round trip (or, with strict client configurations,
+  not at all).
+
+  **Fix.** Both well-known paths route to `handler.getAgentCard()` and
+  return the same body. No other behavior change.
+
+- [#146](https://github.com/planetarium/a2x/pull/146) [`94dffb5`](https://github.com/planetarium/a2x/commit/94dffb5254a450945a021963b023407fb9fecaba) Thanks [@ost006](https://github.com/ost006)! - `@a2x/sdk/client` no longer pulls `x402` into the bundle at build time
+  when consumers don't use it.
+
+  Closes [#134](https://github.com/planetarium/a2x/issues/134).
+
+  **Why.** `x402` is declared as an optional peer dependency, but its
+  runtime helpers were statically imported into the
+  `@a2x/sdk/client` chunk. Bundlers (Next.js, Vite, esbuild, …) treated
+  the import as required and either failed the build or shipped the
+  package even on code paths that never signed a payment.
+
+  **Fix.** `signX402Payment` now lazy-imports the `x402` runtime inside
+  the function body, so the static `import` graph of the client chunk
+  no longer references it. Consumers who never invoke an x402-gated flow
+  do not need to install `x402`. The static imports in
+  `dist/client/*.js` are gone — verifiable by grepping the published
+  bundle.
+
+- [#146](https://github.com/planetarium/a2x/pull/146) [`94dffb5`](https://github.com/planetarium/a2x/commit/94dffb5254a450945a021963b023407fb9fecaba) Thanks [@ost006](https://github.com/ost006)! - Every x402 settlement receipt now carries the `payer` address, including
+  failure rows.
+
+  Closes [#143](https://github.com/planetarium/a2x/issues/143) (fix 2 of 4).
+
+  **Why.** x402-v1 §5.3.2 requires the payer wallet address on every
+  receipt the merchant emits, success or failure. Before, the SDK
+  populated `payer` only on success rows; failure receipts went out
+  without it, breaking spec-conformant downstream auditors.
+
+  **Fix.** `payer: string` is now required on the internal X402Receipt
+  type, and both the blocking and streaming executor paths thread the
+  payer address into every receipt — including the failure-row branch
+  that previously omitted it.
+
+- [#146](https://github.com/planetarium/a2x/pull/146) [`94dffb5`](https://github.com/planetarium/a2x/commit/94dffb5254a450945a021963b023407fb9fecaba) Thanks [@ost006](https://github.com/ost006)! - Add `rejectX402Payment(task)` primitive and let `onPaymentRequired`
+  return `false` to send a payment-rejected message on the merchant's
+  task.
+
+  Closes [#143](https://github.com/planetarium/a2x/issues/143) (fix 1 of 4).
+
+  **Why.** Per a2a-x402 v0.2 §5.4.2, a payer that declines an x402
+  challenge SHOULD send a payment-rejected message back on the same task
+  so the merchant can clean up. Throwing from `onPaymentRequired` in
+  `A2XClient` aborted locally without telling the server, leaving the
+  task in a permanent `payment-required` limbo.
+
+  **Fix.** New export `rejectX402Payment(task)` builds the spec-shaped
+  rejection metadata for a given task. `A2XClient.onPaymentRequired`
+  recognizes a `false` return value and submits the rejection on the
+  same task automatically. Throwing still aborts locally for callers who
+  prefer that semantics; returning `false` ends the merchant's task
+  cleanly.
+
+- [#146](https://github.com/planetarium/a2x/pull/146) [`94dffb5`](https://github.com/planetarium/a2x/commit/94dffb5254a450945a021963b023407fb9fecaba) Thanks [@ost006](https://github.com/ost006)! - `A2XClient` now decides x402 outcomes on the **latest** receipt plus the
+  task state, recognizes the server-side `retryOnFailure` re-prompt, and
+  adds an opt-in `maxRetries` for automatic re-sign on the same task.
+
+  Closes [#143](https://github.com/planetarium/a2x/issues/143) (fix 4 of 4).
+
+  **Why.** The pre-fix client scanned the full receipt history and threw
+  on _any_ historical failure, even when the merchant had since prompted
+  the payer to retry and a successful receipt followed. That mishandled
+  the spec's intended retry flow (a2a-x402 v0.2 §5.5): a failed receipt
+  followed by `input-required + payment-required` is a re-prompt, not a
+  terminal failure.
+
+  **Fix.** `_evaluatePaymentOutcome` now reads the latest receipt and
+  the task state together. A re-prompt (input-required + payment-required
+  metadata) is surfaced to `onPaymentRequired` instead of throwing, so
+  callers can decide whether to re-sign. New
+  `A2XClientX402Options.maxRetries` (default `0`) opts into automatic
+  re-sign on the same task — the client signs, submits, observes the
+  outcome, and loops up to `maxRetries + 1` total attempts before giving
+  up.
+
+- [#146](https://github.com/planetarium/a2x/pull/146) [`94dffb5`](https://github.com/planetarium/a2x/commit/94dffb5254a450945a021963b023407fb9fecaba) Thanks [@ost006](https://github.com/ost006)! - `signX402Payment` now rejects unsupported `x402Version` values up front
+  with a typed `X402InvalidVersionError` instead of crashing inside the
+  underlying `createPaymentHeader` call.
+
+  Closes [#143](https://github.com/planetarium/a2x/issues/143) (fix 3 of 4).
+
+  **Why.** x402-v1 §9 lists `invalid_x402_version` as a defined error
+  code. The SDK never surfaced it: a non-1 `x402Version` in a payment
+  requirement crashed inside `x402.createPaymentHeader` with an opaque
+  error message, leaving callers no way to handle the version mismatch
+  without parsing strings.
+
+  **Fix.** New `X402InvalidVersionError` (exported alongside the other
+  `X402*Error` classes) is thrown from `signX402Payment` when the
+  requirement's `x402Version` is not `1`. The error carries the spec
+  code `invalid_x402_version` (also added to `X402_ERROR_CODES` as
+  `INVALID_X402_VERSION`) so callers can branch on it.
+
 ## 0.11.0
 
 ### Minor Changes
