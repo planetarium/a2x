@@ -1,5 +1,12 @@
 # sample-nextjs-skill
 
+## 0.0.8
+
+### Patch Changes
+
+- Updated dependencies [[`94dffb5`](https://github.com/planetarium/a2x/commit/94dffb5254a450945a021963b023407fb9fecaba), [`94dffb5`](https://github.com/planetarium/a2x/commit/94dffb5254a450945a021963b023407fb9fecaba), [`94dffb5`](https://github.com/planetarium/a2x/commit/94dffb5254a450945a021963b023407fb9fecaba), [`94dffb5`](https://github.com/planetarium/a2x/commit/94dffb5254a450945a021963b023407fb9fecaba), [`94dffb5`](https://github.com/planetarium/a2x/commit/94dffb5254a450945a021963b023407fb9fecaba), [`94dffb5`](https://github.com/planetarium/a2x/commit/94dffb5254a450945a021963b023407fb9fecaba), [`94dffb5`](https://github.com/planetarium/a2x/commit/94dffb5254a450945a021963b023407fb9fecaba), [`94dffb5`](https://github.com/planetarium/a2x/commit/94dffb5254a450945a021963b023407fb9fecaba), [`94dffb5`](https://github.com/planetarium/a2x/commit/94dffb5254a450945a021963b023407fb9fecaba), [`94dffb5`](https://github.com/planetarium/a2x/commit/94dffb5254a450945a021963b023407fb9fecaba)]:
+  - @a2x/sdk@0.11.1
+
 ## 0.0.7
 
 ### Patch Changes
