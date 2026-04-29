@@ -60,6 +60,7 @@ export class AgentExecutor {
 
     const artifacts: Artifact[] = [];
     const textParts: string[] = [];
+    let nonTextSeq = 0;
     let completedNormally = false;
 
     try {
@@ -68,11 +69,28 @@ export class AgentExecutor {
           case 'text':
             textParts.push(event.text);
             break;
+          case 'file':
+            artifacts.push({
+              artifactId: `artifact-${task.id}-file-${++nonTextSeq}`,
+              parts: [{ ...event.file }],
+            });
+            break;
+          case 'data':
+            artifacts.push({
+              artifactId: `artifact-${task.id}-data-${++nonTextSeq}`,
+              parts: [
+                {
+                  data: event.data,
+                  ...(event.mediaType ? { mediaType: event.mediaType } : {}),
+                },
+              ],
+            });
+            break;
           case 'done':
-            // Collect text parts into an artifact
+            // Collect accumulated text into an artifact (if any).
             if (textParts.length > 0) {
               artifacts.push({
-                artifactId: `artifact-${Date.now()}`,
+                artifactId: `artifact-${task.id}-text`,
                 parts: [{ text: textParts.join('') }],
               });
             }
@@ -163,6 +181,8 @@ export class AgentExecutor {
 
     try {
       const textParts: string[] = [];
+      const nonTextArtifacts: Artifact[] = [];
+      let nonTextSeq = 0;
 
       for await (const event of this.runner.runAsync(session, message, abortController.signal)) {
         switch (event.type) {
@@ -173,7 +193,7 @@ export class AgentExecutor {
               taskId: task.id,
               contextId,
               artifact: {
-                artifactId: `artifact-${task.id}`,
+                artifactId: `artifact-${task.id}-text`,
                 parts: [{ text: event.text }],
               },
               append: true,
@@ -181,14 +201,53 @@ export class AgentExecutor {
             } satisfies TaskArtifactUpdateEvent;
             break;
 
+          case 'file': {
+            const artifact: Artifact = {
+              artifactId: `artifact-${task.id}-file-${++nonTextSeq}`,
+              parts: [{ ...event.file }],
+            };
+            nonTextArtifacts.push(artifact);
+            yield {
+              taskId: task.id,
+              contextId,
+              artifact,
+              append: false,
+              lastChunk: true,
+            } satisfies TaskArtifactUpdateEvent;
+            break;
+          }
+
+          case 'data': {
+            const artifact: Artifact = {
+              artifactId: `artifact-${task.id}-data-${++nonTextSeq}`,
+              parts: [
+                {
+                  data: event.data,
+                  ...(event.mediaType ? { mediaType: event.mediaType } : {}),
+                },
+              ],
+            };
+            nonTextArtifacts.push(artifact);
+            yield {
+              taskId: task.id,
+              contextId,
+              artifact,
+              append: false,
+              lastChunk: true,
+            } satisfies TaskArtifactUpdateEvent;
+            break;
+          }
+
           case 'done': {
-            // Emit final artifact chunk if there was text
+            const finalArtifacts: Artifact[] = [...nonTextArtifacts];
+
+            // Emit final text artifact chunk if there was text
             if (textParts.length > 0) {
               const artifact: Artifact = {
-                artifactId: `artifact-${task.id}`,
+                artifactId: `artifact-${task.id}-text`,
                 parts: [{ text: textParts.join('') }],
               };
-              task.artifacts = [artifact];
+              finalArtifacts.push(artifact);
               yield {
                 taskId: task.id,
                 contextId,
@@ -196,6 +255,10 @@ export class AgentExecutor {
                 append: false,
                 lastChunk: true,
               } satisfies TaskArtifactUpdateEvent;
+            }
+
+            if (finalArtifacts.length > 0) {
+              task.artifacts = finalArtifacts;
             }
 
             // Emit completed status
