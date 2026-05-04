@@ -44,7 +44,8 @@
         { "slug": "advanced/task-store", "title": "Custom Task Stores" },
         { "slug": "advanced/agent-card-versioning", "title": "AgentCard v0.3 vs v1.0" },
         { "slug": "advanced/extensions", "title": "Protocol Extensions" },
-        { "slug": "advanced/x402-payments", "title": "x402 Payments" }
+        { "slug": "advanced/x402-payments", "title": "x402 Payments" },
+        { "slug": "advanced/migration-x402-v2", "title": "Migrating from X402PaymentExecutor" }
       ]
     }
   ]

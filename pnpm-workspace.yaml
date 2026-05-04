@@ -1,4 +1,7 @@
 packages:
   - 'packages/*'
+  - 'samples/claude-relay'
+  - 'samples/claude-relay-baseagent'
   - 'samples/nextjs-skill'
   - 'samples/nextjs-x402'
+  - 'samples/nextjs-x402-agent-driven'

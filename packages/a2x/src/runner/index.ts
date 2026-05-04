@@ -3,6 +3,12 @@
  */
 
 export type { Session, InvocationContext } from './context.js';
+export type {
+  InputRoundTripRecord,
+  InputRoundTripOutcome,
+  InputRoundTripHook,
+  InputRoundTripContext,
+} from '../a2x/input-roundtrip.js';
 export type { SessionService } from './session-service.js';
 export { InMemorySessionService } from './in-memory-session.js';
 export { DatabaseSessionService } from './database-session.js';

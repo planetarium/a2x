@@ -117,6 +117,19 @@ The "one logical output = one artifact" mapping matches A2A's intuition and lets
 
 If you need progressive streaming for a single non-text artifact (e.g. chunked image generation), drop down to a custom `AgentExecutor` and emit `TaskArtifactUpdateEvent`s directly with `append: true`. The `AgentEvent` abstraction intentionally stays simple — one event = one artifact.
 
+## Input-required round-trips on streams
+
+Agents can interrupt a streaming run to ask the client for input — most often a payment (`x402RequestPayment`) or an approval. The `request-input` AgentEvent halts the agent and the default `AgentExecutor` emits one final `status-update` carrying state `input-required` plus the agent-supplied wire metadata (e.g. `x402.payment.required`). The original stream then ends. The client signs the payment (or otherwise satisfies the round-trip), resubmits via `message/stream`, and on the second stream the server emits a fresh sequence:
+
+```
+status-update  WORKING
+status-update  WORKING + x402.payment.verified   // intermediate emitted by the registered hook
+artifact-update text                              // agent runs the paid path
+status-update  COMPLETED + x402.payment.completed
+```
+
+The hook-driven intermediate event (`payment-verified` for x402) is emitted exactly once per resume — it's not a tick, just a marker between hook completion and the agent's second-turn run. Custom domains that don't supply an `intermediate` outcome simply skip that line.
+
 > **Note on LLM provider responses.** `LlmAgent` propagates whatever `Part` shapes the configured `LlmProvider` returns. The bundled providers (Anthropic, OpenAI, Google) currently only emit text parts from chat-completion responses; non-text parts are most useful today when you implement a custom `BaseAgent` that calls an image-generation or structured-output API directly.
 
 ## Resuming a dropped SSE stream

@@ -37,7 +37,7 @@ npm install @a2x/sdk
 - **Framework-agnostic** — Works with Express, Fastify, Hono, Next.js, or any HTTP framework.
 - **SSE streaming** — First-class support for `message/stream` via Server-Sent Events.
 - **Multi-modal artifacts** — Agents can yield `text`, `file`, and `data` `AgentEvent`s; the default executor maps each to a `TextPart` / `FilePart` / `DataPart` artifact on the wire.
-- **x402 payments** — Optional `@a2x/sdk/x402` subpath gates agent calls behind on-chain cryptocurrency payments using the [a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402) extension.
+- **x402 payments** — Charge per call with on-chain cryptocurrency payments — declared inline in `agent.run()` via the `request-input` AgentEvent. Optional `@a2x/sdk/x402` subpath; uses the [a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402) extension.
 - **Zero runtime dependencies** — Core module uses only Node.js built-in APIs.
 - **TypeScript-first** — Full type safety with types derived directly from A2A JSON Schema and proto definitions.
 

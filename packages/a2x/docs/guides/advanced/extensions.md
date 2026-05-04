@@ -51,6 +51,40 @@ Two techniques are common:
 
 Use approach (1) for major shape changes, (2) for incremental additions.
 
+## Input-required round-trips for non-payment domains
+
+A2X's `request-input` AgentEvent + `InputRoundTripHook` plumbing was built for x402 payments but is intentionally domain-agnostic. The same machinery works for any extension that needs the merchant agent to ask the client for additional input mid-task — human approvals, OAuth tokens fetched via Device Flow, AP2 mandates, etc.
+
+Pick a domain key you control (e.g. `'myorg.approval'`). The agent yields a `request-input` event with that domain; the executor halts the agent, sets the task to `input-required`, and merges your extension-specific metadata onto the wire status message.
+
+```ts
+class SensitiveAgent extends BaseAgent {
+  async *run(context) {
+    if (!context.input) {
+      yield {
+        type: 'request-input',
+        domain: 'myorg.approval',
+        metadata: {
+          'myorg.approval.required': { reviewerId: '...', topic: 'delete-customer-data' },
+        },
+        message: 'Awaiting approval',
+        payload: { topic: 'delete-customer-data' },
+      };
+      return;
+    }
+    const approved = context.input.resumeMetadata['myorg.approval.granted'] === true;
+    if (!approved) {
+      yield { type: 'error', error: new Error('declined') };
+      return;
+    }
+    yield { type: 'text', role: 'agent', text: 'Done.' };
+    yield { type: 'done' };
+  }
+}
+```
+
+You can register a hook on the executor (`inputRoundTripHooks: [...]`) to centralize verification logic — see how `x402PaymentHook()` does verify+settle in `@a2x/sdk/x402` for the canonical pattern. Or, like the snippet above, inspect `context.input.resumeMetadata` directly when no out-of-band verification is needed. Either way the SDK core stays out of your extension's wire format.
+
 ## When not to use extensions
 
 If the thing you're adding will eventually be part of A2A itself, push the proposal to the A2A spec repo instead of locking users into your private extension. Extensions are for:

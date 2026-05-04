@@ -5,6 +5,8 @@
 import type { BaseAgent, AgentEvent } from '../agent/base-agent.js';
 import type { BasePlugin } from '../plugin/base-plugin.js';
 import type { Message } from '../types/common.js';
+import { INVOCATION_INPUT_SENTINEL_KEY } from '../a2x/agent-executor.js';
+import type { InputRoundTripContext } from '../a2x/input-roundtrip.js';
 import type { Session, InvocationContext } from './context.js';
 import type { SessionService } from './session-service.js';
 import { InMemorySessionService } from './in-memory-session.js';
@@ -41,6 +43,19 @@ export class Runner {
     session.events.push({ type: 'text', text: message.parts.map(p => ('text' in p ? p.text : '')).join(''), role: 'user' });
     await this.sessionService.updateSession(session);
 
+    // Pull the input-required round-trip context the AgentExecutor stashed
+    // on session.state (resume turns only). The Executor sets this key on
+    // the same Session instance we received here, so the lookup is a
+    // simple in-memory read.
+    const inputSentinel = session.state[INVOCATION_INPUT_SENTINEL_KEY] as
+      | InputRoundTripContext
+      | undefined;
+    if (inputSentinel) {
+      // Consume the sentinel so a subsequent unrelated run (same session
+      // reused) doesn't accidentally see a stale resume context.
+      delete session.state[INVOCATION_INPUT_SENTINEL_KEY];
+    }
+
     // Create invocation context
     const context: InvocationContext = {
       session,
@@ -48,6 +63,7 @@ export class Runner {
       agentName: this.agent.name,
       plugins: this.plugins,
       signal,
+      ...(inputSentinel ? { input: inputSentinel } : {}),
     };
 
     // Run the agent and yield events

@@ -14,7 +14,7 @@ A self-contained TypeScript SDK for building [A2A (Agent-to-Agent)](https://a2a-
 - **SSE streaming** — First-class `message/stream` support via Server-Sent Events.
 - **Multi-modal artifacts** — Agents can yield `text`, `file`, and `data` events; the default executor maps each into A2A `TextPart` / `FilePart` / `DataPart` artifacts.
 - **Built-in auth** — API Key, Bearer, OAuth 2.0 (Authorization Code, Client Credentials, Device Code), OpenID Connect, and Mutual TLS.
-- **x402 payments** — Charge per call via the [a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402) extension. On-chain verify + settle through any x402 facilitator.
+- **x402 payments** — Charge per call via the [a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402) extension. Express payment gating inline in `agent.run()` with `x402RequestPayment()`; on-chain verify + settle handled by the registered `x402PaymentHook()`.
 - **Zero runtime dependencies** — Core module uses only Node.js built-in APIs.
 - **TypeScript-first** — Full type safety with types derived from A2A JSON Schema.
 
@@ -317,20 +317,43 @@ Install the optional peers:
 npm install x402 viem
 ```
 
-Server:
+Server (the agent expresses payment gating inline; the executor's hook handles verify + settle):
 
 ```typescript
-import { X402PaymentExecutor, X402_EXTENSION_URI } from '@a2x/sdk/x402';
+import {
+  AgentExecutor,
+  BaseAgent,
+  StreamingMode,
+  x402PaymentHook,
+  x402RequestPayment,
+  readX402Settlement,
+  X402_EXTENSION_URI,
+} from '@a2x/sdk';
 
-const executor = new X402PaymentExecutor(innerExecutor, {
-  accepts: [{
-    network: 'base-sepolia',
-    amount: '10000',                                   // 0.01 USDC (6 decimals)
-    asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e', // USDC on Base Sepolia
-    payTo: process.env.MERCHANT_ADDRESS!,
-    resource: 'https://api.example.com/premium',
-    description: 'Premium agent access',
-  }],
+const ACCEPTS = [{
+  network: 'base-sepolia',
+  amount: '10000',                                      // 0.01 USDC (6 decimals)
+  asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',  // USDC on Base Sepolia
+  payTo: process.env.MERCHANT_ADDRESS!,
+  resource: 'https://api.example.com/premium',
+  description: 'Premium agent access',
+}];
+
+class PaidAgent extends BaseAgent {
+  async *run(context) {
+    if (!readX402Settlement(context).paid) {
+      yield* x402RequestPayment({ accepts: ACCEPTS });
+      return;
+    }
+    yield { type: 'text', role: 'agent', text: 'thanks for paying' };
+    yield { type: 'done' };
+  }
+}
+
+const executor = new AgentExecutor({
+  runner,
+  runConfig: { streamingMode: StreamingMode.SSE },
+  inputRoundTripHooks: [x402PaymentHook()],
 });
 
 const agent = new A2XAgent({ taskStore, executor })
@@ -350,6 +373,7 @@ const task = await client.sendMessage({ message: { role: 'user', parts: [{ text:
 ```
 
 Full guide: [docs/guides/advanced/x402-payments.md](./docs/guides/advanced/x402-payments.md).
+Migration from `X402PaymentExecutor` (SDK 0.x): [docs/guides/advanced/migration-x402-v2.md](./docs/guides/advanced/migration-x402-v2.md).
 
 ## AgentCard Versions
 

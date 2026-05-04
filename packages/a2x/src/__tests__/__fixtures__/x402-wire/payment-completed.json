@@ -1,0 +1,30 @@
+{
+  "id": "t-completed-1",
+  "contextId": "c-completed-1",
+  "status": {
+    "state": "completed",
+    "timestamp": "2026-04-30T00:00:01.000Z",
+    "message": {
+      "messageId": "msg-completed-1",
+      "role": "agent",
+      "parts": [{ "text": "" }],
+      "metadata": {
+        "x402.payment.status": "payment-completed",
+        "x402.payment.receipts": [
+          {
+            "success": true,
+            "transaction": "0xdeadbeef",
+            "network": "base-sepolia",
+            "payer": "0x1234567890123456789012345678901234567890"
+          }
+        ]
+      }
+    }
+  },
+  "artifacts": [
+    {
+      "artifactId": "artifact-t-completed-1-text",
+      "parts": [{ "text": "pong" }]
+    }
+  ]
+}
