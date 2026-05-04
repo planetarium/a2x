@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@a2x/sdk": "workspace:*",
-    "@anthropic-ai/sdk": "^0.91.1",
+    "@anthropic-ai/sdk": "^0.92.0",
     "next": "16.2.4",
     "react": "19.2.5",
     "react-dom": "19.2.5"
