@@ -4,6 +4,8 @@ Charge per call with on-chain cryptocurrency payments. A2X implements the [a2a-x
 
 The flow: the merchant agent responds to an unpaid request with `input-required` + `x402.payment.required`. The client signs a `PaymentPayload` with its wallet and resubmits the same task. The merchant verifies + settles the payment via an x402 **facilitator**, runs the agent, and attaches the settlement receipt to the completed task.
 
+> Migrating from `X402PaymentExecutor` (SDK 0.x)? See [Migrating from X402PaymentExecutor](./migration-x402-v2.md). The wire format hasn't changed; only the server-side authoring surface has.
+
 ## Installation
 
 ```bash
@@ -14,30 +16,56 @@ pnpm add @a2x/sdk x402 viem
 
 ## Server
 
-```ts
-import { A2XAgent, AgentExecutor, StreamingMode, InMemoryTaskStore } from '@a2x/sdk';
-import { X402PaymentExecutor, X402_EXTENSION_URI } from '@a2x/sdk/x402';
+The agent expresses payment gating inline by yielding a `request-input` event from `BaseAgent.run()`. The default `AgentExecutor` runs verify + settle through the `x402PaymentHook` you register in `inputRoundTripHooks`. There is no separate executor class to extend.
 
-const inner = new AgentExecutor({
+```ts
+import {
+  A2XAgent,
+  AgentExecutor,
+  BaseAgent,
+  StreamingMode,
+  InMemoryRunner,
+  InMemoryTaskStore,
+  x402PaymentHook,
+  x402RequestPayment,
+  readX402Settlement,
+  X402_EXTENSION_URI,
+} from '@a2x/sdk';
+
+const ACCEPTS = [{
+  network: 'base-sepolia',
+  amount: '10000',                                      // 0.01 USDC (6 decimals)
+  asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',  // USDC on Base Sepolia
+  payTo: process.env.MERCHANT_ADDRESS!,
+  // x402 v1 §PaymentRequirements requires both `resource` (a URL of the
+  // protected resource) and `description` (human-readable). Wallet UIs
+  // surface `description` to the user as the consent prompt.
+  resource: 'https://api.example.com/premium',
+  description: 'Premium agent access',
+}];
+
+class PaidAgent extends BaseAgent {
+  constructor() {
+    super({ name: 'paid_agent', description: 'Charges per call.' });
+  }
+
+  async *run(context) {
+    if (!readX402Settlement(context).paid) {
+      yield* x402RequestPayment({ accepts: ACCEPTS });
+      return;
+    }
+    yield { type: 'text', role: 'agent', text: 'thanks for paying' };
+    yield { type: 'done' };
+  }
+}
+
+const runner = new InMemoryRunner({ agent: new PaidAgent(), appName: 'paid-agent' });
+const executor = new AgentExecutor({
   runner,
   runConfig: { streamingMode: StreamingMode.SSE },
-});
-
-const executor = new X402PaymentExecutor(inner, {
-  accepts: [{
-    network: 'base-sepolia',
-    amount: '10000',                                   // 0.01 USDC (6 decimals)
-    asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e', // USDC on Base Sepolia
-    payTo: process.env.MERCHANT_ADDRESS!,
-    // x402 v1 §PaymentRequirements requires both `resource` (a URL of
-    // the protected resource) and `description` (human-readable). The
-    // wallet UI surfaces `description` to the user as the consent
-    // prompt; strict facilitators reject non-URL `resource` values.
-    resource: 'https://api.example.com/premium',
-    description: 'Premium agent access',
-  }],
   // Facilitator defaults to https://x402.org/facilitator.
-  // Override if you run your own: facilitator: { url: 'https://…' }
+  // Override if you run your own: x402PaymentHook({ facilitator: { url: 'https://…' } }).
+  inputRoundTripHooks: [x402PaymentHook()],
 });
 
 const agent = new A2XAgent({ taskStore: new InMemoryTaskStore(), executor })
@@ -46,6 +74,13 @@ const agent = new A2XAgent({ taskStore: new InMemoryTaskStore(), executor })
   .addExtension({ uri: X402_EXTENSION_URI, required: true });
 ```
 
+The two new pieces are:
+
+- `x402RequestPayment({ accepts })` — generator helper the agent yields from to publish `payment-required` on the wire. The executor stops the generator and emits the `input-required` task automatically.
+- `x402PaymentHook(options)` — `InputRoundTripHook` factory the executor consults on the resume turn. Encapsulates verify + settle so the agent stays focused on what to do once the payment lands.
+
+`readX402Settlement(context)` is the read-side helper: it returns `{ paid, receipt }` based on whether the resume hook ran successfully. Use it to branch in the agent body — paid clients run the premium path, unpaid ones get the `payment-required` round-trip.
+
 ### Multiple payment options
 
 Put more than one entry in `accepts[]` and the client picks one. Use this for multi-network support:
@@ -53,34 +88,72 @@ Put more than one entry in `accepts[]` and the client picks one. Use this for mu
 ```ts
 const RESOURCE = 'https://api.example.com/premium';
 
-accepts: [
+const ACCEPTS = [
   { network: 'base-sepolia', amount: '10000', asset: USDC_BASE_SEPOLIA, payTo, resource: RESOURCE, description: 'Testnet' },
   { network: 'base',         amount: '10000', asset: USDC_BASE,         payTo, resource: RESOURCE, description: 'Mainnet' },
-],
+];
 ```
 
 ### Conditional pricing
 
-`requiresPayment` is a predicate over the incoming message. Return `false` to pass the message straight through to the inner executor without charging:
+The "is this call paid?" decision lives in `agent.run()` now. The agent inspects whatever it needs (message content, headers, session state, an external policy service) and either yields `x402RequestPayment(...)` or proceeds for free.
 
 ```ts
-new X402PaymentExecutor(inner, {
-  accepts: [...],
-  requiresPayment: (message) => {
-    // Free tier: short health-check messages
-    const text = message.parts.find((p) => 'text' in p)?.text ?? '';
-    return text.length > 10;
-  },
-});
+class TieredAgent extends BaseAgent {
+  async *run(context) {
+    const text = lastUserText(context);
+    const isPremium = text.length > 100 || PREMIUM_KEYWORDS.some((k) => text.includes(k));
+
+    if (isPremium && !readX402Settlement(context).paid) {
+      yield* x402RequestPayment({ accepts: PREMIUM_ACCEPTS });
+      return;
+    }
+
+    yield { type: 'text', role: 'agent', text: isPremium ? 'Premium ...' : 'Free ...' };
+    yield { type: 'done' };
+  }
+}
 ```
+
+The single predicate now lives in one place — the agent body — instead of being duplicated between an executor option and the agent.
+
+### Agent-driven payment requests (mid-execution)
+
+The agent owns the payment decision, so it can request payment **after** classifying the user's intent (e.g. before invoking a paid tool):
+
+```ts
+class TranslationAgent extends BaseAgent {
+  async *run(context) {
+    const intent = classifyIntent(lastUserText(context));
+
+    if (intent.kind === 'lookup') {
+      yield* this._runLookup(intent.word);
+      return;
+    }
+
+    if (intent.kind === 'translate') {
+      if (!readX402Settlement(context).paid) {
+        yield* x402RequestPayment({
+          accepts: PREMIUM_ACCEPTS,
+          description: `About to call deep_translate("${intent.text}")`,
+        });
+        return;
+      }
+      yield* this._runDeepTranslate(intent.text, intent.lang);
+      return;
+    }
+  }
+}
+```
+
+Same generator, same hook — no custom executor, no sentinel events, no session-state tricks. The `samples/nextjs-x402-agent-driven` sample exercises exactly this pattern.
 
 ### Custom facilitator
 
 For self-hosted facilitators or tests, pass a `{ verify, settle }` pair instead of a URL:
 
 ```ts
-new X402PaymentExecutor(inner, {
-  accepts: [...],
+x402PaymentHook({
   facilitator: {
     async verify(payload, requirements) { /* … */ return { isValid: true, payer: '0x…' }; },
     async settle(payload, requirements) { /* … */ return { success: true, transaction: '0x…', network: 'base-sepolia', payer: '0x…' }; },
@@ -154,20 +227,17 @@ The SDK emits `payment-verified` as a transient `working`-state event between su
 
 ### Retry-on-failure (opt-in)
 
-By default, verify/settle failures terminate the task with state `failed` and an error code. Spec §9 also allows the merchant to "request a payment requirement with input-required again"; set `retryOnFailure: true` on the executor to pick that strategy — failures will re-publish `payment-required` on the same task with the prior failure reason carried in `X402PaymentRequiredResponse.error`, letting the client top up the wallet (or refresh the nonce) and resubmit without creating a new task.
+By default, verify/settle failures terminate the task with state `failed` and an error code. Spec §9 also allows the merchant to "request a payment requirement with input-required again"; set `retryOnFailure: true` on the hook to pick that strategy — failures will re-publish `payment-required` on the same task with the prior failure reason carried in `X402PaymentRequiredResponse.error`, letting the client top up the wallet (or refresh the nonce) and resubmit without creating a new task.
 
 ```ts
-new X402PaymentExecutor(inner, {
-  accepts: [...],
-  retryOnFailure: true,
-});
+x402PaymentHook({ retryOnFailure: true });
 ```
 
 `x402.payment.receipts` accumulates every settle attempt (success or failure) across the task's lifetime per spec §7's "complete history" requirement.
 
 ### Rejection handling
 
-When a client decides not to pay it can respond with `x402.payment.status: payment-rejected` (spec §5.4.2). The executor terminates the task with state `failed` and status `payment-rejected` — no further challenges are published, the loop ends.
+When a client decides not to pay it can respond with `x402.payment.status: payment-rejected` (spec §5.4.2). The hook terminates the task with state `failed` and status `payment-rejected` — no further challenges are published, the loop ends.
 
 On the client side, return `false` from `onPaymentRequired` to send `payment-rejected` cleanly; throwing aborts locally and leaves the merchant's task stranded in `input-required`. `rejectX402Payment(task)` is the lower-level primitive that produces the metadata block if you drive the dance manually.
 
@@ -331,3 +401,4 @@ The client side is covered for you when you set `A2XClientOptions.x402` — see 
 - Spec (in-repo): [`specification/a2a-x402-v0.2.md`](https://github.com/planetarium/a2x/blob/main/specification/a2a-x402-v0.2.md)
 - Base protocol: [`specification/x402-v1.md`](https://github.com/planetarium/a2x/blob/main/specification/x402-v1.md)
 - A2A transport binding: [`specification/x402-transport-a2a-v1.md`](https://github.com/planetarium/a2x/blob/main/specification/x402-transport-a2a-v1.md)
+- Migration: [Migrating from X402PaymentExecutor](./migration-x402-v2.md)

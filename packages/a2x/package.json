@@ -54,7 +54,8 @@
   ],
   "scripts": {
     "build": "tsup",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "lint:samples-clone-check": "node scripts/check-samples-clone.mjs"
   },
   "peerDependencies": {
     "@anthropic-ai/sdk": ">=0.52.0",

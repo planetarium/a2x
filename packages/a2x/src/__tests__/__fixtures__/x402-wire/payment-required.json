@@ -1,0 +1,33 @@
+{
+  "id": "t-required-1",
+  "contextId": "c-required-1",
+  "status": {
+    "state": "input-required",
+    "timestamp": "2026-04-30T00:00:00.000Z",
+    "message": {
+      "messageId": "msg-required-1",
+      "role": "agent",
+      "parts": [{ "text": "Payment is required to use this service." }],
+      "metadata": {
+        "x402.payment.status": "payment-required",
+        "x402.payment.required": {
+          "x402Version": 1,
+          "accepts": [
+            {
+              "scheme": "exact",
+              "network": "base-sepolia",
+              "maxAmountRequired": "10000",
+              "resource": "https://api.example.com/premium",
+              "description": "Premium agent access",
+              "mimeType": "application/json",
+              "payTo": "0x2222222222222222222222222222222222222222",
+              "maxTimeoutSeconds": 300,
+              "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+              "extra": { "name": "USDC", "version": "2" }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

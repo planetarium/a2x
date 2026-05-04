@@ -1,0 +1,24 @@
+{
+  "messageId": "msg-submitted-1",
+  "role": "user",
+  "parts": [{ "text": "hi" }],
+  "metadata": {
+    "x402.payment.status": "payment-submitted",
+    "x402.payment.payload": {
+      "x402Version": 1,
+      "scheme": "exact",
+      "network": "base-sepolia",
+      "payload": {
+        "signature": "0xsig",
+        "authorization": {
+          "from": "0x1234567890123456789012345678901234567890",
+          "to": "0x2222222222222222222222222222222222222222",
+          "value": "10000",
+          "validAfter": "0",
+          "validBefore": "9999999999",
+          "nonce": "0xnonce"
+        }
+      }
+    }
+  }
+}

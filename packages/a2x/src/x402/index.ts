@@ -4,29 +4,52 @@
  * Adds on-chain payment gating to A2A agents using the Coinbase x402
  * protocol. See `specification/a2a-x402-v0.2.md` for the wire format.
  *
+ * Server agents express payment gating inline by yielding
+ * `request-input` AgentEvents from `BaseAgent.run()` — there is no
+ * separate executor class to extend. The default `AgentExecutor`
+ * handles the input-required round-trip when `inputRoundTripHooks`
+ * includes `x402PaymentHook(...)`.
+ *
  * Minimal server setup:
  *
  * ```ts
- * import { A2XAgent, AgentExecutor } from '@a2x/sdk';
- * import { X402PaymentExecutor, X402_EXTENSION_URI } from '@a2x/sdk/x402';
+ * import {
+ *   A2XAgent, AgentExecutor, BaseAgent, StreamingMode,
+ *   x402PaymentHook, x402RequestPayment, readX402Settlement, X402_EXTENSION_URI,
+ * } from '@a2x/sdk';
  *
- * const inner = new AgentExecutor({ runner, runConfig });
- * const executor = new X402PaymentExecutor(inner, {
- *   accepts: [{
- *     network: 'base-sepolia',
- *     amount: '10000',                                // 0.01 USDC
- *     asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
- *     payTo: '0xYourMerchantAddress',
- *   }],
+ * const ACCEPTS = [{
+ *   network: 'base-sepolia',
+ *   amount: '10000',                                 // 0.01 USDC
+ *   asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+ *   payTo: '0xYourMerchantAddress',
+ *   resource: 'https://api.example.com/premium',
+ *   description: 'Premium agent access',
+ * }];
+ *
+ * class PaidAgent extends BaseAgent {
+ *   async *run(context) {
+ *     if (!readX402Settlement(context).paid) {
+ *       yield* x402RequestPayment({ accepts: ACCEPTS });
+ *       return;
+ *     }
+ *     yield { type: 'text', role: 'agent', text: 'thanks for paying' };
+ *     yield { type: 'done' };
+ *   }
+ * }
+ *
+ * const executor = new AgentExecutor({
+ *   runner,
+ *   runConfig: { streamingMode: StreamingMode.SSE },
+ *   inputRoundTripHooks: [x402PaymentHook()],
  * });
  *
  * const agent = new A2XAgent({ taskStore, executor })
  *   .setName('Paid Agent')
- *   .setDescription('Charges per call')
  *   .addExtension({ uri: X402_EXTENSION_URI, required: true });
  * ```
  *
- * Minimal client setup:
+ * Minimal client setup (unchanged from prior versions):
  *
  * ```ts
  * import { A2XClient } from '@a2x/sdk/client';
@@ -36,15 +59,12 @@
  *   x402: { signer: privateKeyToAccount(process.env.PRIVATE_KEY) },
  * });
  *
- * const task = await client.sendMessage({ message: { … } });
+ * const task = await client.sendMessage({ message: { ... } });
  * ```
  *
  * `A2XClient` runs the Standalone Flow transparently — detect
  * `payment-required`, sign one of the merchant's `accepts[]`, resubmit
- * with the signed payload, and return the final task. For
- * fine-grained control (e.g. inspecting the `payment-required` task
- * before signing) drop down to the `signX402Payment` primitive
- * exported from this module.
+ * with the signed payload, and return the final task.
  */
 
 export {
@@ -69,8 +89,17 @@ export type {
   X402Network,
 } from './types.js';
 
-export { X402PaymentExecutor } from './executor.js';
-export type { X402PaymentExecutorOptions } from './executor.js';
+// Server-side surface (replaces X402PaymentExecutor).
+export {
+  X402_DOMAIN,
+  x402RequestPayment,
+  x402PaymentHook,
+  readX402Settlement,
+} from './payment.js';
+export type {
+  X402RequestPaymentInput,
+  X402PaymentHookOptions,
+} from './payment.js';
 
 export {
   resolveFacilitator,

@@ -1,0 +1,28 @@
+{
+  "id": "t-failed-1",
+  "contextId": "c-failed-1",
+  "status": {
+    "state": "failed",
+    "timestamp": "2026-04-30T00:00:02.000Z",
+    "message": {
+      "messageId": "msg-failed-1",
+      "role": "agent",
+      "parts": [
+        { "text": "Payment verification failed: invalid_signature" }
+      ],
+      "metadata": {
+        "x402.payment.status": "payment-failed",
+        "x402.payment.error": "INVALID_SIGNATURE",
+        "x402.payment.receipts": [
+          {
+            "success": false,
+            "transaction": "",
+            "network": "base-sepolia",
+            "payer": "0x1234567890123456789012345678901234567890",
+            "errorReason": "invalid_signature"
+          }
+        ]
+      }
+    }
+  }
+}
