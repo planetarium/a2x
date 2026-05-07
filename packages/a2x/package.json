@@ -38,11 +38,6 @@
       "types": "./dist/provider/google/index.d.ts",
       "import": "./dist/provider/google/index.js",
       "require": "./dist/provider/google/index.cjs"
-    },
-    "./x402": {
-      "types": "./dist/x402/index.d.ts",
-      "import": "./dist/x402/index.js",
-      "require": "./dist/x402/index.cjs"
     }
   },
   "main": "./dist/index.cjs",

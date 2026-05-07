@@ -7,7 +7,7 @@ This guide is for projects on `@a2x/sdk` 0.x that use `X402PaymentExecutor`. SDK
 | Item | 0.x | 1.x |
 |---|---|---|
 | Removed | `X402PaymentExecutor`, `X402PaymentExecutorOptions` | — |
-| Added | — | `request-input` AgentEvent variant; `x402RequestPayment()`, `x402PaymentHook()`, `readX402Settlement()`, `X402_DOMAIN` (all from `@a2x/sdk` and `@a2x/sdk/x402`) |
+| Added | — | `request-input` AgentEvent variant; `x402RequestPayment()`, `x402PaymentHook()`, `readX402Settlement()`, `X402_DOMAIN` (all from `@a2x/sdk`) |
 | Where the "is this call paid?" predicate lives | Executor option `requiresPayment` | Inside `agent.run()` |
 | Number of `extends` lines for x402 | 1 (`extends AgentExecutor` in custom case) | 0 |
 | Wire metadata keys, status values, error codes | unchanged | unchanged |

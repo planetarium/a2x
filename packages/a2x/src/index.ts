@@ -61,8 +61,8 @@ export * from './client/index.js';
 // Remote
 export * from './remote/index.js';
 
-// x402 (a2a-x402 v0.2 payment support). Also available via the dedicated
-// `@a2x/sdk/x402` subpath for callers who want to isolate the payment
-// module; we re-export from the main entry so the types share nominal
-// identity across subpaths.
+// x402 (a2a-x402 v0.2 payment support). Imported from the package root —
+// types share nominal identity with the rest of the public surface and
+// modern bundlers tree-shake unused symbols when `viem` / `x402` peer deps
+// are absent.
 export * from './x402/index.js';
