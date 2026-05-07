@@ -28,7 +28,7 @@ export type AgentEvent =
     /**
      * Domain key the SDK uses to look up a registered hook (verify/settle
      * etc.). For x402 this is the canonical `'x402'` literal exported from
-     * `@a2x/sdk/x402`. Custom domains supply their own.
+     * `@a2x/sdk`. Custom domains supply their own.
      */
     domain: string;
     /**

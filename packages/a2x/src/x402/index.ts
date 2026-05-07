@@ -1,5 +1,5 @@
 /**
- * `@a2x/sdk/x402` — a2a-x402 v0.2 payment support.
+ * x402 — a2a-x402 v0.2 payment support, imported from `@a2x/sdk`.
  *
  * Adds on-chain payment gating to A2A agents using the Coinbase x402
  * protocol. See `specification/a2a-x402-v0.2.md` for the wire format.
