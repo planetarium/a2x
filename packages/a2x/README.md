@@ -403,7 +403,6 @@ a2xAgentV03.getAgentCard(); // v0.3 card
 | `@a2x/sdk/anthropic` | `AnthropicProvider` |
 | `@a2x/sdk/openai` | `OpenAIProvider` |
 | `@a2x/sdk/google` | `GoogleProvider` |
-| `@a2x/sdk/x402` | a2a-x402 v0.2 payments (server + client) |
 
 ## Requirements
 
