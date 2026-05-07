@@ -83,7 +83,7 @@ class SensitiveAgent extends BaseAgent {
 }
 ```
 
-You can register a hook on the executor (`inputRoundTripHooks: [...]`) to centralize verification logic — see how `x402PaymentHook()` does verify+settle in `@a2x/sdk/x402` for the canonical pattern. Or, like the snippet above, inspect `context.input.resumeMetadata` directly when no out-of-band verification is needed. Either way the SDK core stays out of your extension's wire format.
+You can register a hook on the executor (`inputRoundTripHooks: [...]`) to centralize verification logic — see how `x402PaymentHook()` does verify+settle in `@a2x/sdk` for the canonical pattern. Or, like the snippet above, inspect `context.input.resumeMetadata` directly when no out-of-band verification is needed. Either way the SDK core stays out of your extension's wire format.
 
 ## When not to use extensions
 

@@ -314,7 +314,7 @@ import { A2XClient } from '@a2x/sdk/client';
 import {
   signX402Payment,
   getX402PaymentRequirements,
-} from '@a2x/sdk/x402';
+} from '@a2x/sdk';
 
 const client = new A2XClient(url, {
   extensions: [X402_EXTENSION_URI], // still required for header activation
@@ -353,7 +353,7 @@ const signed = await signX402Payment(first, {
 Declining a payment manually — produces the metadata block to attach to a follow-up `message/send` call so the merchant terminates the task per spec §5.4.2 instead of leaving it stranded in `input-required`:
 
 ```ts
-import { rejectX402Payment } from '@a2x/sdk/x402';
+import { rejectX402Payment } from '@a2x/sdk';
 
 const rejection = rejectX402Payment(first);
 await client.sendMessage({
@@ -370,7 +370,7 @@ await client.sendMessage({
 ### Reading receipts
 
 ```ts
-import { getX402Receipts } from '@a2x/sdk/x402';
+import { getX402Receipts } from '@a2x/sdk';
 
 const receipts = getX402Receipts(task);
 for (const receipt of receipts) {
