@@ -95,6 +95,8 @@ export class AgentExecutor {
    * Returns the completed Task.
    */
   async execute(task: Task, message: Message): Promise<Task> {
+    const contextId = task.contextId ?? task.id;
+
     // Detect a resume turn by reading the round-trip record off the task's
     // status message metadata. Persisted by the prior turn's
     // applyInputRequired() call.
@@ -176,7 +178,10 @@ export class AgentExecutor {
     let inputRequested = false;
 
     try {
-      for await (const event of this.runner.runAsync(session, message, abortController.signal)) {
+      for await (const event of this.runner.runAsync(session, message, abortController.signal, {
+        taskId: task.id,
+        contextId,
+      })) {
         switch (event.type) {
           case 'text':
             textParts.push(event.text);
@@ -403,7 +408,10 @@ export class AgentExecutor {
       const nonTextArtifacts: Artifact[] = [];
       let nonTextSeq = 0;
 
-      for await (const event of this.runner.runAsync(session, message, abortController.signal)) {
+      for await (const event of this.runner.runAsync(session, message, abortController.signal, {
+        taskId: task.id,
+        contextId,
+      })) {
         switch (event.type) {
           case 'text':
             textParts.push(event.text);
