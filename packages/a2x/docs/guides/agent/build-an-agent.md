@@ -66,6 +66,28 @@ The `instruction` field is where most of your agent's behavior lives. A few prac
 - **Tell the model how to handle unknowns.** "If you don't know, say so" prevents hallucination more reliably than "be accurate".
 - **Keep tool usage hints here, not in the tool definitions.** "Always call `get_weather` before guessing a temperature" belongs in the instruction; the tool's own `description` should just describe the tool.
 
+## What the agent receives: `InvocationContext`
+
+Custom agents that extend `BaseAgent` directly are handed an `InvocationContext` on every turn:
+
+```ts
+class MyAgent extends BaseAgent {
+  async *run(context: InvocationContext): AsyncGenerator<AgentEvent> { /* … */ }
+}
+```
+
+The fields that matter most for everyday agent code:
+
+| Field | Use it for |
+|---|---|
+| `context.taskId` | The A2A `Task.id` of the current turn (wire-protocol identifier). **Stable across `request-input` → resume.** Bind per-task durable state (paid rows, approval tokens, …) to this — not to `session.id`. |
+| `context.contextId` | The A2A `contextId` of the current turn. One `contextId` umbrellas many tasks in the same conversation (1:N), so this is the right key for state that should outlive a single task but stay scoped to one conversation. |
+| `context.input` | Populated only on resume turns of a task that previously emitted `request-input`. Carries the prior turn's record and (optionally) a hook outcome. See [Protocol Extensions](../advanced/extensions.md). |
+| `context.session` | The runner's per-invocation `Session`. `session.id` is **regenerated on every turn** and is not safe to bind per-task state to — use `taskId` / `contextId` instead. |
+| `context.signal` | `AbortSignal` for the run. Listen if you do anything cancellable (e.g. external HTTP). |
+
+`taskId` and `contextId` are set by the default `AgentExecutor` whenever the agent is dispatched under an A2A task; they are `undefined` only when the `Runner` is invoked standalone, with no enclosing A2A task.
+
 ## AgentEvent variants
 
 Custom agents that extend `BaseAgent` directly express their output by yielding `AgentEvent`s. The default `AgentExecutor` knows how to map each variant onto an A2A artifact or task status update.

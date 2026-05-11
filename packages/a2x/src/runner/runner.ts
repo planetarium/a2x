@@ -37,8 +37,19 @@ export class Runner {
 
   /**
    * Run the agent asynchronously, yielding AgentEvents.
+   *
+   * `taskScope` carries the wire-protocol identifiers of the enclosing
+   * A2A task (set by the default `AgentExecutor`); when present they
+   * surface on `InvocationContext.taskId` / `contextId` so agent code
+   * can scope durable state to the A2A task instead of the
+   * per-invocation `session.id`.
    */
-  async *runAsync(session: Session, message: Message, signal?: AbortSignal): AsyncGenerator<AgentEvent> {
+  async *runAsync(
+    session: Session,
+    message: Message,
+    signal?: AbortSignal,
+    taskScope?: { taskId?: string; contextId?: string },
+  ): AsyncGenerator<AgentEvent> {
     // Store the incoming message in session events with user role
     session.events.push({ type: 'text', text: message.parts.map(p => ('text' in p ? p.text : '')).join(''), role: 'user' });
     await this.sessionService.updateSession(session);
@@ -63,6 +74,8 @@ export class Runner {
       agentName: this.agent.name,
       plugins: this.plugins,
       signal,
+      ...(taskScope?.taskId ? { taskId: taskScope.taskId } : {}),
+      ...(taskScope?.contextId ? { contextId: taskScope.contextId } : {}),
       ...(inputSentinel ? { input: inputSentinel } : {}),
     };
 
