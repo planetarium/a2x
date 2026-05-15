@@ -1,5 +1,5 @@
 /**
- * Anthropic-powered demo agent that owns the payment decision.
+ * Anthropic-powered demo agent that owns the entire payment flow.
  *
  * Generalized over a tool registry — each tool declares its own cost (0 for
  * free tools, an atomic-unit cost for paid ones). The agent inspects EVERY
@@ -7,19 +7,32 @@
  * single planning response can include several), validates them, then:
  *
  *   - all tool calls free → execute the batch directly.
- *   - at least one paid call AND not yet settled → sum the costs, advertise
- *     a single combined `accept`, yield `x402RequestPayment`, return.
- *   - already settled → execute the entire batch (paid + free in declared
- *     order) and feed the results back to Claude for a final summary.
+ *   - at least one paid call AND no payment submitted yet → sum the costs,
+ *     advertise a single combined `accept`, yield `x402RequestPayment`,
+ *     return.
+ *   - submission present → call `facilitator.verify` + `facilitator.settle`
+ *     directly, then execute the batch and feed the results back to Claude
+ *     for a final summary.
  *
  * Adding a new tool means adding one entry to TOOLS — no other code changes.
+ *
+ * The agent is the single source of truth for the payment lifecycle: the
+ * SDK does not store offerings, route resume turns, or run verify/settle.
  */
 
 import {
   BaseAgent,
   isTextPart,
-  readX402Settlement,
+  buildX402PaymentCompletedMetadata,
+  buildX402PaymentFailedMetadata,
+  mapVerifyFailureToCode,
+  normalizeX402Accept,
+  parseX402PaymentSubmission,
+  pickX402Requirement,
+  validateX402PayloadShape,
   x402RequestPayment,
+  X402_ERROR_CODES,
+  X402_PAYMENT_STATUS,
 } from '@a2x/sdk';
 import type {
   AgentEvent,
@@ -30,6 +43,8 @@ import type {
   ToolCall,
   ToolDeclaration,
   X402Accept,
+  X402Facilitator,
+  X402SettleResponse,
 } from '@a2x/sdk';
 import type { AnthropicProvider } from '@a2x/sdk/anthropic';
 
@@ -241,6 +256,7 @@ const TOOLS: Record<string, ToolHandler> = {
 
 export interface TranslationAgentOptions {
   provider: AnthropicProvider;
+  facilitator: X402Facilitator;
   /**
    * Network details for the per-turn bill. The agent assembles a single
    * `accept` whose `amount` is the sum of the per-tool atomic costs of every
@@ -264,6 +280,7 @@ const SYSTEM_PROMPT =
 
 export class TranslationAgent extends BaseAgent {
   private readonly _provider: AnthropicProvider;
+  private readonly _facilitator: X402Facilitator;
   private readonly _payment: TranslationAgentOptions['payment'];
   private readonly _toolDeclarations: ToolDeclaration[];
 
@@ -276,13 +293,33 @@ export class TranslationAgent extends BaseAgent {
         "'s cost into a single x402 payment.",
     });
     this._provider = options.provider;
+    this._facilitator = options.facilitator;
     this._payment = options.payment;
     this._toolDeclarations = Object.values(TOOLS).map((t) => t.declaration);
   }
 
   async *run(context: InvocationContext): AsyncGenerator<AgentEvent> {
-    const settled = readX402Settlement(context).paid;
-    const userText = lastUserText(context);
+    if (!context.message) {
+      yield { type: 'error', error: new Error('No incoming message on context.') };
+      return;
+    }
+
+    const submission = parseX402PaymentSubmission(context.message);
+
+    // Client decided not to pay after seeing the prompt.
+    if (submission && submission.status === X402_PAYMENT_STATUS.REJECTED) {
+      yield {
+        type: 'error',
+        error: new Error('Payment was declined by the client.'),
+        metadata: buildX402PaymentFailedMetadata({
+          code: X402_ERROR_CODES.INVALID_PAYLOAD,
+          reason: 'Payment was declined by the client.',
+        }),
+      };
+      return;
+    }
+
+    const userText = userTextFromMessage(context.message);
 
     // Phase 1 — Claude plans against the full tool registry.
     const planResp = await this._provider.generateContent({
@@ -307,8 +344,6 @@ export class TranslationAgent extends BaseAgent {
     }
 
     // Validate every call before any side-effect (charging or executing).
-    // An unknown tool name or schema-broken args is the LLM's fault; we
-    // surface it as an agent error rather than silently dropping or charging.
     for (const tc of toolCalls) {
       const handler = TOOLS[tc.name];
       if (!handler) {
@@ -331,16 +366,19 @@ export class TranslationAgent extends BaseAgent {
       }
     }
 
-    // Sum the per-tool cost across the batch. Free tools contribute 0.
     const totalAtomic = toolCalls.reduce(
       (sum, tc) => sum + (TOOLS[tc.name]?.costAtomic ?? 0),
       0,
     );
 
-    if (totalAtomic > 0 && !settled) {
-      // At least one paid call in the batch. Gate before any execution —
-      // including the free calls in the batch, so the user sees a single
-      // consistent "you're paying for this turn" prompt.
+    // No payment needed for this turn — execute directly.
+    if (totalAtomic === 0) {
+      yield* this._executeAndSummarize(toolCalls, userText);
+      return;
+    }
+
+    // Turn 1: no submission yet — advertise the bill.
+    if (!submission) {
       yield* x402RequestPayment({
         accepts: [this._buildAccept(totalAtomic)],
         description: this._billDescription(toolCalls, totalAtomic),
@@ -348,8 +386,91 @@ export class TranslationAgent extends BaseAgent {
       return;
     }
 
-    // Either fully free, or already paid. Execute every tool call in
-    // declared order and feed the results to Claude for the final reply.
+    if (submission.status !== X402_PAYMENT_STATUS.SUBMITTED || !submission.payload) {
+      yield {
+        type: 'error',
+        error: new Error('Payment payload missing or malformed.'),
+        metadata: buildX402PaymentFailedMetadata({
+          code: X402_ERROR_CODES.INVALID_PAYLOAD,
+          reason: 'Payment payload missing or malformed.',
+        }),
+      };
+      return;
+    }
+
+    // Validate the submitted payment against the bill we would re-derive
+    // for this turn (the planning step is deterministic enough for this
+    // sample; a production merchant would persist the per-task bill in
+    // its own store keyed by `context.taskId`).
+    const requirement = normalizeX402Accept(this._buildAccept(totalAtomic));
+    const matched = pickX402Requirement(submission.payload, [requirement]);
+    if (!matched) {
+      yield {
+        type: 'error',
+        error: new Error('Submitted payment does not match this turn\'s bill.'),
+        metadata: buildX402PaymentFailedMetadata({
+          code: X402_ERROR_CODES.NETWORK_MISMATCH,
+          reason: 'Submitted network/scheme does not match the offered bill.',
+        }),
+      };
+      return;
+    }
+
+    const issues = validateX402PayloadShape(submission.payload, matched);
+    if (issues.length > 0) {
+      const first = issues[0]!;
+      yield {
+        type: 'error',
+        error: new Error(first.reason),
+        metadata: buildX402PaymentFailedMetadata({
+          code: first.code,
+          reason: first.reason,
+        }),
+      };
+      return;
+    }
+
+    const verify = await this._facilitator.verify(submission.payload, matched);
+    if (!verify.isValid) {
+      yield {
+        type: 'error',
+        error: new Error(verify.invalidReason ?? 'Payment verification failed.'),
+        metadata: buildX402PaymentFailedMetadata({
+          code: mapVerifyFailureToCode(verify.invalidReason),
+          reason: verify.invalidReason ?? 'Payment verification failed.',
+        }),
+      };
+      return;
+    }
+
+    const settle = await this._facilitator.settle(submission.payload, matched);
+    if (!settle.success) {
+      yield {
+        type: 'error',
+        error: new Error(settle.errorReason ?? 'Payment settlement failed.'),
+        metadata: buildX402PaymentFailedMetadata({
+          code: X402_ERROR_CODES.SETTLEMENT_FAILED,
+          reason: settle.errorReason ?? 'Payment settlement failed.',
+        }),
+      };
+      return;
+    }
+
+    const receipt: X402SettleResponse = {
+      success: true,
+      transaction: settle.transaction ?? '',
+      network: submission.payload.network,
+      payer: submission.authorization?.from ?? settle.payer ?? 'unknown',
+    };
+
+    yield* this._executeAndSummarize(toolCalls, userText, receipt);
+  }
+
+  private async *_executeAndSummarize(
+    toolCalls: ToolCall[],
+    userText: string,
+    receipt?: X402SettleResponse,
+  ): AsyncGenerator<AgentEvent> {
     const toolResults: Array<{ id: string; name: string; result: unknown }> = [];
     for (const tc of toolCalls) {
       yield {
@@ -358,7 +479,7 @@ export class TranslationAgent extends BaseAgent {
         args: tc.args,
         toolCallId: tc.id,
       };
-      const handler = TOOLS[tc.name];
+      const handler = TOOLS[tc.name]!;
       let result: unknown;
       try {
         result = await handler.execute(tc.args, { provider: this._provider });
@@ -377,16 +498,13 @@ export class TranslationAgent extends BaseAgent {
     // Phase 2 — Claude composes the final answer with all tool results in
     // hand. Anthropic's API requires the assistant's tool_use blocks and
     // the user's tool_result blocks to sit in adjacent messages with
-    // matching ids; we assemble that conversation by hand.
-    const planTextParts: Part[] = planResp.content
-      .filter((p): p is TextPart => isTextPart(p))
-      .map((p) => ({ text: p.text }));
-    const followupContents: Message[] = [
+    // matching ids.
+    const planFollowup: Message[] = [
       { messageId: 'u1', role: 'user', parts: [{ text: userText }] },
       {
         messageId: 'a1',
         role: 'agent',
-        parts: planTextParts.length > 0 ? planTextParts : [{ text: '' }],
+        parts: [{ text: '' }],
         metadata: { toolCalls },
       },
       {
@@ -398,7 +516,7 @@ export class TranslationAgent extends BaseAgent {
     ];
 
     const finalResp = await this._provider.generateContent({
-      contents: followupContents,
+      contents: planFollowup,
       systemInstruction: SYSTEM_PROMPT,
     });
 
@@ -407,13 +525,18 @@ export class TranslationAgent extends BaseAgent {
         yield { type: 'text', role: 'agent', text: part.text };
       }
     }
-    yield { type: 'done' };
+
+    yield {
+      type: 'done',
+      ...(receipt
+        ? { metadata: buildX402PaymentCompletedMetadata({ receipt }) }
+        : {}),
+    };
   }
 
   private _buildAccept(totalAtomic: number): X402Accept {
     return {
       network: this._payment.network,
-      // x402 amount is an atomic-unit decimal string (USDC has 6 decimals).
       amount: String(totalAtomic),
       asset: this._payment.asset,
       payTo: this._payment.payTo,
@@ -439,12 +562,11 @@ export class TranslationAgent extends BaseAgent {
 
 // ─── Helpers ────────────────────────────────────────────────
 
-function lastUserText(context: InvocationContext): string {
-  for (let i = context.session.events.length - 1; i >= 0; i--) {
-    const event = context.session.events[i];
-    if (event.type === 'text' && event.role === 'user') return event.text;
-  }
-  return '';
+function userTextFromMessage(message: Message): string {
+  return message.parts
+    .map((p) => ('text' in p ? p.text : ''))
+    .join('')
+    .trim();
 }
 
 function joinText(parts: Part[]): string {

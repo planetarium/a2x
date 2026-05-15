@@ -8,10 +8,18 @@ import {
   InMemoryTaskStore,
   StreamingMode,
   X402_EXTENSION_URI,
-  readX402Settlement,
-  x402PaymentHook,
+  buildX402PaymentCompletedMetadata,
+  buildX402PaymentFailedMetadata,
+  mapVerifyFailureToCode,
+  normalizeX402Accept,
+  parseX402PaymentSubmission,
+  pickX402Requirement,
+  validateX402PayloadShape,
   x402RequestPayment,
+  X402_ERROR_CODES,
   type AgentEvent,
+  type X402Facilitator,
+  type X402SettleResponse,
 } from '@a2x/sdk';
 import type { InvocationContext, X402Accept } from '@a2x/sdk';
 
@@ -48,15 +56,46 @@ const ACCEPTS: X402Accept[] = [
   },
 ];
 
+// Development escape hatch: when X402_MOCK_FACILITATOR=1 the sample skips
+// verify/settle entirely and returns a fake receipt. Useful for running
+// the sample without an actual funded Base Sepolia wallet.
+const mockFacilitator: X402Facilitator | undefined =
+  process.env.X402_MOCK_FACILITATOR === '1'
+    ? {
+        async verify() {
+          return { isValid: true, invalidReason: undefined } as Awaited<
+            ReturnType<X402Facilitator['verify']>
+          >;
+        },
+        async settle() {
+          return {
+            success: true,
+            transaction: '0xmocktx',
+            network: 'base-sepolia',
+            payer: '0xmock',
+          } as Awaited<ReturnType<X402Facilitator['settle']>>;
+        },
+      }
+    : undefined;
+
+async function loadFacilitator(): Promise<X402Facilitator> {
+  if (mockFacilitator) return mockFacilitator;
+  const { resolveFacilitator } = await import('@a2x/sdk');
+  if (process.env.X402_FACILITATOR_URL) {
+    return resolveFacilitator({ url: process.env.X402_FACILITATOR_URL });
+  }
+  return resolveFacilitator();
+}
+
 /**
- * The agent owns the payment decision. On the first turn the user is
- * unpaid → yield `x402RequestPayment` and let the SDK transition the task
- * to `input-required`. On the resume turn (after the client signs and the
- * executor's `x402PaymentHook` runs verify+settle) `readX402Settlement` is
- * truthy and the agent runs the paid path.
+ * The agent owns the entire payment flow. On the first turn it advertises
+ * the accepted payment options. On the resume turn it parses the signed
+ * submission, validates it against the originally-advertised offerings,
+ * calls `facilitator.verify` and `facilitator.settle` directly, and
+ * decides what to do with each outcome — no SDK round-trip mechanics.
  */
 class EchoAgent extends BaseAgent {
-  constructor() {
+  constructor(private readonly facilitator: X402Facilitator) {
     super({
       name: 'echo_agent',
       description: 'Echoes the most recent user message back to the caller.',
@@ -64,59 +103,130 @@ class EchoAgent extends BaseAgent {
   }
 
   async *run(context: InvocationContext): AsyncGenerator<AgentEvent> {
-    if (!readX402Settlement(context).paid) {
+    if (!context.message) {
+      yield { type: 'error', error: new Error('No incoming message on context.') };
+      return;
+    }
+
+    const submission = parseX402PaymentSubmission(context.message);
+
+    // Turn 1 — no payment submitted yet.
+    if (!submission) {
       yield* x402RequestPayment({ accepts: ACCEPTS });
       return;
     }
 
-    // The Runner pushes the incoming user message into session.events as a
-    // text event right before invoking agent.run(). Echo the most recent
-    // user-role text event.
-    const last = [...context.session.events]
-      .reverse()
-      .find((e) => e.type === 'text' && e.role === 'user');
-    const text = last && last.type === 'text' ? last.text : '(empty message)';
+    // Client rejected payment. Terminate the task as failed.
+    if (submission.status !== 'payment-submitted') {
+      yield {
+        type: 'error',
+        error: new Error('Client declined to pay.'),
+        metadata: buildX402PaymentFailedMetadata({
+          code: X402_ERROR_CODES.INVALID_PAYLOAD,
+          reason: 'Client declined to pay.',
+        }),
+      };
+      return;
+    }
 
-    yield { type: 'text', role: 'agent', text: `You said: ${text}` };
-    yield { type: 'done' };
+    if (!submission.payload) {
+      yield {
+        type: 'error',
+        error: new Error('Payment payload missing.'),
+        metadata: buildX402PaymentFailedMetadata({
+          code: X402_ERROR_CODES.INVALID_PAYLOAD,
+          reason: 'Payment payload missing.',
+        }),
+      };
+      return;
+    }
+
+    // For this single-merchant sample the offered requirements are a
+    // constant. A real merchant would look them up from a durable store
+    // keyed by `context.taskId` so each task validates against what it
+    // actually offered.
+    const requirements = ACCEPTS.map(normalizeX402Accept);
+    const requirement = pickX402Requirement(submission.payload, requirements);
+    if (!requirement) {
+      yield {
+        type: 'error',
+        error: new Error('No matching requirement for submitted payment.'),
+        metadata: buildX402PaymentFailedMetadata({
+          code: X402_ERROR_CODES.NETWORK_MISMATCH,
+          reason: 'Submitted network/scheme does not match any offered option.',
+        }),
+      };
+      return;
+    }
+
+    const issues = validateX402PayloadShape(submission.payload, requirement);
+    if (issues.length > 0) {
+      const first = issues[0]!;
+      yield {
+        type: 'error',
+        error: new Error(first.reason),
+        metadata: buildX402PaymentFailedMetadata({
+          code: first.code,
+          reason: first.reason,
+        }),
+      };
+      return;
+    }
+
+    const verify = await this.facilitator.verify(submission.payload, requirement);
+    if (!verify.isValid) {
+      yield {
+        type: 'error',
+        error: new Error(verify.invalidReason ?? 'Payment verification failed.'),
+        metadata: buildX402PaymentFailedMetadata({
+          code: mapVerifyFailureToCode(verify.invalidReason),
+          reason: verify.invalidReason ?? 'Payment verification failed.',
+        }),
+      };
+      return;
+    }
+
+    const settle = await this.facilitator.settle(submission.payload, requirement);
+    if (!settle.success) {
+      yield {
+        type: 'error',
+        error: new Error(settle.errorReason ?? 'Payment settlement failed.'),
+        metadata: buildX402PaymentFailedMetadata({
+          code: X402_ERROR_CODES.SETTLEMENT_FAILED,
+          reason: settle.errorReason ?? 'Payment settlement failed.',
+        }),
+      };
+      return;
+    }
+
+    // Echo the user's text from the incoming message.
+    const text = context.message.parts
+      .map((p) => ('text' in p ? p.text : ''))
+      .join('');
+    const utterance = text.length > 0 ? text : '(empty message)';
+
+    const receipt: X402SettleResponse = {
+      success: true,
+      transaction: settle.transaction ?? '',
+      network: submission.payload.network,
+      payer: submission.authorization?.from ?? settle.payer ?? 'unknown',
+    };
+
+    yield { type: 'text', role: 'agent', text: `You said: ${utterance}` };
+    yield {
+      type: 'done',
+      metadata: buildX402PaymentCompletedMetadata({ receipt }),
+    };
   }
 }
 
-const agent = new EchoAgent();
+const facilitator = await loadFacilitator();
+const agent = new EchoAgent(facilitator);
 const runner = new InMemoryRunner({ agent, appName: 'nextjs-x402' });
-
-// Development escape hatch: when X402_MOCK_FACILITATOR=1 the sample skips
-// verify/settle entirely and returns a fake receipt. Useful for running
-// the sample without an actual funded Base Sepolia wallet.
-const mockFacilitator =
-  process.env.X402_MOCK_FACILITATOR === '1'
-    ? {
-      async verify() {
-        return { isValid: true, invalidReason: undefined, payer: '0xmock' as `0x${string}` };
-      },
-      async settle() {
-        return {
-          success: true,
-          transaction: '0xmocktx',
-          network: 'base-sepolia' as const,
-          payer: '0xmock' as `0x${string}`,
-        };
-      },
-    }
-    : undefined;
 
 const executor = new AgentExecutor({
   runner,
   runConfig: { streamingMode: StreamingMode.SSE },
-  inputRoundTripHooks: [
-    x402PaymentHook({
-      ...(mockFacilitator
-        ? { facilitator: mockFacilitator }
-        : process.env.X402_FACILITATOR_URL
-          ? { facilitator: { url: process.env.X402_FACILITATOR_URL } }
-          : {}),
-    }),
-  ],
 });
 
 export const a2xAgent = new A2XAgent({

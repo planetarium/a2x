@@ -1,56 +1,44 @@
 /**
- * x402 server-side surface built on top of the SDK's input-required
- * round-trip primitives.
+ * Server-side helpers for a2a-x402 v0.2 payment flows.
  *
- * This module is the spiritual successor to `executor.ts` (now removed).
- * Instead of wrapping `AgentExecutor` in a parallel class, agents express
- * payment gating inline by yielding `request-input` events — `executor.ts`'s
- * decision tree is split into two pieces:
+ * The SDK exposes the spec's mechanics as **stateless helpers** — never as
+ * a flow. Each helper does one step (parse, match, validate, build
+ * response metadata). The agent composes them inside its own
+ * `BaseAgent.run()` and decides:
  *
- *  - `x402RequestPayment()` — generator helper an agent yields from to
- *    publish the wire metadata for `payment-required`.
- *  - `x402PaymentHook()`    — `InputRoundTripHook` factory the default
- *    `AgentExecutor` consults on resume turns to verify + settle.
+ *  - when to request payment,
+ *  - what offerings were promised for a given task (the agent looks this
+ *    up in its own durable store, keyed by `InvocationContext.taskId`),
+ *  - which `accepts` rules to validate against,
+ *  - whether failure terminates or re-prompts (`yield* x402RequestPayment`
+ *    again),
+ *  - what to do between `facilitator.verify` and `facilitator.settle`.
  *
- * Wire format is byte-identical to the prior class-based path; this is
- * purely a refactor of where the decisions live in code.
+ * The SDK never persists payment state, never auto-routes resume turns,
+ * and never bundles verify + settle. Agents call `facilitator.verify()`
+ * and `facilitator.settle()` directly.
+ *
+ * Spec: specification/a2a-x402-v0.2.md
  */
 
-import type {
-  InputRoundTripHook,
-  InputRoundTripOutcome,
-} from '../a2x/input-roundtrip.js';
 import type { AgentEvent } from '../agent/base-agent.js';
-import type { InvocationContext } from '../runner/context.js';
 import type { Message } from '../types/common.js';
 import {
   X402_DEFAULT_TIMEOUT_SECONDS,
   X402_ERROR_CODES,
   X402_METADATA_KEYS,
   X402_PAYMENT_STATUS,
-  mapVerifyFailureToCode,
   type X402ErrorCode,
 } from './constants.js';
-import {
-  resolveFacilitator,
-  type FacilitatorUrlConfig,
-} from './facilitator.js';
 import type {
   X402Accept,
-  X402Facilitator,
   X402PaymentPayload,
   X402PaymentRequiredResponse,
   X402PaymentRequirements,
   X402SettleResponse,
 } from './types.js';
 
-/**
- * Stable domain key the x402 hook registers under. Agents pass this
- * literal as `event.domain` on `request-input` events emitted by
- * `x402RequestPayment`; the default `AgentExecutor` looks it up in its
- * hook map to find the registered `x402PaymentHook`.
- */
-export const X402_DOMAIN = 'x402' as const;
+// ─── 1턴: request payment ───
 
 export interface X402RequestPaymentInput {
   /**
@@ -65,303 +53,68 @@ export interface X402RequestPaymentInput {
    */
   description?: string;
   /**
-   * Optional carry-over of a prior failure reason. Set by the
-   * `retryOnFailure` flow so the next round-trip's
+   * Optional carry-over of a prior failure reason. Set this when
+   * re-prompting after a failed verify/settle so the next round-trip's
    * `X402PaymentRequiredResponse.error` carries the human-readable cause.
    */
   previousError?: string;
 }
 
 /**
- * Generator helper an agent yields from to request payment. Returns an
- * `AsyncGenerator<AgentEvent>` so callers compose it with `yield*` exactly
- * like any other generator.
+ * Build the wire metadata object for a `payment-required` message. Pure
+ * function — does not yield, does not mutate.
+ *
+ * Use this directly when you want to attach payment-required metadata to
+ * a status message without going through the `x402RequestPayment`
+ * generator (e.g. inside a custom retry flow).
+ */
+export function buildX402PaymentRequiredMetadata(
+  input: X402RequestPaymentInput,
+): Record<string, unknown> {
+  if (!input.accepts || input.accepts.length === 0) {
+    throw new Error(
+      'buildX402PaymentRequiredMetadata: at least one entry in `accepts` is required',
+    );
+  }
+  const requirements: X402PaymentRequirements[] = input.accepts.map(
+    normalizeX402Accept,
+  );
+  const required: X402PaymentRequiredResponse = {
+    x402Version: 1,
+    accepts: requirements,
+    ...(input.previousError ? { error: input.previousError } : {}),
+  };
+  return {
+    [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REQUIRED,
+    [X402_METADATA_KEYS.REQUIRED]: required,
+  };
+}
+
+/**
+ * Generator helper an agent yields from to request payment.
  *
  * ```ts
  * yield* x402RequestPayment({
  *   accepts: [{ network: 'base-sepolia', amount: '10000', ... }],
  *   description: 'Premium translation call',
  * });
- * return; // executor halts here and emits payment-required.
+ * return;
  * ```
  */
 export async function* x402RequestPayment(
   input: X402RequestPaymentInput,
 ): AsyncGenerator<AgentEvent> {
-  if (!input.accepts || input.accepts.length === 0) {
-    throw new Error(
-      'x402RequestPayment: at least one entry in `accepts` is required',
-    );
-  }
-
-  const requirements: X402PaymentRequirements[] = input.accepts.map(normalizeAccept);
-  const required: X402PaymentRequiredResponse = {
-    x402Version: 1,
-    accepts: requirements,
-    ...(input.previousError ? { error: input.previousError } : {}),
-  };
-
   yield {
     type: 'request-input',
-    domain: X402_DOMAIN,
-    metadata: {
-      [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REQUIRED,
-      [X402_METADATA_KEYS.REQUIRED]: required,
-    },
+    metadata: buildX402PaymentRequiredMetadata(input),
     message: input.description ?? 'Payment is required to use this service.',
-    // Round-tripped on resume so the second-turn agent — and the SDK's
-    // x402PaymentHook — can read the exact requirements published.
-    payload: { accepts: input.accepts },
   };
 }
 
-export interface X402PaymentHookOptions {
-  /**
-   * Facilitator that performs on-chain verify/settle. Either a URL config
-   * (uses `useFacilitator()` from x402/verify), a fully custom
-   * `{ verify, settle }` pair, or omitted (default Coinbase facilitator).
-   */
-  facilitator?: FacilitatorUrlConfig | X402Facilitator;
-  /**
-   * spec §9: when true, verify/settle failure re-prompts payment-required
-   * instead of terminating with `failed`. Default false.
-   */
-  retryOnFailure?: boolean;
-}
+// ─── 2턴: parse submitted message ───
 
-/**
- * Build the `InputRoundTripHook` the default `AgentExecutor` consults on
- * x402 resume turns. Encapsulates the verify+settle dance the prior
- * `X402PaymentExecutor` inlined.
- */
-export function x402PaymentHook(
-  options: X402PaymentHookOptions = {},
-): InputRoundTripHook {
-  const facilitator = resolveFacilitator(options.facilitator);
-  const retry = options.retryOnFailure ?? false;
-
-  return {
-    domain: X402_DOMAIN,
-    async handleResume({ message, previous }): Promise<InputRoundTripOutcome> {
-      const status = getPaymentStatus(message);
-
-      // Client decided not to pay. Spec §5.4.2 + §7.1: terminate.
-      if (status === X402_PAYMENT_STATUS.REJECTED) {
-        return {
-          resumed: false,
-          terminate: {
-            state: 'failed',
-            reason: 'Payment was declined by the client.',
-            metadata: {
-              [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REJECTED,
-            },
-          },
-        };
-      }
-
-      // Recover what the agent published on the prior turn. We trust the
-      // round-trip record's payload over scraping it back off the task
-      // because the record is the canonical agent intent.
-      const acceptsFromPayload = readAcceptsFromPayload(previous.payload);
-      const acceptsFromMetadata = readAcceptsFromMetadata(
-        previous.emittedMetadata,
-      );
-      const accepts = acceptsFromPayload.length > 0
-        ? acceptsFromPayload
-        : acceptsFromMetadata;
-
-      if (accepts.length === 0) {
-        return {
-          resumed: false,
-          terminate: {
-            state: 'failed',
-            reason:
-              'x402PaymentHook: prior round-trip record carries no accepts; cannot verify.',
-            metadata: {
-              [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.FAILED,
-              [X402_METADATA_KEYS.ERROR]: X402_ERROR_CODES.INVALID_PAYLOAD,
-            },
-          },
-        };
-      }
-
-      const acceptsRequirements: X402PaymentRequirements[] = accepts.map(
-        normalizeAccept,
-      );
-      const priorReceipts = readPriorReceipts(previous.emittedMetadata);
-
-      // Anything other than SUBMITTED is a malformed resume — same as the
-      // pre-refactor executor path.
-      if (status !== X402_PAYMENT_STATUS.SUBMITTED) {
-        return failureOutcome(
-          retry,
-          accepts,
-          X402_ERROR_CODES.INVALID_PAYLOAD,
-          'Payment payload is missing or malformed.',
-          {
-            success: false,
-            transaction: '',
-            network: 'unknown',
-            payer: 'unknown',
-            errorReason: 'Payment payload is missing or malformed.',
-          },
-          priorReceipts,
-        );
-      }
-
-      const payload = getPaymentPayload(message);
-      const authorization = getEvmAuthorization(payload);
-      if (!payload || !authorization) {
-        return failureOutcome(
-          retry,
-          accepts,
-          X402_ERROR_CODES.INVALID_PAYLOAD,
-          'Payment payload is missing or malformed.',
-          {
-            success: false,
-            transaction: '',
-            network: payload?.network ?? 'unknown',
-            payer: resolvePayer(payload, undefined, undefined),
-            errorReason: 'Payment payload is missing or malformed.',
-          },
-          priorReceipts,
-        );
-      }
-
-      const accepted = pickRequirement(payload, acceptsRequirements);
-      const validationErr = validatePayloadAgainstRequirement(
-        payload,
-        accepted,
-      );
-      if (validationErr) {
-        return failureOutcome(
-          retry,
-          accepts,
-          validationErr.code,
-          validationErr.reason,
-          {
-            success: false,
-            transaction: '',
-            network: payload.network,
-            payer: resolvePayer(payload, undefined, undefined),
-            errorReason: validationErr.reason,
-          },
-          priorReceipts,
-        );
-      }
-
-      const verifyResult = await facilitator.verify(payload, accepted!);
-      if (!verifyResult.isValid) {
-        return failureOutcome(
-          retry,
-          accepts,
-          mapVerifyFailureToCode(verifyResult.invalidReason),
-          verifyResult.invalidReason ?? 'Payment verification failed.',
-          {
-            success: false,
-            transaction: '',
-            network: payload.network,
-            payer: resolvePayer(payload, verifyResult, undefined),
-            errorReason:
-              verifyResult.invalidReason ?? 'Payment verification failed.',
-          },
-          priorReceipts,
-        );
-      }
-
-      const settleResult = await facilitator.settle(payload, accepted!);
-      if (!settleResult.success) {
-        return failureOutcome(
-          retry,
-          accepts,
-          X402_ERROR_CODES.SETTLEMENT_FAILED,
-          settleResult.errorReason ?? 'Payment settlement failed.',
-          {
-            success: false,
-            transaction: '',
-            network: payload.network,
-            payer: resolvePayer(payload, verifyResult, settleResult),
-            errorReason: settleResult.errorReason ?? 'Payment settlement failed.',
-          },
-          priorReceipts,
-        );
-      }
-
-      const receipt: X402SettleResponse = {
-        success: true,
-        transaction: settleResult.transaction ?? '',
-        network: payload.network,
-        payer: resolvePayer(payload, verifyResult, settleResult),
-      };
-
-      return {
-        resumed: true,
-        intermediate: {
-          state: 'working',
-          metadata: {
-            [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.VERIFIED,
-          },
-        },
-        data: { paid: true, receipt },
-        finalMetadataPatch: {
-          [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.COMPLETED,
-          [X402_METADATA_KEYS.RECEIPTS]: [...priorReceipts, receipt],
-        },
-      };
-    },
-  };
-}
-
-/**
- * Read settled receipt(s) off the resume context. Convenience for agents
- * that want to surface the payment in their response or branch on
- * "have I been paid yet?".
- *
- * ```ts
- * const { paid, receipt } = readX402Settlement(context);
- * if (!paid) {
- *   yield* x402RequestPayment({ accepts: ACCEPTS });
- *   return;
- * }
- * ```
- */
-export function readX402Settlement(
-  context: InvocationContext,
-): { paid: boolean; receipt?: X402SettleResponse } {
-  const out = context.input?.outcome;
-  if (!out || !out.data) return { paid: false };
-  const data = out.data as { paid?: boolean; receipt?: X402SettleResponse };
-  return { paid: data.paid === true, receipt: data.receipt };
-}
-
-// ─── Module-private helpers ───
-
-function normalizeAccept(entry: X402Accept): X402PaymentRequirements {
-  return {
-    scheme: entry.scheme ?? 'exact',
-    network: entry.network,
-    maxAmountRequired: entry.amount,
-    resource: entry.resource as X402PaymentRequirements['resource'],
-    description: entry.description,
-    mimeType: entry.mimeType ?? 'application/json',
-    payTo: entry.payTo,
-    maxTimeoutSeconds: entry.maxTimeoutSeconds ?? X402_DEFAULT_TIMEOUT_SECONDS,
-    asset: entry.asset,
-    extra: entry.extra ?? { name: 'USDC', version: '2' },
-  } as X402PaymentRequirements;
-}
-
-function getPaymentStatus(message: Message): string | undefined {
-  const meta = (message.metadata ?? {}) as Record<string, unknown>;
-  return meta[X402_METADATA_KEYS.STATUS] as string | undefined;
-}
-
-function getPaymentPayload(message: Message): X402PaymentPayload | undefined {
-  const meta = (message.metadata ?? {}) as Record<string, unknown>;
-  return meta[X402_METADATA_KEYS.PAYLOAD] as X402PaymentPayload | undefined;
-}
-
-interface EvmAuthorization {
+/** EVM-style authorization payload extracted from a signed payment. */
+export interface X402EvmAuthorization {
   from: string;
   to: string;
   value: string;
@@ -370,156 +123,208 @@ interface EvmAuthorization {
   nonce: string;
 }
 
-function getEvmAuthorization(
-  payload: X402PaymentPayload | undefined,
-): EvmAuthorization | undefined {
-  if (!payload) return undefined;
-  const inner = payload.payload as unknown as { authorization?: EvmAuthorization };
-  return inner && typeof inner === 'object' && 'authorization' in inner
-    ? inner.authorization
-    : undefined;
+/**
+ * Structured view of a payment message's x402 metadata. `status` reflects
+ * the value of `x402.payment.status` on the incoming message; `payload`
+ * and `authorization` are populated when the client submitted a signed
+ * payment (status === `payment-submitted`).
+ */
+export interface X402PaymentSubmission {
+  status: string;
+  payload?: X402PaymentPayload;
+  authorization?: X402EvmAuthorization;
 }
 
-function resolvePayer(
-  payload: X402PaymentPayload | undefined,
-  verifyResult: { payer?: string } | undefined,
-  settleResult: { payer?: string } | undefined,
-): string {
-  if (settleResult?.payer) return settleResult.payer;
-  if (verifyResult?.payer) return verifyResult.payer;
-  const authorization = getEvmAuthorization(payload);
-  if (authorization?.from) return authorization.from;
-  return 'unknown';
+/**
+ * Read the x402 fields off an incoming message. Returns `undefined` when
+ * no `x402.payment.status` key is present (i.e. the message is not part
+ * of an x402 flow).
+ */
+export function parseX402PaymentSubmission(
+  message: Message,
+): X402PaymentSubmission | undefined {
+  const meta = (message.metadata ?? {}) as Record<string, unknown>;
+  const status = meta[X402_METADATA_KEYS.STATUS];
+  if (typeof status !== 'string' || status.length === 0) return undefined;
+
+  const payload = meta[X402_METADATA_KEYS.PAYLOAD] as
+    | X402PaymentPayload
+    | undefined;
+  const authorization = extractAuthorization(payload);
+
+  return {
+    status,
+    ...(payload ? { payload } : {}),
+    ...(authorization ? { authorization } : {}),
+  };
 }
 
-function validatePayloadAgainstRequirement(
+// ─── Helpers: matching + validation ───
+
+/**
+ * Find the requirement entry that matches the client's submitted
+ * payload's network/scheme combination. Returns `undefined` when the
+ * client picked an option the merchant did not advertise.
+ */
+export function pickX402Requirement(
   payload: X402PaymentPayload,
-  accepted: X402PaymentRequirements | undefined,
-): { code: X402ErrorCode; reason: string } | undefined {
-  if (!accepted) {
-    return {
-      code: X402_ERROR_CODES.NETWORK_MISMATCH,
-      reason: `Network/scheme "${payload.network}/${payload.scheme}" is not accepted.`,
-    };
-  }
-  const authorization = getEvmAuthorization(payload);
-  if (!authorization) {
-    return {
-      code: X402_ERROR_CODES.INVALID_PAYLOAD,
-      reason: 'Non-EVM payloads are not yet supported by the SDK.',
-    };
-  }
-  if (authorization.to.toLowerCase() !== accepted.payTo.toLowerCase()) {
-    return {
-      code: X402_ERROR_CODES.INVALID_PAY_TO,
-      reason: `payTo mismatch: expected ${accepted.payTo}, got ${authorization.to}.`,
-    };
-  }
-  try {
-    if (BigInt(authorization.value) > BigInt(accepted.maxAmountRequired)) {
-      return {
-        code: X402_ERROR_CODES.INVALID_AMOUNT,
-        reason: `Amount ${authorization.value} exceeds maximum ${accepted.maxAmountRequired}.`,
-      };
-    }
-  } catch {
-    return {
-      code: X402_ERROR_CODES.INVALID_PAYLOAD,
-      reason: 'Authorization value is not a valid number.',
-    };
-  }
-  return undefined;
-}
-
-function pickRequirement(
-  payload: X402PaymentPayload,
-  accepts: X402PaymentRequirements[],
+  requirements: X402PaymentRequirements[],
 ): X402PaymentRequirements | undefined {
-  return accepts.find(
+  return requirements.find(
     (req) => req.network === payload.network && req.scheme === payload.scheme,
   );
 }
 
-function readAcceptsFromPayload(payload: unknown): X402Accept[] {
-  if (!payload || typeof payload !== 'object') return [];
-  const candidate = (payload as { accepts?: unknown }).accepts;
-  return Array.isArray(candidate) ? (candidate as X402Accept[]) : [];
-}
-
-function readAcceptsFromMetadata(
-  metadata: Record<string, unknown>,
-): X402Accept[] {
-  const required = metadata[X402_METADATA_KEYS.REQUIRED] as
-    | { accepts?: X402PaymentRequirements[] }
-    | undefined;
-  if (!required || !Array.isArray(required.accepts)) return [];
-  // Map back to the X402Accept-shaped subset readAcceptsFromPayload returns
-  // so the caller can normalize uniformly.
-  return required.accepts.map((req) => ({
-    network: req.network,
-    amount: req.maxAmountRequired,
-    asset: req.asset,
-    payTo: req.payTo,
-    resource: req.resource,
-    description: req.description,
-    mimeType: req.mimeType,
-    maxTimeoutSeconds: req.maxTimeoutSeconds,
-    extra: req.extra,
-    scheme: req.scheme as 'exact' | undefined,
-  }));
-}
-
-function readPriorReceipts(
-  metadata: Record<string, unknown>,
-): X402SettleResponse[] {
-  const value = metadata[X402_METADATA_KEYS.RECEIPTS];
-  return Array.isArray(value) ? (value as X402SettleResponse[]) : [];
+export interface X402ValidationIssue {
+  code: X402ErrorCode;
+  reason: string;
 }
 
 /**
- * Build the failure outcome shared between every error branch above.
- * `retry === true` re-issues `payment-required` with the failure reason
- * carried in `X402PaymentRequiredResponse.error`; `retry === false`
- * terminates the task with `payment-failed` + the failure receipt.
+ * Local shape validation against the agreed-upon requirement. Returns an
+ * **array of issues** (empty array = no problems) so the caller can
+ * decide what to do with each — reject, log, ignore for VIP users, etc.
+ *
+ * Checks performed:
+ *  - EVM `authorization` must be present (non-EVM payloads not yet
+ *    supported by the SDK).
+ *  - `authorization.to` must equal `requirement.payTo` (case-insensitive).
+ *  - `authorization.value` must not exceed `requirement.maxAmountRequired`.
+ *
+ * Cryptographic / on-chain validity is **not** checked here — call
+ * `facilitator.verify(payload, requirement)` for that.
  */
-function failureOutcome(
-  retry: boolean,
-  accepts: X402Accept[],
-  code: X402ErrorCode,
-  reason: string,
-  receipt: X402SettleResponse,
-  priorReceipts: X402SettleResponse[],
-): InputRoundTripOutcome {
-  if (retry) {
-    const requirements = accepts.map(normalizeAccept);
-    const required: X402PaymentRequiredResponse = {
-      x402Version: 1,
-      accepts: requirements,
-      error: reason,
-    };
-    return {
-      resumed: false,
-      reissueInputRequired: {
-        metadata: {
-          [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REQUIRED,
-          [X402_METADATA_KEYS.REQUIRED]: required,
-          [X402_METADATA_KEYS.ERROR]: code,
-          [X402_METADATA_KEYS.RECEIPTS]: [...priorReceipts, receipt],
-        },
-        payload: { accepts },
-      },
-    };
+export function validateX402PayloadShape(
+  payload: X402PaymentPayload,
+  requirement: X402PaymentRequirements,
+): X402ValidationIssue[] {
+  const issues: X402ValidationIssue[] = [];
+  const authorization = extractAuthorization(payload);
+  if (!authorization) {
+    issues.push({
+      code: X402_ERROR_CODES.INVALID_PAYLOAD,
+      reason: 'Non-EVM payloads are not yet supported by the SDK.',
+    });
+    return issues;
   }
+  if (authorization.to.toLowerCase() !== requirement.payTo.toLowerCase()) {
+    issues.push({
+      code: X402_ERROR_CODES.INVALID_PAY_TO,
+      reason: `payTo mismatch: expected ${requirement.payTo}, got ${authorization.to}.`,
+    });
+  }
+  try {
+    if (BigInt(authorization.value) > BigInt(requirement.maxAmountRequired)) {
+      issues.push({
+        code: X402_ERROR_CODES.INVALID_AMOUNT,
+        reason: `Amount ${authorization.value} exceeds maximum ${requirement.maxAmountRequired}.`,
+      });
+    }
+  } catch {
+    issues.push({
+      code: X402_ERROR_CODES.INVALID_PAYLOAD,
+      reason: 'Authorization value is not a valid number.',
+    });
+  }
+  return issues;
+}
+
+/**
+ * Normalize an `X402Accept` to the spec's `X402PaymentRequirements` shape
+ * (applies default scheme, mimeType, timeout, etc.). Useful when calling
+ * `facilitator.verify` / `facilitator.settle` with the requirement that
+ * was originally advertised to the client.
+ */
+export function normalizeX402Accept(
+  accept: X402Accept,
+): X402PaymentRequirements {
   return {
-    resumed: false,
-    terminate: {
-      state: 'failed',
-      reason: `Payment verification failed: ${reason}`,
-      metadata: {
-        [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.FAILED,
-        [X402_METADATA_KEYS.ERROR]: code,
-        [X402_METADATA_KEYS.RECEIPTS]: [...priorReceipts, receipt],
-      },
-    },
+    scheme: accept.scheme ?? 'exact',
+    network: accept.network,
+    maxAmountRequired: accept.amount,
+    resource: accept.resource as X402PaymentRequirements['resource'],
+    description: accept.description,
+    mimeType: accept.mimeType ?? 'application/json',
+    payTo: accept.payTo,
+    maxTimeoutSeconds: accept.maxTimeoutSeconds ?? X402_DEFAULT_TIMEOUT_SECONDS,
+    asset: accept.asset,
+    extra: accept.extra ?? { name: 'USDC', version: '2' },
+  } as X402PaymentRequirements;
+}
+
+// ─── Response metadata builders ───
+
+/**
+ * Build the metadata for a successful settlement response. Pair with
+ * `{ type: 'done', metadata: buildX402PaymentCompletedMetadata({...}) }`.
+ *
+ * `priorReceipts` lets you preserve receipts from earlier
+ * verify/settle attempts on the same task — useful when an earlier
+ * round-trip failed and you re-prompted the user.
+ */
+export function buildX402PaymentCompletedMetadata(input: {
+  receipt: X402SettleResponse;
+  priorReceipts?: X402SettleResponse[];
+}): Record<string, unknown> {
+  const allReceipts = [...(input.priorReceipts ?? []), input.receipt];
+  return {
+    [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.COMPLETED,
+    [X402_METADATA_KEYS.RECEIPTS]: allReceipts,
   };
+}
+
+/**
+ * Build the metadata for a failed payment. Pair with
+ * `{ type: 'error', error: new Error(reason), metadata: buildX402PaymentFailedMetadata({...}) }`
+ * to terminate the task with `failed` state.
+ *
+ * `failureReceipt` (optional) lets you attach a structured failure
+ * receipt alongside the `RECEIPTS` array — populate this when the
+ * facilitator returned a settle response with `success: false`.
+ */
+export function buildX402PaymentFailedMetadata(input: {
+  code: X402ErrorCode;
+  reason: string;
+  failureReceipt?: X402SettleResponse;
+  priorReceipts?: X402SettleResponse[];
+}): Record<string, unknown> {
+  const receipts = [
+    ...(input.priorReceipts ?? []),
+    ...(input.failureReceipt ? [input.failureReceipt] : []),
+  ];
+  const out: Record<string, unknown> = {
+    [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.FAILED,
+    [X402_METADATA_KEYS.ERROR]: input.code,
+  };
+  if (receipts.length > 0) {
+    out[X402_METADATA_KEYS.RECEIPTS] = receipts;
+  }
+  return out;
+}
+
+/**
+ * Build the metadata for a `payment-verified` intermediate status (spec
+ * §7.1). Emit between `verify` succeeding and `settle` starting when you
+ * want clients to see the verified-but-not-yet-settled state. Pair with
+ * a streaming status update — non-streaming flows can skip this.
+ */
+export function buildX402PaymentVerifiedMetadata(): Record<string, unknown> {
+  return {
+    [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.VERIFIED,
+  };
+}
+
+// ─── Module-private helpers ───
+
+function extractAuthorization(
+  payload: X402PaymentPayload | undefined,
+): X402EvmAuthorization | undefined {
+  if (!payload) return undefined;
+  const inner = payload.payload as unknown as {
+    authorization?: X402EvmAuthorization;
+  };
+  if (!inner || typeof inner !== 'object' || !('authorization' in inner)) {
+    return undefined;
+  }
+  return inner.authorization;
 }

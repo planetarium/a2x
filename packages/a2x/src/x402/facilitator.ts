@@ -31,7 +31,7 @@ export interface FacilitatorUrlConfig {
  *  - `undefined` — uses `useFacilitator()` with defaults
  */
 export function resolveFacilitator(
-  spec: FacilitatorUrlConfig | X402Facilitator | undefined,
+  spec?: FacilitatorUrlConfig | X402Facilitator,
 ): X402Facilitator {
   if (spec && 'verify' in spec && 'settle' in spec) {
     return spec;

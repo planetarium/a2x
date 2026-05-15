@@ -1,64 +1,40 @@
-# Migrating from `X402PaymentExecutor` to the input-required surface
+# Migrating off `x402PaymentHook` to the helper-only surface
 
-This guide is for projects on `@a2x/sdk` 0.x that use `X402PaymentExecutor`. SDK 1.x replaces the class with a smaller, agent-driven surface built on `request-input` AgentEvents. Wire format is unchanged — existing clients keep working without modification.
+This guide is for projects on `@a2x/sdk` 0.13.x that use `x402PaymentHook` / `inputRoundTripHooks` / `readX402Settlement`. The next release removes the SDK-owned payment *flow* and ships only stateless helpers — agents own the entire payment lifecycle inside `BaseAgent.run()`.
+
+**The wire format is unchanged.** All `x402.payment.*` metadata keys, status values, and error codes are bit-for-bit identical. Existing A2A clients keep working without modification. The breaking change is server-side authoring only.
+
+## Why
+
+`x402PaymentHook` persisted bookkeeping under `_a2x.inputRoundTrip` inside `task.status.message.metadata` and ran verify+settle on the SDK's schedule. That had three issues (see [issue #162](https://github.com/planetarium/a2x/issues/162)):
+
+- **Wire leak.** SDK-internal bookkeeping shipped to every client on every `input-required` response, every `tasks/get`, and every push notification.
+- **Flow ownership in the wrong place.** The merchant — not the SDK — is the authority on what was offered, how to validate, what to do between `verify` and `settle`, and whether to retry. The SDK couldn't represent the merchant's business rules without growing options for every case.
+- **Bundled verify+settle.** The hook didn't expose a hook point between the two steps. Audit logging, fraud checks, reward pre-allocation between verify and settle weren't expressible without forking the SDK.
+
+The new design removes the flow entirely. The SDK ships **stateless helpers** the agent composes inside `run()` — every step is its own function, callable in any order, with any user logic inserted in between.
 
 ## What changed
 
-| Item | 0.x | 1.x |
+| Item | 0.13.x | Next |
 |---|---|---|
-| Removed | `X402PaymentExecutor`, `X402PaymentExecutorOptions` | — |
-| Added | — | `request-input` AgentEvent variant; `x402RequestPayment()`, `x402PaymentHook()`, `readX402Settlement()`, `X402_DOMAIN` (all from `@a2x/sdk` and `@a2x/sdk/x402`) |
-| Where the "is this call paid?" predicate lives | Executor option `requiresPayment` | Inside `agent.run()` |
-| Number of `extends` lines for x402 | 1 (`extends AgentExecutor` in custom case) | 0 |
+| Removed | `x402PaymentHook`, `readX402Settlement`, `X402_DOMAIN`, `InputRoundTripRecord`, `InputRoundTripHook`, `InputRoundTripOutcome`, `InputRoundTripContext`, `INPUT_ROUNDTRIP_METADATA_KEY`, `inputRoundTripHooks` (`AgentExecutorOptions`) | — |
+| Added | — | `parseX402PaymentSubmission`, `pickX402Requirement`, `validateX402PayloadShape`, `normalizeX402Accept`, `buildX402PaymentRequiredMetadata`, `buildX402PaymentCompletedMetadata`, `buildX402PaymentFailedMetadata`, `buildX402PaymentVerifiedMetadata`; `metadata?` on `done` / `error` AgentEvents; `message` on `InvocationContext` |
+| Changed | `request-input` event had `domain` + `payload` fields | `request-input` event has only `metadata` + optional `message` |
+| Where verify+settle runs | Inside `x402PaymentHook.handleResume` | Inside `agent.run()` — `facilitator.verify()` and `facilitator.settle()` called directly |
+| Where "what was offered" is stored | Inside the task's metadata as `_a2x.inputRoundTrip.payload` | The merchant's own durable store (or constants), keyed by `context.taskId` |
 | Wire metadata keys, status values, error codes | unchanged | unchanged |
-
-The breaking change consists of exactly two removed exports: `X402PaymentExecutor` and `X402PaymentExecutorOptions`. The wire stays bit-for-bit identical.
 
 ## Step-by-step
 
-### Always-paid (S1)
+### Always-paid
 
-**Before**
-
-```ts
-import {
-  AgentExecutor,
-  X402PaymentExecutor,
-  X402_EXTENSION_URI,
-  BaseAgent,
-} from '@a2x/sdk';
-
-class EchoAgent extends BaseAgent {
-  async *run(context) {
-    yield { type: 'text', role: 'agent', text: 'pong' };
-    yield { type: 'done' };
-  }
-}
-
-const inner = new AgentExecutor({
-  runner,
-  runConfig: { streamingMode: StreamingMode.SSE },
-});
-
-const executor = new X402PaymentExecutor(inner, {
-  accepts: ACCEPTS,
-  facilitator: { url: process.env.X402_FACILITATOR_URL! },
-});
-
-export const agent = new A2XAgent({ taskStore, executor })
-  .addExtension({ uri: X402_EXTENSION_URI, required: true });
-```
-
-**After**
+**Before (0.13.x):**
 
 ```ts
 import {
-  AgentExecutor,
-  BaseAgent,
-  x402PaymentHook,
-  x402RequestPayment,
-  readX402Settlement,
-  X402_EXTENSION_URI,
+  AgentExecutor, BaseAgent, X402_EXTENSION_URI,
+  x402PaymentHook, x402RequestPayment, readX402Settlement,
 } from '@a2x/sdk';
 
 class EchoAgent extends BaseAgent {
@@ -75,154 +51,236 @@ class EchoAgent extends BaseAgent {
 const executor = new AgentExecutor({
   runner,
   runConfig: { streamingMode: StreamingMode.SSE },
-  inputRoundTripHooks: [
-    x402PaymentHook({ facilitator: { url: process.env.X402_FACILITATOR_URL! } }),
-  ],
+  inputRoundTripHooks: [x402PaymentHook({ facilitator: { url: process.env.X402_FACILITATOR_URL! } })],
 });
-
-export const agent = new A2XAgent({ taskStore, executor })
-  .addExtension({ uri: X402_EXTENSION_URI, required: true });
 ```
 
-The new code adds two lines to the agent (the `readX402Settlement` branch and the `x402RequestPayment` yield) and replaces the `X402PaymentExecutor` instantiation with a single `inputRoundTripHooks` option on the existing `AgentExecutor`.
-
-### Conditional pricing (S2)
-
-**Before**
+**After:**
 
 ```ts
-function isPremiumRequest(message: Message): boolean {
-  // ...
-}
+import {
+  AgentExecutor, BaseAgent, X402_EXTENSION_URI, X402_ERROR_CODES, X402_PAYMENT_STATUS,
+  buildX402PaymentCompletedMetadata, buildX402PaymentFailedMetadata,
+  mapVerifyFailureToCode, normalizeX402Accept, parseX402PaymentSubmission,
+  pickX402Requirement, resolveFacilitator, validateX402PayloadShape, x402RequestPayment,
+  type X402Facilitator,
+} from '@a2x/sdk';
 
-class TieredAgent extends BaseAgent {
-  async *run(context) {
-    const isPremium = isPremiumRequest(reconstructedMessage);  // <-- duplicate decision
-    if (isPremium) yield { type: 'text', text: 'Premium ...' };
-    else yield { type: 'text', text: 'Free ...' };
-    yield { type: 'done' };
+class EchoAgent extends BaseAgent {
+  constructor(private readonly facilitator: X402Facilitator) {
+    super({ name: 'echo' });
   }
-}
 
-new X402PaymentExecutor(inner, {
-  accepts: PREMIUM_ACCEPTS,
-  requiresPayment: isPremiumRequest,                       // <-- duplicate decision
-});
-```
-
-The predicate had to be duplicated: once on the executor (to decide whether to gate) and once in the agent (to decide what to respond).
-
-**After**
-
-```ts
-class TieredAgent extends BaseAgent {
   async *run(context) {
-    const text = lastUserText(context);
-    const isPremium = text.length > 100 || PREMIUM_KEYWORDS.some((k) => text.toLowerCase().includes(k));
+    const submission = parseX402PaymentSubmission(context.message!);
 
-    if (isPremium && !readX402Settlement(context).paid) {
-      yield* x402RequestPayment({ accepts: PREMIUM_ACCEPTS });
+    // Turn 1
+    if (!submission) {
+      yield* x402RequestPayment({ accepts: ACCEPTS });
       return;
     }
 
-    yield { type: 'text', role: 'agent', text: isPremium ? 'Premium ...' : 'Free ...' };
-    yield { type: 'done' };
-  }
-}
-
-new AgentExecutor({
-  runner,
-  runConfig: { streamingMode: StreamingMode.SSE },
-  inputRoundTripHooks: [x402PaymentHook({ facilitator: ... })],
-});
-```
-
-Single source of truth for the predicate. The `requiresPayment` option goes away.
-
-### Agent-driven payment (S3)
-
-**Before**
-
-```ts
-// payment-required-event.ts — sentinel MIME (~66 LOC, sample-side)
-export const PAYMENT_REQUIRED_SENTINEL_MIME = '...';
-export const PAYMENT_SETTLED_SESSION_KEY = '__x402_payment_settled';
-export async function* yieldPaymentRequired(...) { ... }
-
-// agent-driven-x402-executor.ts — custom AgentExecutor (~250+ LOC)
-class AgentDrivenX402Executor extends AgentExecutor { ... }
-
-// translation-agent.ts
-const settled = context.state[PAYMENT_SETTLED_SESSION_KEY] === true;
-if (!settled) {
-  yield* yieldPaymentRequired({ ... });
-  return;
-}
-yield* this._runDeepTranslate(...);
-```
-
-The pattern required a sentinel `data` event with a custom MIME type, a session-state hack, and a custom executor that intercepted the sentinel and ran verify/settle.
-
-**After**
-
-```ts
-import { x402RequestPayment, readX402Settlement } from '@a2x/sdk';
-
-class TranslationAgent extends BaseAgent {
-  async *run(context) {
-    const intent = classifyIntent(lastUserText(context));
-    if (intent.kind === 'translate') {
-      if (!readX402Settlement(context).paid) {
-        yield* x402RequestPayment({
-          accepts: [this._buildAccept()],
-          description: `About to call deep_translate("${intent.text}")`,
-        });
-        return;
-      }
-      yield* this._runDeepTranslate(intent.text, intent.lang);
+    // Client declined
+    if (submission.status !== X402_PAYMENT_STATUS.SUBMITTED || !submission.payload) {
+      yield {
+        type: 'error',
+        error: new Error('Payment not submitted.'),
+        metadata: buildX402PaymentFailedMetadata({
+          code: X402_ERROR_CODES.INVALID_PAYLOAD, reason: 'Payment not submitted.',
+        }),
+      };
+      return;
     }
-    // ...
+
+    // Match + validate locally
+    const requirements = ACCEPTS.map(normalizeX402Accept);
+    const requirement = pickX402Requirement(submission.payload, requirements);
+    if (!requirement) {
+      yield {
+        type: 'error',
+        error: new Error('No matching requirement.'),
+        metadata: buildX402PaymentFailedMetadata({
+          code: X402_ERROR_CODES.NETWORK_MISMATCH, reason: 'Submitted option not offered.',
+        }),
+      };
+      return;
+    }
+    const issues = validateX402PayloadShape(submission.payload, requirement);
+    if (issues.length > 0) {
+      const first = issues[0]!;
+      yield {
+        type: 'error',
+        error: new Error(first.reason),
+        metadata: buildX402PaymentFailedMetadata({ code: first.code, reason: first.reason }),
+      };
+      return;
+    }
+
+    // Verify
+    const verify = await this.facilitator.verify(submission.payload, requirement);
+    if (!verify.isValid) {
+      yield {
+        type: 'error',
+        error: new Error(verify.invalidReason ?? 'verify failed'),
+        metadata: buildX402PaymentFailedMetadata({
+          code: mapVerifyFailureToCode(verify.invalidReason),
+          reason: verify.invalidReason ?? 'Verification failed.',
+        }),
+      };
+      return;
+    }
+
+    // [insert any custom logic between verify and settle]
+
+    // Settle
+    const settle = await this.facilitator.settle(submission.payload, requirement);
+    if (!settle.success) {
+      yield {
+        type: 'error',
+        error: new Error(settle.errorReason ?? 'settle failed'),
+        metadata: buildX402PaymentFailedMetadata({
+          code: X402_ERROR_CODES.SETTLEMENT_FAILED,
+          reason: settle.errorReason ?? 'Settlement failed.',
+        }),
+      };
+      return;
+    }
+
+    yield { type: 'text', role: 'agent', text: 'pong' };
+    yield {
+      type: 'done',
+      metadata: buildX402PaymentCompletedMetadata({
+        receipt: {
+          success: true,
+          transaction: settle.transaction ?? '',
+          network: submission.payload.network,
+          payer: submission.authorization?.from ?? settle.payer ?? 'unknown',
+        },
+      }),
+    };
   }
 }
+
+const facilitator = process.env.X402_FACILITATOR_URL
+  ? resolveFacilitator({ url: process.env.X402_FACILITATOR_URL })
+  : resolveFacilitator();
 
 const executor = new AgentExecutor({
-  runner, runConfig: ...,
-  inputRoundTripHooks: [x402PaymentHook({ facilitator: ... })],
+  runner,
+  runConfig: { streamingMode: StreamingMode.SSE },
+  // No inputRoundTripHooks. The agent owns the flow.
 });
 ```
 
-The custom executor (~647 LOC in the original sample), the sentinel module (~66 LOC), and the session-state key all disappear. The agent uses exactly the same `x402RequestPayment` / `readX402Settlement` pair as the always-paid case.
+Longer, yes — but every step is now visible at the call site and interceptable.
+
+### Retry on failure
+
+**Before:** `x402PaymentHook({ retryOnFailure: true })`.
+
+**After:** simply yield `x402RequestPayment` again from the failure branch:
+
+```ts
+if (!verify.isValid) {
+  yield* x402RequestPayment({
+    accepts: ACCEPTS,
+    previousError: verify.invalidReason,
+  });
+  return;
+}
+```
+
+### Variable / per-task pricing
+
+**Before:** the SDK re-derived the requirement from `_a2x.inputRoundTrip.payload.accepts` on resume.
+
+**After:** the merchant persists what it offered, keyed by `context.taskId`:
+
+```ts
+async *run(context) {
+  const submission = parseX402PaymentSubmission(context.message!);
+
+  if (!submission) {
+    const accepts = await this.pricing.quoteFor(context.message!, context.taskId!);
+    await this.db.put(context.taskId!, accepts);          // remember it
+    yield* x402RequestPayment({ accepts });
+    return;
+  }
+
+  const accepts = await this.db.get(context.taskId!);      // recover it
+  // ... validate, verify, settle ...
+}
+```
+
+The merchant has every reason to store this anyway (audit logs, A/B tests, pricing rules).
+
+### Detecting client rejection
+
+**Before:** `x402PaymentHook` auto-handled `payment-rejected` and terminated the task.
+
+**After:** the agent checks the submission status:
+
+```ts
+const submission = parseX402PaymentSubmission(context.message!);
+if (submission?.status === X402_PAYMENT_STATUS.REJECTED) {
+  yield {
+    type: 'error',
+    error: new Error('Client declined.'),
+    metadata: buildX402PaymentFailedMetadata({
+      code: X402_ERROR_CODES.INVALID_PAYLOAD,
+      reason: 'Client declined to pay.',
+    }),
+  };
+  return;
+}
+```
+
+### Reading the user's original message on the resume turn
+
+**Before:** `lastUserText(context)` walked `context.session.events` (which only contains the resume message on turn 2).
+
+**After:** the original message's `parts` and `metadata` are now on `context.message` on every turn — the client preserves the original parts when it submits the signed payment, so reading them straight off `context.message.parts` works.
 
 ## Behaviors that do NOT change
 
-Any of the following keep working without modification:
-
-- All wire metadata keys (`x402.payment.status`, `x402.payment.required`, `x402.payment.payload`, `x402.payment.receipts`, `x402.payment.error`).
-- All payment status values (`payment-required`, `payment-submitted`, `payment-rejected`, `payment-verified`, `payment-completed`, `payment-failed`).
-- All error codes (the seven from spec §9.1 plus the SDK-specific extensions).
-- The full task lifecycle (input-required → submitted → verified → completed/failed).
-- Facilitator URL config and custom `{ verify, settle }` injection — same shape, same path.
+- Every `x402.payment.*` metadata key.
+- Every payment status value (`payment-required` / `submitted` / `rejected` / `verified` / `completed` / `failed`).
+- Every error code (seven from spec §9.1 plus the SDK-specific extensions).
+- The full task lifecycle on the wire.
+- Facilitator URL config and custom `{ verify, settle }` injection.
 - `A2XClient` and every client-side primitive (`signX402Payment`, `getX402PaymentRequirements`, `getX402Receipts`, `rejectX402Payment`).
 - AgentCard extension activation (`addExtension({ uri: X402_EXTENSION_URI, required: true })`).
-- The `retryOnFailure` semantics (now an option on `x402PaymentHook` instead of the executor).
+- `X-A2A-Extensions` header enforcement (`DefaultRequestHandler`).
 
 ## Compile errors you'll see
 
-Searching for these strings in your codebase shows every place that needs updating:
+Search for these strings — every match needs updating:
 
 ```
-import { X402PaymentExecutor } from '@a2x/sdk';
-import type { X402PaymentExecutorOptions } from '@a2x/sdk';
+import { x402PaymentHook }       from '@a2x/sdk';   // removed
+import { readX402Settlement }    from '@a2x/sdk';   // removed
+import { X402_DOMAIN }           from '@a2x/sdk';   // removed
+import type { InputRoundTrip... } from '@a2x/sdk';  // removed
+inputRoundTripHooks: [...]                          // removed AgentExecutorOptions field
+event.domain                                        // removed from request-input
+event.payload                                       // removed from request-input
+context.input                                       // removed from InvocationContext (use context.message)
 ```
-
-Both produce `Module has no exported member ...`. The fix is the 1:1 mapping above.
 
 ## Codemod
 
-There isn't one — by design. The decision of *where* to put your "is this call paid?" predicate is a design choice the SDK can't safely automate (the answer depends on whether you also need to vary the agent's response, on what session/state you have, etc.). The mapping is mechanical enough that grep + the diffs above takes 5–10 minutes per project.
+There isn't one. The shape of the new code depends on:
+
+- whether your prior agent body branched on `readX402Settlement(context).paid`,
+- whether you used `retryOnFailure: true`,
+- what business logic (if any) you'd like between `verify` and `settle`,
+- whether your offering is constant or task-keyed.
+
+The 0.13.x → next migration is mechanical for any *single* shape but the cross-product isn't, and the SDK can't safely autoresolve the differences. Use the always-paid example above as the template; adapt the conditional / variable-pricing / retry pieces by hand.
 
 ## Reference
 
 - [x402 Payments overview](./x402-payments.md) — the full guide for the new surface.
 - [Spec a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402/blob/main/spec/v0.2.md)
-- Sample diffs: `samples/nextjs-x402` (all-paid), `samples/nextjs-x402-agent-driven` (LLM tool-use-driven).
+- [Issue #162](https://github.com/planetarium/a2x/issues/162) — the design discussion that motivated this change.
+- Sample diffs: `samples/nextjs-x402` (always-paid), `samples/nextjs-x402-agent-driven` (LLM tool-use-driven).

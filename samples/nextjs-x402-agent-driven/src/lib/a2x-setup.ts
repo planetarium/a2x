@@ -7,7 +7,8 @@ import {
   InMemoryTaskStore,
   StreamingMode,
   X402_EXTENSION_URI,
-  x402PaymentHook,
+  resolveFacilitator,
+  type X402Facilitator,
 } from '@a2x/sdk';
 import { AnthropicProvider } from '@a2x/sdk/anthropic';
 
@@ -52,8 +53,37 @@ const provider = new AnthropicProvider({
   apiKey: resolveAnthropicApiKey(),
 });
 
+// Development escape hatch: when X402_MOCK_FACILITATOR=1 the sample skips
+// verify/settle entirely and returns a fake receipt. Useful for running
+// the sample without an actual funded Base Sepolia wallet.
+const mockFacilitator: X402Facilitator | undefined =
+  process.env.X402_MOCK_FACILITATOR === '1'
+    ? {
+        async verify() {
+          return { isValid: true, invalidReason: undefined } as Awaited<
+            ReturnType<X402Facilitator['verify']>
+          >;
+        },
+        async settle() {
+          return {
+            success: true,
+            transaction: '0xmocktx',
+            network: 'base-sepolia',
+            payer: '0xmock',
+          } as Awaited<ReturnType<X402Facilitator['settle']>>;
+        },
+      }
+    : undefined;
+
+const facilitator: X402Facilitator =
+  mockFacilitator ??
+  (process.env.X402_FACILITATOR_URL
+    ? resolveFacilitator({ url: process.env.X402_FACILITATOR_URL })
+    : resolveFacilitator());
+
 const agent = new TranslationAgent({
   provider,
+  facilitator,
   payment: {
     network: 'base-sepolia',
     asset: USDC_BASE_SEPOLIA,
@@ -67,42 +97,9 @@ const runner = new InMemoryRunner({
   appName: 'nextjs-x402-agent-driven',
 });
 
-// Development escape hatch: when X402_MOCK_FACILITATOR=1 the sample skips
-// verify/settle entirely and returns a fake receipt. Useful for running
-// the sample without an actual funded Base Sepolia wallet.
-const mockFacilitator =
-  process.env.X402_MOCK_FACILITATOR === '1'
-    ? {
-      async verify() {
-        return {
-          isValid: true,
-          invalidReason: undefined,
-          payer: '0xmock' as `0x${string}`,
-        };
-      },
-      async settle() {
-        return {
-          success: true,
-          transaction: '0xmocktx',
-          network: 'base-sepolia' as const,
-          payer: '0xmock' as `0x${string}`,
-        };
-      },
-    }
-    : undefined;
-
 const executor = new AgentExecutor({
   runner,
   runConfig: { streamingMode: StreamingMode.SSE },
-  inputRoundTripHooks: [
-    x402PaymentHook({
-      ...(mockFacilitator
-        ? { facilitator: mockFacilitator }
-        : process.env.X402_FACILITATOR_URL
-          ? { facilitator: { url: process.env.X402_FACILITATOR_URL } }
-          : {}),
-    }),
-  ],
 });
 
 export const a2xAgent = new A2XAgent({
@@ -117,7 +114,7 @@ export const a2xAgent = new A2XAgent({
     name: 'Chat & Translate',
     description:
       'General-purpose Claude chat. Free for any non-translation request; ' +
-      'when Claude decides to call the `translate` tool, the agent raises ' +
+      'when Claude decides to call a paid tool, the agent raises ' +
       'payment-required and runs the tool only after settlement.',
     tags: ['translate', 'x402', 'agent-driven', 'anthropic', 'demo'],
   })

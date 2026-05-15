@@ -14,7 +14,7 @@ A self-contained TypeScript SDK for building [A2A (Agent-to-Agent)](https://a2a-
 - **SSE streaming** — First-class `message/stream` support via Server-Sent Events.
 - **Multi-modal artifacts** — Agents can yield `text`, `file`, and `data` events; the default executor maps each into A2A `TextPart` / `FilePart` / `DataPart` artifacts.
 - **Built-in auth** — API Key, Bearer, OAuth 2.0 (Authorization Code, Client Credentials, Device Code), OpenID Connect, and Mutual TLS.
-- **x402 payments** — Charge per call via the [a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402) extension. Express payment gating inline in `agent.run()` with `x402RequestPayment()`; on-chain verify + settle handled by the registered `x402PaymentHook()`.
+- **x402 payments** — Charge per call via the [a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402) extension. Express payment gating inline in `agent.run()` with `x402RequestPayment()`; the agent calls `facilitator.verify()` and `facilitator.settle()` directly using the SDK's stateless helpers — no SDK-owned flow, full control over what runs between verify and settle.
 - **Zero runtime dependencies** — Core module uses only Node.js built-in APIs.
 - **TypeScript-first** — Full type safety with types derived from A2A JSON Schema.
 
@@ -317,17 +317,26 @@ Install the optional peers:
 npm install x402 viem
 ```
 
-Server (the agent expresses payment gating inline; the executor's hook handles verify + settle):
+Server (the agent owns the entire payment flow; the SDK ships stateless helpers):
 
 ```typescript
 import {
   AgentExecutor,
   BaseAgent,
   StreamingMode,
-  x402PaymentHook,
-  x402RequestPayment,
-  readX402Settlement,
   X402_EXTENSION_URI,
+  X402_ERROR_CODES,
+  X402_PAYMENT_STATUS,
+  buildX402PaymentCompletedMetadata,
+  buildX402PaymentFailedMetadata,
+  mapVerifyFailureToCode,
+  normalizeX402Accept,
+  parseX402PaymentSubmission,
+  pickX402Requirement,
+  resolveFacilitator,
+  validateX402PayloadShape,
+  x402RequestPayment,
+  type X402Facilitator,
 } from '@a2x/sdk';
 
 const ACCEPTS = [{
@@ -340,27 +349,76 @@ const ACCEPTS = [{
 }];
 
 class PaidAgent extends BaseAgent {
+  constructor(private readonly facilitator: X402Facilitator) {
+    super({ name: 'paid_agent' });
+  }
+
   async *run(context) {
-    if (!readX402Settlement(context).paid) {
+    const submission = parseX402PaymentSubmission(context.message!);
+    if (!submission) {
       yield* x402RequestPayment({ accepts: ACCEPTS });
       return;
     }
+
+    const requirements = ACCEPTS.map(normalizeX402Accept);
+    const requirement = pickX402Requirement(submission.payload!, requirements);
+    const issues = requirement
+      ? validateX402PayloadShape(submission.payload!, requirement)
+      : [{ code: X402_ERROR_CODES.NETWORK_MISMATCH, reason: 'no matching option' }];
+    if (issues.length > 0 || !requirement) {
+      const first = issues[0]!;
+      yield { type: 'error', error: new Error(first.reason),
+        metadata: buildX402PaymentFailedMetadata({ code: first.code, reason: first.reason }) };
+      return;
+    }
+
+    const verify = await this.facilitator.verify(submission.payload!, requirement);
+    if (!verify.isValid) {
+      yield { type: 'error', error: new Error(verify.invalidReason ?? 'verify failed'),
+        metadata: buildX402PaymentFailedMetadata({
+          code: mapVerifyFailureToCode(verify.invalidReason),
+          reason: verify.invalidReason ?? 'Verification failed.',
+        }) };
+      return;
+    }
+
+    // Insert any custom logic between verify and settle.
+
+    const settle = await this.facilitator.settle(submission.payload!, requirement);
+    if (!settle.success) {
+      yield { type: 'error', error: new Error(settle.errorReason ?? 'settle failed'),
+        metadata: buildX402PaymentFailedMetadata({
+          code: X402_ERROR_CODES.SETTLEMENT_FAILED,
+          reason: settle.errorReason ?? 'Settlement failed.',
+        }) };
+      return;
+    }
+
     yield { type: 'text', role: 'agent', text: 'thanks for paying' };
-    yield { type: 'done' };
+    yield {
+      type: 'done',
+      metadata: buildX402PaymentCompletedMetadata({
+        receipt: {
+          success: true,
+          transaction: settle.transaction ?? '',
+          network: submission.payload!.network,
+          payer: submission.authorization?.from ?? settle.payer ?? 'unknown',
+        },
+      }),
+    };
   }
 }
 
 const executor = new AgentExecutor({
   runner,
   runConfig: { streamingMode: StreamingMode.SSE },
-  inputRoundTripHooks: [x402PaymentHook()],
 });
 
 const agent = new A2XAgent({ taskStore, executor })
   .addExtension({ uri: X402_EXTENSION_URI, required: true });
 ```
 
-Client:
+Client (unchanged):
 
 ```typescript
 import { A2XClient } from '@a2x/sdk/client';
@@ -373,7 +431,7 @@ const task = await client.sendMessage({ message: { role: 'user', parts: [{ text:
 ```
 
 Full guide: [docs/guides/advanced/x402-payments.md](./docs/guides/advanced/x402-payments.md).
-Migration from `X402PaymentExecutor` (SDK 0.x): [docs/guides/advanced/migration-x402-v2.md](./docs/guides/advanced/migration-x402-v2.md).
+Migration from `x402PaymentHook` (SDK 0.13.x): [docs/guides/advanced/migration-x402-v2.md](./docs/guides/advanced/migration-x402-v2.md).
 
 ## AgentCard Versions
 
