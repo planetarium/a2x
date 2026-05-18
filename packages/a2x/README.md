@@ -317,27 +317,11 @@ Install the optional peers:
 npm install x402 viem
 ```
 
-Server (the agent owns the entire payment flow; the SDK ships stateless helpers):
+Server (the agent owns the flow; `X402Context` bundles the offering store + facilitator + event builders into one object):
 
 ```typescript
-import {
-  AgentExecutor,
-  BaseAgent,
-  StreamingMode,
-  X402_EXTENSION_URI,
-  X402_ERROR_CODES,
-  X402_PAYMENT_STATUS,
-  buildX402PaymentCompletedMetadata,
-  buildX402PaymentFailedMetadata,
-  mapVerifyFailureToCode,
-  normalizeX402Accept,
-  parseX402PaymentSubmission,
-  pickX402Requirement,
-  resolveFacilitator,
-  validateX402PayloadShape,
-  x402RequestPayment,
-  type X402Facilitator,
-} from '@a2x/sdk';
+import { AgentExecutor, BaseAgent, StreamingMode } from '@a2x/sdk';
+import { X402Context, X402_EXTENSION_URI } from '@a2x/sdk/x402';
 
 const ACCEPTS = [{
   network: 'base-sepolia',
@@ -349,66 +333,55 @@ const ACCEPTS = [{
 }];
 
 class PaidAgent extends BaseAgent {
-  constructor(private readonly facilitator: X402Facilitator) {
+  constructor(private readonly x402: X402Context) {
     super({ name: 'paid_agent' });
   }
 
-  async *run(context) {
-    const submission = parseX402PaymentSubmission(context.message!);
-    if (!submission) {
-      yield* x402RequestPayment({ accepts: ACCEPTS });
-      return;
+  async *run(ctx) {
+    const result = await this.x402.classify(ctx);
+
+    switch (result.kind) {
+      case 'no-submission':
+        yield* this.x402.requestPayment(ctx, { accepts: ACCEPTS, expiresInSeconds: 600 });
+        return;
+      case 'rejected':
+      case 'no-stored-offering':
+      case 'unmatched':
+      case 'invalid-shape':
+        yield this.x402.failedEvent({ code: result.code, reason: result.reason });
+        return;
+      case 'valid':
+        break;
     }
 
-    const requirements = ACCEPTS.map(normalizeX402Accept);
-    const requirement = pickX402Requirement(submission.payload!, requirements);
-    const issues = requirement
-      ? validateX402PayloadShape(submission.payload!, requirement)
-      : [{ code: X402_ERROR_CODES.NETWORK_MISMATCH, reason: 'no matching option' }];
-    if (issues.length > 0 || !requirement) {
-      const first = issues[0]!;
-      yield { type: 'error', error: new Error(first.reason),
-        metadata: buildX402PaymentFailedMetadata({ code: first.code, reason: first.reason }) };
-      return;
-    }
-
-    const verify = await this.facilitator.verify(submission.payload!, requirement);
+    const verify = await this.x402.verify(ctx, result);
     if (!verify.isValid) {
-      yield { type: 'error', error: new Error(verify.invalidReason ?? 'verify failed'),
-        metadata: buildX402PaymentFailedMetadata({
-          code: mapVerifyFailureToCode(verify.invalidReason),
-          reason: verify.invalidReason ?? 'Verification failed.',
-        }) };
+      yield this.x402.failedEvent({
+        code: 'VERIFY_FAILED',
+        reason: verify.invalidReason ?? 'Payment verification failed.',
+      });
       return;
     }
 
-    // Insert any custom logic between verify and settle.
+    // [insert any custom logic between verify and settle]
 
-    const settle = await this.facilitator.settle(submission.payload!, requirement);
-    if (!settle.success) {
-      yield { type: 'error', error: new Error(settle.errorReason ?? 'settle failed'),
-        metadata: buildX402PaymentFailedMetadata({
-          code: X402_ERROR_CODES.SETTLEMENT_FAILED,
-          reason: settle.errorReason ?? 'Settlement failed.',
-        }) };
+    const receipt = await this.x402.settle(ctx, result);
+    if (!receipt.success) {
+      yield this.x402.failedEvent({
+        code: 'SETTLEMENT_FAILED',
+        reason: receipt.errorReason ?? 'Settlement failed.',
+        failureReceipt: receipt,
+      });
       return;
     }
 
+    await this.x402.clearOffering(ctx);
     yield { type: 'text', role: 'agent', text: 'thanks for paying' };
-    yield {
-      type: 'done',
-      metadata: buildX402PaymentCompletedMetadata({
-        receipt: {
-          success: true,
-          transaction: settle.transaction ?? '',
-          network: submission.payload!.network,
-          payer: submission.authorization?.from ?? settle.payer ?? 'unknown',
-        },
-      }),
-    };
+    yield this.x402.completedEvent({ receipt });
   }
 }
 
+const x402 = new X402Context();
 const executor = new AgentExecutor({
   runner,
   runConfig: { streamingMode: StreamingMode.SSE },
@@ -417,6 +390,8 @@ const executor = new AgentExecutor({
 const agent = new A2XAgent({ taskStore, executor })
   .addExtension({ uri: X402_EXTENSION_URI, required: true });
 ```
+
+For deployments that need full bespoke control (multiple facilitators, custom store routing, inserting logic mid-validation), the lower-level stateless helpers `X402Context` is built on (`parseX402PaymentSubmission`, `pickX402Requirement`, `validateX402PayloadShape`, `buildX402Payment*Metadata`, …) remain exported.
 
 Client (unchanged):
 

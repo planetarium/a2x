@@ -156,7 +156,7 @@ export type {
   X402Network,
 } from './types.js';
 
-// Server-side surface: stateless helpers only.
+// Server-side surface: stateless helpers.
 export {
   buildX402PaymentRequiredMetadata,
   x402RequestPayment,
@@ -174,6 +174,30 @@ export type {
   X402EvmAuthorization,
   X402ValidationIssue,
 } from './payment.js';
+
+// Server-side surface: high-level façade over the helpers above.
+// `BaseX402Context` is the extension point for custom flows; `X402Context`
+// is the default concrete implementation most callers instantiate.
+export { BaseX402Context, X402Context } from './context.js';
+export type {
+  X402ContextOptions,
+  X402ContextRequestPaymentInput,
+  X402Classification,
+  X402ValidClassification,
+} from './context.js';
+
+// Server-side surface: lifecycle store. `BaseX402Store` is the abstract
+// contract for custom backends; `InMemoryX402Store` is the default
+// concrete impl suitable for single-instance deployments.
+export { BaseX402Store, InMemoryX402Store } from './store.js';
+export type {
+  X402StoreEntry,
+  X402StoreEntryPatch,
+  X402EntryStatus,
+  X402EntryReceipt,
+  X402EntryFailure,
+  InMemoryX402StoreOptions,
+} from './store.js';
 
 export {
   resolveFacilitator,

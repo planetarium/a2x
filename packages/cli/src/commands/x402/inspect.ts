@@ -5,7 +5,7 @@ import type { SendMessageParams } from '@a2x/sdk';
 import {
   getX402PaymentRequirements,
   X402_EXTENSION_URI,
-} from '@a2x/sdk';
+} from '@a2x/sdk/x402';
 import { createClient, printConnectionError } from '../../format.js';
 
 export const x402InspectCommand = new Command('inspect')

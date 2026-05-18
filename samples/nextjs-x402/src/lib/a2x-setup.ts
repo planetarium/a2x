@@ -7,21 +7,17 @@ import {
   InMemoryRunner,
   InMemoryTaskStore,
   StreamingMode,
-  X402_EXTENSION_URI,
-  buildX402PaymentCompletedMetadata,
-  buildX402PaymentFailedMetadata,
-  mapVerifyFailureToCode,
-  normalizeX402Accept,
-  parseX402PaymentSubmission,
-  pickX402Requirement,
-  validateX402PayloadShape,
-  x402RequestPayment,
-  X402_ERROR_CODES,
   type AgentEvent,
-  type X402Facilitator,
-  type X402SettleResponse,
+  type InvocationContext,
 } from '@a2x/sdk';
-import type { InvocationContext, X402Accept } from '@a2x/sdk';
+
+import {
+  X402Context,
+  InMemoryX402Store,
+  X402_EXTENSION_URI,
+  type X402Accept,
+  type X402Facilitator
+} from '@a2x/sdk/x402';
 
 const MISSING_ADDRESS_PLACEHOLDER = '0x0000000000000000000000000000000000000000';
 
@@ -78,150 +74,80 @@ const mockFacilitator: X402Facilitator | undefined =
       }
     : undefined;
 
-async function loadFacilitator(): Promise<X402Facilitator> {
-  if (mockFacilitator) return mockFacilitator;
-  const { resolveFacilitator } = await import('@a2x/sdk');
-  if (process.env.X402_FACILITATOR_URL) {
-    return resolveFacilitator({ url: process.env.X402_FACILITATOR_URL });
-  }
-  return resolveFacilitator();
-}
-
-/**
- * The agent owns the entire payment flow. On the first turn it advertises
- * the accepted payment options. On the resume turn it parses the signed
- * submission, validates it against the originally-advertised offerings,
- * calls `facilitator.verify` and `facilitator.settle` directly, and
- * decides what to do with each outcome — no SDK round-trip mechanics.
- */
 class EchoAgent extends BaseAgent {
-  constructor(private readonly facilitator: X402Facilitator) {
+  private x402: X402Context;
+
+  constructor() {
     super({
       name: 'echo_agent',
       description: 'Echoes the most recent user message back to the caller.',
     });
+
+    this.x402 = new X402Context({
+    ...(mockFacilitator
+      ? { facilitator: mockFacilitator }
+      : process.env.X402_FACILITATOR_URL
+        ? { facilitator: { url: process.env.X402_FACILITATOR_URL } }
+        : {}),
+      store: new InMemoryX402Store(),
+  });
   }
 
-  async *run(context: InvocationContext): AsyncGenerator<AgentEvent> {
-    if (!context.message) {
-      yield { type: 'error', error: new Error('No incoming message on context.') };
-      return;
+  async *run(ctx: InvocationContext): AsyncGenerator<AgentEvent> {
+    const result = await this.x402.classify(ctx);
+
+    switch (result.kind) {
+      case 'no-submission':
+        // Turn 1 — advertise the bill, store the offering for the
+        // resume turn (10-minute TTL so abandoned tasks free themselves).
+        yield* this.x402.requestPayment(ctx, {
+          accepts: ACCEPTS,
+          expiresInSeconds: 600,
+        });
+        return;
+      case 'rejected':
+      case 'no-stored-offering':
+      case 'unmatched':
+      case 'invalid-shape':
+        // Any non-valid classification — surface the failure and stop.
+        yield this.x402.failedEvent({ code: result.code, reason: result.reason });
+        return;
+      case 'valid':
+        break;
     }
 
-    const submission = parseX402PaymentSubmission(context.message);
-
-    // Turn 1 — no payment submitted yet.
-    if (!submission) {
-      yield* x402RequestPayment({ accepts: ACCEPTS });
-      return;
-    }
-
-    // Client rejected payment. Terminate the task as failed.
-    if (submission.status !== 'payment-submitted') {
-      yield {
-        type: 'error',
-        error: new Error('Client declined to pay.'),
-        metadata: buildX402PaymentFailedMetadata({
-          code: X402_ERROR_CODES.INVALID_PAYLOAD,
-          reason: 'Client declined to pay.',
-        }),
-      };
-      return;
-    }
-
-    if (!submission.payload) {
-      yield {
-        type: 'error',
-        error: new Error('Payment payload missing.'),
-        metadata: buildX402PaymentFailedMetadata({
-          code: X402_ERROR_CODES.INVALID_PAYLOAD,
-          reason: 'Payment payload missing.',
-        }),
-      };
-      return;
-    }
-
-    // For this single-merchant sample the offered requirements are a
-    // constant. A real merchant would look them up from a durable store
-    // keyed by `context.taskId` so each task validates against what it
-    // actually offered.
-    const requirements = ACCEPTS.map(normalizeX402Accept);
-    const requirement = pickX402Requirement(submission.payload, requirements);
-    if (!requirement) {
-      yield {
-        type: 'error',
-        error: new Error('No matching requirement for submitted payment.'),
-        metadata: buildX402PaymentFailedMetadata({
-          code: X402_ERROR_CODES.NETWORK_MISMATCH,
-          reason: 'Submitted network/scheme does not match any offered option.',
-        }),
-      };
-      return;
-    }
-
-    const issues = validateX402PayloadShape(submission.payload, requirement);
-    if (issues.length > 0) {
-      const first = issues[0]!;
-      yield {
-        type: 'error',
-        error: new Error(first.reason),
-        metadata: buildX402PaymentFailedMetadata({
-          code: first.code,
-          reason: first.reason,
-        }),
-      };
-      return;
-    }
-
-    const verify = await this.facilitator.verify(submission.payload, requirement);
+    const verify = await this.x402.verify(ctx, result);
     if (!verify.isValid) {
-      yield {
-        type: 'error',
-        error: new Error(verify.invalidReason ?? 'Payment verification failed.'),
-        metadata: buildX402PaymentFailedMetadata({
-          code: mapVerifyFailureToCode(verify.invalidReason),
-          reason: verify.invalidReason ?? 'Payment verification failed.',
-        }),
-      };
+      yield this.x402.failedEvent({
+        code: 'VERIFY_FAILED',
+        reason: verify.invalidReason ?? 'Payment verification failed.',
+      });
       return;
     }
 
-    const settle = await this.facilitator.settle(submission.payload, requirement);
-    if (!settle.success) {
-      yield {
-        type: 'error',
-        error: new Error(settle.errorReason ?? 'Payment settlement failed.'),
-        metadata: buildX402PaymentFailedMetadata({
-          code: X402_ERROR_CODES.SETTLEMENT_FAILED,
-          reason: settle.errorReason ?? 'Payment settlement failed.',
-        }),
-      };
+    const receipt = await this.x402.settle(ctx, result);
+    if (!receipt.success) {
+      yield this.x402.failedEvent({
+        code: 'SETTLEMENT_FAILED',
+        reason: receipt.errorReason ?? 'Payment settlement failed.',
+        failureReceipt: receipt,
+      });
       return;
     }
 
     // Echo the user's text from the incoming message.
-    const text = context.message.parts
+    const text = (ctx.message?.parts ?? [])
       .map((p) => ('text' in p ? p.text : ''))
       .join('');
     const utterance = text.length > 0 ? text : '(empty message)';
 
-    const receipt: X402SettleResponse = {
-      success: true,
-      transaction: settle.transaction ?? '',
-      network: submission.payload.network,
-      payer: submission.authorization?.from ?? settle.payer ?? 'unknown',
-    };
-
+    await this.x402.clearOffering(ctx);
     yield { type: 'text', role: 'agent', text: `You said: ${utterance}` };
-    yield {
-      type: 'done',
-      metadata: buildX402PaymentCompletedMetadata({ receipt }),
-    };
+    yield this.x402.completedEvent({ receipt });
   }
 }
 
-const facilitator = await loadFacilitator();
-const agent = new EchoAgent(facilitator);
+const agent = new EchoAgent();
 const runner = new InMemoryRunner({ agent, appName: 'nextjs-x402' });
 
 const executor = new AgentExecutor({

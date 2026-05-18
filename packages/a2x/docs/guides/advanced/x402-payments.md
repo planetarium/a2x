@@ -16,7 +16,13 @@ pnpm add @a2x/sdk x402 viem
 
 ## Server
 
-The agent owns the full payment flow. Each helper is one step you can compose, intercept, and customize freely.
+The agent owns the full payment flow. The recommended way to write x402 agents is to instantiate an `X402Context` once, pass it into the agent, and dispatch on `classify(ctx)` inside `run()`. The context bundles three pieces every x402 agent needs together:
+
+- an **offering store** that remembers what was advertised for each `taskId` (so the resume turn validates against the right requirement),
+- a **facilitator** that runs on-chain verify + settle,
+- **event builders** that produce the right wire metadata for each terminal state.
+
+No method bundles `verify` + `settle` — they stay separate so the agent can do anything between them (audit logs, fraud checks, reward pre-allocation, …).
 
 ```ts
 import {
@@ -26,19 +32,12 @@ import {
   StreamingMode,
   InMemoryRunner,
   InMemoryTaskStore,
+} from '@a2x/sdk';
+import {
+  X402Context,
   X402_EXTENSION_URI,
   X402_ERROR_CODES,
-  X402_PAYMENT_STATUS,
-  buildX402PaymentCompletedMetadata,
-  buildX402PaymentFailedMetadata,
-  mapVerifyFailureToCode,
-  normalizeX402Accept,
-  parseX402PaymentSubmission,
-  pickX402Requirement,
-  resolveFacilitator,
-  validateX402PayloadShape,
-  x402RequestPayment,
-} from '@a2x/sdk';
+} from '@a2x/sdk/x402';
 
 const ACCEPTS = [{
   network: 'base-sepolia',
@@ -50,107 +49,68 @@ const ACCEPTS = [{
 }];
 
 class PaidAgent extends BaseAgent {
-  constructor(private readonly facilitator = resolveFacilitator()) {
+// One context per process is enough — pass it into every agent that
+// needs x402 support. Defaults to an in-memory offering store and the
+// Coinbase-hosted facilitator at https://x402.org/facilitator.
+const x402 = new X402Context();
+
+class PaidAgent extends BaseAgent {
+  constructor(private readonly x402: X402Context) {
     super({ name: 'paid_agent', description: 'Charges per call.' });
   }
 
-  async *run(context) {
-    const submission = parseX402PaymentSubmission(context.message!);
+  async *run(ctx) {
+    const result = await this.x402.classify(ctx);
 
-    // Turn 1 — no submission yet, advertise the bill.
-    if (!submission) {
-      yield* x402RequestPayment({ accepts: ACCEPTS });
-      return;
-    }
-
-    // Client declined.
-    if (submission.status !== X402_PAYMENT_STATUS.SUBMITTED || !submission.payload) {
-      yield {
-        type: 'error',
-        error: new Error('Payment was not submitted.'),
-        metadata: buildX402PaymentFailedMetadata({
-          code: X402_ERROR_CODES.INVALID_PAYLOAD,
-          reason: 'Payment was not submitted.',
-        }),
-      };
-      return;
-    }
-
-    // Match the submitted payment against what we offered. A real merchant
-    // looks the offering up by context.taskId from its own store; here we
-    // re-derive it because the offering is constant.
-    const requirements = ACCEPTS.map(normalizeX402Accept);
-    const requirement = pickX402Requirement(submission.payload, requirements);
-    if (!requirement) {
-      yield {
-        type: 'error',
-        error: new Error('No matching requirement.'),
-        metadata: buildX402PaymentFailedMetadata({
-          code: X402_ERROR_CODES.NETWORK_MISMATCH,
-          reason: 'Submitted network/scheme is not one of the offered options.',
-        }),
-      };
-      return;
-    }
-
-    // Local shape validation. Returns an array of issues — the agent
-    // decides which to treat as fatal.
-    const issues = validateX402PayloadShape(submission.payload, requirement);
-    if (issues.length > 0) {
-      const first = issues[0]!;
-      yield {
-        type: 'error',
-        error: new Error(first.reason),
-        metadata: buildX402PaymentFailedMetadata({ code: first.code, reason: first.reason }),
-      };
-      return;
+    switch (result.kind) {
+      case 'no-submission':
+        // Turn 1 — store the offering, yield request-input. 10-minute TTL.
+        yield* this.x402.requestPayment(ctx, {
+          accepts: ACCEPTS,
+          expiresInSeconds: 600,
+        });
+        return;
+      case 'rejected':
+      case 'no-stored-offering':
+      case 'unmatched':
+      case 'invalid-shape':
+        yield this.x402.failedEvent({ code: result.code, reason: result.reason });
+        return;
+      case 'valid':
+        break;
     }
 
     // verify → custom logic → settle → custom logic. Each step is exposed
     // independently so you can record audit logs, run fraud checks, or
     // pre-allocate downstream resources between them.
-    const verify = await this.facilitator.verify(submission.payload, requirement);
+    const verify = await this.x402.verify(ctx, result);
     if (!verify.isValid) {
-      yield {
-        type: 'error',
-        error: new Error(verify.invalidReason ?? 'verify failed'),
-        metadata: buildX402PaymentFailedMetadata({
-          code: mapVerifyFailureToCode(verify.invalidReason),
-          reason: verify.invalidReason ?? 'Payment verification failed.',
-        }),
-      };
+      yield this.x402.failedEvent({
+        code: 'VERIFY_FAILED',
+        reason: verify.invalidReason ?? 'Payment verification failed.',
+      });
       return;
     }
 
-    const settle = await this.facilitator.settle(submission.payload, requirement);
-    if (!settle.success) {
-      yield {
-        type: 'error',
-        error: new Error(settle.errorReason ?? 'settle failed'),
-        metadata: buildX402PaymentFailedMetadata({
-          code: X402_ERROR_CODES.SETTLEMENT_FAILED,
-          reason: settle.errorReason ?? 'Payment settlement failed.',
-        }),
-      };
+    // [insert any custom logic between verify and settle]
+
+    const receipt = await this.x402.settle(ctx, result);
+    if (!receipt.success) {
+      yield this.x402.failedEvent({
+        code: 'SETTLEMENT_FAILED',
+        reason: receipt.errorReason ?? 'Payment settlement failed.',
+        failureReceipt: receipt,
+      });
       return;
     }
 
+    await this.x402.clearOffering(ctx);
     yield { type: 'text', role: 'agent', text: 'thanks for paying' };
-    yield {
-      type: 'done',
-      metadata: buildX402PaymentCompletedMetadata({
-        receipt: {
-          success: true,
-          transaction: settle.transaction ?? '',
-          network: submission.payload.network,
-          payer: submission.authorization?.from ?? settle.payer ?? 'unknown',
-        },
-      }),
-    };
+    yield this.x402.completedEvent({ receipt });
   }
 }
 
-const runner = new InMemoryRunner({ agent: new PaidAgent(), appName: 'paid-agent' });
+const runner = new InMemoryRunner({ agent: new PaidAgent(x402), appName: 'paid-agent' });
 const executor = new AgentExecutor({
   runner,
   runConfig: { streamingMode: StreamingMode.SSE },
@@ -162,23 +122,163 @@ const agent = new A2XAgent({ taskStore: new InMemoryTaskStore(), executor })
   .addExtension({ uri: X402_EXTENSION_URI, required: true });
 ```
 
-### Helper inventory
+### `X402Context` API
+
+| Member | What it does |
+|---|---|
+| `new X402Context({ store?, facilitator? })` | Construct once. `store` defaults to `new InMemoryX402Store()`. `facilitator` accepts a `FacilitatorUrlConfig`, a custom `X402Facilitator` impl, or `undefined` (defaults to `https://x402.org/facilitator`). |
+| `x402.requestPayment(ctx, { accepts, description?, previousError?, expiresInSeconds? })` | Async generator. Persists the offering keyed by `ctx.taskId` (with optional TTL) and yields the `request-input` event. |
+| `x402.classify(ctx)` | Returns a tagged union: `'no-submission'`, `'rejected'`, `'no-stored-offering'`, `'unmatched'`, `'invalid-shape'`, or `'valid'`. Switch on `kind` to decide what to do. |
+| `x402.verify(ctx, classified)` | Calls `facilitator.verify(...)`. Records `status: 'verified'` on success, or `status: 'failed'` with `failure.point: 'verify'` on failure. |
+| `x402.settle(ctx, classified)` | Calls `facilitator.settle(...)` and returns a wire-conformant `X402SettleResponse`. Records `status: 'completed'` + the trimmed receipt on success, or `status: 'failed'` with `failure.point: 'settle'` on failure. |
+| `x402.failedEvent({ code, reason, failureReceipt?, priorReceipts? })` | Builds an `error` `AgentEvent` with `payment-failed` metadata attached. Does NOT touch the store (already recorded by `classify` / `verify` / `settle`). |
+| `x402.completedEvent({ receipt, priorReceipts? })` | Builds a `done` `AgentEvent` with `payment-completed` metadata attached. |
+| `x402.clearOffering(ctx)` | Remove the lifecycle record after a task terminates. Best-effort; no-op if absent. |
+| `x402.store`, `x402.facilitator` | Direct access for advanced callers (e.g. inspect the raw verify response, or read back the recorded entry). |
+
+### Lifecycle status tracking
+
+Every method above updates `X402StoreEntry.status` automatically as the round-trip progresses. The agent never has to call `store.update` directly. The state machine:
+
+```
+requestPayment  →  offered
+classify        →  (no change on 'valid', records 'failed' / 'rejected' otherwise)
+verify          →  verified  (on success)
+                →  failed + failure.point='verify'  (on isValid=false)
+settle          →  completed + receipt  (on success)
+                →  failed + failure.point='settle'  (on success=false)
+```
+
+The entry retains:
+
+- `accepts` — what was offered on turn 1 (immutable)
+- `status` — current lifecycle stage
+- `storedAt` / `updatedAt` — timestamps
+- `expiresAt` — TTL (if set on `requestPayment`)
+- `verifiedAt` — populated once `status` reaches `verified`
+- `receipt` — populated once `status === 'completed'`. Trimmed to `{ transaction, network, payer, settledAt }`
+- `failure` — populated once `status === 'failed'` or `'rejected'`. Contains `{ point, code, reason, failedAt }`
+
+`failure.point` identifies where the round-trip broke:
+
+| `point` value | When |
+|---|---|
+| `'classify'` | Submission was invalid before facilitator was called (no offering / unmatched / shape error) |
+| `'verify'` | `facilitator.verify` returned `isValid: false` |
+| `'settle'` | `facilitator.settle` returned `success: false` |
+| `'rejected-by-client'` | Client sent `x402.payment.status: payment-rejected` |
+
+Read the entry back any time for audit / reconciliation:
+
+```ts
+const entry = await x402.store.get(taskId);
+if (entry?.status === 'completed') {
+  console.log('tx:', entry.receipt!.transaction, 'payer:', entry.receipt!.payer);
+} else if (entry?.status === 'failed') {
+  console.log('failed at', entry.failure!.point, '-', entry.failure!.reason);
+}
+```
+
+### Pluggable offering store
+
+`InMemoryX402Store` is fine for single-instance deployments. It is **not** suitable for:
+
+- **horizontally scaled deployments** — each instance has its own memory, so the resume turn may hit a different instance with no offering record;
+- **deployments that need offerings to survive process restarts**.
+
+For either case, subclass `BaseX402Store` with a shared external backend (Redis / Postgres / Durable Object / …):
+
+```ts
+import { BaseX402Store, type X402StoreEntry, type X402StoreEntryPatch } from '@a2x/sdk/x402';
+
+class RedisX402Store extends BaseX402Store {
+  constructor(private readonly redis: Redis) { super(); }
+
+  async put(entry: X402StoreEntry): Promise<void> {
+    const ttl = entry.expiresAt
+      ? Math.max(1, Math.ceil((entry.expiresAt.getTime() - Date.now()) / 1000))
+      : undefined;
+    await this.redis.set(
+      `x402:${entry.taskId}`,
+      JSON.stringify(entry),
+      ttl ? { EX: ttl } : {},
+    );
+  }
+
+  async get(taskId: string): Promise<X402StoreEntry | undefined> {
+    const raw = await this.redis.get(`x402:${taskId}`);
+    if (!raw) return undefined;
+    // (in your impl: rehydrate Date fields from ISO strings)
+    return JSON.parse(raw) as X402StoreEntry;
+  }
+
+  async update(taskId: string, patch: X402StoreEntryPatch): Promise<void> {
+    const cur = await this.get(taskId);
+    if (!cur) return;
+    await this.put({ ...cur, ...patch, updatedAt: new Date() });
+  }
+
+  async delete(taskId: string): Promise<void> {
+    await this.redis.del(`x402:${taskId}`);
+  }
+}
+
+const x402 = new X402Context({ store: new RedisX402Store(redis) });
+```
+
+Lazy expiry contract: `get(taskId)` MUST return `undefined` after `entry.expiresAt`. Backends with native TTL (Redis `EXPIRE`, Postgres `WHERE expires_at > now()`) satisfy this trivially; in-memory or file-backed stores must check on read. No background reaper required — works in serverless deployments.
+
+`InMemoryX402Store` also accepts `{ maxEntries }` for LRU eviction when the cap is reached.
+
+### Subclassing `BaseX402Context`
+
+Most callers instantiate `X402Context` and pass it around. When you need to override a step — wrap `verify` / `settle` with telemetry, customize `classify` validation, change the event-builder metadata shape — subclass `BaseX402Context` directly:
+
+```ts
+import { BaseX402Context, BaseX402Store, InMemoryX402Store, resolveFacilitator } from '@a2x/sdk/x402';
+
+class TelemetryContext extends BaseX402Context {
+  readonly store: BaseX402Store = new InMemoryX402Store();
+  readonly facilitator = resolveFacilitator();
+
+  async verify(payload, requirement) {
+    const start = Date.now();
+    try {
+      return await super.verify(payload, requirement);
+    } finally {
+      metrics.histogram('x402.verify.duration_ms', Date.now() - start);
+    }
+  }
+
+  async settle(submission, requirement) {
+    const receipt = await super.settle(submission, requirement);
+    auditLog.write({ kind: 'x402.settle', taskId: submission.payload?.network, receipt });
+    return receipt;
+  }
+}
+```
+
+`BaseX402Context` provides concrete implementations for every method, so subclasses only override what they need. `X402Context` is itself a minimal subclass that fills in `store` + `facilitator` defaults; you can model your subclass the same way.
+
+### Advanced: stateless helpers without `X402Context`
+
+The low-level helpers `X402Context` is built on remain exported. Reach for them when you want full bespoke control — multiple facilitators, per-request store routing, or a hot-path that bypasses the context's payer-fallback in `settle`:
 
 | Helper | One step it does |
 |---|---|
-| `x402RequestPayment({ accepts, description?, previousError? })` | Generator that yields the `request-input` event with `payment-required` metadata. |
-| `buildX402PaymentRequiredMetadata(input)` | Same metadata, returned as a plain object (use when you want to compose your own event). |
+| `x402RequestPayment(input)` | Generator that yields the `request-input` event. Does NOT store anything. |
+| `buildX402PaymentRequiredMetadata(input)` | Same metadata, returned as a plain object. |
 | `parseX402PaymentSubmission(message)` | Read the x402 status / payload / authorization fields off an incoming message. |
 | `pickX402Requirement(payload, requirements)` | Find the requirement matching the submitted payload's network + scheme. |
-| `validateX402PayloadShape(payload, requirement)` | Local checks: payTo match, amount cap, EVM-only support. Returns an array of issues; empty = OK. |
-| `normalizeX402Accept(accept)` | Convert your offering shape to the spec's `X402PaymentRequirements` (applies default scheme, mimeType, timeout, extra). |
-| `mapVerifyFailureToCode(reason)` | Translate a facilitator's free-form `invalidReason` to a spec §9.1 error code. |
-| `resolveFacilitator(config?)` | Build the `{ verify, settle }` adapter from a URL or pass-through custom object. |
-| `buildX402PaymentCompletedMetadata({ receipt, priorReceipts? })` | Final-message metadata for a successful payment. Pair with `{ type: 'done', metadata: ... }`. |
-| `buildX402PaymentFailedMetadata({ code, reason, failureReceipt?, priorReceipts? })` | Final-message metadata for a failed payment. Pair with `{ type: 'error', error, metadata: ... }`. |
+| `validateX402PayloadShape(payload, requirement)` | Local checks; returns an array of issues. |
+| `normalizeX402Accept(accept)` | Convert your offering shape to the spec's `X402PaymentRequirements`. |
+| `mapVerifyFailureToCode(reason)` | Translate a facilitator's `invalidReason` to a spec §9.1 error code. |
+| `resolveFacilitator(config?)` | Build the `{ verify, settle }` adapter from a URL or custom object. |
+| `buildX402PaymentCompletedMetadata({ receipt, priorReceipts? })` | Final-message metadata for a successful payment. |
+| `buildX402PaymentFailedMetadata({ code, reason, failureReceipt?, priorReceipts? })` | Final-message metadata for a failed payment. |
 | `buildX402PaymentVerifiedMetadata()` | Intermediate `payment-verified` metadata for streaming (spec §7.1). |
 
-The agent calls `facilitator.verify()` and `facilitator.settle()` directly — the SDK never bundles them. Insert any logic you need between the two.
+No helper bundles `verify` + `settle`. Call `facilitator.verify(...)` and `facilitator.settle(...)` directly, with any custom logic in between.
 
 ### Multiple payment options
 

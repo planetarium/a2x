@@ -6,10 +6,12 @@ import {
   InMemoryRunner,
   InMemoryTaskStore,
   StreamingMode,
-  X402_EXTENSION_URI,
-  resolveFacilitator,
-  type X402Facilitator,
 } from '@a2x/sdk';
+import {
+  X402Context,
+  X402_EXTENSION_URI,
+  type X402Facilitator,
+} from '@a2x/sdk/x402';
 import { AnthropicProvider } from '@a2x/sdk/anthropic';
 
 import { TranslationAgent } from './translation-agent';
@@ -75,15 +77,17 @@ const mockFacilitator: X402Facilitator | undefined =
       }
     : undefined;
 
-const facilitator: X402Facilitator =
-  mockFacilitator ??
-  (process.env.X402_FACILITATOR_URL
-    ? resolveFacilitator({ url: process.env.X402_FACILITATOR_URL })
-    : resolveFacilitator());
+const x402 = new X402Context({
+  ...(mockFacilitator
+    ? { facilitator: mockFacilitator }
+    : process.env.X402_FACILITATOR_URL
+      ? { facilitator: { url: process.env.X402_FACILITATOR_URL } }
+      : {}),
+});
 
 const agent = new TranslationAgent({
   provider,
-  facilitator,
+  x402,
   payment: {
     network: 'base-sepolia',
     asset: USDC_BASE_SEPOLIA,

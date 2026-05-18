@@ -19,10 +19,11 @@ The new design removes the flow entirely. The SDK ships **stateless helpers** th
 | Item | 0.13.x | Next |
 |---|---|---|
 | Removed | `x402PaymentHook`, `readX402Settlement`, `X402_DOMAIN`, `InputRoundTripRecord`, `InputRoundTripHook`, `InputRoundTripOutcome`, `InputRoundTripContext`, `INPUT_ROUNDTRIP_METADATA_KEY`, `inputRoundTripHooks` (`AgentExecutorOptions`) | — |
-| Added | — | `parseX402PaymentSubmission`, `pickX402Requirement`, `validateX402PayloadShape`, `normalizeX402Accept`, `buildX402PaymentRequiredMetadata`, `buildX402PaymentCompletedMetadata`, `buildX402PaymentFailedMetadata`, `buildX402PaymentVerifiedMetadata`; `metadata?` on `done` / `error` AgentEvents; `message` on `InvocationContext` |
+| Added (recommended façade) | — | `X402Context`, `X402Store`, `InMemoryX402Store`, `X402Classification` |
+| Added (low-level helpers) | — | `parseX402PaymentSubmission`, `pickX402Requirement`, `validateX402PayloadShape`, `normalizeX402Accept`, `buildX402PaymentRequiredMetadata`, `buildX402PaymentCompletedMetadata`, `buildX402PaymentFailedMetadata`, `buildX402PaymentVerifiedMetadata`; `metadata?` on `done` / `error` AgentEvents; `message` on `InvocationContext` |
 | Changed | `request-input` event had `domain` + `payload` fields | `request-input` event has only `metadata` + optional `message` |
-| Where verify+settle runs | Inside `x402PaymentHook.handleResume` | Inside `agent.run()` — `facilitator.verify()` and `facilitator.settle()` called directly |
-| Where "what was offered" is stored | Inside the task's metadata as `_a2x.inputRoundTrip.payload` | The merchant's own durable store (or constants), keyed by `context.taskId` |
+| Where verify+settle runs | Inside `x402PaymentHook.handleResume` | Inside `agent.run()` — `x402.verify(...)` and `x402.settle(...)` (or `facilitator.verify/settle` for the low-level path) |
+| Where "what was offered" is stored | Inside the task's metadata as `_a2x.inputRoundTrip.payload` (wire-visible) | In an `X402Store` (in-memory by default, pluggable) keyed by `context.taskId` — never on the wire |
 | Wire metadata keys, status values, error codes | unchanged | unchanged |
 
 ## Step-by-step
@@ -55,136 +56,91 @@ const executor = new AgentExecutor({
 });
 ```
 
-**After:**
+**After (recommended — uses `X402Context`):**
 
 ```ts
-import {
-  AgentExecutor, BaseAgent, X402_EXTENSION_URI, X402_ERROR_CODES, X402_PAYMENT_STATUS,
-  buildX402PaymentCompletedMetadata, buildX402PaymentFailedMetadata,
-  mapVerifyFailureToCode, normalizeX402Accept, parseX402PaymentSubmission,
-  pickX402Requirement, resolveFacilitator, validateX402PayloadShape, x402RequestPayment,
-  type X402Facilitator,
-} from '@a2x/sdk';
+import { AgentExecutor, BaseAgent } from '@a2x/sdk';
+import { X402Context, X402_EXTENSION_URI } from '@a2x/sdk/x402';
 
 class EchoAgent extends BaseAgent {
-  constructor(private readonly facilitator: X402Facilitator) {
+  constructor(private readonly x402: X402Context) {
     super({ name: 'echo' });
   }
 
-  async *run(context) {
-    const submission = parseX402PaymentSubmission(context.message!);
+  async *run(ctx) {
+    const result = await this.x402.classify(ctx);
 
-    // Turn 1
-    if (!submission) {
-      yield* x402RequestPayment({ accepts: ACCEPTS });
-      return;
+    switch (result.kind) {
+      case 'no-submission':
+        yield* this.x402.requestPayment(ctx, {
+          accepts: ACCEPTS,
+          expiresInSeconds: 600,
+        });
+        return;
+      case 'rejected':
+      case 'no-stored-offering':
+      case 'unmatched':
+      case 'invalid-shape':
+        yield this.x402.failedEvent({ code: result.code, reason: result.reason });
+        return;
+      case 'valid':
+        break;
     }
 
-    // Client declined
-    if (submission.status !== X402_PAYMENT_STATUS.SUBMITTED || !submission.payload) {
-      yield {
-        type: 'error',
-        error: new Error('Payment not submitted.'),
-        metadata: buildX402PaymentFailedMetadata({
-          code: X402_ERROR_CODES.INVALID_PAYLOAD, reason: 'Payment not submitted.',
-        }),
-      };
-      return;
-    }
-
-    // Match + validate locally
-    const requirements = ACCEPTS.map(normalizeX402Accept);
-    const requirement = pickX402Requirement(submission.payload, requirements);
-    if (!requirement) {
-      yield {
-        type: 'error',
-        error: new Error('No matching requirement.'),
-        metadata: buildX402PaymentFailedMetadata({
-          code: X402_ERROR_CODES.NETWORK_MISMATCH, reason: 'Submitted option not offered.',
-        }),
-      };
-      return;
-    }
-    const issues = validateX402PayloadShape(submission.payload, requirement);
-    if (issues.length > 0) {
-      const first = issues[0]!;
-      yield {
-        type: 'error',
-        error: new Error(first.reason),
-        metadata: buildX402PaymentFailedMetadata({ code: first.code, reason: first.reason }),
-      };
-      return;
-    }
-
-    // Verify
-    const verify = await this.facilitator.verify(submission.payload, requirement);
+    const verify = await this.x402.verify(ctx, result);
     if (!verify.isValid) {
-      yield {
-        type: 'error',
-        error: new Error(verify.invalidReason ?? 'verify failed'),
-        metadata: buildX402PaymentFailedMetadata({
-          code: mapVerifyFailureToCode(verify.invalidReason),
-          reason: verify.invalidReason ?? 'Verification failed.',
-        }),
-      };
+      yield this.x402.failedEvent({
+        code: 'VERIFY_FAILED',
+        reason: verify.invalidReason ?? 'Payment verification failed.',
+      });
       return;
     }
 
     // [insert any custom logic between verify and settle]
 
-    // Settle
-    const settle = await this.facilitator.settle(submission.payload, requirement);
-    if (!settle.success) {
-      yield {
-        type: 'error',
-        error: new Error(settle.errorReason ?? 'settle failed'),
-        metadata: buildX402PaymentFailedMetadata({
-          code: X402_ERROR_CODES.SETTLEMENT_FAILED,
-          reason: settle.errorReason ?? 'Settlement failed.',
-        }),
-      };
+    const receipt = await this.x402.settle(ctx, result);
+    if (!receipt.success) {
+      yield this.x402.failedEvent({
+        code: 'SETTLEMENT_FAILED',
+        reason: receipt.errorReason ?? 'Payment settlement failed.',
+        failureReceipt: receipt,
+      });
       return;
     }
 
+    await this.x402.clearOffering(ctx);
     yield { type: 'text', role: 'agent', text: 'pong' };
-    yield {
-      type: 'done',
-      metadata: buildX402PaymentCompletedMetadata({
-        receipt: {
-          success: true,
-          transaction: settle.transaction ?? '',
-          network: submission.payload.network,
-          payer: submission.authorization?.from ?? settle.payer ?? 'unknown',
-        },
-      }),
-    };
+    yield this.x402.completedEvent({ receipt });
   }
 }
 
-const facilitator = process.env.X402_FACILITATOR_URL
-  ? resolveFacilitator({ url: process.env.X402_FACILITATOR_URL })
-  : resolveFacilitator();
+const x402 = new X402Context({
+  facilitator: process.env.X402_FACILITATOR_URL
+    ? { url: process.env.X402_FACILITATOR_URL }
+    : undefined,
+});
 
 const executor = new AgentExecutor({
   runner,
   runConfig: { streamingMode: StreamingMode.SSE },
-  // No inputRoundTripHooks. The agent owns the flow.
+  // No payment options. The agent owns the flow via X402Context.
 });
 ```
 
-Longer, yes — but every step is now visible at the call site and interceptable.
+`X402Context` is one new import that replaces the hook + a handful of helpers. It pairs the offering store (was implicit in the old `_a2x.inputRoundTrip` stash, now an explicit pluggable `X402Store`) with the facilitator and the event builders. The lower-level helpers (`parseX402PaymentSubmission`, `pickX402Requirement`, …) are still exported for callers that want full bespoke control.
 
 ### Retry on failure
 
 **Before:** `x402PaymentHook({ retryOnFailure: true })`.
 
-**After:** simply yield `x402RequestPayment` again from the failure branch:
+**After:** yield `requestPayment` again from the failure branch — the offering store is re-populated with the new accepts:
 
 ```ts
 if (!verify.isValid) {
-  yield* x402RequestPayment({
+  yield* this.x402.requestPayment(ctx, {
     accepts: ACCEPTS,
     previousError: verify.invalidReason,
+    expiresInSeconds: 600,
   });
   return;
 }
@@ -194,31 +150,27 @@ if (!verify.isValid) {
 
 **Before:** the SDK re-derived the requirement from `_a2x.inputRoundTrip.payload.accepts` on resume.
 
-**After:** the merchant persists what it offered, keyed by `context.taskId`:
+**After:** `X402Context` already persists per-task offerings keyed by `ctx.taskId` in its `store`. Hand it dynamic `accepts` and it remembers them for the resume turn:
 
 ```ts
-async *run(context) {
-  const submission = parseX402PaymentSubmission(context.message!);
-
-  if (!submission) {
-    const accepts = await this.pricing.quoteFor(context.message!, context.taskId!);
-    await this.db.put(context.taskId!, accepts);          // remember it
-    yield* x402RequestPayment({ accepts });
+async *run(ctx) {
+  const result = await this.x402.classify(ctx);
+  if (result.kind === 'no-submission') {
+    const accepts = await this.pricing.quoteFor(ctx.message!, ctx.taskId!);
+    yield* this.x402.requestPayment(ctx, { accepts, expiresInSeconds: 600 });
     return;
   }
-
-  const accepts = await this.db.get(context.taskId!);      // recover it
-  // ... validate, verify, settle ...
+  // ...
 }
 ```
 
-The merchant has every reason to store this anyway (audit logs, A/B tests, pricing rules).
+For production deployments that need offering state to survive restarts, plug an external store implementing `X402Store` (Postgres / Redis / Durable Object / …).
 
 ### Detecting client rejection
 
 **Before:** `x402PaymentHook` auto-handled `payment-rejected` and terminated the task.
 
-**After:** the agent checks the submission status:
+**After:** `X402Context.classify(...)` returns `{ kind: 'rejected', ... }` — handle that case in the same `switch` you already have. If you're using the low-level helpers directly, check the submission status:
 
 ```ts
 const submission = parseX402PaymentSubmission(context.message!);
@@ -252,19 +204,36 @@ if (submission?.status === X402_PAYMENT_STATUS.REJECTED) {
 - AgentCard extension activation (`addExtension({ uri: X402_EXTENSION_URI, required: true })`).
 - `X-A2A-Extensions` header enforcement (`DefaultRequestHandler`).
 
+## Import path change
+
+x402 is no longer re-exported from the main entry. Every x402 name now imports from the dedicated `@a2x/sdk/x402` subpath:
+
+```ts
+// Before
+import { X402_EXTENSION_URI, signX402Payment, ... } from '@a2x/sdk';
+
+// After
+import { X402_EXTENSION_URI, signX402Payment, ... } from '@a2x/sdk/x402';
+```
+
+This split lets non-payment agents skip the `x402` / `viem` peer-dependency install entirely. `A2XClientX402Options` (the type for `A2XClient`'s `x402` constructor option) stays on the main entry — it's a client-config type, not an x402-feature import.
+
 ## Compile errors you'll see
 
 Search for these strings — every match needs updating:
 
 ```
-import { x402PaymentHook }       from '@a2x/sdk';   // removed
-import { readX402Settlement }    from '@a2x/sdk';   // removed
-import { X402_DOMAIN }           from '@a2x/sdk';   // removed
-import type { InputRoundTrip... } from '@a2x/sdk';  // removed
-inputRoundTripHooks: [...]                          // removed AgentExecutorOptions field
-event.domain                                        // removed from request-input
-event.payload                                       // removed from request-input
-context.input                                       // removed from InvocationContext (use context.message)
+import { x402PaymentHook }       from '@a2x/sdk';     // removed (use @a2x/sdk/x402)
+import { readX402Settlement }    from '@a2x/sdk';     // removed
+import { X402_DOMAIN }           from '@a2x/sdk';     // removed
+import type { InputRoundTrip... } from '@a2x/sdk';    // removed
+import { X402_EXTENSION_URI }    from '@a2x/sdk';     // moved to @a2x/sdk/x402
+import { signX402Payment }       from '@a2x/sdk';     // moved to @a2x/sdk/x402
+import { getX402Receipts }       from '@a2x/sdk';     // moved to @a2x/sdk/x402
+inputRoundTripHooks: [...]                            // removed AgentExecutorOptions field
+event.domain                                          // removed from request-input
+event.payload                                         // removed from request-input
+context.input                                         // removed from InvocationContext (use context.message)
 ```
 
 ## Codemod

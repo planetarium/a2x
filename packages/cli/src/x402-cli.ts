@@ -9,13 +9,13 @@
  */
 
 import chalk from 'chalk';
-import type {
-  A2XClientX402Options,
-  SignX402PaymentOptions,
-  X402PaymentRequiredResponse,
-  X402PaymentRequirements,
-} from '@a2x/sdk';
-import { X402PaymentFailedError } from '@a2x/sdk';
+import type { A2XClientX402Options } from '@a2x/sdk';
+import {
+  X402PaymentFailedError,
+  type SignX402PaymentOptions,
+  type X402PaymentRequiredResponse,
+  type X402PaymentRequirements,
+} from '@a2x/sdk/x402';
 
 /**
  * Default spend ceiling, in the asset's atomic units, applied to every
