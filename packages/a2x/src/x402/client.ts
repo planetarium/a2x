@@ -33,28 +33,44 @@ import type {
   X402SettleResponse,
 } from './types.js';
 
-// x402 is declared as an `optional` peer dep. Importing its runtime
-// helpers at the top level pulls them into the `@a2x/sdk/client` chunk
-// even on code paths that never touch x402, which breaks bundlers when
-// users haven't installed it (issue #134). Lazy-import inside the only
-// function that needs them so non-x402 consumers stay unaffected.
-let _x402Runtime:
-  | Promise<{
-      createPaymentHeader: typeof import('x402/client').createPaymentHeader;
-      safeBase64Decode: typeof import('x402/shared').safeBase64Decode;
-      PaymentPayloadSchema: typeof import('x402/types').PaymentPayloadSchema;
-    }>
-  | undefined;
+type X402Runtime = {
+  createPaymentHeader: (
+    signer: unknown,
+    x402Version: number,
+    requirement: unknown,
+  ) => Promise<string>;
+  safeBase64Decode: (input: string) => string;
+  PaymentPayloadSchema: { parse(input: unknown): unknown };
+};
+
+function x402Specifier(part: string): string {
+  return ['x402', part].join('/');
+}
+
+async function importOptionalPeer(
+  specifier: string,
+): Promise<Record<string, unknown>> {
+  // x402 is declared as an optional peer dependency. Keep the specifier
+  // computed so bundlers that statically inspect dynamic imports do not
+  // require x402 unless callers actually execute the signing path.
+  return import(/* @vite-ignore */ specifier);
+}
+
+let _x402Runtime: Promise<X402Runtime> | undefined;
 async function _loadX402Runtime() {
   if (!_x402Runtime) {
     _x402Runtime = (async () => {
       const [{ createPaymentHeader }, { safeBase64Decode }, { PaymentPayloadSchema }] =
         await Promise.all([
-          import('x402/client'),
-          import('x402/shared'),
-          import('x402/types'),
+          importOptionalPeer(x402Specifier('client')),
+          importOptionalPeer(x402Specifier('shared')),
+          importOptionalPeer(x402Specifier('types')),
         ]);
-      return { createPaymentHeader, safeBase64Decode, PaymentPayloadSchema };
+      return {
+        createPaymentHeader: createPaymentHeader as X402Runtime['createPaymentHeader'],
+        safeBase64Decode: safeBase64Decode as X402Runtime['safeBase64Decode'],
+        PaymentPayloadSchema: PaymentPayloadSchema as X402Runtime['PaymentPayloadSchema'],
+      };
     })();
   }
   return _x402Runtime;
@@ -157,9 +173,9 @@ export async function signX402Payment(
     await _loadX402Runtime();
 
   const header = await createPaymentHeader(
-    options.signer as unknown as Parameters<typeof createPaymentHeader>[0],
+    options.signer,
     required.x402Version,
-    requirement as unknown as Parameters<typeof createPaymentHeader>[2],
+    requirement,
   );
 
   // `createPaymentHeader` returns a base64-encoded PaymentPayload for HTTP
