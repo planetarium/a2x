@@ -5,13 +5,6 @@
 
 export { AgentExecutor, StreamingMode } from './agent-executor.js';
 export type { AgentExecutorOptions, RunConfig } from './agent-executor.js';
-export type {
-  InputRoundTripRecord,
-  InputRoundTripOutcome,
-  InputRoundTripHook,
-  InputRoundTripContext,
-} from './input-roundtrip.js';
-export { INPUT_ROUNDTRIP_METADATA_KEY } from './input-roundtrip.js';
 export { A2XAgent } from './a2x-agent.js';
 export type { ProtocolVersion, A2XAgentOptions } from './a2x-agent.js';
 export { AgentCardMapperFactory } from './agent-card-mapper.js';

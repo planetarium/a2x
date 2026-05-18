@@ -1,5 +1,5 @@
 /**
- * Anthropic-powered demo agent that owns the payment decision.
+ * Anthropic-powered demo agent that owns the entire payment flow.
  *
  * Generalized over a tool registry — each tool declares its own cost (0 for
  * free tools, an atomic-unit cost for paid ones). The agent inspects EVERY
@@ -7,30 +7,37 @@
  * single planning response can include several), validates them, then:
  *
  *   - all tool calls free → execute the batch directly.
- *   - at least one paid call AND not yet settled → sum the costs, advertise
- *     a single combined `accept`, yield `x402RequestPayment`, return.
- *   - already settled → execute the entire batch (paid + free in declared
- *     order) and feed the results back to Claude for a final summary.
+ *   - at least one paid call AND no payment submitted yet → sum the costs,
+ *     advertise a single combined `accept`, store the offering, yield
+ *     `requestPayment`, return.
+ *   - submission present → look up the stored offering, validate the
+ *     submitted payment against it, call `verify` + `settle` directly, then
+ *     execute the batch and feed the results back to Claude for a final
+ *     summary.
  *
  * Adding a new tool means adding one entry to TOOLS — no other code changes.
+ *
+ * The agent owns the payment lifecycle end-to-end. The SDK provides
+ * `X402Context` — a façade over the offering store + facilitator + event
+ * builders — so the agent never reaches for the low-level helpers directly.
  */
 
 import {
   BaseAgent,
   isTextPart,
-  readX402Settlement,
-  x402RequestPayment,
+  type AgentEvent,
+  type InvocationContext,
+  type Message,
+  type Part,
+  type TextPart,
+  type ToolCall,
+  type ToolDeclaration,
 } from '@a2x/sdk';
-import type {
-  AgentEvent,
-  InvocationContext,
-  Message,
-  Part,
-  TextPart,
-  ToolCall,
-  ToolDeclaration,
-  X402Accept,
-} from '@a2x/sdk';
+import {
+  X402_ERROR_CODES,
+  type X402Accept,
+  type X402Context,
+} from '@a2x/sdk/x402';
 import type { AnthropicProvider } from '@a2x/sdk/anthropic';
 
 // ─── Tool registry ──────────────────────────────────────────
@@ -241,6 +248,7 @@ const TOOLS: Record<string, ToolHandler> = {
 
 export interface TranslationAgentOptions {
   provider: AnthropicProvider;
+  x402: X402Context;
   /**
    * Network details for the per-turn bill. The agent assembles a single
    * `accept` whose `amount` is the sum of the per-tool atomic costs of every
@@ -264,6 +272,7 @@ const SYSTEM_PROMPT =
 
 export class TranslationAgent extends BaseAgent {
   private readonly _provider: AnthropicProvider;
+  private readonly _x402: X402Context;
   private readonly _payment: TranslationAgentOptions['payment'];
   private readonly _toolDeclarations: ToolDeclaration[];
 
@@ -276,13 +285,29 @@ export class TranslationAgent extends BaseAgent {
         "'s cost into a single x402 payment.",
     });
     this._provider = options.provider;
+    this._x402 = options.x402;
     this._payment = options.payment;
     this._toolDeclarations = Object.values(TOOLS).map((t) => t.declaration);
   }
 
-  async *run(context: InvocationContext): AsyncGenerator<AgentEvent> {
-    const settled = readX402Settlement(context).paid;
-    const userText = lastUserText(context);
+  async *run(ctx: InvocationContext): AsyncGenerator<AgentEvent> {
+    const classification = await this._x402.classify(ctx);
+
+    // Any payment-side error short-circuits without re-planning.
+    if (
+      classification.kind === 'rejected' ||
+      classification.kind === 'no-stored-offering' ||
+      classification.kind === 'unmatched' ||
+      classification.kind === 'invalid-shape'
+    ) {
+      yield this._x402.failedEvent({
+        code: classification.code,
+        reason: classification.reason,
+      });
+      return;
+    }
+
+    const userText = userTextFromMessage(ctx.message!);
 
     // Phase 1 — Claude plans against the full tool registry.
     const planResp = await this._provider.generateContent({
@@ -306,16 +331,11 @@ export class TranslationAgent extends BaseAgent {
       return;
     }
 
-    // Validate every call before any side-effect (charging or executing).
-    // An unknown tool name or schema-broken args is the LLM's fault; we
-    // surface it as an agent error rather than silently dropping or charging.
+    // Validate every call before any side-effect.
     for (const tc of toolCalls) {
       const handler = TOOLS[tc.name];
       if (!handler) {
-        yield {
-          type: 'error',
-          error: new Error(`Unknown tool: ${tc.name}`),
-        };
+        yield { type: 'error', error: new Error(`Unknown tool: ${tc.name}`) };
         return;
       }
       try {
@@ -331,25 +351,61 @@ export class TranslationAgent extends BaseAgent {
       }
     }
 
-    // Sum the per-tool cost across the batch. Free tools contribute 0.
     const totalAtomic = toolCalls.reduce(
       (sum, tc) => sum + (TOOLS[tc.name]?.costAtomic ?? 0),
       0,
     );
 
-    if (totalAtomic > 0 && !settled) {
-      // At least one paid call in the batch. Gate before any execution —
-      // including the free calls in the batch, so the user sees a single
-      // consistent "you're paying for this turn" prompt.
-      yield* x402RequestPayment({
+    // Fully free — execute directly without involving x402.
+    if (totalAtomic === 0) {
+      yield* this._executeAndSummarize(toolCalls, userText);
+      return;
+    }
+
+    // Turn 1 with paid tools — request payment with the freshly-derived
+    // bill. The X402Context stores the offering so the resume turn
+    // validates against it (not against a fresh re-plan).
+    if (classification.kind === 'no-submission') {
+      yield* this._x402.requestPayment(ctx, {
         accepts: [this._buildAccept(totalAtomic)],
         description: this._billDescription(toolCalls, totalAtomic),
+        // 10-minute window — clients have plenty of time to sign, and
+        // abandoned tasks free their offering record automatically.
+        expiresInSeconds: 600,
       });
       return;
     }
 
-    // Either fully free, or already paid. Execute every tool call in
-    // declared order and feed the results to Claude for the final reply.
+    // Turn 2 with a valid submission — verify, settle, execute.
+    const valid = classification;
+    const verify = await this._x402.verify(ctx, valid);
+    if (!verify.isValid) {
+      yield this._x402.failedEvent({
+        code: X402_ERROR_CODES.VERIFY_FAILED,
+        reason: verify.invalidReason ?? 'Payment verification failed.',
+      });
+      return;
+    }
+
+    const receipt = await this._x402.settle(ctx, valid);
+    if (!receipt.success) {
+      yield this._x402.failedEvent({
+        code: X402_ERROR_CODES.SETTLEMENT_FAILED,
+        reason: receipt.errorReason ?? 'Payment settlement failed.',
+        failureReceipt: receipt,
+      });
+      return;
+    }
+
+    await this._x402.clearOffering(ctx);
+    yield* this._executeAndSummarize(toolCalls, userText, receipt);
+  }
+
+  private async *_executeAndSummarize(
+    toolCalls: ToolCall[],
+    userText: string,
+    receipt?: Awaited<ReturnType<X402Context['settle']>>,
+  ): AsyncGenerator<AgentEvent> {
     const toolResults: Array<{ id: string; name: string; result: unknown }> = [];
     for (const tc of toolCalls) {
       yield {
@@ -358,7 +414,7 @@ export class TranslationAgent extends BaseAgent {
         args: tc.args,
         toolCallId: tc.id,
       };
-      const handler = TOOLS[tc.name];
+      const handler = TOOLS[tc.name]!;
       let result: unknown;
       try {
         result = await handler.execute(tc.args, { provider: this._provider });
@@ -374,19 +430,13 @@ export class TranslationAgent extends BaseAgent {
       toolResults.push({ id: tc.id, name: tc.name, result });
     }
 
-    // Phase 2 — Claude composes the final answer with all tool results in
-    // hand. Anthropic's API requires the assistant's tool_use blocks and
-    // the user's tool_result blocks to sit in adjacent messages with
-    // matching ids; we assemble that conversation by hand.
-    const planTextParts: Part[] = planResp.content
-      .filter((p): p is TextPart => isTextPart(p))
-      .map((p) => ({ text: p.text }));
-    const followupContents: Message[] = [
+    // Phase 2 — Claude composes the final answer with all tool results.
+    const planFollowup: Message[] = [
       { messageId: 'u1', role: 'user', parts: [{ text: userText }] },
       {
         messageId: 'a1',
         role: 'agent',
-        parts: planTextParts.length > 0 ? planTextParts : [{ text: '' }],
+        parts: [{ text: '' }],
         metadata: { toolCalls },
       },
       {
@@ -398,7 +448,7 @@ export class TranslationAgent extends BaseAgent {
     ];
 
     const finalResp = await this._provider.generateContent({
-      contents: followupContents,
+      contents: planFollowup,
       systemInstruction: SYSTEM_PROMPT,
     });
 
@@ -407,13 +457,15 @@ export class TranslationAgent extends BaseAgent {
         yield { type: 'text', role: 'agent', text: part.text };
       }
     }
-    yield { type: 'done' };
+
+    yield receipt
+      ? this._x402.completedEvent({ receipt })
+      : { type: 'done' };
   }
 
   private _buildAccept(totalAtomic: number): X402Accept {
     return {
       network: this._payment.network,
-      // x402 amount is an atomic-unit decimal string (USDC has 6 decimals).
       amount: String(totalAtomic),
       asset: this._payment.asset,
       payTo: this._payment.payTo,
@@ -439,12 +491,11 @@ export class TranslationAgent extends BaseAgent {
 
 // ─── Helpers ────────────────────────────────────────────────
 
-function lastUserText(context: InvocationContext): string {
-  for (let i = context.session.events.length - 1; i >= 0; i--) {
-    const event = context.session.events[i];
-    if (event.type === 'text' && event.role === 'user') return event.text;
-  }
-  return '';
+function userTextFromMessage(message: Message): string {
+  return message.parts
+    .map((p) => ('text' in p ? p.text : ''))
+    .join('')
+    .trim();
 }
 
 function joinText(parts: Part[]): string {

@@ -20,17 +20,13 @@ export type AgentEvent =
      * Yielded by an agent to interrupt its run and ask the client for input
      * (most commonly a payment, an approval, or an external token). The
      * default `AgentExecutor` halts the agent generator on receipt, sets
-     * `task.status = INPUT_REQUIRED`, merges `metadata` into the wire
-     * status message metadata, and persists `payload` for the resume turn
-     * via `InvocationContext.input.previous` (see runner/context.ts).
+     * `task.status = INPUT_REQUIRED`, and merges `metadata` into the wire
+     * status message metadata. The SDK does not record any cross-turn
+     * bookkeeping — the agent re-derives its state on the resume turn from
+     * the incoming message (`InvocationContext.message`) and from any
+     * durable state the agent itself persists.
      */
     type: 'request-input';
-    /**
-     * Domain key the SDK uses to look up a registered hook (verify/settle
-     * etc.). For x402 this is the canonical `'x402'` literal exported from
-     * `@a2x/sdk/x402`. Custom domains supply their own.
-     */
-    domain: string;
     /**
      * Wire metadata that gets merged into the input-required task's
      * `status.message.metadata` as-is. The SDK does not interpret this
@@ -43,20 +39,31 @@ export type AgentEvent =
      * `status.message.parts`. Optional.
      */
     message?: string;
-    /**
-     * Implementation-defined opaque value the agent wants to read back on
-     * the resume turn. The SDK stores this on the task's status message
-     * metadata under a private key and re-surfaces it via
-     * `InvocationContext.input.previous.payload` so the agent doesn't need
-     * to recompute "what did I ask for last time".
-     *
-     * Example for x402: `{ accepts: X402Accept[] }` so the resume-turn
-     * agent can see the exact requirements it published.
-     */
-    payload?: unknown;
   }
-  | { type: 'done'; output?: unknown }
-  | { type: 'error'; error: Error };
+  | {
+    /**
+     * Successful terminal event. The default `AgentExecutor` transitions
+     * the task to `completed` and merges the optional `metadata` onto the
+     * final status message (`task.status.message.metadata`). Agents use
+     * this to attach extension result metadata (e.g. x402 settlement
+     * receipts) to the response.
+     */
+    type: 'done';
+    output?: unknown;
+    metadata?: Record<string, unknown>;
+  }
+  | {
+    /**
+     * Failure terminal event. The default `AgentExecutor` transitions the
+     * task to `failed` with `error.message` as the status text and merges
+     * the optional `metadata` onto the final status message metadata.
+     * Agents use the metadata channel to attach failure detail keys (e.g.
+     * `x402.payment.status: 'payment-failed'`, `x402.payment.error: <code>`).
+     */
+    type: 'error';
+    error: Error;
+    metadata?: Record<string, unknown>;
+  };
 
 // ─── BaseAgent ───
 

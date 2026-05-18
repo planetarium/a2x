@@ -49,12 +49,16 @@ class IdentityRecordingAgent extends BaseAgent {
       sessionId: context.session.id,
     });
 
-    if (!context.input) {
+    // Resume detection: the agent reads its own metadata from the
+    // incoming message. No SDK round-trip bookkeeping.
+    const granted =
+      (context.message?.metadata as { 'test.identity.granted'?: boolean } | undefined)
+        ?.['test.identity.granted'] === true;
+
+    if (!granted) {
       yield {
         type: 'request-input',
-        domain: 'test.identity',
         metadata: { 'test.identity.required': true },
-        payload: { foo: 'bar' },
       };
       return;
     }

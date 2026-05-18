@@ -4,23 +4,27 @@
  * Adds on-chain payment gating to A2A agents using the Coinbase x402
  * protocol. See `specification/a2a-x402-v0.2.md` for the wire format.
  *
- * Server agents express payment gating inline by yielding
- * `request-input` AgentEvents from `BaseAgent.run()` — there is no
- * separate executor class to extend. The default `AgentExecutor`
- * handles the input-required round-trip when `inputRoundTripHooks`
- * includes `x402PaymentHook(...)`.
+ * The SDK exposes spec mechanics as **stateless helpers**, never as a
+ * flow: the agent owns when to request payment, what offerings it
+ * advertised, how to validate the submitted payment, whether to retry
+ * after failure, and what to do between `facilitator.verify` and
+ * `facilitator.settle`. The SDK does not persist payment state or
+ * auto-route resume turns.
  *
  * Minimal server setup:
  *
  * ```ts
  * import {
  *   A2XAgent, AgentExecutor, BaseAgent, StreamingMode,
- *   x402PaymentHook, x402RequestPayment, readX402Settlement, X402_EXTENSION_URI,
+ *   x402RequestPayment, parseX402PaymentSubmission, pickX402Requirement,
+ *   validateX402PayloadShape, normalizeX402Accept,
+ *   buildX402PaymentCompletedMetadata, buildX402PaymentFailedMetadata,
+ *   mapVerifyFailureToCode, resolveFacilitator, X402_EXTENSION_URI,
  * } from '@a2x/sdk';
  *
  * const ACCEPTS = [{
  *   network: 'base-sepolia',
- *   amount: '10000',                                 // 0.01 USDC
+ *   amount: '10000',
  *   asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
  *   payTo: '0xYourMerchantAddress',
  *   resource: 'https://api.example.com/premium',
@@ -28,28 +32,91 @@
  * }];
  *
  * class PaidAgent extends BaseAgent {
- *   async *run(context) {
- *     if (!readX402Settlement(context).paid) {
+ *   constructor(private readonly facilitator) { super({ name: 'paid' }); }
+ *
+ *   async *run(ctx) {
+ *     const submitted = parseX402PaymentSubmission(ctx.message!);
+ *
+ *     // Turn 1 — no payment yet.
+ *     if (!submitted) {
  *       yield* x402RequestPayment({ accepts: ACCEPTS });
  *       return;
  *     }
+ *
+ *     // Turn 2 — validate against what we offered (here: a constant; in
+ *     // production, look up by ctx.taskId from your durable store).
+ *     const requirements = ACCEPTS.map(normalizeX402Accept);
+ *     const requirement = pickX402Requirement(submitted.payload!, requirements);
+ *     if (!requirement) {
+ *       yield {
+ *         type: 'error',
+ *         error: new Error('Submitted payment does not match any advertised option.'),
+ *         metadata: buildX402PaymentFailedMetadata({
+ *           code: 'NETWORK_MISMATCH',
+ *           reason: 'Submitted network/scheme does not match any offered option.',
+ *         }),
+ *       };
+ *       return;
+ *     }
+ *
+ *     const issues = validateX402PayloadShape(submitted.payload!, requirement);
+ *     if (issues.length > 0) {
+ *       yield {
+ *         type: 'error',
+ *         error: new Error(issues[0]!.reason),
+ *         metadata: buildX402PaymentFailedMetadata({ code: issues[0]!.code, reason: issues[0]!.reason }),
+ *       };
+ *       return;
+ *     }
+ *
+ *     const verify = await this.facilitator.verify(submitted.payload!, requirement);
+ *     if (!verify.isValid) {
+ *       yield {
+ *         type: 'error',
+ *         error: new Error(verify.invalidReason ?? 'verify failed'),
+ *         metadata: buildX402PaymentFailedMetadata({
+ *           code: mapVerifyFailureToCode(verify.invalidReason),
+ *           reason: verify.invalidReason ?? 'Payment verification failed.',
+ *         }),
+ *       };
+ *       return;
+ *     }
+ *
+ *     const settle = await this.facilitator.settle(submitted.payload!, requirement);
+ *     if (!settle.success) {
+ *       yield {
+ *         type: 'error',
+ *         error: new Error(settle.errorReason ?? 'settle failed'),
+ *         metadata: buildX402PaymentFailedMetadata({
+ *           code: 'SETTLEMENT_FAILED',
+ *           reason: settle.errorReason ?? 'Payment settlement failed.',
+ *         }),
+ *       };
+ *       return;
+ *     }
+ *
  *     yield { type: 'text', role: 'agent', text: 'thanks for paying' };
- *     yield { type: 'done' };
+ *     yield {
+ *       type: 'done',
+ *       metadata: buildX402PaymentCompletedMetadata({
+ *         receipt: {
+ *           success: true,
+ *           transaction: settle.transaction ?? '',
+ *           network: submitted.payload!.network,
+ *           payer: submitted.authorization?.from ?? 'unknown',
+ *         },
+ *       }),
+ *     };
  *   }
  * }
  *
- * const executor = new AgentExecutor({
- *   runner,
- *   runConfig: { streamingMode: StreamingMode.SSE },
- *   inputRoundTripHooks: [x402PaymentHook()],
- * });
- *
+ * const facilitator = resolveFacilitator();
  * const agent = new A2XAgent({ taskStore, executor })
  *   .setName('Paid Agent')
  *   .addExtension({ uri: X402_EXTENSION_URI, required: true });
  * ```
  *
- * Minimal client setup (unchanged from prior versions):
+ * Minimal client setup (unchanged):
  *
  * ```ts
  * import { A2XClient } from '@a2x/sdk/client';
@@ -89,17 +156,48 @@ export type {
   X402Network,
 } from './types.js';
 
-// Server-side surface (replaces X402PaymentExecutor).
+// Server-side surface: stateless helpers.
 export {
-  X402_DOMAIN,
+  buildX402PaymentRequiredMetadata,
   x402RequestPayment,
-  x402PaymentHook,
-  readX402Settlement,
+  parseX402PaymentSubmission,
+  pickX402Requirement,
+  validateX402PayloadShape,
+  normalizeX402Accept,
+  buildX402PaymentCompletedMetadata,
+  buildX402PaymentFailedMetadata,
+  buildX402PaymentVerifiedMetadata,
 } from './payment.js';
 export type {
   X402RequestPaymentInput,
-  X402PaymentHookOptions,
+  X402PaymentSubmission,
+  X402EvmAuthorization,
+  X402ValidationIssue,
 } from './payment.js';
+
+// Server-side surface: high-level façade over the helpers above.
+// `BaseX402Context` is the extension point for custom flows; `X402Context`
+// is the default concrete implementation most callers instantiate.
+export { BaseX402Context, X402Context } from './context.js';
+export type {
+  X402ContextOptions,
+  X402ContextRequestPaymentInput,
+  X402Classification,
+  X402ValidClassification,
+} from './context.js';
+
+// Server-side surface: lifecycle store. `BaseX402Store` is the abstract
+// contract for custom backends; `InMemoryX402Store` is the default
+// concrete impl suitable for single-instance deployments.
+export { BaseX402Store, InMemoryX402Store } from './store.js';
+export type {
+  X402StoreEntry,
+  X402StoreEntryPatch,
+  X402EntryStatus,
+  X402EntryReceipt,
+  X402EntryFailure,
+  InMemoryX402StoreOptions,
+} from './store.js';
 
 export {
   resolveFacilitator,

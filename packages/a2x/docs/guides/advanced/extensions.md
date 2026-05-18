@@ -53,37 +53,43 @@ Use approach (1) for major shape changes, (2) for incremental additions.
 
 ## Input-required round-trips for non-payment domains
 
-A2X's `request-input` AgentEvent + `InputRoundTripHook` plumbing was built for x402 payments but is intentionally domain-agnostic. The same machinery works for any extension that needs the merchant agent to ask the client for additional input mid-task — human approvals, OAuth tokens fetched via Device Flow, AP2 mandates, etc.
+A2X's `request-input` AgentEvent is intentionally domain-agnostic. The agent uses it for any extension that needs the merchant to ask the client for additional input mid-task — human approvals, OAuth tokens fetched via Device Flow, AP2 mandates, etc.
 
-Pick a domain key you control (e.g. `'myorg.approval'`). The agent yields a `request-input` event with that domain; the executor halts the agent, sets the task to `input-required`, and merges your extension-specific metadata onto the wire status message.
+The agent yields `request-input` with extension-specific metadata; the executor halts the agent, sets the task to `input-required`, and merges the metadata onto the wire status message. The SDK does not record any cross-turn state — the agent detects whether it's a fresh request or a resume by inspecting `context.message.metadata` itself.
 
 ```ts
 class SensitiveAgent extends BaseAgent {
   async *run(context) {
-    if (!context.input) {
-      yield {
-        type: 'request-input',
-        domain: 'myorg.approval',
-        metadata: {
-          'myorg.approval.required': { reviewerId: '...', topic: 'delete-customer-data' },
-        },
-        message: 'Awaiting approval',
-        payload: { topic: 'delete-customer-data' },
-      };
+    const meta = context.message?.metadata as
+      | { 'myorg.approval.granted'?: boolean }
+      | undefined;
+
+    // Resume turn: client either granted or did not.
+    if (meta) {
+      if (meta['myorg.approval.granted'] !== true) {
+        yield { type: 'error', error: new Error('declined') };
+        return;
+      }
+      yield { type: 'text', role: 'agent', text: 'Done.' };
+      yield { type: 'done' };
       return;
     }
-    const approved = context.input.resumeMetadata['myorg.approval.granted'] === true;
-    if (!approved) {
-      yield { type: 'error', error: new Error('declined') };
-      return;
-    }
-    yield { type: 'text', role: 'agent', text: 'Done.' };
-    yield { type: 'done' };
+
+    // First turn: request input.
+    yield {
+      type: 'request-input',
+      metadata: {
+        'myorg.approval.required': { reviewerId: '...', topic: 'delete-customer-data' },
+      },
+      message: 'Awaiting approval',
+    };
   }
 }
 ```
 
-You can register a hook on the executor (`inputRoundTripHooks: [...]`) to centralize verification logic — see how `x402PaymentHook()` does verify+settle in `@a2x/sdk/x402` for the canonical pattern. Or, like the snippet above, inspect `context.input.resumeMetadata` directly when no out-of-band verification is needed. Either way the SDK core stays out of your extension's wire format.
+If your extension needs to keep "what was asked for" across turns (e.g. the merchant offered specific options and needs to validate the response against them), persist that state yourself in a store keyed by `context.taskId`. The merchant always knows what its extension asks for — the SDK has no useful opinion to add.
+
+The x402 module (`@a2x/sdk/x402`) is the canonical example of this pattern at scale — see `samples/nextjs-x402/src/lib/a2x-setup.ts` for a full implementation.
 
 ## When not to use extensions
 

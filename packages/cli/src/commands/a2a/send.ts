@@ -2,7 +2,7 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import crypto from 'node:crypto';
 import type { SendMessageParams, Task } from '@a2x/sdk';
-import { getX402PaymentRequirements, getX402Receipts } from '@a2x/sdk';
+import { getX402PaymentRequirements, getX402Receipts } from '@a2x/sdk/x402';
 import { printTask, printConnectionError, createClient } from '../../format.js';
 import { activeWalletAccount } from '../../wallet-store.js';
 import {

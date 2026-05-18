@@ -1,6 +1,6 @@
 # nextjs-x402-agent-driven sample
 
-An [A2A](https://a2a-protocol.org) agent built with Next.js, `@a2x/sdk`, and the **Anthropic Claude API**. The agent runs Claude with a small **tool registry** — some tools are free (`detect_language`, `word_count`), some are paid (`translate`, `summarize`). On every turn Claude decides which tools to call (zero, one, or many — Anthropic supports parallel tool use); whenever the LLM picks at least one paid tool, the agent yields `x402RequestPayment(...)` with the *summed* per-tool cost. The SDK's default `AgentExecutor` (with the registered `x402PaymentHook`) handles the standalone-flow `payment-required` round-trip — no custom executor, no sample-side sentinels.
+An [A2A](https://a2a-protocol.org) agent built with Next.js, `@a2x/sdk`, and the **Anthropic Claude API**. The agent runs Claude with a small **tool registry** — some tools are free (`detect_language`, `word_count`), some are paid (`translate`, `summarize`). On every turn Claude decides which tools to call (zero, one, or many — Anthropic supports parallel tool use); whenever the LLM picks at least one paid tool, the agent yields `x402RequestPayment(...)` with the *summed* per-tool cost. On the resume turn the **agent itself** calls `facilitator.verify()` and `facilitator.settle()` via the SDK's stateless helpers — no SDK-owned payment flow, no custom executor.
 
 The decision to charge is **driven by the LLM at runtime**: free chat / free-tool-only turns pass through without payment, any paid tool in the planned batch triggers the gate before any tool actually runs.
 
@@ -17,35 +17,35 @@ If your pricing is purely a function of the inbound message text, you can apply 
 ```
 Client                 AgentExecutor                      Agent
   │  message/send         │                                  │
-  ├──────────────────────►│  no priorRecord on the task      │
-  │                       ├─────────────────────────────────►│  Claude (planning):
+  ├──────────────────────►│  forward to agent                │
+  │                       ├─────────────────────────────────►│  parseX402PaymentSubmission(ctx.message)
+  │                       │                                  │   → undefined (turn 1)
+  │                       │                                  │  Claude (planning):
   │                       │                                  │   user msg + 4 tool decls
   │                       │                                  │   → tool_use blocks
-  │                       │                                  │     (e.g. [translate],
-  │                       │                                  │      or [detect_language,
-  │                       │                                  │       translate])
   │                       │                                  │  validate every args
   │                       │                                  │  sum paid tool costs
-  │                       │  ◄── yield* x402RequestPayment   │   if total > 0 && !paid
+  │                       │  ◄── yield* x402RequestPayment   │   if total > 0
   │                       │       (request-input AgentEvent) │
-  │                       │  abort agent                     │
-  │  ◄────────────────────┤  task = input-required           │
-  │  (input-required +    │  + x402.payment.required         │
-  │   payment-required)   │                                  │
+  │                       │  set task = input-required       │
+  │  ◄────────────────────┤  + x402.payment.required         │
+  │  (input-required)     │                                  │
   │                       │                                  │
   │  signs PaymentPayload │                                  │
   │  message/send (resubmit, with payment metadata)          │
-  ├──────────────────────►│  hook.handleResume → verify+settle│
-  │                       ├─────────────────────────────────►│  Claude (planning) again
-  │                       │                                  │  → same tool_use plan
-  │                       │                                  │  readX402Settlement(ctx).paid
-  │                       │                                  │   === true → execute every
-  │                       │                                  │   tool in declared order
-  │                       │                                  │  (Claude calls per paid tool)
-  │                       │                                  │  Claude (summary) with all
-  │                       │                                  │   tool_results
+  ├──────────────────────►│  forward to agent                │
+  │                       ├─────────────────────────────────►│  parseX402PaymentSubmission(ctx.message)
+  │                       │                                  │   → { status: 'submitted', payload }
+  │                       │                                  │  Claude (planning) again → tool_use
+  │                       │                                  │  pickX402Requirement + validateShape
+  │                       │                                  │  facilitator.verify(payload, requirement)
+  │                       │                                  │  [insert custom logic here]
+  │                       │                                  │  facilitator.settle(payload, requirement)
+  │                       │                                  │  execute every tool in order
+  │                       │                                  │  Claude (summary) with all tool_results
   │                       │  ◄── toolCall + toolResult * N    │
-  │                       │  ◄── final text + done            │
+  │                       │  ◄── done with completion        │
+  │                       │       metadata (receipt)         │
   │  ◄────────────────────┤  task = completed                │
   │  (completed +         │  + x402.payment.receipts         │
   │   receipts)           │                                  │
@@ -53,8 +53,8 @@ Client                 AgentExecutor                      Agent
 
 Two components in the sample:
 
-- `src/lib/translation-agent.ts` — `BaseAgent` subclass with a tool registry. Each tool entry declares its name, description, JSON schema, atomic-USDC `costAtomic`, an `args` validator, and an `execute` function. The agent generalizes over the registry: phase 1 plans against all tools, validates every emitted call, sums costs, and gates if any paid tool is in the batch. Phase 2 executes everything in order and lets Claude compose the final summary. **Adding a new tool means one entry in `TOOLS` — no other code changes.**
-- `src/lib/a2x-setup.ts` — wires the standard `AgentExecutor` with `inputRoundTripHooks: [x402PaymentHook(...)]`. No custom executor, no sentinel module, no session-state hack.
+- `src/lib/translation-agent.ts` — `BaseAgent` subclass with a tool registry. Each tool entry declares its name, description, JSON schema, atomic-USDC `costAtomic`, an `args` validator, and an `execute` function. The agent owns the entire payment flow: phase 1 plans against all tools, validates every emitted call, sums costs, and gates if any paid tool is in the batch. Phase 2 verifies + settles the submission with the SDK's stateless helpers, executes every tool in order, and lets Claude compose the final summary. **Adding a new tool means one entry in `TOOLS` — no other code changes.**
+- `src/lib/a2x-setup.ts` — wires the standard `AgentExecutor` with no payment options. The facilitator is injected into the agent constructor.
 
 ## Tools shipped in this sample
 
@@ -205,12 +205,12 @@ Update the system prompt to mention the new tool, and you're done. The dispatch 
 
 - `TOOLS` registry in `src/lib/translation-agent.ts` — add or remove tools, adjust prices.
 - `payment` in `src/lib/a2x-setup.ts` — adjust network, asset, merchant address. The agent constructs an `accept` per turn from this config plus the per-tool sum.
-- `inputRoundTripHooks` in `src/lib/a2x-setup.ts` — pass `retryOnFailure: true` to `x402PaymentHook` to re-issue payment-required (with the failure reason carried in `error`) instead of terminating on verify/settle failure.
+- Retry behavior — to re-issue `payment-required` after a verify/settle failure instead of terminating, yield `x402RequestPayment` again with `previousError` set from the agent's failure branch (see [migration guide](../../packages/a2x/docs/guides/advanced/migration-x402-v2.md#retry-on-failure)).
 - `ANTHROPIC_MODEL` env var — pin a specific Claude model. Defaults to `claude-sonnet-4-20250514`.
 
 ## Caveats
 
 - **Gating is per-turn, all-or-nothing.** When a batch contains one paid tool and several free tools, the entire batch is gated together. Free tools don't run before settlement either. This keeps the user-facing prompt simple ("you are paying for this turn"), at the cost of slightly more wait time on free tools that ride along.
 - **Anthropic spend.** A paid turn does the planning call twice (first turn + resubmit), the per-paid-tool execution call(s), and the final summary call. For two paid tools that's ~5 Anthropic calls. Use `claude-haiku-*` or trim if cost matters.
-- The agent must guard the paid path with `readX402Settlement(context).paid` before yielding the tool calls; the executor halts the generator on `request-input` so subsequent yields after a payment request are dropped (BR-8).
+- The agent gates the paid path on `parseX402PaymentSubmission(context.message)` and the planning result; the executor halts the generator on `request-input` so subsequent yields after a payment request are dropped.
 - LLM outputs (translation, summary, language name) are non-deterministic. Don't rely on exact wording for tests.

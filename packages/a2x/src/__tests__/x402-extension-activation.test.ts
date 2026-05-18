@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import { privateKeyToAccount } from 'viem/accounts';
 import { A2XClient } from '../client/a2x-client.js';
-import { X402_EXTENSION_URI, x402PaymentHook } from '../x402/index.js';
+import { X402_EXTENSION_URI } from '../x402/index.js';
 import { A2XAgent } from '../a2x/a2x-agent.js';
 import { AgentExecutor, StreamingMode } from '../a2x/agent-executor.js';
 import { InMemoryRunner } from '../runner/in-memory-runner.js';
@@ -230,57 +230,11 @@ describe('DefaultRequestHandler — extension activation enforcement (spec §3.1
     expect(result.result).toBeDefined();
   });
 
-  it('exports the same X-A2A-Extensions activation when the executor wires x402PaymentHook (new surface)', async () => {
-    // Regression: the new input-required round-trip surface must not change
-    // how AgentCard activation is published. Wiring the hook up via
-    // `inputRoundTripHooks` and declaring the extension via `addExtension`
-    // produces the same wire activation that the prior X402PaymentExecutor
-    // path produced.
-    const agent = new EchoAgent();
-    const runner = new InMemoryRunner({ agent, appName: 'test-hook' });
-    const executor = new AgentExecutor({
-      runner,
-      runConfig: { streamingMode: StreamingMode.SSE },
-      inputRoundTripHooks: [
-        x402PaymentHook({
-          facilitator: {
-            verify: async () => ({ isValid: true, payer: '0x0' }),
-            settle: async () => ({
-              success: true,
-              transaction: '0x0',
-              network: 'base-sepolia',
-              payer: '0x0',
-            }),
-          },
-        }),
-      ],
-    });
-    const a2x = new A2XAgent({
-      taskStore: new InMemoryTaskStore(),
-      executor,
-      protocolVersion: '0.3',
-    })
-      .setName('x')
-      .setDescription('x')
-      .setDefaultUrl('https://example.com/a2a')
-      .addExtension({ uri: X402_EXTENSION_URI, required: true });
-    const handler = new DefaultRequestHandler(a2x);
-
-    // Handler still rejects requests missing the extension URI, just like
-    // the legacy class-based path did.
-    const result = (await handler.handle(sendBody, { headers: {} })) as {
-      error?: { code: number; message: string };
-    };
-    expect(result.error).toBeDefined();
-    expect(result.error!.code).toBe(-32600);
-    expect(result.error!.message).toContain(X402_EXTENSION_URI);
-  });
-
-  it('keeps spec-required header enforcement when the agent declares x402 but the executor has no hook registered', async () => {
-    // The header check is decided by AgentCard.capabilities.extensions,
-    // not by hook registration. A merchant that opts into the extension
-    // via `addExtension` but forgets to register a hook still rejects
-    // requests missing the header — failure mode is unchanged.
+  it('keeps spec-required header enforcement regardless of how the agent processes payment internally', async () => {
+    // The header check is decided by AgentCard.capabilities.extensions
+    // alone — payment processing in the agent is irrelevant to whether
+    // the request is accepted. A merchant that opts into the extension
+    // via `addExtension` rejects requests missing the header.
     const handler = buildHandler(true);
     const noHeader = (await handler.handle(sendBody, { headers: {} })) as {
       error?: { code: number };

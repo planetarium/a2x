@@ -7,13 +7,17 @@ import {
   InMemoryRunner,
   InMemoryTaskStore,
   StreamingMode,
-  X402_EXTENSION_URI,
-  readX402Settlement,
-  x402PaymentHook,
-  x402RequestPayment,
   type AgentEvent,
+  type InvocationContext,
 } from '@a2x/sdk';
-import type { InvocationContext, X402Accept } from '@a2x/sdk';
+
+import {
+  X402Context,
+  InMemoryX402Store,
+  X402_EXTENSION_URI,
+  type X402Accept,
+  type X402Facilitator
+} from '@a2x/sdk/x402';
 
 const MISSING_ADDRESS_PLACEHOLDER = '0x0000000000000000000000000000000000000000';
 
@@ -48,75 +52,107 @@ const ACCEPTS: X402Accept[] = [
   },
 ];
 
-/**
- * The agent owns the payment decision. On the first turn the user is
- * unpaid → yield `x402RequestPayment` and let the SDK transition the task
- * to `input-required`. On the resume turn (after the client signs and the
- * executor's `x402PaymentHook` runs verify+settle) `readX402Settlement` is
- * truthy and the agent runs the paid path.
- */
+// Development escape hatch: when X402_MOCK_FACILITATOR=1 the sample skips
+// verify/settle entirely and returns a fake receipt. Useful for running
+// the sample without an actual funded Base Sepolia wallet.
+const mockFacilitator: X402Facilitator | undefined =
+  process.env.X402_MOCK_FACILITATOR === '1'
+    ? {
+        async verify() {
+          return { isValid: true, invalidReason: undefined } as Awaited<
+            ReturnType<X402Facilitator['verify']>
+          >;
+        },
+        async settle() {
+          return {
+            success: true,
+            transaction: '0xmocktx',
+            network: 'base-sepolia',
+            payer: '0xmock',
+          } as Awaited<ReturnType<X402Facilitator['settle']>>;
+        },
+      }
+    : undefined;
+
 class EchoAgent extends BaseAgent {
+  private x402: X402Context;
+
   constructor() {
     super({
       name: 'echo_agent',
       description: 'Echoes the most recent user message back to the caller.',
     });
+
+    this.x402 = new X402Context({
+    ...(mockFacilitator
+      ? { facilitator: mockFacilitator }
+      : process.env.X402_FACILITATOR_URL
+        ? { facilitator: { url: process.env.X402_FACILITATOR_URL } }
+        : {}),
+      store: new InMemoryX402Store(),
+  });
   }
 
-  async *run(context: InvocationContext): AsyncGenerator<AgentEvent> {
-    if (!readX402Settlement(context).paid) {
-      yield* x402RequestPayment({ accepts: ACCEPTS });
+  async *run(ctx: InvocationContext): AsyncGenerator<AgentEvent> {
+    const result = await this.x402.classify(ctx);
+
+    switch (result.kind) {
+      case 'no-submission':
+        // Turn 1 — advertise the bill, store the offering for the
+        // resume turn (10-minute TTL so abandoned tasks free themselves).
+        yield* this.x402.requestPayment(ctx, {
+          accepts: ACCEPTS,
+          expiresInSeconds: 600,
+        });
+        return;
+      case 'rejected':
+      case 'no-stored-offering':
+      case 'unmatched':
+      case 'invalid-shape':
+        // Any non-valid classification — surface the failure and stop.
+        yield this.x402.failedEvent({ code: result.code, reason: result.reason });
+        return;
+      case 'valid':
+        break;
+    }
+
+    const verify = await this.x402.verify(ctx, result);
+    if (!verify.isValid) {
+      yield this.x402.failedEvent({
+        code: 'VERIFY_FAILED',
+        reason: verify.invalidReason ?? 'Payment verification failed.',
+      });
       return;
     }
 
-    // The Runner pushes the incoming user message into session.events as a
-    // text event right before invoking agent.run(). Echo the most recent
-    // user-role text event.
-    const last = [...context.session.events]
-      .reverse()
-      .find((e) => e.type === 'text' && e.role === 'user');
-    const text = last && last.type === 'text' ? last.text : '(empty message)';
+    const receipt = await this.x402.settle(ctx, result);
+    if (!receipt.success) {
+      yield this.x402.failedEvent({
+        code: 'SETTLEMENT_FAILED',
+        reason: receipt.errorReason ?? 'Payment settlement failed.',
+        failureReceipt: receipt,
+      });
+      return;
+    }
 
-    yield { type: 'text', role: 'agent', text: `You said: ${text}` };
-    yield { type: 'done' };
+    // Echo the user's text from the incoming message.
+    const text = (ctx.message?.parts ?? [])
+      .map((p) => ('text' in p ? p.text : ''))
+      .join('');
+    const utterance = text.length > 0 ? text : '(empty message)';
+
+    await this.x402.clearOffering(ctx);
+    yield { type: 'text', role: 'agent', text: `You said: ${utterance}` };
+    yield this.x402.completedEvent({ receipt });
   }
 }
 
 const agent = new EchoAgent();
 const runner = new InMemoryRunner({ agent, appName: 'nextjs-x402' });
 
-// Development escape hatch: when X402_MOCK_FACILITATOR=1 the sample skips
-// verify/settle entirely and returns a fake receipt. Useful for running
-// the sample without an actual funded Base Sepolia wallet.
-const mockFacilitator =
-  process.env.X402_MOCK_FACILITATOR === '1'
-    ? {
-      async verify() {
-        return { isValid: true, invalidReason: undefined, payer: '0xmock' as `0x${string}` };
-      },
-      async settle() {
-        return {
-          success: true,
-          transaction: '0xmocktx',
-          network: 'base-sepolia' as const,
-          payer: '0xmock' as `0x${string}`,
-        };
-      },
-    }
-    : undefined;
-
 const executor = new AgentExecutor({
   runner,
   runConfig: { streamingMode: StreamingMode.SSE },
-  inputRoundTripHooks: [
-    x402PaymentHook({
-      ...(mockFacilitator
-        ? { facilitator: mockFacilitator }
-        : process.env.X402_FACILITATOR_URL
-          ? { facilitator: { url: process.env.X402_FACILITATOR_URL } }
-          : {}),
-    }),
-  ],
 });
 
 export const a2xAgent = new A2XAgent({
