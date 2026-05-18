@@ -1,5 +1,11 @@
 # @a2x/sdk
 
+## 0.13.2
+
+### Patch Changes
+
+- [#165](https://github.com/planetarium/a2x/pull/165) [`93c6e69`](https://github.com/planetarium/a2x/commit/93c6e6971cefc6d6fc25805e113082cf75de7d43) Thanks [@TateLyman](https://github.com/TateLyman)! - Keep optional x402 runtime imports opaque so bundlers do not require x402 when apps only import `@a2x/sdk/client`.
+
 ## 0.13.1
 
 ### Patch Changes
