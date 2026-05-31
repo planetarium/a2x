@@ -327,5 +327,5 @@ Remind the user to:
 
 1. Set any environment variables the `AuthProvider` needs (API keys, bearer tokens, OAuth client IDs).
 2. Audit the token storage location if they enabled persistence — a world-readable file with bearer tokens is a security hazard.
-3. Add a **connection error** path distinct from **auth error** path — the SDK throws `InternalError` for HTTP-level failures and typed `A2AError` subclasses (e.g. `AuthenticationRequiredError`) for protocol-level failures. See [wiki/error-handling.md](./wiki/error-handling.md).
+3. Add a **connection error** path distinct from an **auth** path — the SDK throws `InternalError` for HTTP-level failures and typed `A2AError` subclasses (e.g. `TaskNotFoundError`) for protocol-level failures, while auth failures surface as a `Task` in the `auth-required` state (not a thrown error). See [wiki/error-handling.md](./wiki/error-handling.md).
 4. Consider retry / backoff for idempotent operations (`getTask`, `cancelTask`) — the SDK itself does no retrying beyond the single 401 refresh.

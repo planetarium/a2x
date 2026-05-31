@@ -79,11 +79,8 @@ const deviceCodeScheme = new OAuth2DeviceCodeAuthorization({
 
 ```typescript
 import {
-  HttpBasicAuthorization,
   OAuth2AuthorizationCodeAuthorization,
   OAuth2ClientCredentialsAuthorization,
-  OAuth2PasswordAuthorization,
-  OAuth2ImplicitAuthorization,
   OpenIdConnectAuthorization,
   MutualTlsAuthorization,
 } from '@a2x/sdk';

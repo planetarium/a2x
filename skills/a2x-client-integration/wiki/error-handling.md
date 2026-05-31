@@ -10,7 +10,9 @@
 |-------|--------|---------|
 | **Transport** | `fetch` threw, DNS failure, connection refused | `TypeError` (often with `code === 'ECONNREFUSED'`), `AbortError`, `fetch` spec errors |
 | **HTTP** | Non-2xx HTTP response outside the 401-refresh path | `InternalError('HTTP <status>: <statusText>')` |
-| **Protocol** | Valid HTTP response containing a JSON-RPC error | Subclass of `A2AError` (e.g. `AuthenticationRequiredError`, `TaskNotFoundError`) |
+| **Protocol** | Valid HTTP response containing a JSON-RPC error | Subclass of `A2AError` (e.g. `TaskNotFoundError`, `InvalidParamsError`) |
+
+> **Auth failures are not thrown.** Per the A2A spec, an authentication failure surfaces as a returned `Task` in the `auth-required` state — *not* a JSON-RPC error. `A2XClient` refreshes credentials once and retries; if it is still `auth-required`, it returns that task as-is. Check `task.status.state === 'auth-required'` rather than catching an error. See [The Auth-Required Path](#the-auth-required-path).
 
 Importable error types:
 
@@ -29,7 +31,6 @@ import {
   ContentTypeNotSupportedError,
   InvalidAgentResponseError,
   AuthenticatedExtendedCardNotConfiguredError,
-  AuthenticationRequiredError,
   A2A_ERROR_CODES,
 } from '@a2x/sdk';
 ```
@@ -50,15 +51,14 @@ This is the mapping the client uses internally when it sees a JSON-RPC error:
 | `-32001` | `TaskNotFoundError` | `getTask` / `cancelTask` with unknown id |
 | `-32002` | `TaskNotCancelableError` | `cancelTask` on a terminal task |
 | `-32003` | `PushNotificationNotSupportedError` | Server doesn't support push config |
-| `-32004` | `AuthenticationRequiredError` | Authentication required or failed |
-| `-32005` | `AuthenticatedExtendedCardNotConfiguredError` | Extended card requested but not configured |
-| `-32006` | `ContentTypeNotSupportedError` | Unsupported content type |
-| `-32007` | `UnsupportedOperationError` | Operation not allowed here |
-| `-32008` | `InvalidAgentResponseError` | Agent returned something invalid |
+| `-32004` | `UnsupportedOperationError` | Operation not allowed here |
+| `-32005` | `ContentTypeNotSupportedError` | Unsupported content type |
+| `-32006` | `InvalidAgentResponseError` | Agent returned something invalid |
+| `-32007` | `AuthenticatedExtendedCardNotConfiguredError` | Extended card requested but not configured |
 
 The mapping uses `A2A_ERROR_CODES` constants — consult `@a2x/sdk` source if you need the numeric values.
 
-Unknown codes fall through to `InternalError`.
+Unknown codes fall through to `InternalError`. **There is no auth-failure error code** — authentication failures are modeled as a `Task` in the `auth-required` state, not a JSON-RPC error (see below).
 
 ---
 
@@ -67,20 +67,20 @@ Unknown codes fall through to `InternalError`.
 ```typescript
 import {
   A2AError,
-  AuthenticationRequiredError,
   TaskNotFoundError,
   InternalError,
 } from '@a2x/sdk';
 
 try {
   const task = await client.sendMessage(params);
-  // …
-} catch (err) {
-  if (err instanceof AuthenticationRequiredError) {
-    // Protocol-level auth failure. Unlike HTTP 401, the SDK did NOT retry.
-    // Surface to user / log / trigger re-auth UI.
+  // Auth failure is NOT thrown — it comes back as a task state.
+  if (task.status.state === 'auth-required') {
+    // The client already refreshed once and retried; still auth-required.
+    // Surface to user / trigger re-auth UI.
     return { ok: false, reason: 'auth' };
   }
+  // …
+} catch (err) {
   if (err instanceof TaskNotFoundError) {
     return { ok: false, reason: 'task_missing' };
   }
@@ -107,6 +107,14 @@ try {
 
 ---
 
+<a id="the-auth-required-path"></a>
+## The Auth-Required Path
+
+Authentication is modeled at **two** layers, both handled by the client:
+
+1. **`auth-required` task state (protocol layer).** When `sendMessage` returns a `Task` in `auth-required` state, the client calls `authProvider.refresh` once and retries the same request. If the retry is still `auth-required`, that task is returned to you as-is — inspect `task.status.state`. No error is thrown.
+2. **HTTP 401 (transport layer).** See below.
+
 ## The 401 Refresh Path
 
 For **non-streaming** requests, the client retries exactly once on HTTP 401 — but only if:
@@ -132,7 +140,7 @@ Points to remember:
 
 - The retry happens **once**. If the refresh itself throws or the retry also fails, the error is propagated.
 - **Streaming requests do not retry.** See [streaming.md](./streaming.md).
-- **Protocol-level `AuthenticationRequiredError` (code `-32004`) does not trigger a refresh.** It's a JSON-RPC error, not an HTTP 401. If your agent sends this instead of a 401, wrap your calls to retry manually or reconfigure the server.
+- **The `auth-required` task state triggers its own one-shot refresh+retry** (see above), independent of the HTTP 401 path. It is not a JSON-RPC error and never surfaces as a thrown `A2AError`.
 
 ---
 
@@ -167,7 +175,8 @@ Only retry **idempotent** calls (`getTask`, `cancelTask`, `getAgentCard`). Never
 
 ```typescript
 function a2aErrorToHttpStatus(err: unknown): number {
-  if (err instanceof AuthenticationRequiredError) return 401;
+  // Note: auth failures are a task state (`auth-required`), not a thrown
+  // error — map those to 401 where you read the returned task, not here.
   if (err instanceof InvalidParamsError) return 400;
   if (err instanceof MethodNotFoundError) return 501;
   if (err instanceof TaskNotFoundError) return 404;

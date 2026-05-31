@@ -56,9 +56,9 @@ Consequence: if the `AuthProvider` has side effects (prompting the user, opening
 
 ### Refresh is the only re-auth path
 
-The SDK only re-invokes the auth provider under one condition: a non-streaming request returned **HTTP 401** and `authProvider.refresh` is defined. Even then it retries exactly once. Protocol-level `AuthenticationRequiredError` (JSON-RPC error code `-32004`) does **not** trigger a refresh — it surfaces as a thrown error.
+The SDK re-invokes the auth provider under two conditions, each retried exactly once: (1) a non-streaming request returned **HTTP 401** and `authProvider.refresh` is defined, or (2) a response came back as a `Task` in the **`auth-required`** state. There is no thrown auth error — if the single retry is still `auth-required`, that task is returned to you as-is.
 
-If you want to retry on protocol-level auth errors too, wrap the calls yourself and construct a new client on failure.
+If you want to retry further on auth failures, inspect `task.status.state` yourself and construct a new client on failure.
 
 ---
 
