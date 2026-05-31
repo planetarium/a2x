@@ -26,7 +26,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 
 import {
   AgentExecutor,
-  A2XAgent,
+  A2XServer,
   BaseAgent,
   DefaultRequestHandler,
   InMemoryRunner,
@@ -163,7 +163,7 @@ function buildSampleStack(baseUrl: string): {
     runConfig: { streamingMode: StreamingMode.SSE },
   });
 
-  const a2xAgent = new A2XAgent({
+  const a2xServer = new A2XServer({
     taskStore: new InMemoryTaskStore(),
     executor,
     protocolVersion: '1.0',
@@ -179,7 +179,7 @@ function buildSampleStack(baseUrl: string): {
     })
     .addExtension({ uri: X402_EXTENSION_URI, required: true });
 
-  return { handler: new DefaultRequestHandler(a2xAgent), x402 };
+  return { handler: new DefaultRequestHandler(a2xServer), x402 };
 }
 
 /**
@@ -373,7 +373,7 @@ describe('x402 e2e — sample agent + real A2XClient over HTTP', () => {
       runner,
       runConfig: { streamingMode: StreamingMode.SSE },
     });
-    const a2xAgent = new A2XAgent({
+    const a2xServer = new A2XServer({
       taskStore: new InMemoryTaskStore(),
       executor,
       protocolVersion: '1.0',
@@ -384,7 +384,7 @@ describe('x402 e2e — sample agent + real A2XClient over HTTP', () => {
       .addExtension({ uri: X402_EXTENSION_URI, required: true });
     placeholderServer.on(
       'request',
-      createA2xRequestListener(new DefaultRequestHandler(a2xAgent)),
+      createA2xRequestListener(new DefaultRequestHandler(a2xServer)),
     );
 
     try {

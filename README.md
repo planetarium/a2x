@@ -28,8 +28,8 @@ npm install @a2x/sdk
 
 ## Key Features
 
-- **Auto-extraction** — `A2XAgent` infers AgentCard fields (`name`, `description`, `capabilities.streaming`) from your runtime objects. No manual duplication.
-- **Multi-version AgentCard** — Speak A2A v0.3 or v1.0 by constructing `new A2XAgent({ ..., protocolVersion: '0.3' | '1.0' })`. Card and wire stay consistent for the chosen version.
+- **Auto-extraction** — `A2XServer` infers AgentCard fields (`name`, `description`, `capabilities.streaming`) from your runtime objects. No manual duplication.
+- **Multi-version AgentCard** — Speak A2A v0.3 or v1.0 by constructing `new A2XServer({ ..., protocolVersion: '0.3' | '1.0' })`. Card and wire stay consistent for the chosen version.
 - **Builder pattern** — Override any auto-extracted value with chainable methods (`setName()`, `addSkill()`, `addSecurityScheme()`, etc.).
 - **ADK-compatible patterns** — Familiar `LlmAgent`, `SequentialAgent`, `ParallelAgent`, `LoopAgent`, `FunctionTool`, `AgentTool`, `Runner`, and `Session` APIs.
 - **Client SDK** — `A2XClient` for interacting with any A2A-compliant agent, with built-in auth scheme support.
@@ -46,7 +46,7 @@ npm install @a2x/sdk
 ```typescript
 import {
   LlmAgent,
-  A2XAgent,
+  A2XServer,
   AgentExecutor,
   InMemoryRunner,
   InMemoryTaskStore,
@@ -71,8 +71,8 @@ const executor = new AgentExecutor({
 });
 const taskStore = new InMemoryTaskStore();
 
-// 3. Create A2XAgent — name, description, and streaming are auto-extracted
-const a2xAgent = new A2XAgent({ taskStore, executor })
+// 3. Create A2XServer — name, description, and streaming are auto-extracted
+const a2xServer = new A2XServer({ taskStore, executor })
   .setDefaultUrl('https://my-agent.example.com/a2a')
   .addSkill({
     id: 'chat',
@@ -82,17 +82,17 @@ const a2xAgent = new A2XAgent({ taskStore, executor })
   });
 
 // 4. Wire up the request handler
-const handler = new DefaultRequestHandler(a2xAgent);
+const handler = new DefaultRequestHandler(a2xServer);
 
 // 5. Render the AgentCard in the configured wire format
-const card = a2xAgent.getAgentCard();
+const card = a2xServer.getAgentCard();
 //   To serve v0.3 instead, construct with `protocolVersion: '0.3'`.
 ```
 
 ## How It Works
 
 ```
-A2XAgent
+A2XServer
 ├── taskStore (InMemoryTaskStore, etc.)
 └── agentExecutor
     ├── runner
@@ -103,7 +103,7 @@ A2XAgent
         └── streamingMode    → capabilities.streaming (auto-extracted)
 
 getAgentCard()
-└── A2XAgent.protocolVersion → matching mapper → AgentCard JSON
+└── A2XServer.protocolVersion → matching mapper → AgentCard JSON
 ```
 
 **Value resolution priority:**
@@ -178,7 +178,7 @@ export async function POST(request: Request) {
 }
 
 export async function GET() {
-  return Response.json(a2xAgent.getAgentCard());
+  return Response.json(a2xServer.getAgentCard());
 }
 ```
 

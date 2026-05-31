@@ -99,7 +99,7 @@ Look for these key exports:
 | `InMemoryRunner` | Agent execution runtime |
 | `AgentExecutor` | Bridges runner with A2A task lifecycle |
 | `InMemoryTaskStore` | In-memory task storage |
-| `A2XAgent` | A2A protocol integration (AgentCard, skills, security) |
+| `A2XServer` | A2A protocol integration (AgentCard, skills, security) |
 | `DefaultRequestHandler` | Framework-agnostic JSON-RPC handler |
 | `createSSEStream` | SSE streaming helper |
 | `FunctionTool` | Wrap async functions as tools |
@@ -140,7 +140,7 @@ import {
   AgentExecutor,
   StreamingMode,
   InMemoryTaskStore,
-  A2XAgent,
+  A2XServer,
   DefaultRequestHandler,
 } from '@a2x/sdk';
 // Choose your provider — see wiki/providers.md
@@ -168,8 +168,8 @@ const executor = new AgentExecutor({
 });
 const taskStore = new InMemoryTaskStore();
 
-// 3. Create the A2XAgent (A2A protocol bridge)
-export const a2xAgent = new A2XAgent({ taskStore, executor, protocolVersion: '1.0' })
+// 3. Create the A2XServer (A2A protocol bridge)
+export const a2xServer = new A2XServer({ taskStore, executor, protocolVersion: '1.0' })
   .setDefaultUrl(`${process.env.BASE_URL ?? 'http://localhost:3000'}/a2a`)
   .addSkill({
     id: 'chat',
@@ -182,7 +182,7 @@ export const a2xAgent = new A2XAgent({ taskStore, executor, protocolVersion: '1.
 // .addSecurityRequirement({ apiKey: [] })
 
 // 4. Create the request handler
-export const handler = new DefaultRequestHandler(a2xAgent);
+export const handler = new DefaultRequestHandler(a2xServer);
 ```
 
 **Customization points for the user:**
@@ -251,7 +251,7 @@ if (result && typeof result === 'object' && Symbol.asyncIterator in result) {
 | `/.well-known/agent.json` | GET | AgentCard discovery (A2A standard) |
 | `/a2a` | POST | JSON-RPC 2.0 endpoint for A2A messages |
 
-The paths can be customized — update `setDefaultUrl()` on the A2XAgent to match.
+The paths can be customized — update `setDefaultUrl()` on the A2XServer to match.
 
 ---
 
@@ -264,7 +264,7 @@ This skill uses `@a2x/sdk` instead of `@a2a-js/sdk` + `@google/adk`. Key differe
 | Dependencies | Single package | Two packages |
 | LLM Providers | Google, Anthropic, OpenAI built-in | Google only (via ADK) |
 | Protocol Versions | v0.3 + v1.0 from single definition | v1.0 only |
-| AgentCard | Auto-generated via `A2XAgent` builder | Manual JSON object |
+| AgentCard | Auto-generated via `A2XServer` builder | Manual JSON object |
 | Authentication | Built-in security scheme classes | Manual implementation |
 | Handler | `DefaultRequestHandler` (framework-agnostic) | `JsonRpcTransportHandler` |
 | Quick Start | `toA2x()` helper with built-in HTTP server | Not available |

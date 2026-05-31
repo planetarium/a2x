@@ -34,7 +34,7 @@ import {
   AgentExecutor,
   StreamingMode,
   InMemoryTaskStore,
-  A2XAgent,
+  A2XServer,
   DefaultRequestHandler,
 } from '@a2x/sdk';
 import { AnthropicProvider } from '@a2x/sdk/anthropic';
@@ -58,7 +58,7 @@ const executor = new AgentExecutor({
 });
 const taskStore = new InMemoryTaskStore();
 
-export const a2xAgent = new A2XAgent({ taskStore, executor, protocolVersion: '1.0' })
+export const a2xServer = new A2XServer({ taskStore, executor, protocolVersion: '1.0' })
   .setDefaultUrl(`${process.env.BASE_URL ?? 'http://localhost:3000'}/api/a2a`)
   .addSkill({
     id: 'chat',
@@ -67,7 +67,7 @@ export const a2xAgent = new A2XAgent({ taskStore, executor, protocolVersion: '1.
     tags: ['chat', 'general'],
   });
 
-export const handler = new DefaultRequestHandler(a2xAgent);
+export const handler = new DefaultRequestHandler(a2xServer);
 ```
 
 ### globalThis Singleton for HMR
@@ -78,15 +78,15 @@ In dev mode, Next.js HMR re-evaluates server modules. If you need stable singlet
 const GLOBAL_KEY = Symbol.for('a2x-handler');
 
 function getOrCreate() {
-  const g = globalThis as Record<symbol, { handler: DefaultRequestHandler; a2xAgent: A2XAgent } | undefined>;
+  const g = globalThis as Record<symbol, { handler: DefaultRequestHandler; a2xServer: A2XServer } | undefined>;
   if (!g[GLOBAL_KEY]) {
-    // ... create agent, runner, executor, taskStore, a2xAgent, handler ...
-    g[GLOBAL_KEY] = { handler, a2xAgent };
+    // ... create agent, runner, executor, taskStore, a2xServer, handler ...
+    g[GLOBAL_KEY] = { handler, a2xServer };
   }
   return g[GLOBAL_KEY]!;
 }
 
-export const { handler, a2xAgent } = getOrCreate();
+export const { handler, a2xServer } = getOrCreate();
 ```
 
 This is the same pattern Next.js recommends for Prisma and other singleton clients.
@@ -99,11 +99,11 @@ This is the same pattern Next.js recommends for Prisma and other singleton clien
 
 ```typescript
 import { NextResponse } from 'next/server';
-import { a2xAgent } from '@/lib/a2x-setup';
+import { a2xServer } from '@/lib/a2x-setup';
 
 export async function GET(): Promise<Response> {
   try {
-    const card = a2xAgent.getAgentCard();
+    const card = a2xServer.getAgentCard();
     return NextResponse.json(card, {
       headers: { 'Cache-Control': 'public, max-age=3600' },
     });

@@ -10,7 +10,7 @@ import type { ProtocolVersion } from '../a2x/a2x-agent.js';
 import { InMemoryRunner } from '../runner/in-memory-runner.js';
 import { AgentExecutor, StreamingMode } from '../a2x/agent-executor.js';
 import { InMemoryTaskStore } from '../a2x/task-store.js';
-import { A2XAgent } from '../a2x/a2x-agent.js';
+import { A2XServer } from '../a2x/a2x-agent.js';
 import { DefaultRequestHandler } from './request-handler.js';
 import { createSSEStream } from './sse-handler.js';
 import type { RequestContext } from '../types/auth.js';
@@ -27,7 +27,9 @@ export interface ToA2xOptions {
 
 export interface ToA2xResult {
   handler: DefaultRequestHandler;
-  a2xAgent: A2XAgent;
+  a2xServer: A2XServer;
+  /** @deprecated Renamed to {@link ToA2xResult.a2xServer}. Use `a2xServer`. */
+  a2xAgent: A2XServer;
   listen(port?: number): Promise<void>;
 }
 
@@ -51,38 +53,40 @@ export function toA2x(
   });
 
   const taskStore = new InMemoryTaskStore();
-  const a2xAgent = new A2XAgent({
+  const a2xServer = new A2XServer({
     taskStore,
     executor: agentExecutor,
     protocolVersion: options.protocolVersion,
   });
 
   // Apply configuration
-  a2xAgent.setDefaultUrl(options.defaultUrl);
+  a2xServer.setDefaultUrl(options.defaultUrl);
 
   if (options.skills) {
     for (const skill of options.skills) {
-      a2xAgent.addSkill(skill);
+      a2xServer.addSkill(skill);
     }
   }
 
   if (options.securitySchemes) {
     for (const [name, scheme] of Object.entries(options.securitySchemes)) {
-      a2xAgent.addSecurityScheme(name, scheme);
+      a2xServer.addSecurityScheme(name, scheme);
     }
   }
 
   if (options.securityRequirements) {
     for (const req of options.securityRequirements) {
-      a2xAgent.addSecurityRequirement(req);
+      a2xServer.addSecurityRequirement(req);
     }
   }
 
-  const handler = new DefaultRequestHandler(a2xAgent);
+  const handler = new DefaultRequestHandler(a2xServer);
 
   return {
     handler,
-    a2xAgent,
+    a2xServer,
+    // Deprecated alias — same instance, kept for backward compatibility.
+    a2xAgent: a2xServer,
     async listen(port?: number): Promise<void> {
       const listenPort = port ?? options.port ?? 3000;
 

@@ -37,7 +37,7 @@ import {
   AgentExecutor,
   StreamingMode,
   InMemoryTaskStore,
-  A2XAgent,
+  A2XServer,
   DefaultRequestHandler,
   ApiKeyAuthorization,
 } from '@a2x/sdk';
@@ -60,7 +60,7 @@ const executor = new AgentExecutor({
 });
 const taskStore = new InMemoryTaskStore();
 
-export const a2xAgent = new A2XAgent({ taskStore, executor, protocolVersion: '1.0' })
+export const a2xServer = new A2XServer({ taskStore, executor, protocolVersion: '1.0' })
   .setDefaultUrl(`${process.env.BASE_URL ?? 'http://localhost:4000'}/a2a`)
   .addSkill({
     id: 'chat',
@@ -76,7 +76,7 @@ export const a2xAgent = new A2XAgent({ taskStore, executor, protocolVersion: '1.
   }))
   .addSecurityRequirement({ apiKey: [] });
 
-export const handler = new DefaultRequestHandler(a2xAgent);
+export const handler = new DefaultRequestHandler(a2xServer);
 ```
 
 ---
@@ -86,7 +86,7 @@ export const handler = new DefaultRequestHandler(a2xAgent);
 ```typescript
 import 'dotenv/config';
 import express from 'express';
-import { handler, a2xAgent } from './lib/a2x-setup';
+import { handler, a2xServer } from './lib/a2x-setup';
 import { createSSEStream } from '@a2x/sdk';
 import type { RequestContext } from '@a2x/sdk';
 

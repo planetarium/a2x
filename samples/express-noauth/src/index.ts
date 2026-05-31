@@ -6,7 +6,7 @@ import {
   AgentExecutor,
   StreamingMode,
   InMemoryTaskStore,
-  A2XAgent,
+  A2XServer,
   DefaultRequestHandler,
   createSSEStream,
 } from '@a2x/sdk';
@@ -37,14 +37,14 @@ const agentExecutor = new AgentExecutor({
   runConfig: { streamingMode: StreamingMode.SSE },
 });
 const taskStore = new InMemoryTaskStore();
-const a2xAgent = new A2XAgent({
+const a2xServer = new A2XServer({
   taskStore,
   executor: agentExecutor,
   protocolVersion: '1.0',
 });
 
-a2xAgent.setDefaultUrl(`${process.env.BASE_URL ?? 'http://localhost:4000'}/a2a`);
-a2xAgent.addSkill({
+a2xServer.setDefaultUrl(`${process.env.BASE_URL ?? 'http://localhost:4000'}/a2a`);
+a2xServer.addSkill({
   id: 'echo',
   name: 'Echo',
   description: 'Echoes back the user message',
@@ -52,7 +52,7 @@ a2xAgent.addSkill({
   examples: ['Hello, agent!'],
 });
 
-const handler = new DefaultRequestHandler(a2xAgent);
+const handler = new DefaultRequestHandler(a2xServer);
 
 // ─── 3. Express app ───
 

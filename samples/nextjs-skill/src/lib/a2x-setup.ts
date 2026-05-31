@@ -1,6 +1,6 @@
 import path from "node:path";
 import {
-  A2XAgent,
+  A2XServer,
   AgentExecutor,
   DefaultRequestHandler,
   InMemoryRunner,
@@ -64,7 +64,7 @@ const executor = new AgentExecutor({
 
 const taskStore = new InMemoryTaskStore();
 
-export const a2xAgent = new A2XAgent({
+export const a2xServer = new A2XServer({
   taskStore,
   executor,
   protocolVersion: "1.0",
@@ -78,4 +78,4 @@ export const a2xAgent = new A2XAgent({
     tags: ["demo", "skills"],
   });
 
-export const handler = new DefaultRequestHandler(a2xAgent);
+export const handler = new DefaultRequestHandler(a2xServer);

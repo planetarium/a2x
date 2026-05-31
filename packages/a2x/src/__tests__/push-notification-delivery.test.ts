@@ -12,7 +12,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { DefaultRequestHandler } from '../transport/request-handler.js';
-import { A2XAgent } from '../a2x/a2x-agent.js';
+import { A2XServer } from '../a2x/a2x-agent.js';
 import { AgentExecutor, StreamingMode } from '../a2x/agent-executor.js';
 import { InMemoryTaskStore } from '../a2x/task-store.js';
 import { InMemoryRunner } from '../runner/in-memory-runner.js';
@@ -46,7 +46,7 @@ function createTestAgent(sender: PushNotificationSender) {
     runConfig: { streamingMode: StreamingMode.SSE },
   });
   const pushStore = new InMemoryPushNotificationConfigStore();
-  const a2x = new A2XAgent({
+  const a2x = new A2XServer({
     taskStore: new InMemoryTaskStore(),
     executor,
     protocolVersion: '1.0',

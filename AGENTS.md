@@ -20,7 +20,7 @@ specification/      Canonical A2A JSON/proto specs (v0.3, v1.0)
 
 - New / changed / removed exports from `packages/a2x/src/index.ts` (or any subpath export declared in `packages/a2x/package.json`).
 - New / changed JSON-RPC methods wired in `DefaultRequestHandler._registerRoutes()` or the `handle()` special cases.
-- New / changed `A2XAgent` builder methods, constructor options, or accessors.
+- New / changed `A2XServer` builder methods, constructor options, or accessors.
 - New / changed `A2XClient` methods.
 - New / changed error codes exposed via `A2A_ERROR_CODES`.
 - Spec-conformance corrections (e.g. renaming an `A2A_METHODS` constant) even when functional behavior doesn't change.
@@ -32,7 +32,7 @@ Location map:
 | New JSON-RPC method on the server | `docs/guides/agent/streaming.md` or `docs/guides/agent/build-an-agent.md`, plus the matching client page |
 | New `A2XClient` method | `docs/guides/client/*.md` |
 | New security scheme | `docs/guides/advanced/authentication.md` |
-| New `A2XAgentOptions` field or builder method | `docs/guides/advanced/manual-wiring.md` |
+| New `A2XServerOptions` field or builder method | `docs/guides/advanced/manual-wiring.md` |
 | New AgentCard capability flag / version shape | `docs/guides/advanced/agent-card-versioning.md` |
 | New protocol extension | `docs/guides/advanced/extensions.md` |
 | Genuinely new feature with no matching page | Add a new `.md` under `docs/guides/...` and register it in `docs/manifest.json` |

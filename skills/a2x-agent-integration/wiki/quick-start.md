@@ -20,7 +20,7 @@ const agent = new LlmAgent({
   instruction: 'You are a helpful assistant.',
 });
 
-const { handler, a2xAgent, listen } = toA2x(agent, {
+const { handler, a2xServer, listen } = toA2x(agent, {
   defaultUrl: 'http://localhost:3000/a2a',
 });
 
@@ -53,7 +53,7 @@ const agent = new LlmAgent({
   instruction: 'You are a helpful, secure assistant.',
 });
 
-const { handler, a2xAgent, listen } = toA2x(agent, {
+const { handler, a2xServer, listen } = toA2x(agent, {
   defaultUrl: 'http://localhost:4000/a2a',
   port: 4000,
   streamingMode: StreamingMode.SSE,
@@ -102,12 +102,12 @@ interface ToA2xOptions {
 ```typescript
 interface ToA2xResult {
   handler: DefaultRequestHandler;   // For custom HTTP integration
-  a2xAgent: A2XAgent;              // For further configuration
+  a2xServer: A2XServer;              // For further configuration
   listen(port?: number): Promise<void>;  // Start the built-in HTTP server
 }
 ```
 
-You can use `handler` and `a2xAgent` directly if you want to integrate into an existing server, or call `listen()` for the built-in server.
+You can use `handler` and `a2xServer` directly if you want to integrate into an existing server, or call `listen()` for the built-in server.
 
 ---
 

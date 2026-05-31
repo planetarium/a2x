@@ -7,7 +7,7 @@ A self-contained TypeScript SDK for building [A2A (Agent-to-Agent)](https://a2a-
 
 ## Why a2x?
 
-- **Auto-extraction** — `A2XAgent` infers AgentCard fields from your runtime objects. No manual JSON authoring.
+- **Auto-extraction** — `A2XServer` infers AgentCard fields from your runtime objects. No manual JSON authoring.
 - **Multi-version AgentCard** — Generate v0.3 and v1.0 AgentCards from the same instance.
 - **Multi-provider** — Anthropic Claude, OpenAI GPT, and Google Gemini out of the box.
 - **Framework-agnostic** — Works with Express, Fastify, Hono, Next.js, or any HTTP framework.
@@ -105,7 +105,7 @@ import {
   AgentExecutor,
   StreamingMode,
   InMemoryTaskStore,
-  A2XAgent,
+  A2XServer,
   DefaultRequestHandler,
   createSSEStream,
 } from '@a2x/sdk';
@@ -131,8 +131,8 @@ const executor = new AgentExecutor({
 });
 const taskStore = new InMemoryTaskStore();
 
-// 3. Create A2XAgent (auto-extracts name, description, streaming from runtime)
-const a2xAgent = new A2XAgent({ taskStore, executor })
+// 3. Create A2XServer (auto-extracts name, description, streaming from runtime)
+const a2xServer = new A2XServer({ taskStore, executor })
   .setDefaultUrl('https://my-agent.example.com/a2a')
   .addSkill({
     id: 'chat',
@@ -142,7 +142,7 @@ const a2xAgent = new A2XAgent({ taskStore, executor })
   });
 
 // 4. Create the request handler
-const handler = new DefaultRequestHandler(a2xAgent);
+const handler = new DefaultRequestHandler(a2xServer);
 ```
 
 ### Express
@@ -288,7 +288,7 @@ const mainAgent = new LlmAgent({
 ```typescript
 import { ApiKeyAuthorization, HttpBearerAuthorization } from '@a2x/sdk';
 
-a2xAgent
+a2xServer
   .addSecurityScheme('apiKey', new ApiKeyAuthorization({
     in: 'header',
     name: 'x-api-key',
@@ -387,7 +387,7 @@ const executor = new AgentExecutor({
   runConfig: { streamingMode: StreamingMode.SSE },
 });
 
-const agent = new A2XAgent({ taskStore, executor })
+const agent = new A2XServer({ taskStore, executor })
   .addExtension({ uri: X402_EXTENSION_URI, required: true });
 ```
 
@@ -413,8 +413,8 @@ Migration from `x402PaymentHook` (SDK 0.13.x): [docs/guides/advanced/migration-x
 a2x handles the structural differences between A2A protocol versions transparently. Each agent is bound to one wire format at construction:
 
 ```typescript
-const a2xAgentV10 = new A2XAgent({ taskStore, executor });                          // v1.0 (default)
-const a2xAgentV03 = new A2XAgent({ taskStore, executor, protocolVersion: '0.3' });  // v0.3
+const a2xAgentV10 = new A2XServer({ taskStore, executor });                          // v1.0 (default)
+const a2xAgentV03 = new A2XServer({ taskStore, executor, protocolVersion: '0.3' });  // v0.3
 
 a2xAgentV10.getAgentCard(); // v1.0 card
 a2xAgentV03.getAgentCard(); // v0.3 card

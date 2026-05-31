@@ -1,6 +1,6 @@
 # Manual Wiring
 
-`toA2x()` is a convenience wrapper. Underneath, it composes five pieces: the agent, a **runner**, an **executor**, a **task store**, and an **A2XAgent** that binds everything to a **request handler**. This guide unpacks that stack so you can customize any of it.
+`toA2x()` is a convenience wrapper. Underneath, it composes five pieces: the agent, a **runner**, an **executor**, a **task store**, and an **A2XServer** that binds everything to a **request handler**. This guide unpacks that stack so you can customize any of it.
 
 Reach for manual wiring when you need to:
 
@@ -18,7 +18,7 @@ import {
   AgentExecutor,
   StreamingMode,
   InMemoryTaskStore,
-  A2XAgent,
+  A2XServer,
   DefaultRequestHandler,
 } from '@a2x/sdk';
 import { GoogleProvider } from '@a2x/sdk/google';
@@ -46,8 +46,8 @@ const executor = new AgentExecutor({
 // 4. Task store — persists task state across calls (getTask, cancelTask).
 const taskStore = new InMemoryTaskStore();
 
-// 5. A2XAgent — emits the AgentCard and owns skills, security, versioning.
-const a2xAgent = new A2XAgent({ taskStore, executor })
+// 5. A2XServer — emits the AgentCard and owns skills, security, versioning.
+const a2xServer = new A2XServer({ taskStore, executor })
   .setDefaultUrl('https://my-agent.example.com/a2a')
   .addSkill({
     id: 'chat',
@@ -57,7 +57,7 @@ const a2xAgent = new A2XAgent({ taskStore, executor })
   });
 
 // 6. Request handler — the thing your HTTP layer calls.
-const handler = new DefaultRequestHandler(a2xAgent);
+const handler = new DefaultRequestHandler(a2xServer);
 ```
 
 `handler.getAgentCard()` returns the AgentCard JSON. `handler.handle(body, context)` processes a JSON-RPC request and returns either a plain object or an async iterable (for streams).
@@ -79,12 +79,12 @@ const handler = new DefaultRequestHandler(a2xAgent);
 
 ### Task event bus
 
-The bus fans `message/stream` events out to any `tasks/resubscribe` subscribers. `A2XAgent` creates a default `InMemoryTaskEventBus` when you don't pass one — sufficient for single-process deployments.
+The bus fans `message/stream` events out to any `tasks/resubscribe` subscribers. `A2XServer` creates a default `InMemoryTaskEventBus` when you don't pass one — sufficient for single-process deployments.
 
 Swap it when you need cross-process fan-out (e.g. multiple worker nodes behind a load balancer):
 
 ```ts
-import { A2XAgent, type TaskEventBus } from '@a2x/sdk';
+import { A2XServer, type TaskEventBus } from '@a2x/sdk';
 
 class RedisTaskEventBus implements TaskEventBus {
   publish(taskId, event) { /* PUBLISH a2x:task:<taskId> */ }
@@ -93,7 +93,7 @@ class RedisTaskEventBus implements TaskEventBus {
   hasSubscribers(taskId) { /* SUBSCRIBERS count */ }
 }
 
-const a2xAgent = new A2XAgent({
+const a2xServer = new A2XServer({
   taskStore,
   executor,
   taskEventBus: new RedisTaskEventBus(),
@@ -105,7 +105,7 @@ The default implementation's queue is unbounded — fine for most agents, but co
 ### AgentCard skills and metadata
 
 ```ts
-a2xAgent
+a2xServer
   .setDefaultUrl('https://my-agent.example.com/a2a')
   .setIconUrl('https://my-agent.example.com/icon.png')
   .addSkill({
@@ -129,7 +129,7 @@ Skills are how other agents and directories understand what yours does. Prefer d
 ```ts
 import { ApiKeyAuthorization } from '@a2x/sdk';
 
-a2xAgent
+a2xServer
   .addSecurityScheme('apiKey', new ApiKeyAuthorization({
     in: 'header',
     name: 'x-api-key',
@@ -155,7 +155,7 @@ Two capabilities need explicit builder calls — both are append-only / boolean:
 ```ts
 import { X402_EXTENSION_URI } from '@a2x/sdk/x402';
 
-a2xAgent
+a2xServer
   .addExtension({ uri: X402_EXTENSION_URI, required: true })
   // or: .addExtension('https://example.com/ext', { required: true })
   .setStateTransitionHistory(true); // v0.3 only; dropped on v1.0 cards

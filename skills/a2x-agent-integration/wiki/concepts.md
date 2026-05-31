@@ -8,7 +8,7 @@
 
 ```
 Layer 4: Transport        — DefaultRequestHandler, createSSEStream, toA2x
-Layer 3: A2X Integration  — A2XAgent, AgentExecutor, TaskStore, AgentCard mappers
+Layer 3: A2X Integration  — A2XServer, AgentExecutor, TaskStore, AgentCard mappers
 Layer 2: Agent Runtime    — LlmAgent, Tools, Runner, Session, Providers
 Layer 1: Types & Security — A2A protocol types, SecurityScheme classes
 ```
@@ -97,14 +97,14 @@ interface TaskStore {
 }
 ```
 
-### A2XAgent
+### A2XServer
 
 The central integration class. Bridges agent runtime with A2A protocol. Auto-generates AgentCards for both v0.3 and v1.0 from a single definition.
 
 ```typescript
-import { A2XAgent } from '@a2x/sdk';
+import { A2XServer } from '@a2x/sdk';
 
-const a2xAgent = new A2XAgent({
+const a2xServer = new A2XServer({
   taskStore,
   executor,
   protocolVersion: '1.0',  // Default protocol version: '0.3' | '1.0'
@@ -114,7 +114,7 @@ const a2xAgent = new A2XAgent({
 **Builder methods** (all chainable):
 
 ```typescript
-a2xAgent
+a2xServer
   .setName('My Agent')              // Override auto-extracted name
   .setDescription('Agent desc')     // Override auto-extracted description
   .setVersion('1.0.0')              // Agent version
@@ -134,9 +134,9 @@ a2xAgent
 **Getting AgentCards:**
 
 ```typescript
-const cardV10 = a2xAgent.getAgentCard();       // Default version
-const cardV03 = a2xAgent.getAgentCard('0.3');   // Explicit v0.3
-const cardV10 = a2xAgent.getAgentCard('1.0');   // Explicit v1.0
+const cardV10 = a2xServer.getAgentCard();       // Default version
+const cardV03 = a2xServer.getAgentCard('0.3');   // Explicit v0.3
+const cardV10 = a2xServer.getAgentCard('1.0');   // Explicit v1.0
 ```
 
 ### DefaultRequestHandler
@@ -146,7 +146,7 @@ Framework-agnostic JSON-RPC handler. Routes A2A methods to the appropriate logic
 ```typescript
 import { DefaultRequestHandler } from '@a2x/sdk';
 
-const handler = new DefaultRequestHandler(a2xAgent);
+const handler = new DefaultRequestHandler(a2xServer);
 
 // Handle a JSON-RPC request
 const result = await handler.handle(body, context);
@@ -176,7 +176,7 @@ const card = handler.getAgentCard('0.3');     // Specific version
 | Security | `security[]` + `securitySchemes{}` | `securityRequirements[]` (OpenAPI 3.2) |
 | Device Code OAuth | Not supported | Supported |
 
-You define your agent once, and `A2XAgent.getAgentCard(version)` outputs the correct format.
+You define your agent once, and `A2XServer.getAgentCard(version)` outputs the correct format.
 
 ---
 

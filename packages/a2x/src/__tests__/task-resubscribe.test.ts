@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { DefaultRequestHandler } from '../transport/request-handler.js';
-import { A2XAgent } from '../a2x/a2x-agent.js';
+import { A2XServer } from '../a2x/a2x-agent.js';
 import type { ProtocolVersion } from '../a2x/a2x-agent.js';
 import { AgentExecutor, StreamingMode } from '../a2x/agent-executor.js';
 import { InMemoryTaskStore } from '../a2x/task-store.js';
@@ -45,9 +45,9 @@ function createSlowHandler(
     runConfig: { streamingMode: StreamingMode.SSE },
   });
   const taskStore = new InMemoryTaskStore();
-  const a2xAgent = new A2XAgent({ taskStore, executor, protocolVersion });
-  a2xAgent.setDefaultUrl('https://example.com/a2a');
-  return { handler: new DefaultRequestHandler(a2xAgent), taskStore };
+  const a2xServer = new A2XServer({ taskStore, executor, protocolVersion });
+  a2xServer.setDefaultUrl('https://example.com/a2a');
+  return { handler: new DefaultRequestHandler(a2xServer), taskStore };
 }
 
 // Each chunk in a streaming response is a JSON-RPC success envelope per

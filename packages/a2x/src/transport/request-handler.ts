@@ -8,7 +8,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import type { A2XAgent } from '../a2x/a2x-agent.js';
+import type { A2XServer } from '../a2x/a2x-agent.js';
 import type {
   JSONRPCRequest,
   JSONRPCResponse,
@@ -55,14 +55,14 @@ export type HandleResult =
   | AsyncGenerator<unknown>;
 
 export class DefaultRequestHandler {
-  private readonly a2xAgent: A2XAgent;
+  private readonly a2xServer: A2XServer;
   private readonly router: JsonRpcRouter;
   private readonly responseMapper: ResponseMapper;
 
-  constructor(a2xAgent: A2XAgent) {
-    this.a2xAgent = a2xAgent;
+  constructor(a2xServer: A2XServer) {
+    this.a2xServer = a2xServer;
     this.router = new JsonRpcRouter();
-    this.responseMapper = ResponseMapperFactory.getMapper(a2xAgent.protocolVersion);
+    this.responseMapper = ResponseMapperFactory.getMapper(a2xServer.protocolVersion);
     this._registerRoutes();
   }
 
@@ -134,7 +134,7 @@ export class DefaultRequestHandler {
     // emit an auth-required task. Other methods don't have a task-shaped
     // response, so they fall back to `-32600 InvalidRequest`.
     let authResult: AuthResult | undefined;
-    if (context && this.a2xAgent.securityRequirements.length > 0) {
+    if (context && this.a2xServer.securityRequirements.length > 0) {
       authResult = await this._authenticate(context);
       if (!authResult.authenticated) {
         const reason = authResult.error ?? 'Authentication required';
@@ -176,7 +176,7 @@ export class DefaultRequestHandler {
     // route via JsonRpcRouter because that layer has no access to auth.
     if (request.method === A2A_METHODS.GET_EXTENDED_CARD) {
       try {
-        if (!this.a2xAgent.hasAuthenticatedExtendedCardProvider) {
+        if (!this.a2xServer.hasAuthenticatedExtendedCardProvider) {
           throw new AuthenticatedExtendedCardNotConfiguredError();
         }
         if (!authResult || !authResult.authenticated) {
@@ -184,7 +184,7 @@ export class DefaultRequestHandler {
             'Authentication is required for the authenticated extended card',
           );
         }
-        const card = await this.a2xAgent.getAuthenticatedExtendedCard(authResult);
+        const card = await this.a2xServer.getAuthenticatedExtendedCard(authResult);
         return {
           jsonrpc: '2.0',
           id: request.id,
@@ -221,7 +221,7 @@ export class DefaultRequestHandler {
    * `protocolVersion` to match the wire format the server actually speaks.
    */
   getAgentCard(): AgentCardV03 | AgentCardV10 {
-    return this.a2xAgent.getAgentCard();
+    return this.a2xServer.getAgentCard();
   }
 
   // ─── Private: auth-required Task synthesis ───
@@ -310,8 +310,8 @@ export class DefaultRequestHandler {
    * Passes if ANY requirement group is fully satisfied.
    */
   private async _authenticate(context: RequestContext): Promise<AuthResult> {
-    const requirements = this.a2xAgent.securityRequirements;
-    const schemes = this.a2xAgent.securitySchemes;
+    const requirements = this.a2xServer.securityRequirements;
+    const schemes = this.a2xServer.securitySchemes;
 
     const errors: string[] = [];
 
@@ -403,7 +403,7 @@ export class DefaultRequestHandler {
   private _validateExtensionActivation(
     context: RequestContext,
   ): InvalidRequestError | null {
-    const required = this.a2xAgent.extensions.filter((ext) => ext.required);
+    const required = this.a2xServer.extensions.filter((ext) => ext.required);
     if (required.length === 0) return null;
 
     const activated = parseActivatedExtensions(context.headers);
@@ -518,12 +518,12 @@ export class DefaultRequestHandler {
   private async _resolveTaskForMessage(params: SendMessageParams) {
     const messageTaskId = (params.message as { taskId?: unknown }).taskId;
     if (typeof messageTaskId === 'string' && messageTaskId.length > 0) {
-      const existing = await this.a2xAgent.taskStore.getTask(messageTaskId);
+      const existing = await this.a2xServer.taskStore.getTask(messageTaskId);
       if (existing && !TERMINAL_STATES.has(existing.status.state)) {
         return existing;
       }
     }
-    return this.a2xAgent.taskStore.createTask({
+    return this.a2xServer.taskStore.createTask({
       contextId: params.message.contextId,
       metadata: params.metadata,
     });
@@ -540,7 +540,7 @@ export class DefaultRequestHandler {
     // events can find the config when delivery is wired.
     await this._registerInlinePushConfig(task.id, params.configuration);
 
-    const completedTask = await this.a2xAgent.agentExecutor.execute(
+    const completedTask = await this.a2xServer.agentExecutor.execute(
       task,
       params.message,
     );
@@ -568,7 +568,7 @@ export class DefaultRequestHandler {
     const pushConfig = config?.pushNotificationConfig;
     if (!pushConfig) return;
 
-    const store = this.a2xAgent.pushNotificationConfigStore;
+    const store = this.a2xServer.pushNotificationConfigStore;
     if (!store) {
       throw new PushNotificationNotSupportedError();
     }
@@ -591,8 +591,8 @@ export class DefaultRequestHandler {
    * `Task` is only used inside the SDK and must not leak onto the wire.
    */
   private async _dispatchPushNotifications(task: Task): Promise<void> {
-    const store = this.a2xAgent.pushNotificationConfigStore;
-    const sender = this.a2xAgent.pushNotificationSender;
+    const store = this.a2xServer.pushNotificationConfigStore;
+    const sender = this.a2xServer.pushNotificationSender;
     if (!store || !sender) return;
     let configs;
     try {
@@ -610,7 +610,7 @@ export class DefaultRequestHandler {
     params: SendMessageParams,
   ): AsyncGenerator<unknown> {
     if (
-      this.a2xAgent.agentExecutor.runConfig.streamingMode ===
+      this.a2xServer.agentExecutor.runConfig.streamingMode ===
       StreamingMode.NONE
     ) {
       throw new UnsupportedOperationError(
@@ -625,12 +625,12 @@ export class DefaultRequestHandler {
     // §MessageSendConfiguration.
     await this._registerInlinePushConfig(task.id, params.configuration);
 
-    const eventStream = this.a2xAgent.agentExecutor.executeStream(
+    const eventStream = this.a2xServer.agentExecutor.executeStream(
       task,
       params.message,
     );
 
-    const bus = this.a2xAgent.taskEventBus;
+    const bus = this.a2xServer.taskEventBus;
 
     let reachedTerminal = false;
 
@@ -645,7 +645,7 @@ export class DefaultRequestHandler {
           if (TERMINAL_STATES.has(event.status.state)) {
             reachedTerminal = true;
           } else {
-            await this.a2xAgent.taskStore.updateTask(task.id, {
+            await this.a2xServer.taskStore.updateTask(task.id, {
               status: event.status,
             });
           }
@@ -662,7 +662,7 @@ export class DefaultRequestHandler {
       if (reachedTerminal) {
         // Re-fetch the task so the webhook body reflects the final
         // store state (artifacts accumulated during streaming, etc).
-        const final = await this.a2xAgent.taskStore.getTask(task.id);
+        const final = await this.a2xServer.taskStore.getTask(task.id);
         if (final) void this._dispatchPushNotifications(final);
       }
     }
@@ -671,7 +671,7 @@ export class DefaultRequestHandler {
   private async *_handleResubscribe(
     params: TaskIdParams,
   ): AsyncGenerator<unknown> {
-    const task = await this.a2xAgent.taskStore.getTask(params.id);
+    const task = await this.a2xServer.taskStore.getTask(params.id);
     if (!task) {
       throw new TaskNotFoundError(`Task not found: ${params.id}`);
     }
@@ -688,7 +688,7 @@ export class DefaultRequestHandler {
       return;
     }
 
-    const bus = this.a2xAgent.taskEventBus;
+    const bus = this.a2xServer.taskEventBus;
     for await (const event of bus.subscribe(params.id)) {
       if ('status' in event) {
         yield this.responseMapper.mapStatusUpdateEvent(event as TaskStatusUpdateEvent);
@@ -699,7 +699,7 @@ export class DefaultRequestHandler {
   }
 
   private async _handleGetTask(params: TaskQueryParams): Promise<unknown> {
-    const task = await this.a2xAgent.taskStore.getTask(params.id);
+    const task = await this.a2xServer.taskStore.getTask(params.id);
     if (!task) {
       throw new TaskNotFoundError(`Task not found: ${params.id}`);
     }
@@ -708,7 +708,7 @@ export class DefaultRequestHandler {
   }
 
   private async _handleCancelTask(params: TaskIdParams): Promise<unknown> {
-    const task = await this.a2xAgent.taskStore.getTask(params.id);
+    const task = await this.a2xServer.taskStore.getTask(params.id);
     if (!task) {
       throw new TaskNotFoundError(`Task not found: ${params.id}`);
     }
@@ -719,7 +719,7 @@ export class DefaultRequestHandler {
       );
     }
 
-    const canceledTask = await this.a2xAgent.agentExecutor.cancel(task);
+    const canceledTask = await this.a2xServer.agentExecutor.cancel(task);
 
     return this.responseMapper.mapTask(canceledTask);
   }
@@ -727,7 +727,7 @@ export class DefaultRequestHandler {
   private async _handleDeletePushNotificationConfig(
     params: DeletePushNotificationConfigParams,
   ): Promise<null> {
-    const store = this.a2xAgent.pushNotificationConfigStore;
+    const store = this.a2xServer.pushNotificationConfigStore;
     if (!store) {
       throw new PushNotificationNotSupportedError();
     }
@@ -745,7 +745,7 @@ export class DefaultRequestHandler {
   private async _handleSetPushNotificationConfig(
     params: TaskPushNotificationConfig,
   ): Promise<unknown> {
-    const store = this.a2xAgent.pushNotificationConfigStore;
+    const store = this.a2xServer.pushNotificationConfigStore;
     if (!store) {
       throw new PushNotificationNotSupportedError();
     }
@@ -757,7 +757,7 @@ export class DefaultRequestHandler {
   private async _handleGetPushNotificationConfig(
     params: GetPushNotificationConfigParams,
   ): Promise<unknown> {
-    const store = this.a2xAgent.pushNotificationConfigStore;
+    const store = this.a2xServer.pushNotificationConfigStore;
     if (!store) {
       throw new PushNotificationNotSupportedError();
     }
@@ -788,7 +788,7 @@ export class DefaultRequestHandler {
   private async _handleListPushNotificationConfigs(
     params: ListPushNotificationConfigsParams,
   ): Promise<unknown> {
-    const store = this.a2xAgent.pushNotificationConfigStore;
+    const store = this.a2xServer.pushNotificationConfigStore;
     if (!store) {
       throw new PushNotificationNotSupportedError();
     }
@@ -926,7 +926,7 @@ export class DefaultRequestHandler {
     let taskId: string;
     let configId: string;
 
-    if (this.a2xAgent.protocolVersion === '0.3') {
+    if (this.a2xServer.protocolVersion === '0.3') {
       // v0.3: { id: taskId, pushNotificationConfigId: configId }
       if (typeof p.id !== 'string' || p.id.trim() === '') {
         throw new InvalidParamsError(
@@ -1002,7 +1002,7 @@ export class DefaultRequestHandler {
     // top-level `url` is what disambiguates flat from nested — a v0.3
     // request never has top-level `url`, only `pushNotificationConfig`.
     const isFlat =
-      this.a2xAgent.protocolVersion === '1.0' &&
+      this.a2xServer.protocolVersion === '1.0' &&
       typeof p.url === 'string';
 
     const source: Record<string, unknown> = isFlat
@@ -1086,7 +1086,7 @@ export class DefaultRequestHandler {
     }
 
     let schemes: string[];
-    if (this.a2xAgent.protocolVersion === '1.0') {
+    if (this.a2xServer.protocolVersion === '1.0') {
       if (typeof auth.scheme !== 'string' || auth.scheme.trim() === '') {
         throw new InvalidParamsError(
           'SetPushNotificationConfig: "pushNotificationConfig.authentication.scheme" must be a non-empty string',
@@ -1140,7 +1140,7 @@ export class DefaultRequestHandler {
     let taskId: string;
     let configId: string | undefined;
 
-    if (this.a2xAgent.protocolVersion === '0.3') {
+    if (this.a2xServer.protocolVersion === '0.3') {
       // v0.3: { id: taskId, pushNotificationConfigId?: configId }
       if (typeof p.id !== 'string' || p.id.trim() === '') {
         throw new InvalidParamsError(
@@ -1202,7 +1202,7 @@ export class DefaultRequestHandler {
     const p = params as Record<string, unknown>;
     let taskId: string;
 
-    if (this.a2xAgent.protocolVersion === '0.3') {
+    if (this.a2xServer.protocolVersion === '0.3') {
       // v0.3: { id: taskId }
       if (typeof p.id !== 'string' || p.id.trim() === '') {
         throw new InvalidParamsError(

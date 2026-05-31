@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { DefaultRequestHandler } from '../transport/request-handler.js';
-import { A2XAgent } from '../a2x/a2x-agent.js';
+import { A2XServer } from '../a2x/a2x-agent.js';
 import type { ProtocolVersion } from '../a2x/a2x-agent.js';
 import { AgentExecutor, StreamingMode } from '../a2x/agent-executor.js';
 import { InMemoryTaskStore } from '../a2x/task-store.js';
@@ -51,15 +51,15 @@ function createHandler(options: HandlerBuildOptions = {}): DefaultRequestHandler
     runConfig: { streamingMode: StreamingMode.SSE },
   });
   const taskStore = new InMemoryTaskStore();
-  const a2xAgent = new A2XAgent({
+  const a2xServer = new A2XServer({
     taskStore,
     executor,
     protocolVersion: options.protocolVersion,
   });
-  a2xAgent.setDefaultUrl('https://example.com/a2a');
+  a2xServer.setDefaultUrl('https://example.com/a2a');
 
   if (options.withAuth) {
-    a2xAgent
+    a2xServer
       .addSecurityScheme(
         'apiKey',
         new ApiKeyAuthorization({
@@ -72,10 +72,10 @@ function createHandler(options: HandlerBuildOptions = {}): DefaultRequestHandler
   }
 
   if (options.withProvider) {
-    a2xAgent.setAuthenticatedExtendedCardProvider(options.withProvider);
+    a2xServer.setAuthenticatedExtendedCardProvider(options.withProvider);
   }
 
-  return new DefaultRequestHandler(a2xAgent);
+  return new DefaultRequestHandler(a2xServer);
 }
 
 function isAsyncGenerator(value: unknown): value is AsyncGenerator {

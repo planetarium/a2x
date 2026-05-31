@@ -1,5 +1,5 @@
 /**
- * Layer 3: A2XAgent - the main integration class that bridges
+ * Layer 3: A2XServer - the main integration class that bridges
  * the agent system with the A2A protocol.
  */
 
@@ -33,7 +33,7 @@ const SUPPORTED_PROTOCOL_VERSIONS: ReadonlySet<string> = new Set<string>([
   '1.0',
 ]);
 
-export interface A2XAgentOptions {
+export interface A2XServerOptions {
   taskStore: TaskStore;
   executor: AgentExecutor;
   protocolVersion?: ProtocolVersion;
@@ -49,7 +49,7 @@ export interface A2XAgentOptions {
   taskEventBus?: TaskEventBus;
 }
 
-export class A2XAgent {
+export class A2XServer {
   private readonly _taskStore: TaskStore;
   private readonly _agentExecutor: AgentExecutor;
   private readonly _protocolVersion: ProtocolVersion;
@@ -84,19 +84,19 @@ export class A2XAgent {
   // (see issue #133).
   private _cachedCard?: AgentCardV03 | AgentCardV10;
 
-  constructor(options: A2XAgentOptions) {
+  constructor(options: A2XServerOptions) {
     if (!options.taskStore) {
-      throw new Error('A2XAgent: taskStore is required');
+      throw new Error('A2XServer: taskStore is required');
     }
     if (!options.executor) {
-      throw new Error('A2XAgent: executor is required');
+      throw new Error('A2XServer: executor is required');
     }
     if (
       options.protocolVersion !== undefined &&
       !SUPPORTED_PROTOCOL_VERSIONS.has(options.protocolVersion)
     ) {
       throw new Error(
-        `A2XAgent: unsupported protocolVersion '${options.protocolVersion}'. Supported versions: ${Array.from(SUPPORTED_PROTOCOL_VERSIONS).join(', ')}`,
+        `A2XServer: unsupported protocolVersion '${options.protocolVersion}'. Supported versions: ${Array.from(SUPPORTED_PROTOCOL_VERSIONS).join(', ')}`,
       );
     }
 
@@ -130,7 +130,7 @@ export class A2XAgent {
 
   setDefaultUrl(url: string): this {
     if (!url || url.trim() === '') {
-      throw new Error('A2XAgent.setDefaultUrl: url must not be empty');
+      throw new Error('A2XServer.setDefaultUrl: url must not be empty');
     }
     this._defaultUrl = url;
     this._invalidateCache();
@@ -146,7 +146,7 @@ export class A2XAgent {
   addSecurityScheme(name: string, scheme: BaseSecurityScheme): this {
     if (this._securitySchemes.has(name)) {
       console.warn(
-        `A2XAgent.addSecurityScheme: overwriting existing scheme '${name}'`,
+        `A2XServer.addSecurityScheme: overwriting existing scheme '${name}'`,
       );
     }
     this._securitySchemes.set(name, scheme);
@@ -163,7 +163,7 @@ export class A2XAgent {
   addInterface(iface: A2XInterfaceEntry): this {
     if (!iface.url || !iface.protocol) {
       throw new Error(
-        'A2XAgent.addInterface: url and protocol are required',
+        'A2XServer.addInterface: url and protocol are required',
       );
     }
     this._interfaces.push(iface);
@@ -326,7 +326,7 @@ export class A2XAgent {
    * give clients a false contract: the response shapes, role/part encoding,
    * and `pushNotificationConfig` param shape are all bound to the
    * configured protocol version. To serve a different version, construct a
-   * separate `A2XAgent` with that `protocolVersion`.
+   * separate `A2XServer` with that `protocolVersion`.
    */
   getAgentCard(): AgentCardV03 | AgentCardV10 {
     if (this._cachedCard) {
@@ -339,12 +339,12 @@ export class A2XAgent {
     // Validate required fields
     if (!state.name) {
       throw new Error(
-        'A2XAgent.getAgentCard: name is required. Use setName() or ensure the agent has a name.',
+        'A2XServer.getAgentCard: name is required. Use setName() or ensure the agent has a name.',
       );
     }
     if (!state.description) {
       throw new Error(
-        'A2XAgent.getAgentCard: description is required. Use setDescription() or ensure the agent has a description.',
+        'A2XServer.getAgentCard: description is required. Use setDescription() or ensure the agent has a description.',
       );
     }
 
@@ -353,7 +353,7 @@ export class A2XAgent {
       for (const schemeName of Object.keys(req)) {
         if (!state.securitySchemes.has(schemeName)) {
           throw new Error(
-            `A2XAgent.getAgentCard: security requirement references unregistered scheme '${schemeName}'`,
+            `A2XServer.getAgentCard: security requirement references unregistered scheme '${schemeName}'`,
           );
         }
       }
@@ -366,7 +366,7 @@ export class A2XAgent {
           for (const schemeName of Object.keys(req)) {
             if (!state.securitySchemes.has(schemeName)) {
               throw new Error(
-                `A2XAgent.getAgentCard: skill '${skill.id}' security requirement references unregistered scheme '${schemeName}'`,
+                `A2XServer.getAgentCard: skill '${skill.id}' security requirement references unregistered scheme '${schemeName}'`,
               );
             }
           }
@@ -466,12 +466,12 @@ export class A2XAgent {
 
     if (!mergedState.name) {
       throw new Error(
-        'A2XAgent.getAuthenticatedExtendedCard: name is required on the merged state',
+        'A2XServer.getAuthenticatedExtendedCard: name is required on the merged state',
       );
     }
     if (!mergedState.description) {
       throw new Error(
-        'A2XAgent.getAuthenticatedExtendedCard: description is required on the merged state',
+        'A2XServer.getAuthenticatedExtendedCard: description is required on the merged state',
       );
     }
 
@@ -556,3 +556,17 @@ export class A2XAgent {
     };
   }
 }
+
+// ─── Deprecated aliases ───
+//
+// `A2XServer` was originally named `A2XAgent`. The class is the A2A protocol
+// *server* wrapper (task store, executor, AgentCard builder) — not an agent —
+// so it was renamed to remove the confusion with `LlmAgent`. These aliases
+// keep existing imports working and will be removed in a future major.
+
+/** @deprecated Renamed to {@link A2XServer}. Import `A2XServer` instead. */
+export const A2XAgent = A2XServer;
+/** @deprecated Renamed to {@link A2XServer}. Use `A2XServer` instead. */
+export type A2XAgent = A2XServer;
+/** @deprecated Renamed to {@link A2XServerOptions}. Use `A2XServerOptions` instead. */
+export type A2XAgentOptions = A2XServerOptions;

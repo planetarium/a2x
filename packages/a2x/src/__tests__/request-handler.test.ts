@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { DefaultRequestHandler } from '../transport/request-handler.js';
-import { A2XAgent } from '../a2x/a2x-agent.js';
+import { A2XServer } from '../a2x/a2x-agent.js';
 import type { ProtocolVersion } from '../a2x/a2x-agent.js';
 import { AgentExecutor, StreamingMode } from '../a2x/agent-executor.js';
 import { InMemoryTaskStore } from '../a2x/task-store.js';
@@ -48,10 +48,10 @@ function createHandlerWithStore(protocolVersion?: ProtocolVersion): {
     runConfig: { streamingMode: StreamingMode.SSE },
   });
   const taskStore = new InMemoryTaskStore();
-  const a2xAgent = new A2XAgent({ taskStore, executor, protocolVersion });
-  a2xAgent.setDefaultUrl('https://example.com/a2a');
+  const a2xServer = new A2XServer({ taskStore, executor, protocolVersion });
+  a2xServer.setDefaultUrl('https://example.com/a2a');
 
-  return { handler: new DefaultRequestHandler(a2xAgent), taskStore };
+  return { handler: new DefaultRequestHandler(a2xServer), taskStore };
 }
 
 function createHandlerWithPushNotification(protocolVersion?: ProtocolVersion): {
@@ -72,15 +72,15 @@ function createHandlerWithPushNotification(protocolVersion?: ProtocolVersion): {
   });
   const taskStore = new InMemoryTaskStore();
   const pushStore = new InMemoryPushNotificationConfigStore();
-  const a2xAgent = new A2XAgent({
+  const a2xServer = new A2XServer({
     taskStore,
     executor,
     protocolVersion,
     pushNotificationConfigStore: pushStore,
   });
-  a2xAgent.setDefaultUrl('https://example.com/a2a');
+  a2xServer.setDefaultUrl('https://example.com/a2a');
 
-  return { handler: new DefaultRequestHandler(a2xAgent), pushStore };
+  return { handler: new DefaultRequestHandler(a2xServer), pushStore };
 }
 
 function isAsyncGenerator(value: unknown): value is AsyncGenerator {
@@ -511,9 +511,9 @@ describe('Layer 4: DefaultRequestHandler', () => {
         runConfig: { streamingMode: StreamingMode.SSE },
       });
       const taskStore = new InMemoryTaskStore();
-      const a2xAgent = new A2XAgent({ taskStore, executor });
-      a2xAgent.setDefaultUrl('https://example.com/a2a');
-      const handler = new DefaultRequestHandler(a2xAgent);
+      const a2xServer = new A2XServer({ taskStore, executor });
+      a2xServer.setDefaultUrl('https://example.com/a2a');
+      const handler = new DefaultRequestHandler(a2xServer);
 
       // Create a task and set it to WORKING state directly
       const task = await taskStore.createTask({});
@@ -682,7 +682,7 @@ describe('Layer 4: DefaultRequestHandler', () => {
 
   describe('Authentication', () => {
     function createAuthHandler(
-      schemeSetup: (agent: A2XAgent) => void,
+      schemeSetup: (agent: A2XServer) => void,
     ): DefaultRequestHandler {
       const agent = new LlmAgent({
         name: 'auth-test-agent',
@@ -697,11 +697,11 @@ describe('Layer 4: DefaultRequestHandler', () => {
         runConfig: { streamingMode: StreamingMode.SSE },
       });
       const taskStore = new InMemoryTaskStore();
-      const a2xAgent = new A2XAgent({ taskStore, executor });
-      a2xAgent.setDefaultUrl('https://example.com/a2a');
-      schemeSetup(a2xAgent);
+      const a2xServer = new A2XServer({ taskStore, executor });
+      a2xServer.setDefaultUrl('https://example.com/a2a');
+      schemeSetup(a2xServer);
 
-      return new DefaultRequestHandler(a2xAgent);
+      return new DefaultRequestHandler(a2xServer);
     }
 
     const validRequest = {

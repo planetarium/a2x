@@ -15,7 +15,7 @@
  *
  * ```ts
  * import {
- *   A2XAgent, AgentExecutor, BaseAgent, StreamingMode,
+ *   A2XServer, AgentExecutor, BaseAgent, StreamingMode,
  *   x402RequestPayment, parseX402PaymentSubmission, pickX402Requirement,
  *   validateX402PayloadShape, normalizeX402Accept,
  *   buildX402PaymentCompletedMetadata, buildX402PaymentFailedMetadata,
@@ -111,7 +111,7 @@
  * }
  *
  * const facilitator = resolveFacilitator();
- * const agent = new A2XAgent({ taskStore, executor })
+ * const agent = new A2XServer({ taskStore, executor })
  *   .setName('Paid Agent')
  *   .addExtension({ uri: X402_EXTENSION_URI, required: true });
  * ```

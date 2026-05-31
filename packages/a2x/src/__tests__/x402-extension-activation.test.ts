@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 import { privateKeyToAccount } from 'viem/accounts';
 import { A2XClient } from '../client/a2x-client.js';
 import { X402_EXTENSION_URI } from '../x402/index.js';
-import { A2XAgent } from '../a2x/a2x-agent.js';
+import { A2XServer } from '../a2x/a2x-agent.js';
 import { AgentExecutor, StreamingMode } from '../a2x/agent-executor.js';
 import { InMemoryRunner } from '../runner/in-memory-runner.js';
 import { BaseAgent, type AgentEvent } from '../agent/base-agent.js';
@@ -154,7 +154,7 @@ describe('DefaultRequestHandler — extension activation enforcement (spec §3.1
       runner,
       runConfig: { streamingMode: StreamingMode.SSE },
     });
-    const a2x = new A2XAgent({
+    const a2x = new A2XServer({
       taskStore: new InMemoryTaskStore(),
       executor,
       protocolVersion: '0.3',
