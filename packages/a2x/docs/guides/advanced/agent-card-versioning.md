@@ -24,11 +24,11 @@ A2X models everything internally in a version-neutral shape and renders it throu
 Pass `protocolVersion` to the constructor. The choice is fixed for the life of the agent:
 
 ```ts
-const a2xAgentV10 = new A2XServer({ taskStore, executor }); // v1.0 (default)
-const a2xAgentV03 = new A2XServer({ taskStore, executor, protocolVersion: '0.3' });
+const a2xServerV10 = new A2XServer({ taskStore, executor }); // v1.0 (default)
+const a2xServerV03 = new A2XServer({ taskStore, executor, protocolVersion: '0.3' });
 
-a2xAgentV10.getAgentCard(); // → v1.0 card
-a2xAgentV03.getAgentCard(); // → v0.3 card
+a2xServerV10.getAgentCard(); // → v1.0 card
+a2xServerV03.getAgentCard(); // → v0.3 card
 ```
 
 To serve both versions from one deployment, run two `A2XServer` instances behind separate URLs and advertise each in the other's `additionalInterfaces`. One instance cannot lie about its wire format.

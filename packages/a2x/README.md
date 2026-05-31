@@ -413,11 +413,11 @@ Migration from `x402PaymentHook` (SDK 0.13.x): [docs/guides/advanced/migration-x
 a2x handles the structural differences between A2A protocol versions transparently. Each agent is bound to one wire format at construction:
 
 ```typescript
-const a2xAgentV10 = new A2XServer({ taskStore, executor });                          // v1.0 (default)
-const a2xAgentV03 = new A2XServer({ taskStore, executor, protocolVersion: '0.3' });  // v0.3
+const a2xServerV10 = new A2XServer({ taskStore, executor });                          // v1.0 (default)
+const a2xServerV03 = new A2XServer({ taskStore, executor, protocolVersion: '0.3' });  // v0.3
 
-a2xAgentV10.getAgentCard(); // v1.0 card
-a2xAgentV03.getAgentCard(); // v0.3 card
+a2xServerV10.getAgentCard(); // v1.0 card
+a2xServerV03.getAgentCard(); // v0.3 card
 ```
 
 | Field | v0.3 | v1.0 |
