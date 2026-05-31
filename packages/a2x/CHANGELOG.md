@@ -1,5 +1,17 @@
 # @a2x/sdk
 
+## 0.15.0
+
+### Minor Changes
+
+- [#169](https://github.com/planetarium/a2x/pull/169) [`4481309`](https://github.com/planetarium/a2x/commit/4481309fad7c8febe3f90a2eb75f2b441b86428a) Thanks [@ost006](https://github.com/ost006)! - Rename `A2XAgent` to `A2XServer`. The class is the A2A protocol _server_ wrapper (task store, executor, AgentCard builder), not an agent — the old name collided with `LlmAgent` and suggested that tools/skills belonged on it. `A2XServerOptions` replaces `A2XAgentOptions`, and `toA2x()` now returns `a2xServer` on its result.
+
+  Backward compatible: `A2XAgent`, `A2XAgentOptions`, and `ToA2xResult.a2xAgent` remain as `@deprecated` aliases of the new names and will be removed in a future major. `A2XAgentSkill` and `A2XAgentState` (AgentCard types) are unchanged.
+
+- [#171](https://github.com/planetarium/a2x/pull/171) [`a3a872b`](https://github.com/planetarium/a2x/commit/a3a872b2680e849dd1e29cdb1c57ce862280ad26) Thanks [@ost006](https://github.com/ost006)! - Export `TaskEventBus` and `InMemoryTaskEventBus` from the package entry. The `taskEventBus` constructor option on `A2XServer` was already public, but its supporting types were not exported, so callers could not type a custom bus (as the manual-wiring guide showed). They are now importable from `@a2x/sdk`.
+
+  Also re-syncs documentation with the current public surface: corrects the `request-input` / resume model in the agent guide (the SDK keeps no cross-turn state — agents read `context.message`), fixes the client error-handling guide (auth failures surface as a `Task` in `auth-required` state, not a removed `AuthenticationRequiredError`; the JSON-RPC error-code table now matches `A2A_ERROR_CODES`), and drops references to non-existent security scheme classes.
+
 ## 0.14.0
 
 ### Minor Changes
