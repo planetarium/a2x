@@ -126,10 +126,11 @@ If the server returns `application/json` instead of `text/event-stream` (e.g. be
 try {
   for await (const event of client.sendMessageStream(params)) { /* … */ }
 } catch (err) {
-  if (err instanceof AuthenticationRequiredError) { /* handle */ }
-  else if (err instanceof InvalidParamsError) { /* … */ }
+  if (err instanceof InvalidParamsError) { /* … */ }
   else throw err;
 }
+// Auth failure is not thrown — it arrives as a streamed task in the
+// `auth-required` state. Inspect `event.status.state` rather than catching.
 ```
 
 All error classes importable from `@a2x/sdk`. See [error-handling.md](./error-handling.md) for the full list.

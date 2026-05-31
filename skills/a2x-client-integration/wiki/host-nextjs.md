@@ -94,7 +94,6 @@ import { NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
 import { agentClientFor } from '@/lib/agent';
 import crypto from 'node:crypto';
-import { AuthenticationRequiredError } from '@a2x/sdk';
 import type { SendMessageParams } from '@a2x/sdk';
 
 export async function POST(request: Request) {
@@ -115,11 +114,12 @@ export async function POST(request: Request) {
       },
     };
     const task = await client.sendMessage(params);
-    return NextResponse.json(task);
-  } catch (err) {
-    if (err instanceof AuthenticationRequiredError) {
+    // Auth failure surfaces as a task state, not a thrown error.
+    if (task.status.state === 'auth-required') {
       return NextResponse.json({ error: 'reauth_required' }, { status: 401 });
     }
+    return NextResponse.json(task);
+  } catch (err) {
     if (err instanceof Error && err.message === 'REAUTH_REQUIRED') {
       return NextResponse.json({ error: 'reauth_required' }, { status: 401 });
     }

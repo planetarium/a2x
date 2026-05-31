@@ -82,7 +82,7 @@ The fields that matter most for everyday agent code:
 |---|---|
 | `context.taskId` | The A2A `Task.id` of the current turn (wire-protocol identifier). **Stable across `request-input` → resume.** Bind per-task durable state (paid rows, approval tokens, …) to this — not to `session.id`. |
 | `context.contextId` | The A2A `contextId` of the current turn. One `contextId` umbrellas many tasks in the same conversation (1:N), so this is the right key for state that should outlive a single task but stay scoped to one conversation. |
-| `context.input` | Populated only on resume turns of a task that previously emitted `request-input`. Carries the prior turn's record and (optionally) a hook outcome. See [Protocol Extensions](../advanced/extensions.md). |
+| `context.message` | The incoming A2A `Message` for the current turn. On a resume turn (after the agent emitted `request-input`), read `context.message.metadata` to recover what the client submitted — the SDK keeps **no** cross-turn state, so the agent re-derives its own context. See [Protocol Extensions](../advanced/extensions.md). |
 | `context.session` | The runner's per-invocation `Session`. `session.id` is **regenerated on every turn** and is not safe to bind per-task state to — use `taskId` / `contextId` instead. |
 | `context.signal` | `AbortSignal` for the run. Listen if you do anything cancellable (e.g. external HTTP). |
 
@@ -98,7 +98,7 @@ Custom agents that extend `BaseAgent` directly express their output by yielding 
 | `file` | An attached file (URL or base64 raw). One artifact per event. |
 | `data` | A structured non-text payload (`mediaType` indicates the shape). One artifact per event. |
 | `toolCall` / `toolResult` | LLM-style tool turns (consumed by `LlmAgent` plumbing; surface only when you're modeling the round-trip yourself). |
-| `request-input` | Halt the agent and ask the client for input — most often a payment (via `x402RequestPayment`) or an approval. The executor sets the task to `input-required` and persists a small bookkeeping record so the resume turn can read what was asked for. See [Protocol Extensions](../advanced/extensions.md) and [x402 Payments](../advanced/x402-payments.md). |
+| `request-input` | Halt the agent and ask the client for input — most often a payment (via `x402RequestPayment`) or an approval. The executor sets the task to `input-required` and merges the agent-supplied metadata onto the status message. The SDK keeps **no** cross-turn bookkeeping — on the resume turn the agent re-derives what it asked for from `context.message` (and any state it persisted itself, keyed by `taskId`). See [Protocol Extensions](../advanced/extensions.md) and [x402 Payments](../advanced/x402-payments.md). |
 | `done` | Mark the run finished. Required at the end of every successful run. |
 | `error` | Mark the task failed with the given `Error`. |
 

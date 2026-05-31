@@ -36,6 +36,8 @@ export type {
   PushNotificationSender,
   FetchPushNotificationSenderOptions,
 } from './push-notification-sender.js';
+export { InMemoryTaskEventBus } from './task-event-bus.js';
+export type { TaskEventBus } from './task-event-bus.js';
 
 // ─── Register default agent-card mappers ───
 
