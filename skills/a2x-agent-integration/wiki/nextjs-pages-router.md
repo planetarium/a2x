@@ -33,7 +33,7 @@ src/
 
 ```typescript
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { a2xAgent } from '@/lib/a2x-setup';
+import { a2xServer } from '@/lib/a2x-setup';
 
 export default function agentCardHandler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== 'GET') {
@@ -42,7 +42,7 @@ export default function agentCardHandler(req: NextApiRequest, res: NextApiRespon
   }
 
   try {
-    const card = a2xAgent.getAgentCard();
+    const card = a2xServer.getAgentCard();
     res.setHeader('Cache-Control', 'public, max-age=3600');
     res.json(card);
   } catch (error) {

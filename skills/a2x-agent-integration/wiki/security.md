@@ -91,10 +91,10 @@ import {
 
 ---
 
-## Registering Schemes on A2XAgent
+## Registering Schemes on A2XServer
 
 ```typescript
-a2xAgent
+a2xServer
   .addSecurityScheme('apiKey', apiKeyScheme)
   .addSecurityScheme('bearer', bearerScheme)
   .addSecurityScheme('deviceCode', deviceCodeScheme);
@@ -110,7 +110,7 @@ Security requirements define which schemes must be satisfied. Multiple requireme
 
 ```typescript
 // User can authenticate with EITHER api key OR bearer token
-a2xAgent
+a2xServer
   .addSecurityRequirement({ apiKey: [] })
   .addSecurityRequirement({ bearer: ['agent:invoke'] });
 ```
@@ -119,7 +119,7 @@ a2xAgent
 
 ```typescript
 // User must provide BOTH api key AND bearer token
-a2xAgent
+a2xServer
   .addSecurityRequirement({ apiKey: [], bearer: ['agent:invoke'] });
 ```
 

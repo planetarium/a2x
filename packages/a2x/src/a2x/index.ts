@@ -5,8 +5,11 @@
 
 export { AgentExecutor, StreamingMode } from './agent-executor.js';
 export type { AgentExecutorOptions, RunConfig } from './agent-executor.js';
+export { A2XServer } from './a2x-agent.js';
+export type { ProtocolVersion, A2XServerOptions } from './a2x-agent.js';
+// Deprecated aliases (A2XAgent → A2XServer). Removed in a future major.
 export { A2XAgent } from './a2x-agent.js';
-export type { ProtocolVersion, A2XAgentOptions } from './a2x-agent.js';
+export type { A2XAgentOptions } from './a2x-agent.js';
 export { AgentCardMapperFactory } from './agent-card-mapper.js';
 export type { AgentCardMapper } from './agent-card-mapper.js';
 export { V03AgentCardMapper } from './v03-mapper.js';

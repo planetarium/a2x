@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { A2XAgent } from '../a2x/a2x-agent.js';
+import { A2XServer, A2XAgent } from '../a2x/a2x-agent.js';
 import { AgentExecutor, StreamingMode } from '../a2x/agent-executor.js';
 import { InMemoryTaskStore } from '../a2x/task-store.js';
 import { InMemoryPushNotificationConfigStore } from '../a2x/push-notification-config-store.js';
@@ -41,10 +41,10 @@ function createA2XAgent(
   });
   const taskStore = new InMemoryTaskStore();
 
-  return new A2XAgent({ taskStore, executor, protocolVersion });
+  return new A2XServer({ taskStore, executor, protocolVersion });
 }
 
-describe('Layer 3: A2XAgent', () => {
+describe('Layer 3: A2XServer', () => {
   describe('Constructor - options object', () => {
     it('should construct with required options', () => {
       const a2x = createA2XAgent();
@@ -66,7 +66,7 @@ describe('Layer 3: A2XAgent', () => {
       });
       const taskStore = new InMemoryTaskStore();
 
-      const a2x = new A2XAgent({ taskStore, executor, protocolVersion: '0.3' });
+      const a2x = new A2XServer({ taskStore, executor, protocolVersion: '0.3' });
       expect(a2x.protocolVersion).toBe('0.3');
     });
 
@@ -84,7 +84,7 @@ describe('Layer 3: A2XAgent', () => {
       });
       const taskStore = new InMemoryTaskStore();
 
-      const a2x = new A2XAgent({ taskStore, executor, protocolVersion: '1.0' });
+      const a2x = new A2XServer({ taskStore, executor, protocolVersion: '1.0' });
       expect(a2x.protocolVersion).toBe('1.0');
     });
 
@@ -108,19 +108,19 @@ describe('Layer 3: A2XAgent', () => {
       const taskStore = new InMemoryTaskStore();
 
       expect(
-        () => new A2XAgent({ taskStore, executor, protocolVersion: '2.0' as '0.3' }),
+        () => new A2XServer({ taskStore, executor, protocolVersion: '2.0' as '0.3' }),
       ).toThrow("unsupported protocolVersion '2.0'");
     });
 
     it('should throw when taskStore is missing', () => {
       expect(
-        () => new A2XAgent({ taskStore: null as never, executor: {} as never }),
+        () => new A2XServer({ taskStore: null as never, executor: {} as never }),
       ).toThrow('taskStore is required');
     });
 
     it('should throw when executor is missing', () => {
       expect(
-        () => new A2XAgent({ taskStore: {} as never, executor: null as never }),
+        () => new A2XServer({ taskStore: {} as never, executor: null as never }),
       ).toThrow('executor is required');
     });
   });
@@ -322,7 +322,7 @@ describe('Layer 3: A2XAgent', () => {
       });
       const taskStore = new InMemoryTaskStore();
 
-      const a2x = new A2XAgent({ taskStore, executor, protocolVersion: '0.3' });
+      const a2x = new A2XServer({ taskStore, executor, protocolVersion: '0.3' });
       a2x.setDefaultUrl('https://example.com/a2a');
 
       const card = a2x.getAgentCard() as AgentCardV03;
@@ -343,7 +343,7 @@ describe('Layer 3: A2XAgent', () => {
       });
       const taskStore = new InMemoryTaskStore();
 
-      const a2x = new A2XAgent({ taskStore, executor, protocolVersion: '1.0' });
+      const a2x = new A2XServer({ taskStore, executor, protocolVersion: '1.0' });
       a2x.setDefaultUrl('https://example.com/a2a');
 
       const card = a2x.getAgentCard() as AgentCardV10;
@@ -364,7 +364,7 @@ describe('Layer 3: A2XAgent', () => {
         runner,
         runConfig: { streamingMode: StreamingMode.NONE },
       });
-      const a2x = new A2XAgent({ taskStore: new InMemoryTaskStore(), executor });
+      const a2x = new A2XServer({ taskStore: new InMemoryTaskStore(), executor });
 
       expect(() => a2x.getAgentCard()).toThrow('name is required');
     });
@@ -381,7 +381,7 @@ describe('Layer 3: A2XAgent', () => {
         runner,
         runConfig: { streamingMode: StreamingMode.NONE },
       });
-      const a2x = new A2XAgent({ taskStore: new InMemoryTaskStore(), executor });
+      const a2x = new A2XServer({ taskStore: new InMemoryTaskStore(), executor });
 
       expect(() => a2x.getAgentCard()).toThrow('description is required');
     });
@@ -459,7 +459,7 @@ describe('Layer 3: A2XAgent', () => {
         runner,
         runConfig: { streamingMode: StreamingMode.NONE },
       });
-      const a2x = new A2XAgent({
+      const a2x = new A2XServer({
         taskStore: new InMemoryTaskStore(),
         executor,
         pushNotificationConfigStore: new InMemoryPushNotificationConfigStore(),
@@ -482,7 +482,7 @@ describe('Layer 3: A2XAgent', () => {
         runner,
         runConfig: { streamingMode: StreamingMode.NONE },
       });
-      const a2x = new A2XAgent({
+      const a2x = new A2XServer({
         taskStore: new InMemoryTaskStore(),
         executor,
         pushNotificationConfigStore: new InMemoryPushNotificationConfigStore(),
@@ -512,7 +512,7 @@ describe('Layer 3: A2XAgent', () => {
         runner,
         runConfig: { streamingMode: StreamingMode.NONE },
       });
-      const a2x = new A2XAgent({
+      const a2x = new A2XServer({
         taskStore: new InMemoryTaskStore(),
         executor,
         pushNotificationConfigStore: new InMemoryPushNotificationConfigStore(),
@@ -536,7 +536,7 @@ describe('Layer 3: A2XAgent', () => {
         runner,
         runConfig: { streamingMode: StreamingMode.NONE },
       });
-      const a2x = new A2XAgent({
+      const a2x = new A2XServer({
         taskStore: new InMemoryTaskStore(),
         executor,
         protocolVersion: '0.3',
@@ -562,6 +562,28 @@ describe('Layer 3: A2XAgent', () => {
       const card3 = a2x.getAgentCard();
       expect(card3).not.toBe(card1); // New object (cache invalidated)
       expect((card3 as AgentCardV10).version).toBe('2.0.0');
+    });
+  });
+
+  describe('deprecated A2XAgent alias', () => {
+    it('is the same constructor as A2XServer', () => {
+      expect(A2XAgent).toBe(A2XServer);
+    });
+
+    it('constructs a working server instance', () => {
+      const agent = new LlmAgent({
+        name: 'alias-agent',
+        provider: mockProvider,
+        description: 'alias test',
+        instruction: 'x',
+      });
+      const runner = new InMemoryRunner({ agent, appName: 'test' });
+      const executor = new AgentExecutor({
+        runner,
+        runConfig: { streamingMode: StreamingMode.SSE },
+      });
+      const server = new A2XAgent({ taskStore: new InMemoryTaskStore(), executor });
+      expect(server).toBeInstanceOf(A2XServer);
     });
   });
 });

@@ -6,13 +6,13 @@ A2X ships adapters for the auth schemes A2A defines plus OpenID Connect and Mutu
 
 Every scheme follows the same two-step pattern:
 
-1. Register the scheme with `a2xAgent.addSecurityScheme(id, scheme)`. This publishes it on the AgentCard so clients know what to expect.
-2. Add a `SecurityRequirement` with `a2xAgent.addSecurityRequirement({ id: [] })` to enforce it.
+1. Register the scheme with `a2xServer.addSecurityScheme(id, scheme)`. This publishes it on the AgentCard so clients know what to expect.
+2. Add a `SecurityRequirement` with `a2xServer.addSecurityRequirement({ id: [] })` to enforce it.
 
 Multiple requirements act as **OR** (any satisfies); multiple schemes inside one requirement act as **AND** (all required).
 
 ```ts
-a2xAgent
+a2xServer
   .addSecurityScheme('apiKey', apiKeyScheme)
   .addSecurityScheme('bearer', bearerScheme)
   // OR: either apiKey OR bearer is enough
@@ -27,7 +27,7 @@ Simplest scheme — a static secret in a header, query, or cookie.
 ```ts
 import { ApiKeyAuthorization } from '@a2x/sdk';
 
-a2xAgent
+a2xServer
   .addSecurityScheme('apiKey', new ApiKeyAuthorization({
     in: 'header',
     name: 'x-api-key',
@@ -45,7 +45,7 @@ Opaque tokens validated by your own logic — useful when you issue tokens from 
 ```ts
 import { HttpBearerAuthorization } from '@a2x/sdk';
 
-a2xAgent.addSecurityScheme('bearer', new HttpBearerAuthorization({
+a2xServer.addSecurityScheme('bearer', new HttpBearerAuthorization({
   validator: async (token) => {
     const session = await lookupSession(token);
     return session
@@ -66,7 +66,7 @@ Three standard flows are supported out of the box.
 ```ts
 import { OAuth2AuthorizationCodeAuthorization } from '@a2x/sdk';
 
-a2xAgent.addSecurityScheme('oauthCode', new OAuth2AuthorizationCodeAuthorization({
+a2xServer.addSecurityScheme('oauthCode', new OAuth2AuthorizationCodeAuthorization({
   authorizationUrl: 'https://auth.example.com/authorize',
   tokenUrl: 'https://auth.example.com/token',
   scopes: { read: 'Read access', write: 'Write access' },
@@ -81,7 +81,7 @@ Use this for user-driven flows where the client can open a browser.
 ```ts
 import { OAuth2ClientCredentialsAuthorization } from '@a2x/sdk';
 
-a2xAgent.addSecurityScheme('oauthService', new OAuth2ClientCredentialsAuthorization({
+a2xServer.addSecurityScheme('oauthService', new OAuth2ClientCredentialsAuthorization({
   tokenUrl: 'https://auth.example.com/token',
   scopes: { api: 'API access' },
   validator: async (token) => { /* verify */ },
@@ -97,7 +97,7 @@ For headless devices / CLIs without a browser.
 ```ts
 import { OAuth2DeviceCodeAuthorization } from '@a2x/sdk';
 
-a2xAgent.addSecurityScheme('deviceCode', new OAuth2DeviceCodeAuthorization({
+a2xServer.addSecurityScheme('deviceCode', new OAuth2DeviceCodeAuthorization({
   deviceAuthorizationUrl: 'https://auth.example.com/device/code',
   tokenUrl: 'https://auth.example.com/token',
   scopes: { api: 'API access' },
@@ -114,7 +114,7 @@ Standard OIDC discovery endpoint.
 ```ts
 import { OpenIdConnectAuthorization } from '@a2x/sdk';
 
-a2xAgent.addSecurityScheme('oidc', new OpenIdConnectAuthorization({
+a2xServer.addSecurityScheme('oidc', new OpenIdConnectAuthorization({
   openIdConnectUrl: 'https://auth.example.com/.well-known/openid-configuration',
   validator: async (token) => { /* verify id_token or access_token */ },
 }));
@@ -127,7 +127,7 @@ Client-certificate-based auth.
 ```ts
 import { MutualTlsAuthorization } from '@a2x/sdk';
 
-a2xAgent.addSecurityScheme('mtls', new MutualTlsAuthorization({
+a2xServer.addSecurityScheme('mtls', new MutualTlsAuthorization({
   validator: async (context) => {
     const cert = context.clientCertificate;
     return cert && isTrusted(cert)

@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { a2xAgent } from '@/lib/a2x-setup';
+import { a2xServer } from '@/lib/a2x-setup';
 
 export async function AgentCardHandler(_: NextRequest) {
   try {
-    const card = a2xAgent.getAgentCard();
+    const card = a2xServer.getAgentCard();
     return NextResponse.json(card);
   } catch (error) {
     return NextResponse.json(

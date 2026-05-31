@@ -68,7 +68,7 @@ Wire it in:
 
 ```ts
 const taskStore = new RedisTaskStore(new Redis(process.env.REDIS_URL!));
-const a2xAgent = new A2XAgent({ taskStore, executor });
+const a2xServer = new A2XServer({ taskStore, executor });
 ```
 
 ## Choosing a TTL

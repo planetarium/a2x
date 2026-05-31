@@ -30,7 +30,7 @@ import {
   AgentExecutor,
   StreamingMode,
   InMemoryTaskStore,
-  A2XAgent,
+  A2XServer,
   DefaultRequestHandler,
   createSSEStream,
 } from '@a2x/sdk';
@@ -42,7 +42,7 @@ import { GoogleProvider } from '@a2x/sdk/google';
 @Injectable()
 export class A2aService implements OnModuleInit {
   private handler!: DefaultRequestHandler;
-  private a2xAgent!: A2XAgent;
+  private a2xServer!: A2XServer;
 
   onModuleInit() {
     const agent = new LlmAgent({
@@ -62,7 +62,7 @@ export class A2aService implements OnModuleInit {
     });
     const taskStore = new InMemoryTaskStore();
 
-    this.a2xAgent = new A2XAgent({ taskStore, executor, protocolVersion: '1.0' })
+    this.a2xServer = new A2XServer({ taskStore, executor, protocolVersion: '1.0' })
       .setDefaultUrl(`${process.env.BASE_URL ?? 'http://localhost:3000'}/a2a`)
       .addSkill({
         id: 'chat',
@@ -71,7 +71,7 @@ export class A2aService implements OnModuleInit {
         tags: ['chat', 'general'],
       });
 
-    this.handler = new DefaultRequestHandler(this.a2xAgent);
+    this.handler = new DefaultRequestHandler(this.a2xServer);
   }
 
   getAgentCard() {

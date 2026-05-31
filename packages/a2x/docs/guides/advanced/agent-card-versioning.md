@@ -1,6 +1,6 @@
 # AgentCard v0.3 vs v1.0
 
-A2A has two spec versions in active use. The **AgentCard** — the JSON your agent serves at `/.well-known/agent.json` — differs in shape between them. Each `A2XAgent` instance is bound to one wire format, chosen at construction time via `protocolVersion` (default `'1.0'`).
+A2A has two spec versions in active use. The **AgentCard** — the JSON your agent serves at `/.well-known/agent.json` — differs in shape between them. Each `A2XServer` instance is bound to one wire format, chosen at construction time via `protocolVersion` (default `'1.0'`).
 
 You usually don't pick. `toA2x()` and `DefaultRequestHandler.getAgentCard()` render whatever `protocolVersion` was configured. The card shape, the JSON-RPC response shape, and the `pushNotificationConfig` param shape always match — so clients reading the card get a faithful contract for the wire underneath.
 
@@ -15,7 +15,7 @@ You usually don't pick. `toA2x()` and `DefaultRequestHandler.getAgentCard()` ren
 
 A2X models everything internally in a version-neutral shape and renders it through the configured wire format. This means:
 
-- Every declaration you make on `A2XAgent` (skills, security, default URL) works for both versions.
+- Every declaration you make on `A2XServer` (skills, security, default URL) works for both versions.
 - The card and the wire are always consistent — the SDK never publishes a card whose `protocolVersion` disagrees with what the server actually emits.
 - You don't write version branches in your own code.
 
@@ -24,14 +24,14 @@ A2X models everything internally in a version-neutral shape and renders it throu
 Pass `protocolVersion` to the constructor. The choice is fixed for the life of the agent:
 
 ```ts
-const a2xAgentV10 = new A2XAgent({ taskStore, executor }); // v1.0 (default)
-const a2xAgentV03 = new A2XAgent({ taskStore, executor, protocolVersion: '0.3' });
+const a2xServerV10 = new A2XServer({ taskStore, executor }); // v1.0 (default)
+const a2xServerV03 = new A2XServer({ taskStore, executor, protocolVersion: '0.3' });
 
-a2xAgentV10.getAgentCard(); // → v1.0 card
-a2xAgentV03.getAgentCard(); // → v0.3 card
+a2xServerV10.getAgentCard(); // → v1.0 card
+a2xServerV03.getAgentCard(); // → v0.3 card
 ```
 
-To serve both versions from one deployment, run two `A2XAgent` instances behind separate URLs and advertise each in the other's `additionalInterfaces`. One instance cannot lie about its wire format.
+To serve both versions from one deployment, run two `A2XServer` instances behind separate URLs and advertise each in the other's `additionalInterfaces`. One instance cannot lie about its wire format.
 
 ## When this matters to you
 
@@ -47,7 +47,7 @@ OAuth 2.0 Device Code is a v1.0-native security flow. A2X extends it onto v0.3 c
 
 ### Advertising the authenticated extended card
 
-When you call `a2xAgent.setAuthenticatedExtendedCardProvider(...)`, A2X flips the version-specific capability flag on the base card automatically:
+When you call `a2xServer.setAuthenticatedExtendedCardProvider(...)`, A2X flips the version-specific capability flag on the base card automatically:
 
 - v0.3: top-level `supportsAuthenticatedExtendedCard: true`
 - v1.0: `capabilities.extendedAgentCard: true`

@@ -6,7 +6,7 @@ import {
   AgentExecutor,
   StreamingMode,
   InMemoryTaskStore,
-  A2XAgent,
+  A2XServer,
   DefaultRequestHandler,
   createSSEStream,
   ApiKeyAuthorization,
@@ -36,14 +36,14 @@ const agentExecutor = new AgentExecutor({
   runConfig: { streamingMode: StreamingMode.SSE },
 });
 const taskStore = new InMemoryTaskStore();
-const a2xAgent = new A2XAgent({
+const a2xServer = new A2XServer({
   taskStore,
   executor: agentExecutor,
   protocolVersion: '1.0',
 });
 
-a2xAgent.setDefaultUrl(`${process.env.BASE_URL}/a2a`);
-a2xAgent.addSkill({
+a2xServer.setDefaultUrl(`${process.env.BASE_URL}/a2a`);
+a2xServer.addSkill({
   id: 'echo',
   name: 'Echo',
   description: 'Echoes back the user message',
@@ -53,7 +53,7 @@ a2xAgent.addSkill({
 
 // ─── 3. Security: API Key + OAuth2 Device Code (OR logic) ───
 
-a2xAgent
+a2xServer
   .addSecurityScheme(
     'apiKey',
     new ApiKeyAuthorization({
@@ -93,7 +93,7 @@ a2xAgent
   .addSecurityRequirement({ apiKey: [] })
   .addSecurityRequirement({ deviceCode: ['agent:invoke'] });
 
-const handler = new DefaultRequestHandler(a2xAgent);
+const handler = new DefaultRequestHandler(a2xServer);
 
 // ─── 4. Express app ───
 

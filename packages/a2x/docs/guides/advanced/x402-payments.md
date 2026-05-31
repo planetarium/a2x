@@ -26,7 +26,7 @@ No method bundles `verify` + `settle` — they stay separate so the agent can do
 
 ```ts
 import {
-  A2XAgent,
+  A2XServer,
   AgentExecutor,
   BaseAgent,
   StreamingMode,
@@ -116,7 +116,7 @@ const executor = new AgentExecutor({
   runConfig: { streamingMode: StreamingMode.SSE },
 });
 
-const agent = new A2XAgent({ taskStore: new InMemoryTaskStore(), executor })
+const agent = new A2XServer({ taskStore: new InMemoryTaskStore(), executor })
   .setName('Paid Agent')
   .setDescription('Charges per call')
   .addExtension({ uri: X402_EXTENSION_URI, required: true });

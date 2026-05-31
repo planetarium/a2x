@@ -11,7 +11,7 @@ A2X emits `oauth2.flows.deviceCode` on v0.3 cards as a non-standard extension, a
 ```ts
 import { OAuth2DeviceCodeAuthorization } from '@a2x/sdk';
 
-a2xAgent
+a2xServer
   .addSecurityScheme('deviceCode', new OAuth2DeviceCodeAuthorization({ /* ... */ }))
   .addSecurityRequirement({ deviceCode: [] });
 ```
@@ -25,7 +25,7 @@ You'll see a warning in logs when emitting this on a v0.3 card; it's information
 Extensions live on the AgentCard as additional JSON properties. Pick a namespace you control (a domain you own, a prefix like `x-<team>-`) to avoid collisions.
 
 ```ts
-const a2xAgent = new A2XAgent({ taskStore, executor })
+const a2xServer = new A2XServer({ taskStore, executor })
   .setDefaultUrl('...')
   .setExtension('x-acme-pricing', {
     tier: 'enterprise',

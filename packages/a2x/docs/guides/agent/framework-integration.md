@@ -15,7 +15,7 @@ import {
   AgentExecutor,
   StreamingMode,
   InMemoryTaskStore,
-  A2XAgent,
+  A2XServer,
   DefaultRequestHandler,
   createSSEStream,
 } from '@a2x/sdk';
@@ -39,7 +39,7 @@ const executor = new AgentExecutor({
 });
 const taskStore = new InMemoryTaskStore();
 
-const a2xAgent = new A2XAgent({ taskStore, executor })
+const a2xServer = new A2XServer({ taskStore, executor })
   .setDefaultUrl('https://my-agent.example.com/a2a')
   .addSkill({
     id: 'chat',
@@ -48,7 +48,7 @@ const a2xAgent = new A2XAgent({ taskStore, executor })
     tags: ['chat'],
   });
 
-const handler = new DefaultRequestHandler(a2xAgent);
+const handler = new DefaultRequestHandler(a2xServer);
 ```
 
 `handler` is what you mount. See [Manual Wiring](../advanced/manual-wiring.md) for why each step exists.

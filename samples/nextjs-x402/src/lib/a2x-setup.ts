@@ -1,6 +1,6 @@
 import {
   AgentExecutor,
-  A2XAgent,
+  A2XServer,
   BaseAgent,
   DefaultRequestHandler,
   InMemoryPushNotificationConfigStore,
@@ -155,7 +155,7 @@ const executor = new AgentExecutor({
   runConfig: { streamingMode: StreamingMode.SSE },
 });
 
-export const a2xAgent = new A2XAgent({
+export const a2xServer = new A2XServer({
   taskStore: new InMemoryTaskStore(),
   executor,
   protocolVersion: '1.0',
@@ -170,4 +170,4 @@ export const a2xAgent = new A2XAgent({
   })
   .addExtension({ uri: X402_EXTENSION_URI, required: true });
 
-export const handler = new DefaultRequestHandler(a2xAgent);
+export const handler = new DefaultRequestHandler(a2xServer);

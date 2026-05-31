@@ -14,13 +14,13 @@ Register a provider callback that, given the resolved `AuthResult`, returns a pa
 
 ```ts
 import {
-  A2XAgent,
+  A2XServer,
   ApiKeyAuthorization,
   type AuthResult,
   type A2XAgentState,
 } from '@a2x/sdk';
 
-const a2xAgent = new A2XAgent({ taskStore, executor })
+const a2xServer = new A2XServer({ taskStore, executor })
   .setDefaultUrl('https://agent.example.com/a2a')
   .setName('acme-agent')
   .setDescription('Public description of Acme Agent.')
@@ -68,7 +68,7 @@ If you only want to *add* skills rather than replace them, build the merged arra
 
 ```ts
 .setAuthenticatedExtendedCardProvider(async (auth) => {
-  const base = a2xAgent.getAgentCard();   // current public card
+  const base = a2xServer.getAgentCard();   // current public card
   return {
     skills: [...base.skills, { id: 'premium', ... }],
   };
