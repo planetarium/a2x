@@ -136,24 +136,51 @@
 
 export {
   X402_EXTENSION_URI,
+  X402_V2_EXTENSION_URI,
+  X402_EXTENSION_URIS,
   X402_METADATA_KEYS,
   X402_PAYMENT_STATUS,
   X402_ERROR_CODES,
   X402_DEFAULT_TIMEOUT_SECONDS,
   mapVerifyFailureToCode,
+  x402GenerationForUri,
+  isX402ExtensionUri,
   type X402PaymentStatus,
   type X402ErrorCode,
 } from './constants.js';
+
+export {
+  X402_SUPPORTED_VERSIONS,
+  X402_DEFAULT_GENERATION,
+  detectGeneration,
+  isSupportedVersion,
+  requirementAmount,
+  requirementNetwork,
+  requirementScheme,
+  requirementPayTo,
+  payloadNetwork,
+  payloadMatchesRequirement,
+  type X402Generation,
+} from './generations.js';
 
 export type {
   X402Accept,
   X402Facilitator,
   X402PaymentRequirements,
+  X402PaymentRequirementsV1,
+  X402PaymentRequirementsV2,
   X402PaymentPayload,
+  X402PaymentPayloadV1,
+  X402PaymentPayloadV2,
   X402PaymentRequiredResponse,
+  X402PaymentRequiredResponseV1,
+  X402PaymentRequiredResponseV2,
+  X402ResourceInfo,
   X402SettleResponse,
+  X402FacilitatorSettleResponse,
   X402VerifyResponse,
   X402Network,
+  X402EvmAuthorization,
 } from './types.js';
 
 // Server-side surface: stateless helpers.
@@ -171,7 +198,6 @@ export {
 export type {
   X402RequestPaymentInput,
   X402PaymentSubmission,
-  X402EvmAuthorization,
   X402ValidationIssue,
 } from './payment.js';
 

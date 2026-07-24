@@ -26,6 +26,7 @@ import {
   X402NoSupportedRequirementError,
   X402PaymentRequiredError,
 } from './errors.js';
+import { detectGeneration } from './generations.js';
 import type {
   X402PaymentPayload,
   X402PaymentRequirements,
@@ -33,47 +34,59 @@ import type {
   X402SettleResponse,
 } from './types.js';
 
-type X402Runtime = {
-  createPaymentHeader: (
-    signer: unknown,
-    x402Version: number,
-    requirement: unknown,
-  ) => Promise<string>;
-  safeBase64Decode: (input: string) => string;
-  PaymentPayloadSchema: { parse(input: unknown): unknown };
-};
-
-function x402Specifier(part: string): string {
-  return ['x402', part].join('/');
+/**
+ * The subset of `@x402/core`'s `x402Client` the SDK drives. One client,
+ * registered with the exact EVM scheme for both generations, signs V1 and
+ * V2 payments — `createPaymentPayload` dispatches on the requirement's
+ * generation and returns the structured payload directly (no base64/header
+ * round-trip; that dance only exists for HTTP-header transports).
+ */
+interface X402ClientRuntime {
+  createPaymentPayload(paymentRequired: unknown): Promise<X402PaymentPayload>;
 }
+
+type X402CoreClientModule = {
+  x402Client: new () => X402ClientRuntime;
+};
+type X402EvmClientModule = {
+  registerExactEvmScheme: (
+    client: X402ClientRuntime,
+    config: { signer: LocalAccount },
+  ) => X402ClientRuntime;
+};
 
 async function importOptionalPeer(
   specifier: string,
 ): Promise<Record<string, unknown>> {
-  // x402 is declared as an optional peer dependency. Keep the specifier
-  // computed so bundlers that statically inspect dynamic imports do not
-  // require x402 unless callers actually execute the signing path.
+  // @x402/core and @x402/evm are optional peer dependencies. Keep the
+  // specifier computed so bundlers that statically inspect dynamic imports
+  // do not require them unless callers actually execute the signing path.
   return import(/* @vite-ignore */ specifier);
 }
 
-let _x402Runtime: Promise<X402Runtime> | undefined;
-async function _loadX402Runtime() {
-  if (!_x402Runtime) {
-    _x402Runtime = (async () => {
-      const [{ createPaymentHeader }, { safeBase64Decode }, { PaymentPayloadSchema }] =
-        await Promise.all([
-          importOptionalPeer(x402Specifier('client')),
-          importOptionalPeer(x402Specifier('shared')),
-          importOptionalPeer(x402Specifier('types')),
-        ]);
-      return {
-        createPaymentHeader: createPaymentHeader as X402Runtime['createPaymentHeader'],
-        safeBase64Decode: safeBase64Decode as X402Runtime['safeBase64Decode'],
-        PaymentPayloadSchema: PaymentPayloadSchema as X402Runtime['PaymentPayloadSchema'],
-      };
+// Memoize one x402Client per signer identity — constructing the client and
+// registering the scheme is not free, and callers typically reuse a signer.
+const _runtimeBySigner = new WeakMap<LocalAccount, Promise<X402ClientRuntime>>();
+
+function _loadRuntime(signer: LocalAccount): Promise<X402ClientRuntime> {
+  let existing = _runtimeBySigner.get(signer);
+  if (!existing) {
+    existing = (async () => {
+      const [core, evm] = await Promise.all([
+        importOptionalPeer(['@x402', 'core/client'].join('/')),
+        importOptionalPeer(['@x402', 'evm/exact/client'].join('/')),
+      ]);
+      const { x402Client } = core as unknown as X402CoreClientModule;
+      const { registerExactEvmScheme } = evm as unknown as X402EvmClientModule;
+      const client = new x402Client();
+      // Registers BOTH generations (V2 eip155:* wildcard + V1 bare networks)
+      // on the one client; createPaymentPayload then self-dispatches.
+      registerExactEvmScheme(client, { signer });
+      return client;
     })();
+    _runtimeBySigner.set(signer, existing);
   }
-  return _x402Runtime;
+  return existing;
 }
 
 export interface SignX402PaymentOptions {
@@ -154,36 +167,29 @@ export async function signX402Payment(
     );
   }
 
-  // x402-v1 §6/§9: only x402Version 1 is defined. The x402 npm package
-  // pins `x402Versions: [1]`; signing a non-1 requirement would let a
-  // malformed/forward-versioned payload reach the wire (or crash deep
-  // inside `createPaymentHeader`). Reject early so callers see the spec
-  // error code (`invalid_x402_version`) instead of an opaque exception.
-  if (required.x402Version !== 1) {
+  // Reject unsupported generations early so callers see the spec error code
+  // (`invalid_x402_version`) instead of an opaque exception deep inside the
+  // signing scheme. The SDK speaks x402Version 1 and 2.
+  if (!detectGeneration(required)) {
     throw new X402InvalidVersionError(required.x402Version as unknown as number);
   }
 
   const select = options.selectRequirement ?? defaultSelect;
-  const requirement = select(required.accepts);
+  const accepts = required.accepts as X402PaymentRequirements[];
+  const requirement = select(accepts);
   if (!requirement) {
     throw new X402NoSupportedRequirementError();
   }
 
-  const { createPaymentHeader, safeBase64Decode, PaymentPayloadSchema } =
-    await _loadX402Runtime();
+  const runtime = await _loadRuntime(options.signer);
 
-  const header = await createPaymentHeader(
-    options.signer,
-    required.x402Version,
-    requirement,
-  );
-
-  // `createPaymentHeader` returns a base64-encoded PaymentPayload for HTTP
-  // transports. A2A doesn't transport through headers, so we decode it
-  // back to the structured object for embedding in `message.metadata`.
-  const decoded = safeBase64Decode(header);
-  const parsed = PaymentPayloadSchema.parse(JSON.parse(decoded));
-  const payload = parsed as unknown as X402PaymentPayload;
+  // Hand the client the received `payment-required` envelope with `accepts`
+  // narrowed to the single selected requirement, so selection stays
+  // deterministic and a2x-owned (budget / wallet networks) rather than
+  // delegated to the client's scheme selector. `createPaymentPayload`
+  // dispatches on `x402Version` and returns the structured payload.
+  const narrowed = { ...required, accepts: [requirement] };
+  const payload = await runtime.createPaymentPayload(narrowed);
 
   return {
     requirement,

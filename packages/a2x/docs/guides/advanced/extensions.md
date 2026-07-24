@@ -51,6 +51,18 @@ Two techniques are common:
 
 Use approach (1) for major shape changes, (2) for incremental additions.
 
+### Activation families (multiple URIs, one capability)
+
+Sometimes one capability spans two wire generations that a client can speak either of. Advertise **both** URIs on the AgentCard and let the client activate whichever one it understands. The x402 module does exactly this to bridge its V1 and V2 generations:
+
+```ts
+server
+  .addExtension({ uri: X402_V2_EXTENSION_URI, required: true }) // V2 (foundation)
+  .addExtension({ uri: X402_EXTENSION_URI, required: true });   // V1 (legacy v0.2)
+```
+
+The request handler treats the x402 URIs as an **activation family**: a client that activates *any* member satisfies a `required: true` family URI. Without that rule, a client that speaks only one generation would be rejected for not activating the other. The specific URI the client activates is what selects the generation the server emits — read it inside the agent from `context.activatedExtensions` (see [Manual Wiring](./manual-wiring.md#reading-activated-extensions)).
+
 ## Input-required round-trips for non-payment domains
 
 A2X's `request-input` AgentEvent is intentionally domain-agnostic. The agent uses it for any extension that needs the merchant to ask the client for additional input mid-task — human approvals, OAuth tokens fetched via Device Flow, AP2 mandates, etc.

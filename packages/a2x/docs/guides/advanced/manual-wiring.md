@@ -169,6 +169,35 @@ wired but you want to hide the capability.
 > field is treated as append-only so multi-source callers no longer clobber
 > each other.
 
+### Reading activated extensions
+
+The extension URIs the client activated via the `X-A2A-Extensions` header are
+threaded onto `InvocationContext.activatedExtensions`, so an agent can branch
+on what the client negotiated:
+
+```ts
+async *run(ctx: InvocationContext) {
+  if (ctx.activatedExtensions?.includes(X402_V2_EXTENSION_URI)) {
+    // client speaks x402 V2
+  }
+}
+```
+
+The x402 module uses this to pick the wire generation it emits. When you drive
+`X402Context` yourself, forward the activated set into `requestPayment` so it
+emits the negotiated generation and records it against the task:
+
+```ts
+yield* x402.requestPayment(
+  { taskId: ctx.taskId, activatedExtensions: ctx.activatedExtensions },
+  { accepts },
+);
+```
+
+`new X402Context({ defaultGeneration })` sets the generation emitted when the
+client's activation pins none (defaults to `1` — the migration-safe fallback;
+set `2` once your fleet has migrated).
+
 ## Serving the handler
 
 Once you have `handler`, mount it in any HTTP framework. The recipe is in [Framework Integration](../agent/framework-integration.md).

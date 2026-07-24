@@ -9,9 +9,43 @@
  * Spec: specification/a2a-x402-v0.2.md
  */
 
-/** Canonical URI for a2a-x402 v0.2. */
+/**
+ * Canonical URI for a2a-x402 v0.2 — selects the **V1** wire generation.
+ * Retained for the transition window; new deployments should advertise
+ * `X402_V2_EXTENSION_URI` as well (or instead).
+ */
 export const X402_EXTENSION_URI =
   'https://github.com/google-agentic-commerce/a2a-x402/blob/main/spec/v0.2';
+
+/**
+ * Canonical URI for the x402 Foundation A2A transport — selects the **V2**
+ * wire generation. This is the URI a2x advertises for V2-capable agents.
+ */
+export const X402_V2_EXTENSION_URI =
+  'https://github.com/google-a2a/a2a-x402/v0.1';
+
+/**
+ * The x402 extension activation family. Both URIs advertise x402 payment
+ * support; the specific one a client activates selects the wire generation.
+ * `_validateExtensionActivation` treats these as an any-of group so a client
+ * that speaks only one generation still satisfies a required x402 extension.
+ */
+export const X402_EXTENSION_URIS: readonly string[] = [
+  X402_V2_EXTENSION_URI,
+  X402_EXTENSION_URI,
+];
+
+/** Map an activation URI to the wire generation it selects, if it is an x402 URI. */
+export function x402GenerationForUri(uri: string): 1 | 2 | undefined {
+  if (uri === X402_V2_EXTENSION_URI) return 2;
+  if (uri === X402_EXTENSION_URI) return 1;
+  return undefined;
+}
+
+/** True when the URI is a member of the x402 activation family. */
+export function isX402ExtensionUri(uri: string): boolean {
+  return x402GenerationForUri(uri) !== undefined;
+}
 
 /** Metadata keys used inside `message.metadata` for x402 payment coordination. */
 export const X402_METADATA_KEYS = {

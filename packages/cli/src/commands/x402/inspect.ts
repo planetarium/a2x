@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import type { SendMessageParams } from '@a2x/sdk';
 import {
   getX402PaymentRequirements,
+  requirementAmount,
   X402_EXTENSION_URI,
 } from '@a2x/sdk/x402';
 import { createClient, printConnectionError } from '../../format.js';
@@ -88,10 +89,10 @@ export const x402InspectCommand = new Command('inspect')
           console.log(
             `  ${chalk.cyan(accept.network)} / ${accept.scheme}`,
           );
-          console.log(`    amount: ${accept.maxAmountRequired}`);
+          console.log(`    amount: ${requirementAmount(accept)}`);
           console.log(`    asset:  ${accept.asset}`);
           console.log(`    payTo:  ${accept.payTo}`);
-          if (accept.description) {
+          if ('description' in accept && accept.description) {
             console.log(`    note:   ${accept.description}`);
           }
         }

@@ -12,6 +12,7 @@ import chalk from 'chalk';
 import type { A2XClientX402Options } from '@a2x/sdk';
 import {
   X402PaymentFailedError,
+  requirementAmount,
   type SignX402PaymentOptions,
   type X402PaymentRequiredResponse,
   type X402PaymentRequirements,
@@ -90,12 +91,13 @@ export function buildBudgetedX402ClientSettings(args: {
     maxAmount,
     onPaymentRequired: (required) => {
       printPaymentRequirement(required, maxAmount);
-      const affordable = required.accepts.filter(
-        (a) => safeBigInt(a.maxAmountRequired) <= maxAmount,
+      const accepts = required.accepts as X402PaymentRequirements[];
+      const affordable = accepts.filter(
+        (a) => safeBigInt(requirementAmount(a)) <= maxAmount,
       );
       if (affordable.length === 0) {
-        const cheapest = required.accepts
-          .map((a) => ({ v: safeBigInt(a.maxAmountRequired), asset: a.asset }))
+        const cheapest = accepts
+          .map((a) => ({ v: safeBigInt(requirementAmount(a)), asset: a.asset }))
           .sort((x, y) => (x.v < y.v ? -1 : 1))[0];
         throw new X402BudgetExceededError(
           cheapest?.v ?? 0n,
@@ -127,7 +129,7 @@ export function printPaymentRequirement(
 }
 
 function printAccept(accept: X402PaymentRequirements, budget: bigint): void {
-  const amount = accept.maxAmountRequired;
+  const amount = requirementAmount(accept);
   const overBudget = safeBigInt(amount) > budget;
   const amountLine = overBudget ? chalk.red(`${amount} (over budget)`) : amount;
   console.log(`  ${chalk.bold('network:')}  ${chalk.cyan(accept.network)}`);
@@ -136,7 +138,9 @@ function printAccept(accept: X402PaymentRequirements, budget: bigint): void {
     `  ${chalk.bold('amount:')}   ${amountLine} (atomic units of ${accept.asset.slice(0, 10)}…)`,
   );
   console.log(`  ${chalk.bold('pay to:')}   ${accept.payTo}`);
-  if (accept.description) {
+  // `description` is inline only on V1 requirements; V2 carries it on the
+  // top-level `resource` object.
+  if ('description' in accept && accept.description) {
     console.log(`  ${chalk.bold('note:')}     ${accept.description}`);
   }
 }

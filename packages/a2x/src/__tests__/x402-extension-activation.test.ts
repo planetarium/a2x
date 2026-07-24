@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import { privateKeyToAccount } from 'viem/accounts';
 import { A2XClient } from '../client/a2x-client.js';
-import { X402_EXTENSION_URI } from '../x402/index.js';
+import { X402_EXTENSION_URI, X402_V2_EXTENSION_URI } from '../x402/index.js';
 import { A2XServer } from '../a2x/a2x-agent.js';
 import { AgentExecutor, StreamingMode } from '../a2x/agent-executor.js';
 import { InMemoryRunner } from '../runner/in-memory-runner.js';
@@ -196,6 +196,55 @@ describe('DefaultRequestHandler — extension activation enforcement (spec §3.1
     })) as { result?: unknown; error?: unknown };
     expect(result.error).toBeUndefined();
     expect(result.result).toBeDefined();
+  });
+
+  // Dual-stack: an agent may advertise both x402 URIs as required. They form
+  // an activation family, so activating either one satisfies the requirement.
+  function buildDualHandler(): DefaultRequestHandler {
+    const agent = new EchoAgent();
+    const runner = new InMemoryRunner({ agent, appName: 'test' });
+    const executor = new AgentExecutor({
+      runner,
+      runConfig: { streamingMode: StreamingMode.SSE },
+    });
+    const a2x = new A2XServer({
+      taskStore: new InMemoryTaskStore(),
+      executor,
+      protocolVersion: '0.3',
+    })
+      .setName('x')
+      .setDescription('x')
+      .setDefaultUrl('https://example.com/a2a')
+      .addExtension({ uri: X402_V2_EXTENSION_URI, required: true })
+      .addExtension({ uri: X402_EXTENSION_URI, required: true });
+    return new DefaultRequestHandler(a2x);
+  }
+
+  it('accepts a V1-only client (activates only the legacy URI) against a dual-required agent', async () => {
+    const handler = buildDualHandler();
+    const result = (await handler.handle(sendBody, {
+      headers: { 'x-a2a-extensions': X402_EXTENSION_URI },
+    })) as { result?: unknown; error?: unknown };
+    expect(result.error).toBeUndefined();
+    expect(result.result).toBeDefined();
+  });
+
+  it('accepts a V2-only client (activates only the foundation URI) against a dual-required agent', async () => {
+    const handler = buildDualHandler();
+    const result = (await handler.handle(sendBody, {
+      headers: { 'x-a2a-extensions': X402_V2_EXTENSION_URI },
+    })) as { result?: unknown; error?: unknown };
+    expect(result.error).toBeUndefined();
+    expect(result.result).toBeDefined();
+  });
+
+  it('still rejects a dual-required agent when no x402 URI is activated', async () => {
+    const handler = buildDualHandler();
+    const result = (await handler.handle(sendBody, { headers: {} })) as {
+      error?: { code: number };
+    };
+    expect(result.error).toBeDefined();
+    expect(result.error!.code).toBe(-32600);
   });
 
   it('accepts the request when required=false even without the header', async () => {

@@ -1,18 +1,31 @@
 # x402 Payments
 
-Charge per call with on-chain cryptocurrency payments. A2X implements the [a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402/blob/main/spec/v0.2.md) extension, which layers the [x402 payment protocol](https://x402.org) on top of A2A tasks.
+Charge per call with on-chain cryptocurrency payments. A2X implements the x402 A2A transport on top of A2A tasks, speaking **both generations** of the x402 protocol on the wire: the legacy V1 envelopes ([a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402/blob/main/spec/v0.2.md)) and the V2 envelopes defined by the [x402 Foundation A2A transport](https://github.com/x402-foundation/x402/blob/main/specs/transports-v2/a2a.md).
 
-The flow: the merchant agent responds to an unpaid request with `input-required` + `x402.payment.required`. The client signs a `PaymentPayload` with its wallet and resubmits the same task. The merchant validates the payload, verifies it via an x402 **facilitator**, settles on-chain, and attaches the settlement receipt to the completed task.
+The flow: the merchant agent responds to an unpaid request with `input-required` + `x402.payment.required`. The client signs a `PaymentPayload` with its wallet and resubmits the same task. The merchant validates the payload, verifies it via an x402 **facilitator**, settles on-chain, and attaches the settlement receipt to the completed task. This flow is identical across generations — only the JSON envelope shapes differ (see [Protocol generations](#protocol-generations-v1--v2)).
 
 > **What changed in this release.** The SDK no longer ships a payment *flow* — only stateless helpers. The agent owns when to request payment, what was offered, how to validate the submission, whether to retry, and what to do between `verify` and `settle`. The previous `x402PaymentHook` / `inputRoundTripHooks` API is removed; see [Migrating from X402PaymentExecutor / x402PaymentHook](./migration-x402-v2.md) for the migration steps.
 
 ## Installation
 
 ```bash
-pnpm add @a2x/sdk x402 viem
+pnpm add @a2x/sdk @x402/core @x402/evm viem
 ```
 
-`x402` and `viem` are **optional peer dependencies** — only install them if you actually enable x402 on your agent or client. The SDK lazy-loads the `x402` runtime helpers on the first call to `signX402Payment` (or the first time `A2XClient.sendMessage` enters the dance), so non-x402 consumers can omit the dep without breaking bundlers.
+`@x402/core`, `@x402/evm`, and `viem` are **optional peer dependencies** — only install them if you actually enable x402 on your agent or client. The SDK lazy-loads the signing runtime on the first call to `signX402Payment` (or the first time `A2XClient.sendMessage` enters the dance) and the facilitator client on the first `verify`/`settle`, so non-x402 consumers can omit the deps without breaking bundlers. One `@x402/evm` scheme registration signs both V1 and V2 payments.
+
+## Protocol generations (V1 / V2)
+
+A2X negotiates the x402 wire generation per interaction using the A2A extension-activation mechanism — no new metadata key or wire field is involved.
+
+- **V1** (`x402Version: 1`) — bare network names (`base-sepolia`), `maxAmountRequired`, `resource`/`description`/`mimeType` inline. Activation URI `X402_EXTENSION_URI`.
+- **V2** (`x402Version: 2`) — CAIP-2 networks (`eip155:84532`), `amount`, a hoisted top-level `resource` object, and a `PaymentPayload` that echoes the chosen requirement under `accepted`. Activation URI `X402_V2_EXTENSION_URI`.
+
+The five `x402.payment.*` metadata keys, the payment status lifecycle, and the EIP-3009 signing typed-data are identical across generations.
+
+**Who decides:** the **server owns emission** (it emits the generation the client's activated extension proves it speaks), and the **client owns upgrade preference** (it activates the newest generation the AgentCard advertises, and signs whichever generation it actually receives). When the client's activation pins no x402 URI, the server falls back to `defaultGeneration` — **V1** by default, the migration-safe choice; set it to `2` via `new X402Context({ defaultGeneration: 2 })` once your fleet has migrated.
+
+To advertise both generations during a transition, declare both URIs on your AgentCard (see [Protocol Extensions](./extensions.md)). Clients that speak only one generation are still accepted — the two URIs form an activation family.
 
 ## Server
 

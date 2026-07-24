@@ -1,24 +1,65 @@
 /**
- * Facilitator adapter. Wraps the `useFacilitator()` helper from
- * `x402/verify` so the SDK's `X402PaymentExecutor` can stay agnostic of
- * the underlying x402 package surface.
+ * Facilitator adapter. Wraps `@x402/core`'s `HTTPFacilitatorClient` so the
+ * SDK's x402 server flow can stay agnostic of the underlying package
+ * surface.
  *
- * The default Coinbase-hosted facilitator lives at `https://x402.org/facilitator`
+ * One client serves both generations: `HTTPFacilitatorClient.verify/settle`
+ * echo the payload's `x402Version`, and its response schemas accept both
+ * bare-name (V1) and CAIP-2 (V2) networks — so a single facilitator client
+ * verifies and settles V1 and V2 payments with no up-conversion.
+ *
+ * The default hosted facilitator lives at `https://x402.org/facilitator`,
  * but callers can point to any URL or inject a fully custom
  * `{ verify, settle }` pair for testing / self-hosted facilitators.
+ *
+ * `@x402/core` is an optional peer dependency, imported lazily so bundlers
+ * skip it unless the verify/settle path actually executes.
  */
 
-import { useFacilitator, type CreateHeaders } from 'x402/verify';
 import type { X402Facilitator } from './types.js';
 
-/** Default facilitator URL used by the Coinbase reference implementation. */
+/** Default facilitator URL used by the hosted reference implementation. */
 export const X402_DEFAULT_FACILITATOR_URL = 'https://x402.org/facilitator';
+
+/**
+ * Mints auth headers for facilitators that require signed requests. Shape
+ * is forwarded verbatim to `HTTPFacilitatorClient`; typed loosely so the
+ * SDK does not couple to the peer's exact signature.
+ */
+export type X402CreateAuthHeaders = (...args: unknown[]) => unknown;
 
 export interface FacilitatorUrlConfig {
   /** URL of a hosted facilitator. Default: `https://x402.org/facilitator`. */
   url?: string;
   /** Optional auth-header minter for facilitators that require signed requests. */
-  createAuthHeaders?: CreateHeaders;
+  createAuthHeaders?: X402CreateAuthHeaders;
+}
+
+interface HttpFacilitatorClient {
+  verify(payload: unknown, requirements: unknown): Promise<unknown>;
+  settle(payload: unknown, requirements: unknown): Promise<unknown>;
+}
+
+type HttpFacilitatorModule = {
+  HTTPFacilitatorClient: new (config: {
+    url: string;
+    createAuthHeaders?: X402CreateAuthHeaders;
+  }) => HttpFacilitatorClient;
+};
+
+async function importOptionalPeer(
+  specifier: string,
+): Promise<Record<string, unknown>> {
+  // @x402/core is an optional peer dependency. Keep the specifier computed
+  // so bundlers that statically inspect dynamic imports do not require it
+  // unless callers actually execute the facilitator path.
+  return import(/* @vite-ignore */ specifier);
+}
+
+function isX402Facilitator(
+  spec: FacilitatorUrlConfig | X402Facilitator | undefined,
+): spec is X402Facilitator {
+  return !!spec && 'verify' in spec && 'settle' in spec;
 }
 
 /**
@@ -26,36 +67,52 @@ export interface FacilitatorUrlConfig {
  * `{ verify, settle }` pair the SDK needs.
  *
  * Accepts:
- *  - a URL config object — constructs an `useFacilitator()` under the hood
+ *  - a URL config object — constructs an `HTTPFacilitatorClient` lazily
  *  - an already-implemented `X402Facilitator` — passed through
- *  - `undefined` — uses `useFacilitator()` with defaults
+ *  - `undefined` — uses the default hosted facilitator
  */
 export function resolveFacilitator(
   spec?: FacilitatorUrlConfig | X402Facilitator,
 ): X402Facilitator {
-  if (spec && 'verify' in spec && 'settle' in spec) {
+  if (isX402Facilitator(spec)) {
     return spec;
   }
 
   const urlSpec = spec as FacilitatorUrlConfig | undefined;
-  const url = (urlSpec?.url ?? X402_DEFAULT_FACILITATOR_URL) as `https://${string}`;
-  const { verify, settle } = useFacilitator({
-    url,
-    ...(urlSpec?.createAuthHeaders
-      ? { createAuthHeaders: urlSpec.createAuthHeaders }
-      : {}),
-  });
+  const url = urlSpec?.url ?? X402_DEFAULT_FACILITATOR_URL;
+
+  let clientPromise: Promise<HttpFacilitatorClient> | undefined;
+  const client = () => {
+    if (!clientPromise) {
+      clientPromise = (async () => {
+        const mod = (await importOptionalPeer(
+          ['@x402', 'core/http'].join('/'),
+        )) as unknown as HttpFacilitatorModule;
+        return new mod.HTTPFacilitatorClient({
+          url,
+          ...(urlSpec?.createAuthHeaders
+            ? { createAuthHeaders: urlSpec.createAuthHeaders }
+            : {}),
+        });
+      })();
+    }
+    return clientPromise;
+  };
 
   return {
-    verify: async (payload, requirements) =>
-      verify(
-        payload as Parameters<typeof verify>[0],
-        requirements as Parameters<typeof verify>[1],
-      ),
-    settle: async (payload, requirements) =>
-      settle(
-        payload as Parameters<typeof settle>[0],
-        requirements as Parameters<typeof settle>[1],
-      ),
+    verify: async (payload, requirements) => {
+      const c = await client();
+      return (await c.verify(
+        payload,
+        requirements,
+      )) as Awaited<ReturnType<X402Facilitator['verify']>>;
+    },
+    settle: async (payload, requirements) => {
+      const c = await client();
+      return (await c.settle(
+        payload,
+        requirements,
+      )) as Awaited<ReturnType<X402Facilitator['settle']>>;
+    },
   };
 }

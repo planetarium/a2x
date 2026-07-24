@@ -46,7 +46,11 @@ export class Runner {
     session: Session,
     message: Message,
     signal?: AbortSignal,
-    taskScope?: { taskId?: string; contextId?: string },
+    taskScope?: {
+      taskId?: string;
+      contextId?: string;
+      activatedExtensions?: readonly string[];
+    },
   ): AsyncGenerator<AgentEvent> {
     // Store the incoming message in session events with user role
     session.events.push({ type: 'text', text: message.parts.map(p => ('text' in p ? p.text : '')).join(''), role: 'user' });
@@ -62,6 +66,9 @@ export class Runner {
       message,
       ...(taskScope?.taskId ? { taskId: taskScope.taskId } : {}),
       ...(taskScope?.contextId ? { contextId: taskScope.contextId } : {}),
+      ...(taskScope?.activatedExtensions
+        ? { activatedExtensions: taskScope.activatedExtensions }
+        : {}),
     };
 
     // Run the agent and yield events

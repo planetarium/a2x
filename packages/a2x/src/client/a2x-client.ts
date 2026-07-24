@@ -46,9 +46,11 @@ import type { AuthScheme, AuthRequestContext } from './auth-scheme.js';
 import { normalizeRequirements } from './auth-normalizer.js';
 import {
   X402_EXTENSION_URI,
+  X402_V2_EXTENSION_URI,
   X402_METADATA_KEYS,
   X402_PAYMENT_STATUS,
 } from '../x402/constants.js';
+import { requirementAmount } from '../x402/generations.js';
 import {
   signX402Payment,
   rejectX402Payment,
@@ -694,6 +696,31 @@ export class A2XClient {
       this._resolved!.card,
       this._resolved.version,
     );
+    this._activateX402Extension();
+  }
+
+  /**
+   * Pick the x402 generation to activate from the resolved AgentCard. The
+   * constructor seeds the legacy v0.2 (V1) URI as a backward-compatible
+   * baseline; if the card advertises the V2 URI, upgrade to it (activating a
+   * single generation URI). Signing dispatches on the generation of the
+   * envelope actually received, so a server that ignores the header is still
+   * handled correctly.
+   */
+  private _activateX402Extension(): void {
+    if (!this._x402) return;
+    const card = this._resolved?.card as
+      | { capabilities?: { extensions?: Array<{ uri?: string }> } }
+      | undefined;
+    const advertised = new Set(
+      (card?.capabilities?.extensions ?? [])
+        .map((e) => e.uri)
+        .filter((u): u is string => typeof u === 'string'),
+    );
+    if (advertised.has(X402_V2_EXTENSION_URI)) {
+      this._extensions.add(X402_V2_EXTENSION_URI);
+      this._extensions.delete(X402_EXTENSION_URI);
+    }
   }
 
   /**
@@ -799,7 +826,10 @@ function isWithinBudget(
   maxAmount: bigint,
 ): boolean {
   try {
-    return BigInt(requirement.maxAmountRequired) <= maxAmount;
+    // Read through the generation-agnostic accessor: V2 requirements carry
+    // `amount`, not `maxAmountRequired` — reading the V1 field directly would
+    // throw here and the catch below would silently disable the budget cap.
+    return BigInt(requirementAmount(requirement)) <= maxAmount;
   } catch {
     // Unparseable amount — defer to the signer to fail loudly rather
     // than silently swallow the requirement.

@@ -83,15 +83,21 @@ import type { AgentEvent } from '../agent/base-agent.js';
 import type { InvocationContext } from '../runner/context.js';
 import {
   X402_ERROR_CODES,
+  X402_EXTENSION_URI,
   X402_PAYMENT_STATUS,
+  X402_V2_EXTENSION_URI,
   mapVerifyFailureToCode,
   type X402ErrorCode,
 } from './constants.js';
 import { resolveFacilitator, type FacilitatorUrlConfig } from './facilitator.js';
 import {
+  X402_DEFAULT_GENERATION,
+  payloadNetwork,
+  type X402Generation,
+} from './generations.js';
+import {
   buildX402PaymentCompletedMetadata,
   buildX402PaymentFailedMetadata,
-  normalizeX402Accept,
   parseX402PaymentSubmission,
   pickX402Requirement,
   validateX402PayloadShape,
@@ -100,6 +106,8 @@ import {
   type X402RequestPaymentInput,
   type X402ValidationIssue,
 } from './payment.js';
+import { encodeRequirementV1 } from './wire-v1.js';
+import { encodeRequirementV2 } from './wire-v2.js';
 import {
   BaseX402Store,
   InMemoryX402Store,
@@ -132,6 +140,13 @@ export interface X402ContextOptions {
    * facilitator.
    */
   facilitator?: X402Facilitator | FacilitatorUrlConfig;
+  /**
+   * Wire generation to emit when the client's activated extension set
+   * doesn't pin one (e.g. a transport that stripped `X-A2A-Extensions`).
+   * Defaults to V2. Deployments still serving legacy V1-only fleets behind
+   * header-stripping infrastructure should set this to `1`.
+   */
+  defaultGeneration?: X402Generation;
 }
 
 // ─── requestPayment input ───
@@ -243,12 +258,31 @@ export abstract class BaseX402Context {
   abstract readonly facilitator: X402Facilitator;
 
   /**
+   * Wire generation emitted when the client's activation doesn't pin one.
+   * Overridable by subclasses / `X402Context` options. Defaults to V2.
+   */
+  defaultGeneration: X402Generation = X402_DEFAULT_GENERATION;
+
+  /**
+   * Select the wire generation to emit for this round-trip from the client's
+   * activated extension URIs. V2 URI wins; the legacy v0.2 URI selects V1;
+   * absent x402 activation falls back to `defaultGeneration`.
+   */
+  protected pickEmissionGeneration(
+    activatedExtensions: readonly string[] | undefined,
+  ): X402Generation {
+    if (activatedExtensions?.includes(X402_V2_EXTENSION_URI)) return 2;
+    if (activatedExtensions?.includes(X402_EXTENSION_URI)) return 1;
+    return this.defaultGeneration;
+  }
+
+  /**
    * Persist the offering with status `'offered'` and yield the spec's
    * `request-input` event. The agent's one call site for "ask the
    * client to pay".
    */
   async *requestPayment(
-    ctx: { taskId?: string },
+    ctx: { taskId?: string; activatedExtensions?: readonly string[] },
     input: X402ContextRequestPaymentInput,
   ): AsyncGenerator<AgentEvent> {
     if (!input.accepts || input.accepts.length === 0) {
@@ -263,10 +297,12 @@ export abstract class BaseX402Context {
           'AgentExecutor populates it when running under an A2A task.',
       );
     }
+    const generation = this.pickEmissionGeneration(ctx.activatedExtensions);
     const now = new Date();
     const entry: X402StoreEntry = {
       taskId,
       accepts: input.accepts,
+      offeredGeneration: generation,
       status: 'offered',
       storedAt: now,
       updatedAt: now,
@@ -275,7 +311,7 @@ export abstract class BaseX402Context {
         : {}),
     };
     await this.store.put(entry);
-    yield* x402RequestPayment(input);
+    yield* x402RequestPayment(input, { generation });
   }
 
   /**
@@ -338,7 +374,32 @@ export abstract class BaseX402Context {
       return result;
     }
 
-    const requirements = entry.accepts.map(normalizeX402Accept);
+    // Normalize the stored offering to the generation it was published
+    // under, so the requirement handed to verify/settle matches the wire
+    // generation of the client's payload.
+    const offeredGeneration = entry.offeredGeneration ?? 1;
+    const requirements = entry.accepts.map((a) =>
+      offeredGeneration === 2 ? encodeRequirementV2(a) : encodeRequirementV1(a),
+    );
+
+    // Reject a submission whose generation disagrees with what we offered:
+    // a V1 payload against a V2 offering (or vice versa) can never match and
+    // must fail before reaching the facilitator.
+    if (
+      submission.generation !== undefined &&
+      submission.generation !== offeredGeneration
+    ) {
+      const result: X402Classification = {
+        kind: 'unmatched',
+        submission,
+        offering: entry.accepts,
+        code: X402_ERROR_CODES.INVALID_X402_VERSION,
+        reason: `Submitted x402Version ${submission.generation} does not match the offered generation ${offeredGeneration}.`,
+      };
+      await this._recordClassifyOutcome(ctx.taskId, result);
+      return result;
+    }
+
     const requirement = pickX402Requirement(submission.payload, requirements);
     if (!requirement) {
       const result: X402Classification = {
@@ -423,7 +484,8 @@ export abstract class BaseX402Context {
     const receipt: X402SettleResponse = {
       success: raw.success,
       transaction: raw.transaction ?? '',
-      network: payload.network,
+      // V1 carries `network` top-level; V2 reads it from `accepted`.
+      network: payloadNetwork(payload),
       payer:
         classified.submission.authorization?.from ??
         (raw.payer as string | undefined) ??
@@ -540,6 +602,9 @@ export class X402Context extends BaseX402Context {
   constructor(options: X402ContextOptions = {}) {
     super();
     this.store = options.store ?? new InMemoryX402Store();
+    if (options.defaultGeneration !== undefined) {
+      this.defaultGeneration = options.defaultGeneration;
+    }
     const spec = options.facilitator;
     this.facilitator =
       spec && typeof spec === 'object' && 'verify' in spec && 'settle' in spec
