@@ -1,14 +1,17 @@
 <!--
-  Vendored copy of the x402 Foundation A2A transport specification (V2).
+  Vendored copy of the x402 Foundation A2A transport specification (V2) — the
+  official spec a2x adopts for the x402 protocol V2 generation.
 
   Upstream: https://github.com/x402-foundation/x402/blob/main/specs/transports-v2/a2a.md
   Retrieved: 2026-07-24
 
-  This document is the V2 revision of the same lineage as `x402-transport-a2a-v1.md`
-  and is the normative transport reference for `a2a-x402-v0.3.md`. It is reproduced
-  here verbatim for offline reference and version pinning; the x402 Foundation copy
-  remains authoritative. The upstream "References" links below point at sibling files
-  in the foundation repo and are preserved as-published.
+  This is the V2 revision of the same lineage as `x402-transport-a2a-v1.md`. a2x does
+  not maintain a separate extension spec on top of it: the x402 Foundation document is
+  authoritative and is reproduced here verbatim for offline reference and version
+  pinning. Any a2x-specific behavior needed to bridge the V1 and V2 generations during
+  the migration window is an SDK implementation profile documented in the SDK guides,
+  not a competing spec. The upstream "References" links below point at sibling files in
+  the foundation repo and are preserved as-published.
 -->
 
 # Transport: A2A (Agent-to-Agent Protocol)
