@@ -15,6 +15,7 @@ import {
   X402Context,
   InMemoryX402Store,
   X402_EXTENSION_URI,
+  X402_V2_EXTENSION_URI,
   type X402Accept,
   type X402Facilitator
 } from '@a2x/sdk/x402';
@@ -168,6 +169,10 @@ export const a2xServer = new A2XServer({
     description: 'Echoes your message back — paid per call via x402.',
     tags: ['echo', 'x402', 'demo'],
   })
+  // Advertise both x402 generations. They form an activation family, so a
+  // client that speaks only V1 or only V2 is still accepted; the SDK emits
+  // whichever generation the client activated (V2 preferred).
+  .addExtension({ uri: X402_V2_EXTENSION_URI, required: true })
   .addExtension({ uri: X402_EXTENSION_URI, required: true });
 
 export const handler = new DefaultRequestHandler(a2xServer);

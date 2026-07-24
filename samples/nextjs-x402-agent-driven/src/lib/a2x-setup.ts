@@ -10,6 +10,7 @@ import {
 import {
   X402Context,
   X402_EXTENSION_URI,
+  X402_V2_EXTENSION_URI,
   type X402Facilitator,
 } from '@a2x/sdk/x402';
 import { AnthropicProvider } from '@a2x/sdk/anthropic';
@@ -122,6 +123,10 @@ export const a2xServer = new A2XServer({
       'payment-required and runs the tool only after settlement.',
     tags: ['translate', 'x402', 'agent-driven', 'anthropic', 'demo'],
   })
+  // Advertise both x402 generations (V2 preferred). They form an activation
+  // family, so V1-only and V2-only clients both interoperate; the SDK emits
+  // whichever generation the client activated.
+  .addExtension({ uri: X402_V2_EXTENSION_URI, required: true })
   .addExtension({ uri: X402_EXTENSION_URI, required: true });
 
 export const handler = new DefaultRequestHandler(a2xServer);

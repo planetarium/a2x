@@ -1,6 +1,6 @@
 # nextjs-x402 sample
 
-An [A2A](https://a2a-protocol.org) agent built with Next.js and `@a2x/sdk` where every call is paywalled using the [a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402) extension.
+An [A2A](https://a2a-protocol.org) agent built with Next.js and `@a2x/sdk` where every call is paywalled using x402. The agent advertises **both** x402 protocol generations (legacy V1 and the [x402 Foundation](https://github.com/x402-foundation/x402) V2 transport) as an activation family and emits whichever generation the client negotiates.
 
 The agent itself is a trivial echo — the interesting bit is the x402 payment flow:
 
