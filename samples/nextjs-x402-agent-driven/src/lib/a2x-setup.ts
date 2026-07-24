@@ -123,10 +123,11 @@ export const a2xServer = new A2XServer({
       'payment-required and runs the tool only after settlement.',
     tags: ['translate', 'x402', 'agent-driven', 'anthropic', 'demo'],
   })
-  // Advertise both x402 generations (V2 preferred). They form an activation
-  // family, so V1-only and V2-only clients both interoperate; the SDK emits
-  // whichever generation the client activated.
+  // Advertise the canonical (generation-neutral) x402 extension as required,
+  // and the legacy v0.2 URI as an optional V1 pin. a2x's request handler
+  // treats the two as an activation family so a v0.2-only client still
+  // satisfies the requirement — an a2x-server-specific relaxation.
   .addExtension({ uri: X402_V2_EXTENSION_URI, required: true })
-  .addExtension({ uri: X402_EXTENSION_URI, required: true });
+  .addExtension({ uri: X402_EXTENSION_URI, required: false });
 
 export const handler = new DefaultRequestHandler(a2xServer);

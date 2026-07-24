@@ -169,10 +169,12 @@ export const a2xServer = new A2XServer({
     description: 'Echoes your message back — paid per call via x402.',
     tags: ['echo', 'x402', 'demo'],
   })
-  // Advertise both x402 generations. They form an activation family, so a
-  // client that speaks only V1 or only V2 is still accepted; the SDK emits
-  // whichever generation the client activated (V2 preferred).
+  // Advertise the canonical (generation-neutral) x402 extension as required,
+  // and the legacy v0.2 URI as an optional V1 pin for older clients. a2x's
+  // request handler treats the two as an activation family, so a v0.2-only
+  // client (e.g. a2a-x402 v0.2) still satisfies the requirement — an
+  // a2x-server-specific relaxation, not standard A2A semantics.
   .addExtension({ uri: X402_V2_EXTENSION_URI, required: true })
-  .addExtension({ uri: X402_EXTENSION_URI, required: true });
+  .addExtension({ uri: X402_EXTENSION_URI, required: false });
 
 export const handler = new DefaultRequestHandler(a2xServer);
