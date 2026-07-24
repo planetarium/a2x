@@ -143,9 +143,8 @@ export interface X402ContextOptions {
   /**
    * Wire generation to emit when the client's activated extension set
    * doesn't pin one (e.g. a transport that stripped `X-A2A-Extensions`).
-   * Defaults to V2 (v0.3 is V2-first). Deployments still serving legacy
-   * V1-only fleets behind header-stripping infrastructure should set this
-   * to `1`.
+   * Defaults to V2 (a2x's negotiation profile is V2-first). Deployments still
+   * serving legacy V1-only fleets should set this to `1`.
    */
   defaultGeneration?: X402Generation;
 }
@@ -266,15 +265,22 @@ export abstract class BaseX402Context {
 
   /**
    * Select the wire generation to emit for this round-trip from the client's
-   * activated extension URIs. V2 URI wins; the legacy v0.2 URI selects V1;
-   * absent x402 activation falls back to `defaultGeneration`.
+   * activated extension URIs. The foundation URI is generation-neutral, so
+   * only the legacy v0.2 URI (activated on its own) pins V1; everything else
+   * falls back to `defaultGeneration`. This URI→generation mapping is an
+   * a2x negotiation profile, not part of the foundation transport spec.
    */
   protected pickEmissionGeneration(
     activatedExtensions: readonly string[] | undefined,
   ): X402Generation {
-    if (activatedExtensions?.includes(X402_V2_EXTENSION_URI)) return 2;
-    if (activatedExtensions?.includes(X402_EXTENSION_URI)) return 1;
-    return this.defaultGeneration;
+    const activated = activatedExtensions ?? [];
+    // The legacy v0.2 URI pins V1 — but only when the client did NOT also
+    // activate the (generation-neutral) foundation URI, which signals a
+    // dual-capable client. Everything else falls back to `defaultGeneration`.
+    const pinsV1 =
+      activated.includes(X402_EXTENSION_URI) &&
+      !activated.includes(X402_V2_EXTENSION_URI);
+    return pinsV1 ? 1 : this.defaultGeneration;
   }
 
   /**
@@ -482,15 +488,17 @@ export abstract class BaseX402Context {
   ): Promise<X402SettleResponse> {
     const payload = classified.submission.payload!;
     const raw = await this.facilitator.settle(payload, classified.requirement);
+    const payer =
+      classified.submission.authorization?.from ??
+      (raw.payer as string | undefined);
     const receipt: X402SettleResponse = {
       success: raw.success,
       transaction: raw.transaction ?? '',
       // V1 carries `network` top-level; V2 reads it from `accepted`.
       network: payloadNetwork(payload),
-      payer:
-        classified.submission.authorization?.from ??
-        (raw.payer as string | undefined) ??
-        'unknown',
+      // Omit `payer` when neither the authorization nor the facilitator
+      // supplies it — never fabricate a placeholder address.
+      ...(payer ? { payer } : {}),
       ...(raw.errorReason ? { errorReason: raw.errorReason } : {}),
     };
 
@@ -500,7 +508,7 @@ export abstract class BaseX402Context {
         const stored: X402EntryReceipt = {
           transaction: receipt.transaction,
           network: receipt.network,
-          payer: receipt.payer,
+          ...(receipt.payer ? { payer: receipt.payer } : {}),
           settledAt,
         };
         await this.store.update(ctx.taskId, {

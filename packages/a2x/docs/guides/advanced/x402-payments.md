@@ -16,16 +16,18 @@ pnpm add @a2x/sdk @x402/core @x402/evm viem
 
 ## Protocol generations (V1 / V2)
 
-A2X negotiates the x402 wire generation per interaction using the A2A extension-activation mechanism — no new metadata key or wire field is involved.
+The two wire generations differ only in envelope shape:
 
-- **V1** (`x402Version: 1`) — bare network names (`base-sepolia`), `maxAmountRequired`, `resource`/`description`/`mimeType` inline. Activation URI `X402_EXTENSION_URI`.
-- **V2** (`x402Version: 2`) — CAIP-2 networks (`eip155:84532`), `amount`, a hoisted top-level `resource` object, and a `PaymentPayload` that echoes the chosen requirement under `accepted`. Activation URI `X402_V2_EXTENSION_URI`.
+- **V1** (`x402Version: 1`) — bare network names (`base-sepolia`), `maxAmountRequired`, `resource`/`description`/`mimeType` inline.
+- **V2** (`x402Version: 2`) — CAIP-2 networks (`eip155:84532`), `amount`, a hoisted top-level `resource` object, and a `PaymentPayload` that echoes the chosen requirement under `accepted`.
 
 The five `x402.payment.*` metadata keys, the payment status lifecycle, and the EIP-3009 signing typed-data are identical across generations.
 
-**Who decides:** the **server owns emission** (it emits the generation the client's activated extension proves it speaks), and the **client owns upgrade preference** (it activates the newest generation the AgentCard advertises, and signs whichever generation it actually receives). When the client's activation pins no x402 URI, the server falls back to `defaultGeneration` — **V2** by default (v0.3 is V2-first). Real V1 clients activate the legacy v0.2 URI, so this fallback only bites the no-activation edge case; deployments serving legacy V1-only fleets behind header-stripping infrastructure can set `new X402Context({ defaultGeneration: 1 })`.
+> **Generation is signalled by `x402Version` in the envelope, not by the extension URI.** In the x402 Foundation lineage the canonical URI (`X402_V2_EXTENSION_URI`, `github.com/google-a2a/a2a-x402/v0.1`) is **generation-neutral** — the `v0.1` there is the *extension's* version, not the x402 protocol generation. The URI→generation negotiation below is an **a2x SDK profile**, not part of the foundation transport spec.
 
-To advertise both generations during a transition, declare both URIs on your AgentCard (see [Protocol Extensions](./extensions.md)). Clients that speak only one generation are still accepted — the two URIs form an activation family.
+**How a2x negotiates (SDK profile):** the **server owns emission** and the **client signs whatever generation it receives**. The server emits its `defaultGeneration` (**V2** by default) unless the client pins V1 by activating a2x's legacy v0.2 URI (`X402_EXTENSION_URI`) on its own. So: a2x↔a2x runs V2; a legacy `a2a-x402 v0.2` client (or a2x's own older client) that activates the v0.2 URI gets V1; deployments serving V1-only fleets can flip the default with `new X402Context({ defaultGeneration: 1 })`.
+
+To keep legacy clients working during a transition, declare both URIs on your AgentCard (see [Protocol Extensions](./extensions.md)) — a2x treats them as an activation family so a v0.2-only client still satisfies the requirement.
 
 ## Server
 
@@ -61,7 +63,6 @@ const ACCEPTS = [{
   description: 'Premium agent access',
 }];
 
-class PaidAgent extends BaseAgent {
 // One context per process is enough — pass it into every agent that
 // needs x402 support. Defaults to an in-memory offering store and the
 // Coinbase-hosted facilitator at https://x402.org/facilitator.
@@ -571,12 +572,12 @@ When the merchant agent declares the extension with `required: true` on its Agen
 
 ## Supported scope
 
-- **Standalone Flow** from a2a-x402 v0.2. Embedded Flow (AP2 `CartMandate` etc.) isn't yet wired up.
+- **Both x402 protocol generations** (V1 `x402Version: 1` and V2 `x402Version: 2`), negotiated per the SDK profile above.
+- **Standalone Flow.** The Embedded Flow (x402 nested in an AP2 `CartMandate` / `PaymentMandate`) and its signing models are not implemented in either generation — those were described in a2a-x402 v0.2 but have no counterpart in the foundation V2 transport, so their V2 semantics are currently undefined.
 - **`exact` scheme, EVM networks** (`base`, `base-sepolia`, `polygon`, `avalanche`, …). Adding Solana support means passing a Solana-compatible signer in a later release.
-- The base protocol is **x402 v1** (`x402Version: 1`). a2a-x402 v0.2 pins to this version.
 
 ## Reference
 
-- Spec (in-repo): [`specification/a2a-x402-v0.2.md`](https://github.com/planetarium/a2x/blob/main/specification/a2a-x402-v0.2.md)
-- Base protocol: [`specification/x402-v1.md`](https://github.com/planetarium/a2x/blob/main/specification/x402-v1.md)
-- Migration: [Migrating off `x402PaymentHook`](./migration-x402-v2.md)
+- V2 transport (in-repo, vendored from the x402 Foundation): [`specification/x402-transport-a2a-v2.md`](https://github.com/planetarium/a2x/blob/main/specification/x402-transport-a2a-v2.md)
+- V1 lineage: [`specification/x402-transport-a2a-v1.md`](https://github.com/planetarium/a2x/blob/main/specification/x402-transport-a2a-v1.md), [`specification/a2a-x402-v0.2.md`](https://github.com/planetarium/a2x/blob/main/specification/a2a-x402-v0.2.md), [`specification/x402-v1.md`](https://github.com/planetarium/a2x/blob/main/specification/x402-v1.md)
+- Migration (SDK API, not protocol): [Migrating off `x402PaymentHook`](./migration-x402-v2.md)

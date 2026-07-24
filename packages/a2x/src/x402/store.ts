@@ -44,13 +44,14 @@ export type X402EntryStatus =
  *
  *  - `transaction` — on-chain tx hash; the canonical lookup key.
  *  - `network` — which chain settled, for multi-chain deployments.
- *  - `payer` — payer wallet address (x402-v1 §5.3.2 requires this on every receipt).
+ *  - `payer` — payer wallet address. Optional: x402 V2 marks it optional and
+ *    a facilitator may omit it; the SDK never fabricates a placeholder.
  *  - `settledAt` — wall-clock instant the SDK observed the settlement returning.
  */
 export interface X402EntryReceipt {
   transaction: string;
   network: string;
-  payer: string;
+  payer?: string;
   settledAt: Date;
 }
 

@@ -195,8 +195,9 @@ yield* x402.requestPayment(
 ```
 
 `new X402Context({ defaultGeneration })` sets the generation emitted when the
-client's activation pins none (defaults to `2` — v0.3 is V2-first; set `1` for
-legacy V1-only fleets behind header-stripping infrastructure).
+client's activation pins none — which is the common case, since the foundation
+x402 URI is generation-neutral (only the legacy v0.2 URI pins V1). Defaults to
+`2` (a2x's negotiation profile is V2-first); set `1` for legacy V1-only fleets.
 
 ## Serving the handler
 

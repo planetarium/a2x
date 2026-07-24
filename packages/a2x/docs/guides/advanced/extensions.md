@@ -51,17 +51,19 @@ Two techniques are common:
 
 Use approach (1) for major shape changes, (2) for incremental additions.
 
-### Activation families (multiple URIs, one capability)
+### Activation families (a2x-specific relaxation)
 
-Sometimes one capability spans two wire generations that a client can speak either of. Advertise **both** URIs on the AgentCard and let the client activate whichever one it understands. The x402 module does exactly this to bridge its V1 and V2 generations:
+During a migration between wire generations, a2x lets one capability be advertised under more than one URI. The canonical (generation-neutral) x402 URI is advertised as required, and the legacy v0.2 URI as an optional V1 pin:
 
 ```ts
 server
-  .addExtension({ uri: X402_V2_EXTENSION_URI, required: true }) // V2 (foundation)
-  .addExtension({ uri: X402_EXTENSION_URI, required: true });   // V1 (legacy v0.2)
+  .addExtension({ uri: X402_V2_EXTENSION_URI, required: true })  // canonical x402
+  .addExtension({ uri: X402_EXTENSION_URI, required: false });   // legacy v0.2 (V1 pin)
 ```
 
-The request handler treats the x402 URIs as an **activation family**: a client that activates *any* member satisfies a `required: true` family URI. Without that rule, a client that speaks only one generation would be rejected for not activating the other. The specific URI the client activates is what selects the generation the server emits — read it inside the agent from `context.activatedExtensions` (see [Manual Wiring](./manual-wiring.md#reading-activated-extensions)).
+a2x's request handler treats the x402 URIs as an **activation family**: activating *any* member satisfies the required x402 extension. This is an **a2x-server-specific relaxation** of A2A's per-extension `required` rule — a non-a2x server enforces `required` per URI. It exists so a legacy `a2a-x402 v0.2` client (which activates only the v0.2 URI) still passes an agent that requires the canonical URI.
+
+Generation is **not** selected by which URI is activated (the canonical URI is generation-neutral — see [x402 Payments](./x402-payments.md#protocol-generations-v1--v2)); only the legacy v0.2 URI, activated on its own, pins V1. Read the activated set inside the agent from `context.activatedExtensions` (see [Manual Wiring](./manual-wiring.md#reading-activated-extensions)).
 
 ## Input-required round-trips for non-payment domains
 

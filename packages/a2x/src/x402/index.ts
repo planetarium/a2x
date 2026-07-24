@@ -143,7 +143,7 @@ export {
   X402_ERROR_CODES,
   X402_DEFAULT_TIMEOUT_SECONDS,
   mapVerifyFailureToCode,
-  x402GenerationForUri,
+  x402PinnedGeneration,
   isX402ExtensionUri,
   type X402PaymentStatus,
   type X402ErrorCode,

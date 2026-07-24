@@ -104,7 +104,7 @@ describe('server emission generation from activation', () => {
     expect(required.accepts[0]!.network).toBe('base-sepolia');
   });
 
-  it('falls back to V2 when no x402 URI is activated (v0.3 is V2-first)', async () => {
+  it('falls back to V2 when no x402 URI pins a generation (profile is V2-first)', async () => {
     const ctx = new X402Context({ facilitator: mockFacilitator() });
     const meta = await drainMetadata(
       ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }),

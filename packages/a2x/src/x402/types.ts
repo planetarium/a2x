@@ -195,13 +195,14 @@ export interface X402SettleResponse {
   /** Network the settlement occurred on (bare name for V1, CAIP-2 for V2). */
   network: string;
   /**
-   * Address of the payer's wallet. Required on every settle response —
-   * including failure rows, since post-settlement audits / multi-wallet
-   * bookkeeping branch on this field. The SDK propagates whatever the
-   * facilitator returns; for EVM "exact" payloads it falls back to
-   * `authorization.from` if the facilitator omits it.
+   * Address of the payer's wallet. **Optional** — x402 V2 (and the foundation
+   * A2A transport's failure examples) mark `payer` optional, and V2 receipts
+   * from third-party servers may omit it. The SDK propagates whatever the
+   * facilitator returns; for EVM "exact" payloads it fills it from
+   * `authorization.from` when the facilitator omits it, and leaves it absent
+   * otherwise (never a placeholder like `'unknown'`).
    */
-  payer: string;
+  payer?: string;
   /** Short error code (e.g. `VERIFY_FAILED`) when `success` is false. */
   errorReason?: string;
 }

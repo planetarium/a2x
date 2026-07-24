@@ -54,6 +54,20 @@ export function encodePaymentRequiredV2(
   if (!first) {
     throw new Error('encodePaymentRequiredV2: at least one offering is required');
   }
+  // V2 has one top-level `resource` for the whole PaymentRequired. Refuse to
+  // silently relabel options that describe different resources under the
+  // first one — the payer would consent to the wrong description.
+  const divergent = accepts.find(
+    (a) => a.resource !== first.resource || a.description !== first.description,
+  );
+  if (divergent) {
+    throw new Error(
+      'encodePaymentRequiredV2: all offerings in one payment-required must share ' +
+        `the same resource/description (V2 hoists a single top-level resource); ` +
+        `"${divergent.resource}" differs from "${first.resource}". ` +
+        'Split differing resources into separate payment-required rounds.',
+    );
+  }
   return {
     x402Version: 2,
     resource: resourceFrom(first),

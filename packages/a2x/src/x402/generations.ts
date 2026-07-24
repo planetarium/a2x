@@ -26,12 +26,11 @@ export const X402_SUPPORTED_VERSIONS: readonly X402Generation[] = [1, 2];
 
 /**
  * Fallback generation `X402Context` emits when the client's activation set
- * pins no x402 URI (e.g. a transport that stripped `X-A2A-Extensions`, or a
- * client that activated nothing). V2 — v0.3 is V2-first. Real V1 clients
- * activate the legacy v0.2 URI, so this fallback only applies to the
- * no-activation edge case; deployments serving legacy V1-only fleets behind
- * header-stripping infrastructure can override it to `1` via
- * `X402ContextOptions.defaultGeneration`.
+ * pins no x402 generation (the foundation URI is generation-neutral, or the
+ * transport stripped `X-A2A-Extensions`). a2x's negotiation profile is
+ * V2-first. Legacy V1-only clients pin V1 by activating the v0.2 URI, so this
+ * fallback governs the neutral/no-activation case; deployments serving V1-only
+ * fleets can override it to `1` via `X402ContextOptions.defaultGeneration`.
  */
 export const X402_DEFAULT_GENERATION: X402Generation = 2;
 
