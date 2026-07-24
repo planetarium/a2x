@@ -143,8 +143,9 @@ export interface X402ContextOptions {
   /**
    * Wire generation to emit when the client's activated extension set
    * doesn't pin one (e.g. a transport that stripped `X-A2A-Extensions`).
-   * Defaults to V2. Deployments still serving legacy V1-only fleets behind
-   * header-stripping infrastructure should set this to `1`.
+   * Defaults to V2 (v0.3 is V2-first). Deployments still serving legacy
+   * V1-only fleets behind header-stripping infrastructure should set this
+   * to `1`.
    */
   defaultGeneration?: X402Generation;
 }

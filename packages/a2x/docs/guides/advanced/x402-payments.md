@@ -23,7 +23,7 @@ A2X negotiates the x402 wire generation per interaction using the A2A extension-
 
 The five `x402.payment.*` metadata keys, the payment status lifecycle, and the EIP-3009 signing typed-data are identical across generations.
 
-**Who decides:** the **server owns emission** (it emits the generation the client's activated extension proves it speaks), and the **client owns upgrade preference** (it activates the newest generation the AgentCard advertises, and signs whichever generation it actually receives). When the client's activation pins no x402 URI, the server falls back to `defaultGeneration` — **V1** by default, the migration-safe choice; set it to `2` via `new X402Context({ defaultGeneration: 2 })` once your fleet has migrated.
+**Who decides:** the **server owns emission** (it emits the generation the client's activated extension proves it speaks), and the **client owns upgrade preference** (it activates the newest generation the AgentCard advertises, and signs whichever generation it actually receives). When the client's activation pins no x402 URI, the server falls back to `defaultGeneration` — **V2** by default (v0.3 is V2-first). Real V1 clients activate the legacy v0.2 URI, so this fallback only bites the no-activation edge case; deployments serving legacy V1-only fleets behind header-stripping infrastructure can set `new X402Context({ defaultGeneration: 1 })`.
 
 To advertise both generations during a transition, declare both URIs on your AgentCard (see [Protocol Extensions](./extensions.md)). Clients that speak only one generation are still accepted — the two URIs form an activation family.
 

@@ -195,8 +195,8 @@ yield* x402.requestPayment(
 ```
 
 `new X402Context({ defaultGeneration })` sets the generation emitted when the
-client's activation pins none (defaults to `1` — the migration-safe fallback;
-set `2` once your fleet has migrated).
+client's activation pins none (defaults to `2` — v0.3 is V2-first; set `1` for
+legacy V1-only fleets behind header-stripping infrastructure).
 
 ## Serving the handler
 

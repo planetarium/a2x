@@ -104,25 +104,25 @@ describe('server emission generation from activation', () => {
     expect(required.accepts[0]!.network).toBe('base-sepolia');
   });
 
-  it('falls back to V1 when no x402 URI is activated', async () => {
+  it('falls back to V2 when no x402 URI is activated (v0.3 is V2-first)', async () => {
     const ctx = new X402Context({ facilitator: mockFacilitator() });
     const meta = await drainMetadata(
       ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }),
     );
     const required = meta[X402_METADATA_KEYS.REQUIRED] as X402PaymentRequiredResponse;
-    expect(required.x402Version).toBe(1);
+    expect(required.x402Version).toBe(2);
   });
 
-  it('honors a V2 default override when no URI is activated', async () => {
+  it('honors a V1 default override for legacy fleets', async () => {
     const ctx = new X402Context({
       facilitator: mockFacilitator(),
-      defaultGeneration: 2,
+      defaultGeneration: 1,
     });
     const meta = await drainMetadata(
       ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }),
     );
     const required = meta[X402_METADATA_KEYS.REQUIRED] as X402PaymentRequiredResponse;
-    expect(required.x402Version).toBe(2);
+    expect(required.x402Version).toBe(1);
   });
 });
 

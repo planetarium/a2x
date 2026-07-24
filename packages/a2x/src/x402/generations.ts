@@ -25,14 +25,15 @@ export type X402Generation = 1 | 2;
 export const X402_SUPPORTED_VERSIONS: readonly X402Generation[] = [1, 2];
 
 /**
- * Fallback generation the server emits when the client's activation set
+ * Fallback generation `X402Context` emits when the client's activation set
  * pins no x402 URI (e.g. a transport that stripped `X-A2A-Extensions`, or a
- * client that activated nothing). V1 during the transition window: it is the
- * migration-safe choice for legacy clients, and any V2-capable client
- * negotiates *up* to V2 by activating the V2 URI. Deployments that have fully
- * migrated can override this to `2` via `X402ContextOptions.defaultGeneration`.
+ * client that activated nothing). V2 — v0.3 is V2-first. Real V1 clients
+ * activate the legacy v0.2 URI, so this fallback only applies to the
+ * no-activation edge case; deployments serving legacy V1-only fleets behind
+ * header-stripping infrastructure can override it to `1` via
+ * `X402ContextOptions.defaultGeneration`.
  */
-export const X402_DEFAULT_GENERATION: X402Generation = 1;
+export const X402_DEFAULT_GENERATION: X402Generation = 2;
 
 /** True when `version` is a generation this SDK supports. */
 export function isSupportedVersion(version: unknown): version is X402Generation {
