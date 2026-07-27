@@ -14,6 +14,18 @@ pnpm add @a2x/sdk @x402/core @x402/evm viem
 
 `@x402/core`, `@x402/evm`, and `viem` are **optional peer dependencies** — only install them if you actually enable x402 on your agent or client. The SDK lazy-loads the signing runtime on the first call to `signX402Payment` (or the first time `A2XClient.sendMessage` enters the dance) and the facilitator client on the first `verify`/`settle`, so non-x402 consumers can omit the deps without breaking bundlers. One `@x402/evm` scheme registration signs both V1 and V2 payments.
 
+Because the load is lazy, a missing peer isn't caught at install, typecheck, or startup — it surfaces on the first real payment. The SDK translates that into `X402PeerMissingError`, which names the packages to install:
+
+```
+X402PeerMissingError: Cannot load "@x402/core", required for x402 payments.
+Install the optional peer dependencies:
+  npm install @x402/core @x402/evm viem
+Upgrading from @a2x/sdk 0.15 or earlier? The signing and facilitator runtime
+moved from `x402` to `@x402/core` + `@x402/evm`.
+```
+
+The failed load isn't cached, so a long-running server recovers on the next attempt once the peers are installed — no restart needed.
+
 ## Protocol generations (V1 / V2)
 
 The two wire generations differ only in envelope shape:

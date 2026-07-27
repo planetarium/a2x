@@ -28,6 +28,7 @@ import {
 } from './errors.js';
 import { detectGeneration } from './generations.js';
 import { isEvmNetwork } from './networks.js';
+import { importX402Peer } from './peer.js';
 import type {
   X402PaymentPayload,
   X402PaymentRequirements,
@@ -56,15 +57,6 @@ type X402EvmClientModule = {
   ) => X402ClientRuntime;
 };
 
-async function importOptionalPeer(
-  specifier: string,
-): Promise<Record<string, unknown>> {
-  // @x402/core and @x402/evm are optional peer dependencies. Keep the
-  // specifier computed so bundlers that statically inspect dynamic imports
-  // do not require them unless callers actually execute the signing path.
-  return import(/* @vite-ignore */ specifier);
-}
-
 // Memoize one x402Client per signer identity — constructing the client and
 // registering the scheme is not free, and callers typically reuse a signer.
 const _runtimeBySigner = new WeakMap<LocalAccount, Promise<X402ClientRuntime>>();
@@ -74,8 +66,8 @@ function _loadRuntime(signer: LocalAccount): Promise<X402ClientRuntime> {
   if (!existing) {
     existing = (async () => {
       const [core, evm] = await Promise.all([
-        importOptionalPeer(['@x402', 'core/client'].join('/')),
-        importOptionalPeer(['@x402', 'evm/exact/client'].join('/')),
+        importX402Peer(['@x402', 'core/client'].join('/')),
+        importX402Peer(['@x402', 'evm/exact/client'].join('/')),
       ]);
       const { x402Client } = core as unknown as X402CoreClientModule;
       const { registerExactEvmScheme } = evm as unknown as X402EvmClientModule;
@@ -85,6 +77,14 @@ function _loadRuntime(signer: LocalAccount): Promise<X402ClientRuntime> {
       registerExactEvmScheme(client, { signer });
       return client;
     })();
+    // Don't memoize a failure: `X402PeerMissingError` tells the operator to
+    // install the peers, and in a long-running server a cached rejection
+    // would keep failing after they did.
+    existing.catch(() => {
+      if (_runtimeBySigner.get(signer) === existing) {
+        _runtimeBySigner.delete(signer);
+      }
+    });
     _runtimeBySigner.set(signer, existing);
   }
   return existing;

@@ -249,4 +249,5 @@ export {
   X402PaymentFailedError,
   X402NoSupportedRequirementError,
   X402InvalidVersionError,
+  X402PeerMissingError,
 } from './errors.js';
