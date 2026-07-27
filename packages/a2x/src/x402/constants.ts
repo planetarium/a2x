@@ -27,12 +27,14 @@ export const X402_EXTENSION_URI =
  * the URI. The `v0.1` in the path is the *extension's* version, not the x402
  * protocol generation.
  *
- * a2x advertises this as the canonical x402 extension and, when a client
- * activates it without also pinning V1, emits its configured
- * `defaultGeneration` (V2). Activation of this URI is therefore NOT proof the
- * client speaks V2 — it only proves the client speaks x402-on-A2A. This is
- * why a2x keeps the legacy v0.2 URI (`X402_EXTENSION_URI`) as an explicit V1
- * pin for clients that can only decode V1 envelopes.
+ * a2x advertises this as the canonical x402 extension. It is **not** an input
+ * to generation selection: activating it is not proof the client speaks V2,
+ * only that it speaks x402-on-A2A, so a client that activates it (and nothing
+ * else) gets the server's configured `defaultGeneration` — V1 unless the
+ * operator opted in. This is why a2x keeps the legacy v0.2 URI
+ * (`X402_EXTENSION_URI`) as an explicit V1 pin for clients that can only
+ * decode V1 envelopes; see `x402PinnedGeneration`, the single place that
+ * maps a URI to a generation.
  */
 export const X402_FOUNDATION_EXTENSION_URI =
   'https://github.com/google-a2a/a2a-x402/v0.1';

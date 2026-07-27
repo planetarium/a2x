@@ -12,3 +12,5 @@ Two halves of the same mistake, both fixed:
 - `pickEmissionGeneration` treated "both URIs activated" as a dual-capable client and emitted `defaultGeneration`. That is fail-open: activating the V1 pin proves the client decodes V1, while neither URI proves it decodes V2 (the foundation URI is generation-neutral). The v0.2 URI now pins V1 whenever it is present. A client that prefers V2 activates the foundation URI alone — which is what `A2XClient` does once a card advertises it.
 
 The bug was unreachable until an agent advertised the foundation URI, so no released configuration is affected.
+
+The URI→generation mapping now lives in exactly one place, `x402PinnedGeneration` — `BaseX402Context.pickEmissionGeneration` reads it instead of re-deriving the rule. Re-deriving it is what let the two halves drift apart. `x402PinnedGeneration` was exported by the previous release-in-progress but unused by the SDK itself; it is now the single source of truth and has direct test coverage.
