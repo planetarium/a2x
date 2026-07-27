@@ -13,8 +13,7 @@
     "@anthropic-ai/sdk": "^0.91.1",
     "dotenv": "^16",
     "express": "^5.1.0",
-    "viem": "^2.21.0",
-    "x402": "^1.2.0"
+    "viem": "^2.21.0"
   },
   "devDependencies": {
     "@types/express": "^5",

@@ -15,7 +15,7 @@ import {
   X402Context,
   InMemoryX402Store,
   X402_EXTENSION_URI,
-  X402_V2_EXTENSION_URI,
+  X402_FOUNDATION_EXTENSION_URI,
   type X402Accept,
   type X402Facilitator
 } from '@a2x/sdk/x402';
@@ -91,6 +91,9 @@ class EchoAgent extends BaseAgent {
         ? { facilitator: { url: process.env.X402_FACILITATOR_URL } }
         : {}),
       store: new InMemoryX402Store(),
+      // Opt into x402 V2: this sample advertises the foundation URI (below),
+      // so its clients activate it and negotiate V2. The SDK default is V1.
+      defaultGeneration: 2,
   });
   }
 
@@ -174,7 +177,7 @@ export const a2xServer = new A2XServer({
   // request handler treats the two as an activation family, so a v0.2-only
   // client (e.g. a2a-x402 v0.2) still satisfies the requirement — an
   // a2x-server-specific relaxation, not standard A2A semantics.
-  .addExtension({ uri: X402_V2_EXTENSION_URI, required: true })
+  .addExtension({ uri: X402_FOUNDATION_EXTENSION_URI, required: true })
   .addExtension({ uri: X402_EXTENSION_URI, required: false });
 
 export const handler = new DefaultRequestHandler(a2xServer);

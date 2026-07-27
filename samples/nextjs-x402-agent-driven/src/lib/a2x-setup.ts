@@ -10,7 +10,7 @@ import {
 import {
   X402Context,
   X402_EXTENSION_URI,
-  X402_V2_EXTENSION_URI,
+  X402_FOUNDATION_EXTENSION_URI,
   type X402Facilitator,
 } from '@a2x/sdk/x402';
 import { AnthropicProvider } from '@a2x/sdk/anthropic';
@@ -84,6 +84,9 @@ const x402 = new X402Context({
     : process.env.X402_FACILITATOR_URL
       ? { facilitator: { url: process.env.X402_FACILITATOR_URL } }
       : {}),
+  // Opt into x402 V2: this sample advertises the foundation URI (below), so
+  // its clients activate it and negotiate V2. The SDK default is V1.
+  defaultGeneration: 2,
 });
 
 const agent = new TranslationAgent({
@@ -127,7 +130,7 @@ export const a2xServer = new A2XServer({
   // and the legacy v0.2 URI as an optional V1 pin. a2x's request handler
   // treats the two as an activation family so a v0.2-only client still
   // satisfies the requirement — an a2x-server-specific relaxation.
-  .addExtension({ uri: X402_V2_EXTENSION_URI, required: true })
+  .addExtension({ uri: X402_FOUNDATION_EXTENSION_URI, required: true })
   .addExtension({ uri: X402_EXTENSION_URI, required: false });
 
 export const handler = new DefaultRequestHandler(a2xServer);
