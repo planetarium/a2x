@@ -7,6 +7,7 @@
  * the byte shape a2a-x402 v0.2 clients and the V1 facilitator expect.
  */
 
+import { defaultEip712Extra } from './assets.js';
 import { X402_DEFAULT_TIMEOUT_SECONDS } from './constants.js';
 import { toBareName } from './networks.js';
 import type {
@@ -14,8 +15,6 @@ import type {
   X402PaymentRequiredResponseV1,
   X402PaymentRequirementsV1,
 } from './types.js';
-
-const DEFAULT_EXTRA = { name: 'USDC', version: '2' } as const;
 
 /** Encode one `X402Accept` into a V1 `PaymentRequirements`. */
 export function encodeRequirementV1(
@@ -31,7 +30,7 @@ export function encodeRequirementV1(
     payTo: accept.payTo,
     maxTimeoutSeconds: accept.maxTimeoutSeconds ?? X402_DEFAULT_TIMEOUT_SECONDS,
     asset: accept.asset,
-    extra: accept.extra ?? { ...DEFAULT_EXTRA },
+    extra: accept.extra ?? defaultEip712Extra(accept.asset),
   };
 }
 

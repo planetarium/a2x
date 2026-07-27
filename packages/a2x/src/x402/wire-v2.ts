@@ -10,6 +10,7 @@
  * single `payment-required` are expected to describe the same resource.
  */
 
+import { defaultEip712Extra } from './assets.js';
 import { X402_DEFAULT_TIMEOUT_SECONDS } from './constants.js';
 import { toCaip2 } from './networks.js';
 import type {
@@ -18,8 +19,6 @@ import type {
   X402PaymentRequirementsV2,
   X402ResourceInfo,
 } from './types.js';
-
-const DEFAULT_EXTRA = { name: 'USDC', version: '2' } as const;
 
 /** Encode one `X402Accept` into a V2 `PaymentRequirements` (resource hoisted out). */
 export function encodeRequirementV2(
@@ -32,7 +31,7 @@ export function encodeRequirementV2(
     amount: accept.amount,
     payTo: accept.payTo,
     maxTimeoutSeconds: accept.maxTimeoutSeconds ?? X402_DEFAULT_TIMEOUT_SECONDS,
-    extra: accept.extra ?? { ...DEFAULT_EXTRA },
+    extra: accept.extra ?? defaultEip712Extra(accept.asset),
   };
 }
 

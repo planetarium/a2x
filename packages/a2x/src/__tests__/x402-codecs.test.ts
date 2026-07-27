@@ -142,4 +142,25 @@ describe('wire codecs', () => {
     expect(encodePaymentRequiredV1([ACCEPT], { error: 'boom' }).error).toBe('boom');
     expect(encodePaymentRequiredV2([ACCEPT], { error: 'boom' }).error).toBe('boom');
   });
+
+  it('defaults `extra` to the asset-correct EIP-712 domain', () => {
+    // Base Sepolia USDC → name "USDC"; Base mainnet USDC → name "USD Coin".
+    const sepolia = encodeRequirementV1({ ...ACCEPT });
+    expect(sepolia.extra).toEqual({ name: 'USDC', version: '2' });
+
+    const mainnet = encodeRequirementV2({
+      ...ACCEPT,
+      network: 'base',
+      asset: '0x833589fCD6eDb6E08f4c7C32D4f71b54bda02913',
+    });
+    expect(mainnet.extra).toEqual({ name: 'USD Coin', version: '2' });
+  });
+
+  it('honors a caller-supplied `extra` over the default', () => {
+    const req = encodeRequirementV2({
+      ...ACCEPT,
+      extra: { name: 'DAI', version: '1' },
+    });
+    expect(req.extra).toEqual({ name: 'DAI', version: '1' });
+  });
 });
