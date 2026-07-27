@@ -23,9 +23,11 @@ The two wire generations differ only in envelope shape:
 
 The five `x402.payment.*` metadata keys, the payment status lifecycle, and the EIP-3009 signing typed-data are identical across generations.
 
-> **Generation is signalled by `x402Version` in the envelope, not by the extension URI.** In the x402 Foundation lineage the canonical URI (`X402_V2_EXTENSION_URI`, `github.com/google-a2a/a2a-x402/v0.1`) is **generation-neutral** — the `v0.1` there is the *extension's* version, not the x402 protocol generation. The URI→generation negotiation below is an **a2x SDK profile**, not part of the foundation transport spec.
+> **Generation is signalled by `x402Version` in the envelope, not by the extension URI.** In the x402 Foundation lineage the canonical URI (`X402_FOUNDATION_EXTENSION_URI`, `github.com/google-a2a/a2a-x402/v0.1`) is **generation-neutral** — the `v0.1` there is the *extension's* version, not the x402 protocol generation. The URI→generation negotiation below is an **a2x SDK profile**, not part of the foundation transport spec.
 
-**How a2x negotiates (SDK profile):** the **server owns emission** and the **client signs whatever generation it receives**. The server emits its `defaultGeneration` (**V2** by default) unless the client pins V1 by activating a2x's legacy v0.2 URI (`X402_EXTENSION_URI`) on its own. So: a2x↔a2x runs V2; a legacy `a2a-x402 v0.2` client (or a2x's own older client) that activates the v0.2 URI gets V1; deployments serving V1-only fleets can flip the default with `new X402Context({ defaultGeneration: 1 })`.
+**How a2x negotiates (SDK profile):** the **server owns emission** and the **client signs whatever generation it receives**. The server emits its `defaultGeneration` (**V1** by default — migration-safe, since the foundation URI is generation-neutral and emitting V2 to a client that only pinned the neutral URI would be a silent wire break) unless the client pins V1 explicitly via the legacy v0.2 URI.
+
+So **out of the box a2x↔a2x runs V1.** To run V2, the server opts in: `new X402Context({ defaultGeneration: 2 })` **and** advertise `X402_FOUNDATION_EXTENSION_URI` on its AgentCard (so a2x clients activate it and upgrade). A legacy `a2a-x402 v0.2` client that activates only the v0.2 URI always gets V1.
 
 To keep legacy clients working during a transition, declare both URIs on your AgentCard (see [Protocol Extensions](./extensions.md)) — a2x treats them as an activation family so a v0.2-only client still satisfies the requirement.
 

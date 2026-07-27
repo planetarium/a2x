@@ -177,7 +177,7 @@ on what the client negotiated:
 
 ```ts
 async *run(ctx: InvocationContext) {
-  if (ctx.activatedExtensions?.includes(X402_V2_EXTENSION_URI)) {
+  if (ctx.activatedExtensions?.includes(X402_FOUNDATION_EXTENSION_URI)) {
     // client speaks x402 V2
   }
 }

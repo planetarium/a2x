@@ -26,13 +26,18 @@ export const X402_SUPPORTED_VERSIONS: readonly X402Generation[] = [1, 2];
 
 /**
  * Fallback generation `X402Context` emits when the client's activation set
- * pins no x402 generation (the foundation URI is generation-neutral, or the
- * transport stripped `X-A2A-Extensions`). a2x's negotiation profile is
- * V2-first. Legacy V1-only clients pin V1 by activating the v0.2 URI, so this
- * fallback governs the neutral/no-activation case; deployments serving V1-only
- * fleets can override it to `1` via `X402ContextOptions.defaultGeneration`.
+ * pins no x402 generation — which is the common case, since the foundation URI
+ * is generation-neutral (only the legacy v0.2 URI pins a generation), plus the
+ * no-header / stripped-header cases.
+ *
+ * **V1** by default: emitting V2 on a signal the peer has not proven it speaks
+ * V2 (the neutral foundation URI, or no header at all) would hand a V1-only
+ * client an envelope it cannot parse — a silent, fail-open wire break. A
+ * deployment whose clients all speak V2 opts in explicitly with
+ * `new X402Context({ defaultGeneration: 2 })` (and advertises the foundation
+ * URI on its card so its own clients upgrade).
  */
-export const X402_DEFAULT_GENERATION: X402Generation = 2;
+export const X402_DEFAULT_GENERATION: X402Generation = 1;
 
 /** True when `version` is a generation this SDK supports. */
 export function isSupportedVersion(version: unknown): version is X402Generation {

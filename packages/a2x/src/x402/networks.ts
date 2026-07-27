@@ -2,9 +2,10 @@
  * Bare-name ↔ CAIP-2 network normalization.
  *
  * x402 V1 wire uses bare network names (`"base-sepolia"`); V2 wire uses
- * CAIP-2 ids (`"eip155:84532"`). `@x402/evm` keeps its own bare↔chainId map
- * private (compiled into the exact scheme), so a2x carries a matching table
- * for the three jobs it needs it for:
+ * CAIP-2 ids (`"eip155:84532"`). `@x402/evm` exports an equivalent map, but
+ * it is an optional peer the SDK loads lazily only on the signing path — so
+ * a2x carries a matching table (kept in sync with `@x402/evm`) for the three
+ * jobs it needs it for, without forcing the peer to be installed:
  *
  *  1. `X402Accept` normalization — agents configure `network` once (usually
  *     a bare name) and the V2 codec must emit the CAIP-2 form.

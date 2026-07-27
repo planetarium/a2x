@@ -57,7 +57,7 @@ During a migration between wire generations, a2x lets one capability be advertis
 
 ```ts
 server
-  .addExtension({ uri: X402_V2_EXTENSION_URI, required: true })  // canonical x402
+  .addExtension({ uri: X402_FOUNDATION_EXTENSION_URI, required: true })  // canonical x402
   .addExtension({ uri: X402_EXTENSION_URI, required: false });   // legacy v0.2 (V1 pin)
 ```
 

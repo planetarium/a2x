@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import { privateKeyToAccount } from 'viem/accounts';
 import { A2XClient } from '../client/a2x-client.js';
-import { X402_EXTENSION_URI, X402_V2_EXTENSION_URI } from '../x402/index.js';
+import { X402_EXTENSION_URI, X402_FOUNDATION_EXTENSION_URI } from '../x402/index.js';
 import { A2XServer } from '../a2x/a2x-agent.js';
 import { AgentExecutor, StreamingMode } from '../a2x/agent-executor.js';
 import { InMemoryRunner } from '../runner/in-memory-runner.js';
@@ -215,7 +215,7 @@ describe('DefaultRequestHandler — extension activation enforcement (spec §3.1
       .setName('x')
       .setDescription('x')
       .setDefaultUrl('https://example.com/a2a')
-      .addExtension({ uri: X402_V2_EXTENSION_URI, required: true })
+      .addExtension({ uri: X402_FOUNDATION_EXTENSION_URI, required: true })
       .addExtension({ uri: X402_EXTENSION_URI, required: true });
     return new DefaultRequestHandler(a2x);
   }
@@ -232,7 +232,7 @@ describe('DefaultRequestHandler — extension activation enforcement (spec §3.1
   it('accepts a V2-only client (activates only the foundation URI) against a dual-required agent', async () => {
     const handler = buildDualHandler();
     const result = (await handler.handle(sendBody, {
-      headers: { 'x-a2a-extensions': X402_V2_EXTENSION_URI },
+      headers: { 'x-a2a-extensions': X402_FOUNDATION_EXTENSION_URI },
     })) as { result?: unknown; error?: unknown };
     expect(result.error).toBeUndefined();
     expect(result.result).toBeDefined();
@@ -296,5 +296,98 @@ describe('DefaultRequestHandler — extension activation enforcement (spec §3.1
     })) as { result?: unknown; error?: unknown };
     expect(withHeader.error).toBeUndefined();
     expect(withHeader.result).toBeDefined();
+  });
+});
+
+describe('A2XClient — card-based x402 generation activation', () => {
+  // recordingFetch returns a card with `capabilities: {}`; this variant lets
+  // the card advertise x402 extension URIs so the client's card-based upgrade
+  // (`_activateX402Extension`) can be exercised.
+  function fetchWithCardExtensions(uris: string[]): {
+    fetch: typeof globalThis.fetch;
+    calls: Array<{ url: string; headers: Record<string, string> }>;
+  } {
+    const calls: Array<{ url: string; headers: Record<string, string> }> = [];
+    const fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const headers: Record<string, string> = {};
+      if (init?.headers) {
+        const src = init.headers as Record<string, string>;
+        for (const key of Object.keys(src)) headers[key.toLowerCase()] = src[key]!;
+      }
+      calls.push({ url, headers });
+      if (url.endsWith('/agent-card.json') || url.endsWith('/agent.json')) {
+        return new Response(
+          JSON.stringify({
+            protocolVersion: '0.3.0',
+            name: 'test',
+            description: 'test',
+            url: 'https://example.com/a2a',
+            version: '1.0.0',
+            capabilities: {
+              extensions: uris.map((uri) => ({ uri, required: true })),
+            },
+            defaultInputModes: ['text'],
+            defaultOutputModes: ['text'],
+            skills: [],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          result: {
+            kind: 'task',
+            id: 't1',
+            contextId: 'c1',
+            status: { state: 'completed', timestamp: new Date().toISOString() },
+            artifacts: [],
+            history: [],
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    }) as unknown as typeof globalThis.fetch;
+    return { fetch, calls };
+  }
+
+  it('upgrades to the foundation URI when the card advertises it (drops the auto-seeded v0.2 URI)', async () => {
+    const { fetch, calls } = fetchWithCardExtensions([
+      X402_FOUNDATION_EXTENSION_URI,
+    ]);
+    const client = new A2XClient('https://example.com', {
+      fetch,
+      x402: { signer: TEST_ACCOUNT },
+    });
+    await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    const rpcCall = calls.find((c) => c.url.endsWith('/a2a'))!;
+    const header = rpcCall.headers['x-a2a-extensions'] ?? '';
+    expect(header).toContain(X402_FOUNDATION_EXTENSION_URI);
+    expect(header).not.toContain(X402_EXTENSION_URI);
+  });
+
+  it('preserves an explicitly registered v0.2 URI even when the card advertises the foundation URI', async () => {
+    const { fetch, calls } = fetchWithCardExtensions([
+      X402_FOUNDATION_EXTENSION_URI,
+    ]);
+    // Caller deliberately pins V1 (e.g. tooling that only decodes V1 envelopes).
+    const client = new A2XClient('https://example.com', {
+      fetch,
+      x402: { signer: TEST_ACCOUNT },
+      extensions: [X402_EXTENSION_URI],
+    });
+    await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    const rpcCall = calls.find((c) => c.url.endsWith('/a2a'))!;
+    const header = rpcCall.headers['x-a2a-extensions'] ?? '';
+    expect(header).toContain(X402_EXTENSION_URI);
   });
 });

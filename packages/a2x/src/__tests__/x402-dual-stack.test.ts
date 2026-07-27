@@ -14,7 +14,7 @@ import {
   X402Context,
   X402_EXTENSION_URI,
   X402_METADATA_KEYS,
-  X402_V2_EXTENSION_URI,
+  X402_FOUNDATION_EXTENSION_URI,
   requirementAmount,
   signX402Payment,
   type X402Accept,
@@ -50,6 +50,14 @@ function mockFacilitator(): X402Facilitator {
   };
 }
 
+// A server that has opted into V2 (defaultGeneration: 2). Since the foundation
+// URI is generation-neutral, V2 emission is a server opt-in, not a per-URI
+// signal — these tests model an operator that advertises the foundation URI
+// and configured V2.
+function v2Context(facilitator: X402Facilitator = mockFacilitator()): X402Context {
+  return new X402Context({ facilitator, defaultGeneration: 2 });
+}
+
 async function drainMetadata(
   gen: AsyncGenerator<AgentEvent>,
 ): Promise<Record<string, unknown>> {
@@ -79,11 +87,11 @@ function requiredTask(required: X402PaymentRequiredResponse): Task {
 }
 
 describe('server emission generation from activation', () => {
-  it('emits V2 when the client activated the V2 URI', async () => {
-    const ctx = new X402Context({ facilitator: mockFacilitator() });
+  it('emits V2 when the server opted into V2 and the client activated the foundation URI', async () => {
+    const ctx = v2Context();
     const meta = await drainMetadata(
       ctx.requestPayment(
-        { taskId: 't1', activatedExtensions: [X402_V2_EXTENSION_URI] },
+        { taskId: 't1', activatedExtensions: [X402_FOUNDATION_EXTENSION_URI] },
         { accepts: [ACCEPT] },
       ),
     );
@@ -105,35 +113,32 @@ describe('server emission generation from activation', () => {
     expect(required.accepts[0]!.network).toBe('base-sepolia');
   });
 
-  it('falls back to V2 when no x402 URI pins a generation (profile is V2-first)', async () => {
+  it('falls back to V1 when no x402 URI pins a generation (migration-safe default)', async () => {
     const ctx = new X402Context({ facilitator: mockFacilitator() });
-    const meta = await drainMetadata(
-      ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }),
-    );
-    const required = meta[X402_METADATA_KEYS.REQUIRED] as X402PaymentRequiredResponse;
-    expect(required.x402Version).toBe(2);
-  });
-
-  it('honors a V1 default override for legacy fleets', async () => {
-    const ctx = new X402Context({
-      facilitator: mockFacilitator(),
-      defaultGeneration: 1,
-    });
     const meta = await drainMetadata(
       ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }),
     );
     const required = meta[X402_METADATA_KEYS.REQUIRED] as X402PaymentRequiredResponse;
     expect(required.x402Version).toBe(1);
   });
+
+  it('emits V2 on the neutral fallback only when the server opted into V2', async () => {
+    const ctx = v2Context();
+    const meta = await drainMetadata(
+      ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }),
+    );
+    const required = meta[X402_METADATA_KEYS.REQUIRED] as X402PaymentRequiredResponse;
+    expect(required.x402Version).toBe(2);
+  });
 });
 
 describe('full V2 round-trip', () => {
   it('offers V2, signs V2, classifies valid, settles with CAIP-2 receipt', async () => {
-    const ctx = new X402Context({ facilitator: mockFacilitator() });
-    // Offer under V2.
+    const ctx = v2Context();
+    // Offer under V2 (server opted into V2).
     await drainMetadata(
       ctx.requestPayment(
-        { taskId: 't1', activatedExtensions: [X402_V2_EXTENSION_URI] },
+        { taskId: 't1', activatedExtensions: [X402_FOUNDATION_EXTENSION_URI] },
         { accepts: [ACCEPT] },
       ),
     );
@@ -168,10 +173,10 @@ describe('full V2 round-trip', () => {
   });
 
   it('rejects a V1 submission against a V2 offering (generation mismatch)', async () => {
-    const ctx = new X402Context({ facilitator: mockFacilitator() });
+    const ctx = v2Context();
     await drainMetadata(
       ctx.requestPayment(
-        { taskId: 't1', activatedExtensions: [X402_V2_EXTENSION_URI] },
+        { taskId: 't1', activatedExtensions: [X402_FOUNDATION_EXTENSION_URI] },
         { accepts: [ACCEPT] },
       ),
     );
@@ -200,10 +205,13 @@ describe('full V2 round-trip', () => {
 describe('EIP-3009 signature recovery (both generations)', () => {
   for (const [label, uri, expectedVersion] of [
     ['V1', X402_EXTENSION_URI, 1],
-    ['V2', X402_V2_EXTENSION_URI, 2],
+    ['V2', X402_FOUNDATION_EXTENSION_URI, 2],
   ] as const) {
     it(`${label} payload signature recovers to the signer`, async () => {
-      const ctx = new X402Context({ facilitator: mockFacilitator() });
+      const ctx = new X402Context({
+        facilitator: mockFacilitator(),
+        defaultGeneration: expectedVersion,
+      });
       await drainMetadata(
         ctx.requestPayment(
           { taskId: 't1', activatedExtensions: [uri] },
@@ -268,11 +276,11 @@ function submitMessage(payload: unknown) {
 
 describe('adversarial code-review regressions', () => {
   it('binds a multi-tier V2 submission to the tier the client actually signed', async () => {
-    const ctx = new X402Context({ facilitator: mockFacilitator() });
+    const ctx = v2Context();
     const accepts: X402Accept[] = [ACCEPT, { ...ACCEPT, amount: '50000' }];
     await drainMetadata(
       ctx.requestPayment(
-        { taskId: 't1', activatedExtensions: [X402_V2_EXTENSION_URI] },
+        { taskId: 't1', activatedExtensions: [X402_FOUNDATION_EXTENSION_URI] },
         { accepts },
       ),
     );
@@ -293,10 +301,10 @@ describe('adversarial code-review regressions', () => {
   });
 
   it('rejects an unsupported x402Version with invalid_x402_version', async () => {
-    const ctx = new X402Context({ facilitator: mockFacilitator() });
+    const ctx = v2Context();
     await drainMetadata(
       ctx.requestPayment(
-        { taskId: 't1', activatedExtensions: [X402_V2_EXTENSION_URI] },
+        { taskId: 't1', activatedExtensions: [X402_FOUNDATION_EXTENSION_URI] },
         { accepts: [ACCEPT] },
       ),
     );
@@ -323,10 +331,10 @@ describe('adversarial code-review regressions', () => {
         throw new Error('facilitator 500');
       },
     };
-    const ctx = new X402Context({ facilitator: throwing });
+    const ctx = v2Context(throwing);
     await drainMetadata(
       ctx.requestPayment(
-        { taskId: 't1', activatedExtensions: [X402_V2_EXTENSION_URI] },
+        { taskId: 't1', activatedExtensions: [X402_FOUNDATION_EXTENSION_URI] },
         { accepts: [ACCEPT] },
       ),
     );

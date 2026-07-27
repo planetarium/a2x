@@ -12,7 +12,7 @@
 /**
  * Canonical URI for a2a-x402 v0.2 — selects the **V1** wire generation.
  * Retained for the transition window; new deployments should advertise
- * `X402_V2_EXTENSION_URI` as well (or instead).
+ * `X402_FOUNDATION_EXTENSION_URI` as well (or instead).
  */
 export const X402_EXTENSION_URI =
   'https://github.com/google-agentic-commerce/a2a-x402/blob/main/spec/v0.2';
@@ -34,7 +34,7 @@ export const X402_EXTENSION_URI =
  * why a2x keeps the legacy v0.2 URI (`X402_EXTENSION_URI`) as an explicit V1
  * pin for clients that can only decode V1 envelopes.
  */
-export const X402_V2_EXTENSION_URI =
+export const X402_FOUNDATION_EXTENSION_URI =
   'https://github.com/google-a2a/a2a-x402/v0.1';
 
 /**
@@ -45,7 +45,7 @@ export const X402_V2_EXTENSION_URI =
  * satisfies a required x402 extension during the migration window.
  */
 export const X402_EXTENSION_URIS: readonly string[] = [
-  X402_V2_EXTENSION_URI,
+  X402_FOUNDATION_EXTENSION_URI,
   X402_EXTENSION_URI,
 ];
 

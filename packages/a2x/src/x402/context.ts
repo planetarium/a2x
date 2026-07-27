@@ -85,7 +85,7 @@ import {
   X402_ERROR_CODES,
   X402_EXTENSION_URI,
   X402_PAYMENT_STATUS,
-  X402_V2_EXTENSION_URI,
+  X402_FOUNDATION_EXTENSION_URI,
   mapVerifyFailureToCode,
   type X402ErrorCode,
 } from './constants.js';
@@ -143,8 +143,10 @@ export interface X402ContextOptions {
   /**
    * Wire generation to emit when the client's activated extension set
    * doesn't pin one (e.g. a transport that stripped `X-A2A-Extensions`).
-   * Defaults to V2 (a2x's negotiation profile is V2-first). Deployments still
-   * serving legacy V1-only fleets should set this to `1`.
+   * Defaults to V1 — the migration-safe choice, since the foundation URI is
+   * generation-neutral and emitting V2 to a client that only pinned the neutral
+   * URI (or sent no header) would be a silent wire break. Deployments whose
+   * clients all speak V2 opt in with `2`.
    */
   defaultGeneration?: X402Generation;
 }
@@ -279,7 +281,7 @@ export abstract class BaseX402Context {
     // dual-capable client. Everything else falls back to `defaultGeneration`.
     const pinsV1 =
       activated.includes(X402_EXTENSION_URI) &&
-      !activated.includes(X402_V2_EXTENSION_URI);
+      !activated.includes(X402_FOUNDATION_EXTENSION_URI);
     return pinsV1 ? 1 : this.defaultGeneration;
   }
 

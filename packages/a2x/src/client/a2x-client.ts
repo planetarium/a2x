@@ -46,7 +46,7 @@ import type { AuthScheme, AuthRequestContext } from './auth-scheme.js';
 import { normalizeRequirements } from './auth-normalizer.js';
 import {
   X402_EXTENSION_URI,
-  X402_V2_EXTENSION_URI,
+  X402_FOUNDATION_EXTENSION_URI,
   X402_METADATA_KEYS,
   X402_PAYMENT_STATUS,
 } from '../x402/constants.js';
@@ -726,8 +726,8 @@ export class A2XClient {
         .map((e) => e.uri)
         .filter((u): u is string => typeof u === 'string'),
     );
-    if (advertised.has(X402_V2_EXTENSION_URI)) {
-      this._extensions.add(X402_V2_EXTENSION_URI);
+    if (advertised.has(X402_FOUNDATION_EXTENSION_URI)) {
+      this._extensions.add(X402_FOUNDATION_EXTENSION_URI);
       // Only drop the v0.2 URI if we auto-seeded it — never override a caller's
       // explicit V1 pin (e.g. tooling that only understands V1 envelopes).
       if (this._x402UriAutoSeeded) this._extensions.delete(X402_EXTENSION_URI);

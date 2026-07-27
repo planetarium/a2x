@@ -64,7 +64,7 @@ describe('generation detection + accessors', () => {
     expect(isSupportedVersion(1)).toBe(true);
     expect(isSupportedVersion(2)).toBe(true);
     expect(isSupportedVersion(3)).toBe(false);
-    expect(X402_DEFAULT_GENERATION).toBe(2);
+    expect(X402_DEFAULT_GENERATION).toBe(1);
   });
 
   it('detects generation from an envelope or bare version', () => {
