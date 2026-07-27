@@ -53,13 +53,13 @@ Use approach (1) for major shape changes, (2) for incremental additions.
 
 ### Activation families (a2x-specific relaxation)
 
-During a migration between wire generations, a2x lets one capability be advertised under more than one URI. The canonical (generation-neutral) x402 URI is advertised as required, and the legacy v0.2 URI as an optional V1 pin:
+The x402 extension exists in two upstream spec versions, each declaring its own URI (A2A mandates a new URI per breaking version). a2x accepts either, but **declare only the one the foundation transport mandates** — the other is a backward-compatible input, not a second capability your agent offers:
 
 ```ts
-server
-  .addExtension({ uri: X402_FOUNDATION_EXTENSION_URI, required: true })  // canonical x402
-  .addExtension({ uri: X402_EXTENSION_URI, required: false });   // legacy v0.2 (V1 pin)
+server.addExtension({ uri: X402_FOUNDATION_EXTENSION_URI, required: true });
 ```
+
+Adding `X402_EXTENSION_URI` as a second entry reports one capability as two extensions on the card, and buys nothing: `required: false` entries never participate in the activation check, and `A2XClient` only looks for the URI above.
 
 a2x's request handler treats the x402 URIs as an **activation family**: activating *any* member satisfies the required x402 extension. This is an **a2x-server-specific relaxation** of A2A's per-extension `required` rule — a non-a2x server enforces `required` per URI. It exists so a legacy `a2a-x402 v0.2` client (which activates only the v0.2 URI) still passes an agent that requires the canonical URI.
 

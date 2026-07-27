@@ -10,22 +10,43 @@
  */
 
 /**
- * Canonical URI for a2a-x402 v0.2 — selects the **V1** wire generation.
+ * URI declared by `spec/v0.2/spec.md` of the a2a-x402 extension repo. a2x
+ * treats activating it as an explicit pin to the **V1** wire generation.
+ *
+ * Counterintuitively this is the *newer* extension spec of the two URIs here:
+ * both come from the same upstream repo (`google-agentic-commerce/a2a-x402`),
+ * which declares a different URI per spec version — v0.1 declares
+ * `X402_FOUNDATION_EXTENSION_URI`, v0.2 declares this one. A2A requires that
+ * (`topics/extensions`: "A new URI MUST be used when introducing a breaking
+ * change"), so the two URIs are legitimately distinct identifiers rather than
+ * aliases. The x402 Foundation's A2A transport docs nonetheless standardized
+ * on the v0.1 URI, which is why a2x advertises that one and keeps this as a
+ * backward-compatible input only.
+ *
  * Retained for the transition window; new deployments should advertise
- * `X402_FOUNDATION_EXTENSION_URI` as well (or instead).
+ * `X402_FOUNDATION_EXTENSION_URI` instead.
  */
 export const X402_EXTENSION_URI =
   'https://github.com/google-agentic-commerce/a2a-x402/blob/main/spec/v0.2';
 
 /**
- * Canonical URI of the x402 Foundation A2A transport extension.
+ * The URI the x402 Foundation's A2A transport specs mandate. Declared by
+ * `spec/v0.1/spec.md` of the a2a-x402 extension repo, and by the foundation's
+ * `transports-v2/a2a.md` (and its V1 predecessor) verbatim.
  *
- * IMPORTANT: in the foundation lineage this URI is **generation-neutral** —
- * the *same* URI identifies the extension across both x402 protocol
- * generations (the foundation V1 and V2 transport docs both declare it), and
- * the generation is signalled by `x402Version` *inside* the envelope, not by
- * the URI. The `v0.1` in the path is the *extension's* version, not the x402
- * protocol generation.
+ * IMPORTANT: this URI is **generation-neutral** — the foundation V1 *and* V2
+ * transport docs declare the *same* URI, so the generation is signalled by
+ * `x402Version` *inside* the envelope, not by the URI. The `v0.1` in the path
+ * is the *extension spec's* version, not the x402 protocol generation.
+ *
+ * Note this is the *older* of the two extension specs a2x knows: the same
+ * upstream repo also ships v0.2, which declares `X402_EXTENSION_URI`. The
+ * foundation transport standardized on v0.1 regardless, so advertising this
+ * URI while emitting V2 envelopes is correct even though it reads backwards.
+ *
+ * Neither URI is registered in A2A's official `a2a-protocol.org/extensions/`
+ * namespace; both are vendor-declared. The path is an identifier, not a
+ * fetchable document (it has no `/tree/` or `/blob/` segment).
  *
  * a2x advertises this as the canonical x402 extension. It is **not** an input
  * to generation selection: activating it is not proof the client speaks V2,
@@ -40,11 +61,17 @@ export const X402_FOUNDATION_EXTENSION_URI =
   'https://github.com/google-a2a/a2a-x402/v0.1';
 
 /**
- * The x402 extension activation family — the URIs a2x recognizes as
- * advertising x402 payment support. `_validateExtensionActivation` treats
- * these as an any-of group (an a2x-server-specific relaxation of A2A's
- * per-extension `required` rule) so a client that activated either member
- * satisfies a required x402 extension during the migration window.
+ * The x402 extension activation family — the two spec versions of the same
+ * upstream extension (v0.1 and v0.2) that a2x recognizes as advertising x402
+ * payment support.
+ *
+ * A2A treats a per-version URI as a distinct extension, so an agent that
+ * requires one and a client that activated the other would normally fail the
+ * activation check. `_validateExtensionActivation` treats these two as an
+ * any-of group instead — an a2x-server-specific relaxation of A2A's
+ * per-extension `required` rule — so a client speaking either version gets
+ * through the migration window. a2x implements only the Standalone flow,
+ * which is unchanged between the two versions, so accepting either is safe.
  */
 export const X402_EXTENSION_URIS: readonly string[] = [
   X402_FOUNDATION_EXTENSION_URI,

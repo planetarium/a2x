@@ -171,13 +171,14 @@ export const a2xServer = new A2XServer({
     description: 'Echoes your message back — paid per call via x402.',
     tags: ['echo', 'x402', 'demo'],
   })
-  // One capability, declared once, under the canonical (generation-neutral)
-  // x402 URI. Legacy clients that only know a2x's v0.2 URI still get through:
-  // a2x's request handler recognizes it as an alias of the same extension, so
-  // activating it satisfies this requirement — an a2x-server-specific
-  // relaxation, not standard A2A semantics. Declaring the v0.2 URI as a second
-  // extension would misreport one capability as two; it is an alias a2x
-  // accepts on input, not a separate thing this agent supports.
+  // Declare the extension once, under the URI the x402 Foundation's A2A
+  // transport mandates. a2x also answers to the a2a-x402 v0.2 URI — a later
+  // spec version of the same upstream extension, which the foundation
+  // transport did not adopt — but that is a backward-compatible input, not a
+  // second capability this agent offers, so it does not belong on the card.
+  // A client activating it still passes: a2x's request handler accepts either
+  // version of the family (an a2x-specific relaxation of A2A's per-URI
+  // `required` rule).
   .addExtension({ uri: X402_FOUNDATION_EXTENSION_URI, required: true });
 
 export const handler = new DefaultRequestHandler(a2xServer);
