@@ -36,6 +36,7 @@ import {
   requirementPayTo,
   type X402Generation,
 } from './generations.js';
+import { sameNetwork } from './networks.js';
 import { encodePaymentRequiredV1, encodeRequirementV1 } from './wire-v1.js';
 import { encodePaymentRequiredV2 } from './wire-v2.js';
 import type {
@@ -177,6 +178,23 @@ export function pickX402Requirement(
   payload: X402PaymentPayload,
   requirements: X402PaymentRequirements[],
 ): X402PaymentRequirements | undefined {
+  // V2 payloads echo the full chosen requirement under `accepted`. Use it to
+  // disambiguate multi-option offerings (price tiers, or multiple assets on
+  // the same network) — matching only on network+scheme would bind the
+  // submission to the first same-network option and mis-validate the amount
+  // or hand verify/settle the wrong asset.
+  if (payload.x402Version === 2 && payload.accepted) {
+    const acc = payload.accepted;
+    const exact = requirements.find(
+      (req) =>
+        req.scheme === acc.scheme &&
+        sameNetwork(req.network, acc.network) &&
+        req.asset === acc.asset &&
+        req.payTo === acc.payTo &&
+        requirementAmount(req) === acc.amount,
+    );
+    if (exact) return exact;
+  }
   return requirements.find((req) => payloadMatchesRequirement(payload, req));
 }
 
@@ -209,6 +227,16 @@ export function validateX402PayloadShape(
     issues.push({
       code: X402_ERROR_CODES.INVALID_PAYLOAD,
       reason: 'Non-EVM payloads are not yet supported by the SDK.',
+    });
+    return issues;
+  }
+  // `authorization` is client-controlled; guard the fields we read so a
+  // malformed submission (non-string `to`/`value`) yields a clean
+  // INVALID_PAYLOAD issue instead of throwing a TypeError up through classify.
+  if (typeof authorization.to !== 'string' || typeof authorization.value !== 'string') {
+    issues.push({
+      code: X402_ERROR_CODES.INVALID_PAYLOAD,
+      reason: 'Authorization is missing a string `to`/`value`.',
     });
     return issues;
   }

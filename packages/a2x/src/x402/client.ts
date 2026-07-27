@@ -27,6 +27,7 @@ import {
   X402PaymentRequiredError,
 } from './errors.js';
 import { detectGeneration } from './generations.js';
+import { isEvmNetwork } from './networks.js';
 import type {
   X402PaymentPayload,
   X402PaymentRequirements,
@@ -234,5 +235,12 @@ export function rejectX402Payment(task: Task): {
 function defaultSelect(
   requirements: X402PaymentRequirements[],
 ): X402PaymentRequirements | undefined {
-  return requirements.find((r) => r.scheme === 'exact') ?? requirements[0];
+  // Only pick an option the signer can actually fulfil (EVM `exact`). In a
+  // multi-rail V2 offer, blindly taking the first `exact` and narrowing to it
+  // would hand the signer a network it can't sign, throwing deep inside
+  // createPaymentPayload; returning undefined instead surfaces the clean
+  // X402NoSupportedRequirementError.
+  return requirements.find(
+    (r) => r.scheme === 'exact' && isEvmNetwork(r.network),
+  );
 }

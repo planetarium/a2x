@@ -51,6 +51,7 @@ import {
   X402_PAYMENT_STATUS,
 } from '../x402/constants.js';
 import { requirementAmount } from '../x402/generations.js';
+import { isEvmNetwork } from '../x402/networks.js';
 import {
   signX402Payment,
   rejectX402Payment,
@@ -246,12 +247,18 @@ export class A2XClient {
     this._authProvider = options?.authProvider;
     this._extensions = new Set(options?.extensions ?? []);
     this._x402 = options?.x402;
-    if (this._x402) {
+    if (this._x402 && !this._extensions.has(X402_EXTENSION_URI)) {
       // Spec a2a-x402 v0.2 §8: clients MUST activate the extension via
-      // `X-A2A-Extensions`. Auto-register so callers don't have to.
+      // `X-A2A-Extensions`. Auto-register so callers don't have to — but only
+      // when the caller didn't already register it explicitly, so a
+      // deliberate V1 pin is not later dropped by the card-based upgrade.
       this._extensions.add(X402_EXTENSION_URI);
+      this._x402UriAutoSeeded = true;
     }
   }
+
+  /** True when the constructor seeded the v0.2 URI itself (vs. the caller). */
+  private _x402UriAutoSeeded = false;
 
   /**
    * Register an A2A extension URI to be included in the
@@ -550,7 +557,9 @@ export class A2XClient {
           ? reqs
           : reqs.filter((r) => isWithinBudget(r, x402.maxAmount!));
       if (userSelect) return userSelect(affordable);
-      return affordable.find((r) => r.scheme === 'exact') ?? affordable[0];
+      // Only auto-pick an option the EVM signer can fulfil (see defaultSelect
+      // in x402/client.ts); undefined surfaces as X402NoSupportedRequirementError.
+      return affordable.find((r) => r.scheme === 'exact' && isEvmNetwork(r.network));
     };
     return signX402Payment(task, {
       signer: x402.signer,
@@ -719,7 +728,9 @@ export class A2XClient {
     );
     if (advertised.has(X402_V2_EXTENSION_URI)) {
       this._extensions.add(X402_V2_EXTENSION_URI);
-      this._extensions.delete(X402_EXTENSION_URI);
+      // Only drop the v0.2 URI if we auto-seeded it — never override a caller's
+      // explicit V1 pin (e.g. tooling that only understands V1 envelopes).
+      if (this._x402UriAutoSeeded) this._extensions.delete(X402_EXTENSION_URI);
     }
   }
 

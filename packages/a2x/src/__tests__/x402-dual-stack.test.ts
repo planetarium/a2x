@@ -15,6 +15,7 @@ import {
   X402_EXTENSION_URI,
   X402_METADATA_KEYS,
   X402_V2_EXTENSION_URI,
+  requirementAmount,
   signX402Payment,
   type X402Accept,
   type X402Facilitator,
@@ -251,6 +252,127 @@ describe('EIP-3009 signature recovery (both generations)', () => {
       expect(recovered.toLowerCase()).toBe(ACCOUNT.address.toLowerCase());
     });
   }
+});
+
+function submitMessage(payload: unknown) {
+  return {
+    messageId: 'm2',
+    role: 'user',
+    parts: [{ text: '' }],
+    metadata: {
+      [X402_METADATA_KEYS.STATUS]: 'payment-submitted',
+      [X402_METADATA_KEYS.PAYLOAD]: payload,
+    },
+  } as never;
+}
+
+describe('adversarial code-review regressions', () => {
+  it('binds a multi-tier V2 submission to the tier the client actually signed', async () => {
+    const ctx = new X402Context({ facilitator: mockFacilitator() });
+    const accepts: X402Accept[] = [ACCEPT, { ...ACCEPT, amount: '50000' }];
+    await drainMetadata(
+      ctx.requestPayment(
+        { taskId: 't1', activatedExtensions: [X402_V2_EXTENSION_URI] },
+        { accepts },
+      ),
+    );
+    const stored = await ctx.store.get('t1');
+    const required = encodeRequiredFromStore(stored!.accepts, 2);
+    // Client signs the *higher* tier — matching on network+scheme alone would
+    // bind it to the first (10000) tier and reject it as INVALID_AMOUNT.
+    const signed = await signX402Payment(requiredTask(required), {
+      signer: ACCOUNT,
+      selectRequirement: (reqs) =>
+        reqs.find((r) => requirementAmount(r) === '50000'),
+    });
+    const classified = await ctx.classify({
+      taskId: 't1',
+      message: submitMessage(signed.payload),
+    });
+    expect(classified.kind).toBe('valid');
+  });
+
+  it('rejects an unsupported x402Version with invalid_x402_version', async () => {
+    const ctx = new X402Context({ facilitator: mockFacilitator() });
+    await drainMetadata(
+      ctx.requestPayment(
+        { taskId: 't1', activatedExtensions: [X402_V2_EXTENSION_URI] },
+        { accepts: [ACCEPT] },
+      ),
+    );
+    const classified = await ctx.classify({
+      taskId: 't1',
+      message: submitMessage({
+        x402Version: 3,
+        accepted: { scheme: 'exact', network: 'eip155:84532' },
+        payload: {},
+      }),
+    });
+    expect(classified.kind).toBe('unmatched');
+    if (classified.kind === 'unmatched') {
+      expect(classified.code).toBe('invalid_x402_version');
+    }
+  });
+
+  it('verify returns isValid:false and records failure when the facilitator throws', async () => {
+    const throwing: X402Facilitator = {
+      verify: async () => {
+        throw new Error('facilitator 500');
+      },
+      settle: async () => {
+        throw new Error('facilitator 500');
+      },
+    };
+    const ctx = new X402Context({ facilitator: throwing });
+    await drainMetadata(
+      ctx.requestPayment(
+        { taskId: 't1', activatedExtensions: [X402_V2_EXTENSION_URI] },
+        { accepts: [ACCEPT] },
+      ),
+    );
+    const required = encodeRequiredFromStore((await ctx.store.get('t1'))!.accepts, 2);
+    const signed = await signX402Payment(requiredTask(required), { signer: ACCOUNT });
+    const classified = await ctx.classify({
+      taskId: 't1',
+      message: submitMessage(signed.payload),
+    });
+    if (classified.kind !== 'valid') throw new Error('expected valid');
+    const v = await ctx.verify({ taskId: 't1' }, classified);
+    expect(v.isValid).toBe(false);
+    expect((await ctx.store.get('t1'))?.status).toBe('failed');
+  });
+
+  it('default selection skips a non-EVM rail and picks the EVM option', async () => {
+    const required = {
+      x402Version: 2 as const,
+      resource: { url: 'https://x', description: 'd', mimeType: 'application/json' },
+      accepts: [
+        {
+          scheme: 'exact',
+          network: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp',
+          asset: 'So11111111111111111111111111111111111111112',
+          amount: '10000',
+          payTo: ACCEPT.payTo,
+          maxTimeoutSeconds: 300,
+          extra: {},
+        },
+        {
+          scheme: 'exact',
+          network: 'eip155:84532',
+          asset: ACCEPT.asset,
+          amount: '10000',
+          payTo: ACCEPT.payTo,
+          maxTimeoutSeconds: 300,
+          extra: { name: 'USDC', version: '2' },
+        },
+      ],
+    };
+    const signed = await signX402Payment(
+      requiredTask(required as never),
+      { signer: ACCOUNT },
+    );
+    expect(signed.requirement.network).toBe('eip155:84532');
+  });
 });
 
 // Re-encode an offering the way X402Context would, for the given generation,

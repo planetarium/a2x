@@ -54,6 +54,16 @@ export function isCaip2(network: string): boolean {
 }
 
 /**
+ * True when the network is an EVM chain the SDK's `exact` scheme can sign —
+ * a known bare EVM name (V1) or an `eip155:<chainId>` CAIP-2 id (V2). Used to
+ * avoid selecting an offering (e.g. a Solana rail in a multi-rail V2 offer)
+ * the EVM signer cannot fulfil.
+ */
+export function isEvmNetwork(network: string): boolean {
+  return network in EVM_NETWORK_CHAIN_ID || /^eip155:\d+$/.test(network);
+}
+
+/**
  * Normalize a network id to CAIP-2. Bare EVM names map through the chain-id
  * table to `eip155:<chainId>`. Values that are already CAIP-2 are returned
  * unchanged. Unknown bare names are returned as-is (best effort — the

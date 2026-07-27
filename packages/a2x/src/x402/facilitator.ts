@@ -102,17 +102,53 @@ export function resolveFacilitator(
   return {
     verify: async (payload, requirements) => {
       const c = await client();
-      return (await c.verify(
-        payload,
-        requirements,
-      )) as Awaited<ReturnType<X402Facilitator['verify']>>;
+      try {
+        return (await c.verify(
+          payload,
+          requirements,
+        )) as Awaited<ReturnType<X402Facilitator['verify']>>;
+      } catch (err) {
+        // HTTPFacilitatorClient throws (VerifyError) on a non-2xx response
+        // even when the body is a usable `{isValid:false, invalidReason}` —
+        // unwrap it back into a normal negative result so callers branch on
+        // `isValid` instead of catching. Genuine transport/schema errors (no
+        // structured body) still propagate.
+        const body = extractFacilitatorErrorBody(err);
+        if (body && 'isValid' in body) {
+          return body as Awaited<ReturnType<X402Facilitator['verify']>>;
+        }
+        throw err;
+      }
     },
     settle: async (payload, requirements) => {
       const c = await client();
-      return (await c.settle(
-        payload,
-        requirements,
-      )) as Awaited<ReturnType<X402Facilitator['settle']>>;
+      try {
+        return (await c.settle(
+          payload,
+          requirements,
+        )) as Awaited<ReturnType<X402Facilitator['settle']>>;
+      } catch (err) {
+        const body = extractFacilitatorErrorBody(err);
+        if (body && 'success' in body) {
+          return body as Awaited<ReturnType<X402Facilitator['settle']>>;
+        }
+        throw err;
+      }
     },
   };
+}
+
+/**
+ * `@x402/core`'s `VerifyError`/`SettleError` carry the parsed facilitator
+ * response body on `.response` (a `{isValid:false,…}` / `{success:false,…}`
+ * object). Extract it when present so a "facilitator says invalid" result is
+ * treated as data, not an exception.
+ */
+function extractFacilitatorErrorBody(
+  err: unknown,
+): Record<string, unknown> | undefined {
+  const response = (err as { response?: unknown })?.response;
+  return response && typeof response === 'object'
+    ? (response as Record<string, unknown>)
+    : undefined;
 }

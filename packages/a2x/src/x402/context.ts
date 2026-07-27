@@ -98,10 +98,10 @@ import {
 import {
   buildX402PaymentCompletedMetadata,
   buildX402PaymentFailedMetadata,
+  buildX402PaymentRequiredMetadata,
   parseX402PaymentSubmission,
   pickX402Requirement,
   validateX402PayloadShape,
-  x402RequestPayment,
   type X402PaymentSubmission,
   type X402RequestPaymentInput,
   type X402ValidationIssue,
@@ -305,6 +305,11 @@ export abstract class BaseX402Context {
       );
     }
     const generation = this.pickEmissionGeneration(ctx.activatedExtensions);
+    // Encode up-front so a misconfigured offering (e.g. a CAIP-2 network with
+    // no V1 bare-name mapping under a V1 offer) throws a clean configuration
+    // error here — before we persist an entry that would then be unusable and
+    // make the resume turn's `classify` fail too.
+    const metadata = buildX402PaymentRequiredMetadata(input, { generation });
     const now = new Date();
     const entry: X402StoreEntry = {
       taskId,
@@ -318,7 +323,11 @@ export abstract class BaseX402Context {
         : {}),
     };
     await this.store.put(entry);
-    yield* x402RequestPayment(input, { generation });
+    yield {
+      type: 'request-input',
+      metadata,
+      message: input.description ?? 'Payment is required to use this service.',
+    };
   }
 
   /**
@@ -381,27 +390,47 @@ export abstract class BaseX402Context {
       return result;
     }
 
-    // Normalize the stored offering to the generation it was published
-    // under, so the requirement handed to verify/settle matches the wire
-    // generation of the client's payload.
+    // Reject a submission whose generation is unsupported, or disagrees with
+    // what we offered: an unparseable `x402Version`, or a V1 payload against a
+    // V2 offering (or vice versa), can never match and must fail before the
+    // facilitator — with the spec's `invalid_x402_version` code, not a
+    // misleading network-mismatch.
     const offeredGeneration = entry.offeredGeneration ?? 1;
-    const requirements = entry.accepts.map((a) =>
-      offeredGeneration === 2 ? encodeRequirementV2(a) : encodeRequirementV1(a),
-    );
-
-    // Reject a submission whose generation disagrees with what we offered:
-    // a V1 payload against a V2 offering (or vice versa) can never match and
-    // must fail before reaching the facilitator.
     if (
-      submission.generation !== undefined &&
+      submission.generation === undefined ||
       submission.generation !== offeredGeneration
     ) {
+      const submitted =
+        submission.generation ??
+        (submission.payload as { x402Version?: unknown }).x402Version;
       const result: X402Classification = {
         kind: 'unmatched',
         submission,
         offering: entry.accepts,
         code: X402_ERROR_CODES.INVALID_X402_VERSION,
-        reason: `Submitted x402Version ${submission.generation} does not match the offered generation ${offeredGeneration}.`,
+        reason: `Submitted x402Version ${String(submitted)} is unsupported or does not match the offered generation ${offeredGeneration}.`,
+      };
+      await this._recordClassifyOutcome(ctx.taskId, result);
+      return result;
+    }
+
+    // Normalize the stored offering to the generation it was published under,
+    // so the requirement handed to verify/settle matches the wire generation
+    // of the client's payload. A codec throw (e.g. a CAIP-2 network with no
+    // V1 bare-name mapping) is a server-side configuration error surfaced as a
+    // clean failure rather than an unhandled exception from classify.
+    let requirements: X402PaymentRequirements[];
+    try {
+      requirements = entry.accepts.map((a) =>
+        offeredGeneration === 2 ? encodeRequirementV2(a) : encodeRequirementV1(a),
+      );
+    } catch (err) {
+      const result: X402Classification = {
+        kind: 'unmatched',
+        submission,
+        offering: entry.accepts,
+        code: X402_ERROR_CODES.INVALID_PAYLOAD,
+        reason: `Stored offering cannot be encoded for generation ${offeredGeneration}: ${err instanceof Error ? err.message : String(err)}`,
       };
       await this._recordClassifyOutcome(ctx.taskId, result);
       return result;
@@ -447,10 +476,31 @@ export abstract class BaseX402Context {
     ctx: { taskId?: string },
     classified: X402ValidClassification,
   ): Promise<X402VerifyResponse> {
-    const result = await this.facilitator.verify(
-      classified.submission.payload!,
-      classified.requirement,
-    );
+    let result: X402VerifyResponse;
+    try {
+      result = await this.facilitator.verify(
+        classified.submission.payload!,
+        classified.requirement,
+      );
+    } catch (err) {
+      // A genuine transport/schema error (not a structured `isValid:false`,
+      // which the adapter already unwraps) still records a failure so the
+      // store never sticks at `offered`/`verified` and the caller gets an
+      // actionable negative result instead of an exception.
+      const reason = err instanceof Error ? err.message : 'Facilitator verify failed.';
+      if (ctx.taskId) {
+        await this.store.update(ctx.taskId, {
+          status: 'failed',
+          failure: {
+            point: 'verify',
+            code: X402_ERROR_CODES.VERIFY_FAILED,
+            reason,
+            failedAt: new Date(),
+          },
+        });
+      }
+      return { isValid: false, invalidReason: reason };
+    }
     if (ctx.taskId) {
       if (result.isValid) {
         await this.store.update(ctx.taskId, {
@@ -487,7 +537,35 @@ export abstract class BaseX402Context {
     classified: X402ValidClassification,
   ): Promise<X402SettleResponse> {
     const payload = classified.submission.payload!;
-    const raw = await this.facilitator.settle(payload, classified.requirement);
+    let raw: Awaited<ReturnType<X402Facilitator['settle']>>;
+    try {
+      raw = await this.facilitator.settle(payload, classified.requirement);
+    } catch (err) {
+      // A settle exception (transport/schema error, possibly after the
+      // transfer was broadcast) must not leave the entry stuck at `verified`
+      // with no record. Mark it failed and return a negative receipt.
+      const reason = err instanceof Error ? err.message : 'Facilitator settle failed.';
+      if (ctx.taskId) {
+        await this.store.update(ctx.taskId, {
+          status: 'failed',
+          failure: {
+            point: 'settle',
+            code: X402_ERROR_CODES.SETTLEMENT_FAILED,
+            reason,
+            failedAt: new Date(),
+          },
+        });
+      }
+      return {
+        success: false,
+        transaction: '',
+        network: payloadNetwork(payload),
+        ...(classified.submission.authorization?.from
+          ? { payer: classified.submission.authorization.from }
+          : {}),
+        errorReason: reason,
+      };
+    }
     const payer =
       classified.submission.authorization?.from ??
       (raw.payer as string | undefined);
