@@ -14,7 +14,6 @@ import {
 import {
   X402Context,
   InMemoryX402Store,
-  X402_EXTENSION_URI,
   X402_FOUNDATION_EXTENSION_URI,
   type X402Accept,
   type X402Facilitator
@@ -172,12 +171,13 @@ export const a2xServer = new A2XServer({
     description: 'Echoes your message back — paid per call via x402.',
     tags: ['echo', 'x402', 'demo'],
   })
-  // Advertise the canonical (generation-neutral) x402 extension as required,
-  // and the legacy v0.2 URI as an optional V1 pin for older clients. a2x's
-  // request handler treats the two as an activation family, so a v0.2-only
-  // client (e.g. a2a-x402 v0.2) still satisfies the requirement — an
-  // a2x-server-specific relaxation, not standard A2A semantics.
-  .addExtension({ uri: X402_FOUNDATION_EXTENSION_URI, required: true })
-  .addExtension({ uri: X402_EXTENSION_URI, required: false });
+  // One capability, declared once, under the canonical (generation-neutral)
+  // x402 URI. Legacy clients that only know a2x's v0.2 URI still get through:
+  // a2x's request handler recognizes it as an alias of the same extension, so
+  // activating it satisfies this requirement — an a2x-server-specific
+  // relaxation, not standard A2A semantics. Declaring the v0.2 URI as a second
+  // extension would misreport one capability as two; it is an alias a2x
+  // accepts on input, not a separate thing this agent supports.
+  .addExtension({ uri: X402_FOUNDATION_EXTENSION_URI, required: true });
 
 export const handler = new DefaultRequestHandler(a2xServer);

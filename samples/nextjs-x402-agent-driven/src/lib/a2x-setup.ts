@@ -9,7 +9,6 @@ import {
 } from '@a2x/sdk';
 import {
   X402Context,
-  X402_EXTENSION_URI,
   X402_FOUNDATION_EXTENSION_URI,
   type X402Facilitator,
 } from '@a2x/sdk/x402';
@@ -126,11 +125,10 @@ export const a2xServer = new A2XServer({
       'payment-required and runs the tool only after settlement.',
     tags: ['translate', 'x402', 'agent-driven', 'anthropic', 'demo'],
   })
-  // Advertise the canonical (generation-neutral) x402 extension as required,
-  // and the legacy v0.2 URI as an optional V1 pin. a2x's request handler
-  // treats the two as an activation family so a v0.2-only client still
-  // satisfies the requirement — an a2x-server-specific relaxation.
-  .addExtension({ uri: X402_FOUNDATION_EXTENSION_URI, required: true })
-  .addExtension({ uri: X402_EXTENSION_URI, required: false });
+  // One capability, declared once, under the canonical (generation-neutral)
+  // x402 URI. a2x's request handler recognizes the legacy v0.2 URI as an alias
+  // of the same extension, so a v0.2-only client still satisfies this
+  // requirement without the card claiming to support two extensions.
+  .addExtension({ uri: X402_FOUNDATION_EXTENSION_URI, required: true });
 
 export const handler = new DefaultRequestHandler(a2xServer);
