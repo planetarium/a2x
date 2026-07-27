@@ -322,6 +322,73 @@ describe('adversarial code-review regressions', () => {
     }
   });
 
+  // x402-v1 §5.2 defines `x402Version` as a required `number` on every
+  // PaymentPayload. Before dual-stack a submission was matched on
+  // `scheme`/`network` alone and the version was never read, so a
+  // non-conformant client got through. These pin the tightened validation —
+  // the one V1 acceptance narrowing in this release.
+  const NON_CONFORMANT_V1: Array<[string, Record<string, unknown>]> = [
+    ['omits x402Version entirely', {}],
+    ['sends x402Version as the string "1"', { x402Version: '1' }],
+    ['sends x402Version as null', { x402Version: null }],
+  ];
+
+  for (const [label, versionField] of NON_CONFORMANT_V1) {
+    it(`rejects a V1 submission that ${label} (x402-v1 §5.2)`, async () => {
+      // Default context — V1 offering, the generation a legacy client speaks.
+      const ctx = new X402Context({ facilitator: mockFacilitator() });
+      await drainMetadata(ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }));
+      const classified = await ctx.classify({
+        taskId: 't1',
+        message: submitMessage({
+          ...versionField,
+          scheme: 'exact',
+          network: 'base-sepolia',
+          payload: {
+            signature: '0xsig',
+            authorization: {
+              from: ACCOUNT.address,
+              to: ACCEPT.payTo,
+              value: ACCEPT.amount,
+              validAfter: '0',
+              validBefore: '99999999999',
+              nonce: '0x00',
+            },
+          },
+        } as never),
+      });
+      expect(classified.kind).toBe('unmatched');
+      if (classified.kind === 'unmatched') {
+        expect(classified.code).toBe('invalid_x402_version');
+      }
+    });
+  }
+
+  it('accepts the same V1 submission once x402Version is the number 1', async () => {
+    const ctx = new X402Context({ facilitator: mockFacilitator() });
+    await drainMetadata(ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }));
+    const classified = await ctx.classify({
+      taskId: 't1',
+      message: submitMessage({
+        x402Version: 1,
+        scheme: 'exact',
+        network: 'base-sepolia',
+        payload: {
+          signature: '0xsig',
+          authorization: {
+            from: ACCOUNT.address,
+            to: ACCEPT.payTo,
+            value: ACCEPT.amount,
+            validAfter: '0',
+            validBefore: '99999999999',
+            nonce: '0x00',
+          },
+        },
+      } as never),
+    });
+    expect(classified.kind).toBe('valid');
+  });
+
   it('verify returns isValid:false and records failure when the facilitator throws', async () => {
     const throwing: X402Facilitator = {
       verify: async () => {
