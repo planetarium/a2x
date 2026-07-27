@@ -1,8 +1,10 @@
 # nextjs-x402-agent-driven sample
 
-An [A2A](https://a2a-protocol.org) agent built with Next.js, `@a2x/sdk`, and the **Anthropic Claude API**. The agent runs Claude with a small **tool registry** — some tools are free (`detect_language`, `word_count`), some are paid (`translate`, `summarize`). On every turn Claude decides which tools to call (zero, one, or many — Anthropic supports parallel tool use); whenever the LLM picks at least one paid tool, the agent yields `x402RequestPayment(...)` with the *summed* per-tool cost. On the resume turn the **agent itself** calls `facilitator.verify()` and `facilitator.settle()` via the SDK's stateless helpers — no SDK-owned payment flow, no custom executor.
+An [A2A](https://a2a-protocol.org) agent built with Next.js, `@a2x/sdk`, and the **Anthropic Claude API**. The agent runs Claude with a small **tool registry** — some tools are free (`detect_language`, `word_count`), some are paid (`translate`, `summarize`). On every turn Claude decides which tools to call (zero, one, or many — Anthropic supports parallel tool use); whenever the LLM picks at least one paid tool, the agent yields `x402.requestPayment(...)` with the *summed* per-tool cost. On the resume turn the **agent itself** calls `facilitator.verify()` and `facilitator.settle()` via the SDK's stateless helpers — no SDK-owned payment flow, no custom executor.
 
 The decision to charge is **driven by the LLM at runtime**: free chat / free-tool-only turns pass through without payment, any paid tool in the planned batch triggers the gate before any tool actually runs.
+
+The agent advertises **both** x402 protocol generations (legacy V1 and the [x402 Foundation](https://github.com/x402-foundation/x402) V2 transport) as an activation family and emits whichever generation the client negotiates. It opts into V2 via `new X402Context({ defaultGeneration: 2 })`; a legacy client that activates only the v0.2 URI still gets V1.
 
 ## When to reach for this pattern
 
