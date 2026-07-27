@@ -14,7 +14,7 @@ import {
 import {
   X402Context,
   InMemoryX402Store,
-  X402_EXTENSION_URI,
+  X402_FOUNDATION_EXTENSION_URI,
   type X402Accept,
   type X402Facilitator
 } from '@a2x/sdk/x402';
@@ -90,6 +90,9 @@ class EchoAgent extends BaseAgent {
         ? { facilitator: { url: process.env.X402_FACILITATOR_URL } }
         : {}),
       store: new InMemoryX402Store(),
+      // Opt into x402 V2: this sample advertises the foundation URI (below),
+      // so its clients activate it and negotiate V2. The SDK default is V1.
+      defaultGeneration: 2,
   });
   }
 
@@ -168,6 +171,14 @@ export const a2xServer = new A2XServer({
     description: 'Echoes your message back — paid per call via x402.',
     tags: ['echo', 'x402', 'demo'],
   })
-  .addExtension({ uri: X402_EXTENSION_URI, required: true });
+  // Declare the extension once, under the URI the x402 Foundation's A2A
+  // transport mandates. a2x also answers to the a2a-x402 v0.2 URI — a later
+  // spec version of the same upstream extension, which the foundation
+  // transport did not adopt — but that is a backward-compatible input, not a
+  // second capability this agent offers, so it does not belong on the card.
+  // A client activating it still passes: a2x's request handler accepts either
+  // version of the family (an a2x-specific relaxation of A2A's per-URI
+  // `required` rule).
+  .addExtension({ uri: X402_FOUNDATION_EXTENSION_URI, required: true });
 
 export const handler = new DefaultRequestHandler(a2xServer);

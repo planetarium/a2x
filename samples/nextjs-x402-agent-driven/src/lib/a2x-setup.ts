@@ -9,7 +9,7 @@ import {
 } from '@a2x/sdk';
 import {
   X402Context,
-  X402_EXTENSION_URI,
+  X402_FOUNDATION_EXTENSION_URI,
   type X402Facilitator,
 } from '@a2x/sdk/x402';
 import { AnthropicProvider } from '@a2x/sdk/anthropic';
@@ -83,6 +83,9 @@ const x402 = new X402Context({
     : process.env.X402_FACILITATOR_URL
       ? { facilitator: { url: process.env.X402_FACILITATOR_URL } }
       : {}),
+  // Opt into x402 V2: this sample advertises the foundation URI (below), so
+  // its clients activate it and negotiate V2. The SDK default is V1.
+  defaultGeneration: 2,
 });
 
 const agent = new TranslationAgent({
@@ -122,6 +125,11 @@ export const a2xServer = new A2XServer({
       'payment-required and runs the tool only after settlement.',
     tags: ['translate', 'x402', 'agent-driven', 'anthropic', 'demo'],
   })
-  .addExtension({ uri: X402_EXTENSION_URI, required: true });
+  // Declare the extension once, under the URI the x402 Foundation's A2A
+  // transport mandates. a2x also answers to the a2a-x402 v0.2 URI (a later
+  // spec version of the same upstream extension), but as a backward-compatible
+  // input rather than a second capability — the request handler accepts either
+  // version, so a v0.2-only client still passes this requirement.
+  .addExtension({ uri: X402_FOUNDATION_EXTENSION_URI, required: true });
 
 export const handler = new DefaultRequestHandler(a2xServer);

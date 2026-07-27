@@ -35,7 +35,9 @@ The two wire generations differ only in envelope shape:
 
 The five `x402.payment.*` metadata keys, the payment status lifecycle, and the EIP-3009 signing typed-data are identical across generations.
 
-> **Generation is signalled by `x402Version` in the envelope, not by the extension URI.** In the x402 Foundation lineage the canonical URI (`X402_FOUNDATION_EXTENSION_URI`, `github.com/google-a2a/a2a-x402/v0.1`) is **generation-neutral** — the `v0.1` there is the *extension's* version, not the x402 protocol generation. The URI→generation negotiation below is an **a2x SDK profile**, not part of the foundation transport spec.
+> **Generation is signalled by `x402Version` in the envelope, not by the extension URI.** The URI the foundation transport mandates (`X402_FOUNDATION_EXTENSION_URI`, `github.com/google-a2a/a2a-x402/v0.1`) is **generation-neutral** — the foundation's V1 and V2 transport docs declare the *same* URI, and the `v0.1` there is the *extension spec's* version, not the x402 protocol generation. The URI→generation mapping below is an **a2x SDK profile**, not part of the foundation transport spec.
+>
+> The two URIs a2x knows are the two spec versions of one upstream extension (`google-agentic-commerce/a2a-x402`; the `google-a2a` path redirects there). v0.1 declares the URI above; v0.2 declares `X402_EXTENSION_URI`. A2A mandates a new URI per breaking version, so they are distinct identifiers rather than aliases — but the foundation transport standardized on v0.1, so **a2x advertises the older extension spec while emitting the newer wire generation**. That reads backwards and is intentional. Neither URI is registered in A2A's official `a2a-protocol.org/extensions/` namespace.
 
 **How a2x negotiates (SDK profile):** the **server owns emission** and the **client signs whatever generation it receives**. The server emits its `defaultGeneration` (**V1** by default — migration-safe, since the foundation URI is generation-neutral and emitting V2 to a client that only pinned the neutral URI would be a silent wire break) unless the client pins V1 explicitly via the legacy v0.2 URI.
 

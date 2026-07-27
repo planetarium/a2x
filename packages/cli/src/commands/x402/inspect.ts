@@ -4,8 +4,8 @@ import crypto from 'node:crypto';
 import type { SendMessageParams } from '@a2x/sdk';
 import {
   getX402PaymentRequirements,
+  isX402ExtensionUri,
   requirementAmount,
-  X402_EXTENSION_URI,
 } from '@a2x/sdk/x402';
 import { createClient, printConnectionError } from '../../format.js';
 
@@ -28,7 +28,10 @@ export const x402InspectCommand = new Command('inspect')
         const extensions = (card as unknown as {
           capabilities?: { extensions?: { uri: string }[] };
         }).capabilities?.extensions ?? [];
-        const declares = extensions.some((e) => e.uri === X402_EXTENSION_URI);
+        // Match any URI in the x402 activation family, not just a2x's legacy
+        // v0.2 one — an agent that advertises only the canonical URI (what the
+        // foundation transport spec mandates) still supports x402.
+        const declares = extensions.some((e) => isX402ExtensionUri(e.uri));
 
         const params: SendMessageParams = {
           message: {
