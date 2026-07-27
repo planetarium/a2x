@@ -389,5 +389,10 @@ describe('A2XClient — card-based x402 generation activation', () => {
     const rpcCall = calls.find((c) => c.url.endsWith('/a2a'))!;
     const header = rpcCall.headers['x-a2a-extensions'] ?? '';
     expect(header).toContain(X402_EXTENSION_URI);
+    // Keeping the v0.2 URI is not enough — the pin must also survive. The
+    // server reads the v0.2 URI as "pin V1", so adding the foundation URI
+    // beside it used to flip the round-trip to the server's defaultGeneration
+    // and hand V1-only tooling a V2 envelope.
+    expect(header).not.toContain(X402_FOUNDATION_EXTENSION_URI);
   });
 });

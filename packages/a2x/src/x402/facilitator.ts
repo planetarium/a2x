@@ -16,6 +16,7 @@
  * skip it unless the verify/settle path actually executes.
  */
 
+import { importX402Peer } from './peer.js';
 import type { X402Facilitator } from './types.js';
 
 /** Default facilitator URL used by the hosted reference implementation. */
@@ -47,15 +48,6 @@ type HttpFacilitatorModule = {
   }) => HttpFacilitatorClient;
 };
 
-async function importOptionalPeer(
-  specifier: string,
-): Promise<Record<string, unknown>> {
-  // @x402/core is an optional peer dependency. Keep the specifier computed
-  // so bundlers that statically inspect dynamic imports do not require it
-  // unless callers actually execute the facilitator path.
-  return import(/* @vite-ignore */ specifier);
-}
-
 function isX402Facilitator(
   spec: FacilitatorUrlConfig | X402Facilitator | undefined,
 ): spec is X402Facilitator {
@@ -85,7 +77,7 @@ export function resolveFacilitator(
   const client = () => {
     if (!clientPromise) {
       clientPromise = (async () => {
-        const mod = (await importOptionalPeer(
+        const mod = (await importX402Peer(
           ['@x402', 'core/http'].join('/'),
         )) as unknown as HttpFacilitatorModule;
         return new mod.HTTPFacilitatorClient({
@@ -95,6 +87,13 @@ export function resolveFacilitator(
             : {}),
         });
       })();
+      // Don't memoize a failure: `X402PeerMissingError` tells the operator to
+      // install the peers, and in a long-running server a cached rejection
+      // would keep failing after they did.
+      const pending = clientPromise;
+      pending.catch(() => {
+        if (clientPromise === pending) clientPromise = undefined;
+      });
     }
     return clientPromise;
   };

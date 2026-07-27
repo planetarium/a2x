@@ -83,10 +83,9 @@ import type { AgentEvent } from '../agent/base-agent.js';
 import type { InvocationContext } from '../runner/context.js';
 import {
   X402_ERROR_CODES,
-  X402_EXTENSION_URI,
   X402_PAYMENT_STATUS,
-  X402_FOUNDATION_EXTENSION_URI,
   mapVerifyFailureToCode,
+  x402PinnedGeneration,
   type X402ErrorCode,
 } from './constants.js';
 import { resolveFacilitator, type FacilitatorUrlConfig } from './facilitator.js';
@@ -268,21 +267,29 @@ export abstract class BaseX402Context {
   /**
    * Select the wire generation to emit for this round-trip from the client's
    * activated extension URIs. The foundation URI is generation-neutral, so
-   * only the legacy v0.2 URI (activated on its own) pins V1; everything else
-   * falls back to `defaultGeneration`. This URI→generation mapping is an
-   * a2x negotiation profile, not part of the foundation transport spec.
+   * only the legacy v0.2 URI pins a generation (V1); everything else falls
+   * back to `defaultGeneration`. This URI→generation mapping is an a2x
+   * negotiation profile, not part of the foundation transport spec.
    */
   protected pickEmissionGeneration(
     activatedExtensions: readonly string[] | undefined,
   ): X402Generation {
-    const activated = activatedExtensions ?? [];
-    // The legacy v0.2 URI pins V1 — but only when the client did NOT also
-    // activate the (generation-neutral) foundation URI, which signals a
-    // dual-capable client. Everything else falls back to `defaultGeneration`.
-    const pinsV1 =
-      activated.includes(X402_EXTENSION_URI) &&
-      !activated.includes(X402_FOUNDATION_EXTENSION_URI);
-    return pinsV1 ? 1 : this.defaultGeneration;
+    // Which URI pins which generation lives solely in `x402PinnedGeneration`.
+    // Re-deriving it here is how the two halves drifted apart before: the
+    // client thought keeping the v0.2 URI preserved a V1 pin while the server
+    // only honored that pin when the canonical URI was absent.
+    //
+    // A pin wins whenever it is present, including alongside the canonical
+    // URI. Reading "both activated" as "dual-capable, send V2" would be
+    // fail-open — activating the V1 pin proves the client decodes V1, while
+    // neither URI proves it decodes V2. A V2-preferring client activates the
+    // canonical URI alone, which is what `A2XClient` does once a card
+    // advertises it.
+    for (const uri of activatedExtensions ?? []) {
+      const pinned = x402PinnedGeneration(uri);
+      if (pinned !== undefined) return pinned;
+    }
+    return this.defaultGeneration;
   }
 
   /**
