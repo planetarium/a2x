@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { Message } from '../types/common.js';
 import {
   X402_ERROR_CODES,
+  X402_EXTENSION_URI,
   X402_METADATA_KEYS,
   X402_PAYMENT_STATUS,
 } from '../x402/constants.js';
@@ -144,7 +145,7 @@ describe('X402Context.requestPayment', () => {
     const ctx = new X402Context({ facilitator });
 
     const events: unknown[] = [];
-    for await (const ev of ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] })) {
+    for await (const ev of ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] })) {
       events.push(ev);
     }
 
@@ -161,7 +162,7 @@ describe('X402Context.requestPayment', () => {
 
   it('writes status=offered on the new entry', async () => {
     const ctx = new X402Context({ facilitator: makeMockFacilitator() });
-    await drain(ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }));
+    await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
     const entry = await ctx.store.get('t1');
     expect(entry?.status).toBe('offered');
     expect(entry?.storedAt).toBeInstanceOf(Date);
@@ -173,7 +174,7 @@ describe('X402Context.requestPayment', () => {
 
   it('records expiresAt when expiresInSeconds is set', async () => {
     const ctx = new X402Context({ facilitator: makeMockFacilitator() });
-    await drain(ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT], expiresInSeconds: 60 }));
+    await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT], expiresInSeconds: 60 }));
     const entry = await ctx.store.get('t1');
     expect(entry?.expiresAt).toBeInstanceOf(Date);
     expect(entry!.expiresAt!.getTime()).toBeGreaterThan(Date.now());
@@ -188,7 +189,7 @@ describe('X402Context.requestPayment', () => {
 
   it('throws when accepts is empty', async () => {
     const ctx = new X402Context({ facilitator: makeMockFacilitator() });
-    await expect(drain(ctx.requestPayment({ taskId: 't1' }, { accepts: [] }))).rejects.toThrow(
+    await expect(drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [] }))).rejects.toThrow(
       /at least one entry/,
     );
   });
@@ -224,7 +225,7 @@ describe('X402Context.classify', () => {
 
   it('returns no-stored-offering when payload is missing', async () => {
     const ctx = new X402Context({ facilitator: makeMockFacilitator() });
-    await drain(ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }));
+    await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
     const result = await ctx.classify({
       taskId: 't1',
       message: buildSubmittedMessage({ noPayload: true }),
@@ -237,7 +238,7 @@ describe('X402Context.classify', () => {
 
   it('returns unmatched when the submitted network/scheme is not in the offering', async () => {
     const ctx = new X402Context({ facilitator: makeMockFacilitator() });
-    await drain(ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }));
+    await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
     const result = await ctx.classify({
       taskId: 't1',
       message: buildSubmittedMessage({ network: 'base' }),
@@ -250,7 +251,7 @@ describe('X402Context.classify', () => {
 
   it('returns invalid-shape when payTo / amount do not match the requirement', async () => {
     const ctx = new X402Context({ facilitator: makeMockFacilitator() });
-    await drain(ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }));
+    await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
     const result = await ctx.classify({
       taskId: 't1',
       message: buildSubmittedMessage({ payTo: '0xWRONG' }),
@@ -264,7 +265,7 @@ describe('X402Context.classify', () => {
 
   it('records failure with point=rejected-by-client on rejected', async () => {
     const ctx = new X402Context({ facilitator: makeMockFacilitator() });
-    await drain(ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }));
+    await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
     await ctx.classify({
       taskId: 't1',
       message: buildSubmittedMessage({ status: X402_PAYMENT_STATUS.REJECTED, noPayload: true }),
@@ -276,7 +277,7 @@ describe('X402Context.classify', () => {
 
   it('records failure with point=classify on unmatched', async () => {
     const ctx = new X402Context({ facilitator: makeMockFacilitator() });
-    await drain(ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }));
+    await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
     await ctx.classify({
       taskId: 't1',
       message: buildSubmittedMessage({ network: 'base' }),
@@ -289,7 +290,7 @@ describe('X402Context.classify', () => {
 
   it('records failure with point=classify on invalid-shape', async () => {
     const ctx = new X402Context({ facilitator: makeMockFacilitator() });
-    await drain(ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }));
+    await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
     await ctx.classify({
       taskId: 't1',
       message: buildSubmittedMessage({ payTo: '0xWRONG' }),
@@ -301,7 +302,7 @@ describe('X402Context.classify', () => {
 
   it('returns valid for a well-formed matching submission', async () => {
     const ctx = new X402Context({ facilitator: makeMockFacilitator() });
-    await drain(ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }));
+    await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
     const result = await ctx.classify({
       taskId: 't1',
       message: buildSubmittedMessage(),
@@ -324,7 +325,7 @@ describe('X402Context.verify and X402Context.settle', () => {
   it('verify forwards to facilitator.verify and records status=verified', async () => {
     const facilitator = makeMockFacilitator();
     const ctx = new X402Context({ facilitator });
-    await drain(ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }));
+    await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
     const classified = await ctx.classify({
       taskId: 't1',
       message: buildSubmittedMessage(),
@@ -351,7 +352,7 @@ describe('X402Context.verify and X402Context.settle', () => {
       } as Awaited<ReturnType<X402Facilitator['settle']>>)),
     };
     const ctx = new X402Context({ facilitator });
-    await drain(ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }));
+    await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
     const classified = await ctx.classify({
       taskId: 't1',
       message: buildSubmittedMessage(),
@@ -375,7 +376,7 @@ describe('X402Context.verify and X402Context.settle', () => {
       } as Awaited<ReturnType<X402Facilitator['settle']>>)),
     };
     const ctx = new X402Context({ facilitator });
-    await drain(ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }));
+    await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
     const classified = await ctx.classify({
       taskId: 't1',
       message: buildSubmittedMessage(),
@@ -406,7 +407,7 @@ describe('X402Context.verify and X402Context.settle', () => {
       } as Awaited<ReturnType<X402Facilitator['settle']>>)),
     };
     const ctx = new X402Context({ facilitator });
-    await drain(ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }));
+    await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
     const classified = await ctx.classify({
       taskId: 't1',
       message: buildSubmittedMessage(),
@@ -450,7 +451,7 @@ describe('X402Context.failedEvent / completedEvent / clearOffering', () => {
 
   it('clearOffering removes the stored entry', async () => {
     const ctx = new X402Context({ facilitator: makeMockFacilitator() });
-    await drain(ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }));
+    await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
     await ctx.clearOffering({ taskId: 't1' });
     expect(await ctx.store.get('t1')).toBeUndefined();
   });
@@ -477,7 +478,7 @@ describe('BaseX402Context subclassing', () => {
       }
     }
     const ctx = new LoggingContext();
-    await drain(ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }));
+    await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
     const classified = await ctx.classify({
       taskId: 't1',
       message: buildSubmittedMessage(),
@@ -495,7 +496,7 @@ describe('BaseX402Context subclassing', () => {
     const ctx = new TightContext();
     // The full classify pipeline works against the subclass-provided
     // store without going through the X402Context default wiring.
-    await drain(ctx.requestPayment({ taskId: 't-tight' }, { accepts: [ACCEPT] }));
+    await drain(ctx.requestPayment({ taskId: 't-tight', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
     const result = await ctx.classify({
       taskId: 't-tight',
       message: buildSubmittedMessage(),
@@ -524,7 +525,7 @@ describe('X402Context custom store', () => {
     }
     const store = new RecordingStore();
     const ctx = new X402Context({ store, facilitator: makeMockFacilitator() });
-    await drain(ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }));
+    await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
     await ctx.clearOffering({ taskId: 't1' });
     expect(calls.map((c) => c.method)).toEqual(['put', 'delete']);
   });

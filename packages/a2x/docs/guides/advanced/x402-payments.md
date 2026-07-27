@@ -1,18 +1,47 @@
 # x402 Payments
 
-Charge per call with on-chain cryptocurrency payments. A2X implements the [a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402/blob/main/spec/v0.2.md) extension, which layers the [x402 payment protocol](https://x402.org) on top of A2A tasks.
+Charge per call with on-chain cryptocurrency payments. A2X implements the x402 A2A transport on top of A2A tasks, speaking **both generations** of the x402 protocol on the wire: the legacy V1 envelopes ([a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402/blob/main/spec/v0.2.md)) and the V2 envelopes defined by the [x402 Foundation A2A transport](https://github.com/x402-foundation/x402/blob/main/specs/transports-v2/a2a.md).
 
-The flow: the merchant agent responds to an unpaid request with `input-required` + `x402.payment.required`. The client signs a `PaymentPayload` with its wallet and resubmits the same task. The merchant validates the payload, verifies it via an x402 **facilitator**, settles on-chain, and attaches the settlement receipt to the completed task.
+The flow: the merchant agent responds to an unpaid request with `input-required` + `x402.payment.required`. The client signs a `PaymentPayload` with its wallet and resubmits the same task. The merchant validates the payload, verifies it via an x402 **facilitator**, settles on-chain, and attaches the settlement receipt to the completed task. This flow is identical across generations — only the JSON envelope shapes differ (see [Protocol generations](#protocol-generations-v1--v2)).
 
 > **What changed in this release.** The SDK no longer ships a payment *flow* — only stateless helpers. The agent owns when to request payment, what was offered, how to validate the submission, whether to retry, and what to do between `verify` and `settle`. The previous `x402PaymentHook` / `inputRoundTripHooks` API is removed; see [Migrating from X402PaymentExecutor / x402PaymentHook](./migration-x402-v2.md) for the migration steps.
 
 ## Installation
 
 ```bash
-pnpm add @a2x/sdk x402 viem
+pnpm add @a2x/sdk @x402/core @x402/evm viem
 ```
 
-`x402` and `viem` are **optional peer dependencies** — only install them if you actually enable x402 on your agent or client. The SDK lazy-loads the `x402` runtime helpers on the first call to `signX402Payment` (or the first time `A2XClient.sendMessage` enters the dance), so non-x402 consumers can omit the dep without breaking bundlers.
+`@x402/core`, `@x402/evm`, and `viem` are **optional peer dependencies** — only install them if you actually enable x402 on your agent or client. The SDK lazy-loads the signing runtime on the first call to `signX402Payment` (or the first time `A2XClient.sendMessage` enters the dance) and the facilitator client on the first `verify`/`settle`, so non-x402 consumers can omit the deps without breaking bundlers. One `@x402/evm` scheme registration signs both V1 and V2 payments.
+
+Because the load is lazy, a missing peer isn't caught at install, typecheck, or startup — it surfaces on the first real payment. The SDK translates that into `X402PeerMissingError`, which names the packages to install:
+
+```
+X402PeerMissingError: Cannot load "@x402/core", required for x402 payments.
+Install the optional peer dependencies:
+  npm install @x402/core @x402/evm viem
+Upgrading from @a2x/sdk 0.15 or earlier? The signing and facilitator runtime
+moved from `x402` to `@x402/core` + `@x402/evm`.
+```
+
+The failed load isn't cached, so a long-running server recovers on the next attempt once the peers are installed — no restart needed.
+
+## Protocol generations (V1 / V2)
+
+The two wire generations differ only in envelope shape:
+
+- **V1** (`x402Version: 1`) — bare network names (`base-sepolia`), `maxAmountRequired`, `resource`/`description`/`mimeType` inline.
+- **V2** (`x402Version: 2`) — CAIP-2 networks (`eip155:84532`), `amount`, a hoisted top-level `resource` object, and a `PaymentPayload` that echoes the chosen requirement under `accepted`.
+
+The five `x402.payment.*` metadata keys, the payment status lifecycle, and the EIP-3009 signing typed-data are identical across generations.
+
+> **Generation is signalled by `x402Version` in the envelope, not by the extension URI.** In the x402 Foundation lineage the canonical URI (`X402_FOUNDATION_EXTENSION_URI`, `github.com/google-a2a/a2a-x402/v0.1`) is **generation-neutral** — the `v0.1` there is the *extension's* version, not the x402 protocol generation. The URI→generation negotiation below is an **a2x SDK profile**, not part of the foundation transport spec.
+
+**How a2x negotiates (SDK profile):** the **server owns emission** and the **client signs whatever generation it receives**. The server emits its `defaultGeneration` (**V1** by default — migration-safe, since the foundation URI is generation-neutral and emitting V2 to a client that only pinned the neutral URI would be a silent wire break) unless the client pins V1 explicitly via the legacy v0.2 URI.
+
+So **out of the box a2x↔a2x runs V1.** To run V2, the server opts in: `new X402Context({ defaultGeneration: 2 })` **and** advertise `X402_FOUNDATION_EXTENSION_URI` on its AgentCard (so a2x clients activate it and upgrade). A legacy `a2a-x402 v0.2` client that activates only the v0.2 URI always gets V1.
+
+To keep legacy clients working during a transition, declare both URIs on your AgentCard (see [Protocol Extensions](./extensions.md)) — a2x treats them as an activation family so a v0.2-only client still satisfies the requirement.
 
 ## Server
 
@@ -48,7 +77,6 @@ const ACCEPTS = [{
   description: 'Premium agent access',
 }];
 
-class PaidAgent extends BaseAgent {
 // One context per process is enough — pass it into every agent that
 // needs x402 support. Defaults to an in-memory offering store and the
 // Coinbase-hosted facilitator at https://x402.org/facilitator.
@@ -558,12 +586,12 @@ When the merchant agent declares the extension with `required: true` on its Agen
 
 ## Supported scope
 
-- **Standalone Flow** from a2a-x402 v0.2. Embedded Flow (AP2 `CartMandate` etc.) isn't yet wired up.
+- **Both x402 protocol generations** (V1 `x402Version: 1` and V2 `x402Version: 2`), negotiated per the SDK profile above.
+- **Standalone Flow.** The Embedded Flow (x402 nested in an AP2 `CartMandate` / `PaymentMandate`) and its signing models are not implemented in either generation — those were described in a2a-x402 v0.2 but have no counterpart in the foundation V2 transport, so their V2 semantics are currently undefined.
 - **`exact` scheme, EVM networks** (`base`, `base-sepolia`, `polygon`, `avalanche`, …). Adding Solana support means passing a Solana-compatible signer in a later release.
-- The base protocol is **x402 v1** (`x402Version: 1`). a2a-x402 v0.2 pins to this version.
 
 ## Reference
 
-- Spec (in-repo): [`specification/a2a-x402-v0.2.md`](https://github.com/planetarium/a2x/blob/main/specification/a2a-x402-v0.2.md)
-- Base protocol: [`specification/x402-v1.md`](https://github.com/planetarium/a2x/blob/main/specification/x402-v1.md)
-- Migration: [Migrating off `x402PaymentHook`](./migration-x402-v2.md)
+- V2 transport (in-repo, vendored from the x402 Foundation): [`specification/x402-transport-a2a-v2.md`](https://github.com/planetarium/a2x/blob/main/specification/x402-transport-a2a-v2.md)
+- V1 lineage: [`specification/x402-transport-a2a-v1.md`](https://github.com/planetarium/a2x/blob/main/specification/x402-transport-a2a-v1.md), [`specification/a2a-x402-v0.2.md`](https://github.com/planetarium/a2x/blob/main/specification/a2a-x402-v0.2.md), [`specification/x402-v1.md`](https://github.com/planetarium/a2x/blob/main/specification/x402-v1.md)
+- Migration (SDK API, not protocol): [Migrating off `x402PaymentHook`](./migration-x402-v2.md)

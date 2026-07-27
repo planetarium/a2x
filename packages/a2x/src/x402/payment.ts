@@ -24,19 +24,30 @@
 import type { AgentEvent } from '../agent/base-agent.js';
 import type { Message } from '../types/common.js';
 import {
-  X402_DEFAULT_TIMEOUT_SECONDS,
   X402_ERROR_CODES,
   X402_METADATA_KEYS,
   X402_PAYMENT_STATUS,
   type X402ErrorCode,
 } from './constants.js';
+import {
+  detectGeneration,
+  payloadMatchesRequirement,
+  requirementAmount,
+  requirementPayTo,
+  type X402Generation,
+} from './generations.js';
+import { sameNetwork } from './networks.js';
+import { encodePaymentRequiredV1, encodeRequirementV1 } from './wire-v1.js';
+import { encodePaymentRequiredV2 } from './wire-v2.js';
 import type {
   X402Accept,
+  X402EvmAuthorization,
   X402PaymentPayload,
-  X402PaymentRequiredResponse,
   X402PaymentRequirements,
   X402SettleResponse,
 } from './types.js';
+
+export type { X402EvmAuthorization } from './types.js';
 
 // ─── 1턴: request payment ───
 
@@ -70,20 +81,22 @@ export interface X402RequestPaymentInput {
  */
 export function buildX402PaymentRequiredMetadata(
   input: X402RequestPaymentInput,
+  options?: { generation?: X402Generation },
 ): Record<string, unknown> {
   if (!input.accepts || input.accepts.length === 0) {
     throw new Error(
       'buildX402PaymentRequiredMetadata: at least one entry in `accepts` is required',
     );
   }
-  const requirements: X402PaymentRequirements[] = input.accepts.map(
-    normalizeX402Accept,
-  );
-  const required: X402PaymentRequiredResponse = {
-    x402Version: 1,
-    accepts: requirements,
-    ...(input.previousError ? { error: input.previousError } : {}),
-  };
+  // Defaults to V1 for backward compatibility. The negotiation layer
+  // (`X402Context.requestPayment`) selects the generation from the client's
+  // activated extension and passes it explicitly, defaulting to V2.
+  const generation = options?.generation ?? 1;
+  const errorOpt = input.previousError ? { error: input.previousError } : {};
+  const required =
+    generation === 2
+      ? encodePaymentRequiredV2(input.accepts, errorOpt)
+      : encodePaymentRequiredV1(input.accepts, errorOpt);
   return {
     [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REQUIRED,
     [X402_METADATA_KEYS.REQUIRED]: required,
@@ -103,36 +116,29 @@ export function buildX402PaymentRequiredMetadata(
  */
 export async function* x402RequestPayment(
   input: X402RequestPaymentInput,
+  options?: { generation?: X402Generation },
 ): AsyncGenerator<AgentEvent> {
   yield {
     type: 'request-input',
-    metadata: buildX402PaymentRequiredMetadata(input),
+    metadata: buildX402PaymentRequiredMetadata(input, options),
     message: input.description ?? 'Payment is required to use this service.',
   };
 }
 
 // ─── 2턴: parse submitted message ───
 
-/** EVM-style authorization payload extracted from a signed payment. */
-export interface X402EvmAuthorization {
-  from: string;
-  to: string;
-  value: string;
-  validAfter: string;
-  validBefore: string;
-  nonce: string;
-}
-
 /**
  * Structured view of a payment message's x402 metadata. `status` reflects
- * the value of `x402.payment.status` on the incoming message; `payload`
- * and `authorization` are populated when the client submitted a signed
- * payment (status === `payment-submitted`).
+ * the value of `x402.payment.status` on the incoming message; `payload`,
+ * `authorization`, and `generation` are populated when the client submitted
+ * a signed payment (status === `payment-submitted`).
  */
 export interface X402PaymentSubmission {
   status: string;
   payload?: X402PaymentPayload;
   authorization?: X402EvmAuthorization;
+  /** Wire generation of the submitted payload (1 or 2), when present. */
+  generation?: X402Generation;
 }
 
 /**
@@ -151,11 +157,13 @@ export function parseX402PaymentSubmission(
     | X402PaymentPayload
     | undefined;
   const authorization = extractAuthorization(payload);
+  const generation = payload ? detectGeneration(payload) : undefined;
 
   return {
     status,
     ...(payload ? { payload } : {}),
     ...(authorization ? { authorization } : {}),
+    ...(generation ? { generation } : {}),
   };
 }
 
@@ -170,9 +178,24 @@ export function pickX402Requirement(
   payload: X402PaymentPayload,
   requirements: X402PaymentRequirements[],
 ): X402PaymentRequirements | undefined {
-  return requirements.find(
-    (req) => req.network === payload.network && req.scheme === payload.scheme,
-  );
+  // V2 payloads echo the full chosen requirement under `accepted`. Use it to
+  // disambiguate multi-option offerings (price tiers, or multiple assets on
+  // the same network) — matching only on network+scheme would bind the
+  // submission to the first same-network option and mis-validate the amount
+  // or hand verify/settle the wrong asset.
+  if (payload.x402Version === 2 && payload.accepted) {
+    const acc = payload.accepted;
+    const exact = requirements.find(
+      (req) =>
+        req.scheme === acc.scheme &&
+        sameNetwork(req.network, acc.network) &&
+        req.asset === acc.asset &&
+        req.payTo === acc.payTo &&
+        requirementAmount(req) === acc.amount,
+    );
+    if (exact) return exact;
+  }
+  return requirements.find((req) => payloadMatchesRequirement(payload, req));
 }
 
 export interface X402ValidationIssue {
@@ -207,17 +230,29 @@ export function validateX402PayloadShape(
     });
     return issues;
   }
-  if (authorization.to.toLowerCase() !== requirement.payTo.toLowerCase()) {
+  // `authorization` is client-controlled; guard the fields we read so a
+  // malformed submission (non-string `to`/`value`) yields a clean
+  // INVALID_PAYLOAD issue instead of throwing a TypeError up through classify.
+  if (typeof authorization.to !== 'string' || typeof authorization.value !== 'string') {
+    issues.push({
+      code: X402_ERROR_CODES.INVALID_PAYLOAD,
+      reason: 'Authorization is missing a string `to`/`value`.',
+    });
+    return issues;
+  }
+  const payTo = requirementPayTo(requirement);
+  const maxAmount = requirementAmount(requirement);
+  if (authorization.to.toLowerCase() !== payTo.toLowerCase()) {
     issues.push({
       code: X402_ERROR_CODES.INVALID_PAY_TO,
-      reason: `payTo mismatch: expected ${requirement.payTo}, got ${authorization.to}.`,
+      reason: `payTo mismatch: expected ${payTo}, got ${authorization.to}.`,
     });
   }
   try {
-    if (BigInt(authorization.value) > BigInt(requirement.maxAmountRequired)) {
+    if (BigInt(authorization.value) > BigInt(maxAmount)) {
       issues.push({
         code: X402_ERROR_CODES.INVALID_AMOUNT,
-        reason: `Amount ${authorization.value} exceeds maximum ${requirement.maxAmountRequired}.`,
+        reason: `Amount ${authorization.value} exceeds maximum ${maxAmount}.`,
       });
     }
   } catch {
@@ -230,26 +265,19 @@ export function validateX402PayloadShape(
 }
 
 /**
- * Normalize an `X402Accept` to the spec's `X402PaymentRequirements` shape
+ * Normalize an `X402Accept` to a **V1** `X402PaymentRequirements` shape
  * (applies default scheme, mimeType, timeout, etc.). Useful when calling
  * `facilitator.verify` / `facilitator.settle` with the requirement that
  * was originally advertised to the client.
+ *
+ * V1-shaped for backward compatibility. For V2 offerings, the negotiation
+ * layer (`X402Context`) encodes requirements through the V2 codec; direct
+ * callers needing V2 use `encodeRequirementV2` from the SDK internals.
  */
 export function normalizeX402Accept(
   accept: X402Accept,
 ): X402PaymentRequirements {
-  return {
-    scheme: accept.scheme ?? 'exact',
-    network: accept.network,
-    maxAmountRequired: accept.amount,
-    resource: accept.resource as X402PaymentRequirements['resource'],
-    description: accept.description,
-    mimeType: accept.mimeType ?? 'application/json',
-    payTo: accept.payTo,
-    maxTimeoutSeconds: accept.maxTimeoutSeconds ?? X402_DEFAULT_TIMEOUT_SECONDS,
-    asset: accept.asset,
-    extra: accept.extra ?? { name: 'USDC', version: '2' },
-  } as X402PaymentRequirements;
+  return encodeRequirementV1(accept);
 }
 
 // ─── Response metadata builders ───

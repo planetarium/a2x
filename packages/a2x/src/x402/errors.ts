@@ -49,12 +49,46 @@ export class X402NoSupportedRequirementError extends X402Error {
 }
 
 /**
+ * Thrown when an optional x402 peer dependency isn't installed.
+ *
+ * `@x402/core` / `@x402/evm` are optional peers loaded lazily on the first
+ * sign / verify / settle, so a missing peer would otherwise surface as a raw
+ * `ERR_MODULE_NOT_FOUND` in the middle of a payment round-trip — long after
+ * install, typecheck, and startup all passed. This names the packages to
+ * install instead, and calls out the peer rename for anyone upgrading.
+ */
+export class X402PeerMissingError extends X402Error {
+  /** Bare package name that failed to resolve (e.g. `@x402/core`). */
+  readonly packageName: string;
+  /** Full specifier the SDK tried to import (e.g. `@x402/core/http`). */
+  readonly specifier: string;
+
+  constructor(specifier: string, packageName: string, options?: { cause?: unknown }) {
+    super(
+      `Cannot load "${packageName}", required for x402 payments. ` +
+        'Install the optional peer dependencies:\n' +
+        '  npm install @x402/core @x402/evm viem\n' +
+        'Upgrading from @a2x/sdk 0.15 or earlier? The signing and facilitator ' +
+        'runtime moved from `x402` to `@x402/core` + `@x402/evm`.',
+    );
+    this.name = 'X402PeerMissingError';
+    this.packageName = packageName;
+    this.specifier = specifier;
+    if (options && 'cause' in options) {
+      // Preserve the original resolution error for debugging without
+      // depending on the ES2022 `cause` constructor option.
+      (this as { cause?: unknown }).cause = options.cause;
+    }
+  }
+}
+
+/**
  * Thrown when the merchant claims an `x402Version` the SDK can't speak.
- * x402-v1 §6 / §9: only `x402Version: 1` is defined. The wire `code`
- * matches the spec's `invalid_x402_version` token verbatim — a2a-x402
- * v0.2 §9.1 doesn't redefine this code (it only enumerates seven
- * UPPERCASE codes none of which apply here), so x402-v1's lowercase
- * spelling is the authoritative wire form.
+ * a2x supports x402Version 1 and 2. The wire `code` matches the spec's
+ * `invalid_x402_version` token verbatim — a2a-x402 v0.2 §9.1 doesn't
+ * redefine this code (it only enumerates seven UPPERCASE codes none of
+ * which apply here), so x402-v1's lowercase spelling is the authoritative
+ * wire form.
  */
 export class X402InvalidVersionError extends X402Error {
   readonly version: number;
@@ -62,7 +96,7 @@ export class X402InvalidVersionError extends X402Error {
 
   constructor(version: number) {
     super(
-      `Unsupported x402Version ${version}; this SDK only speaks x402Version 1.`,
+      `Unsupported x402Version ${version}; this SDK speaks x402Version 1 and 2.`,
     );
     this.name = 'X402InvalidVersionError';
     this.version = version;

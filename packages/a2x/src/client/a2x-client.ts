@@ -46,9 +46,12 @@ import type { AuthScheme, AuthRequestContext } from './auth-scheme.js';
 import { normalizeRequirements } from './auth-normalizer.js';
 import {
   X402_EXTENSION_URI,
+  X402_FOUNDATION_EXTENSION_URI,
   X402_METADATA_KEYS,
   X402_PAYMENT_STATUS,
 } from '../x402/constants.js';
+import { requirementAmount } from '../x402/generations.js';
+import { isEvmNetwork } from '../x402/networks.js';
 import {
   signX402Payment,
   rejectX402Payment,
@@ -244,12 +247,18 @@ export class A2XClient {
     this._authProvider = options?.authProvider;
     this._extensions = new Set(options?.extensions ?? []);
     this._x402 = options?.x402;
-    if (this._x402) {
+    if (this._x402 && !this._extensions.has(X402_EXTENSION_URI)) {
       // Spec a2a-x402 v0.2 §8: clients MUST activate the extension via
-      // `X-A2A-Extensions`. Auto-register so callers don't have to.
+      // `X-A2A-Extensions`. Auto-register so callers don't have to — but only
+      // when the caller didn't already register it explicitly, so a
+      // deliberate V1 pin is not later dropped by the card-based upgrade.
       this._extensions.add(X402_EXTENSION_URI);
+      this._x402UriAutoSeeded = true;
     }
   }
+
+  /** True when the constructor seeded the v0.2 URI itself (vs. the caller). */
+  private _x402UriAutoSeeded = false;
 
   /**
    * Register an A2A extension URI to be included in the
@@ -548,7 +557,9 @@ export class A2XClient {
           ? reqs
           : reqs.filter((r) => isWithinBudget(r, x402.maxAmount!));
       if (userSelect) return userSelect(affordable);
-      return affordable.find((r) => r.scheme === 'exact') ?? affordable[0];
+      // Only auto-pick an option the EVM signer can fulfil (see defaultSelect
+      // in x402/client.ts); undefined surfaces as X402NoSupportedRequirementError.
+      return affordable.find((r) => r.scheme === 'exact' && isEvmNetwork(r.network));
     };
     return signX402Payment(task, {
       signer: x402.signer,
@@ -694,6 +705,33 @@ export class A2XClient {
       this._resolved!.card,
       this._resolved.version,
     );
+    this._activateX402Extension();
+  }
+
+  /**
+   * Pick the x402 generation to activate from the resolved AgentCard. The
+   * constructor seeds the legacy v0.2 (V1) URI as a backward-compatible
+   * baseline; if the card advertises the V2 URI, upgrade to it (activating a
+   * single generation URI). Signing dispatches on the generation of the
+   * envelope actually received, so a server that ignores the header is still
+   * handled correctly.
+   */
+  private _activateX402Extension(): void {
+    if (!this._x402) return;
+    const card = this._resolved?.card as
+      | { capabilities?: { extensions?: Array<{ uri?: string }> } }
+      | undefined;
+    const advertised = new Set(
+      (card?.capabilities?.extensions ?? [])
+        .map((e) => e.uri)
+        .filter((u): u is string => typeof u === 'string'),
+    );
+    if (advertised.has(X402_FOUNDATION_EXTENSION_URI)) {
+      this._extensions.add(X402_FOUNDATION_EXTENSION_URI);
+      // Only drop the v0.2 URI if we auto-seeded it — never override a caller's
+      // explicit V1 pin (e.g. tooling that only understands V1 envelopes).
+      if (this._x402UriAutoSeeded) this._extensions.delete(X402_EXTENSION_URI);
+    }
   }
 
   /**
@@ -799,7 +837,10 @@ function isWithinBudget(
   maxAmount: bigint,
 ): boolean {
   try {
-    return BigInt(requirement.maxAmountRequired) <= maxAmount;
+    // Read through the generation-agnostic accessor: V2 requirements carry
+    // `amount`, not `maxAmountRequired` — reading the V1 field directly would
+    // throw here and the catch below would silently disable the budget cap.
+    return BigInt(requirementAmount(requirement)) <= maxAmount;
   } catch {
     // Unparseable amount — defer to the signer to fail loudly rather
     // than silently swallow the requirement.

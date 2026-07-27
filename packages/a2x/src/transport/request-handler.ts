@@ -42,7 +42,8 @@ import {
   type A2AError,
 } from '../types/errors.js';
 import { StreamingMode } from '../a2x/agent-executor.js';
-import { JsonRpcRouter } from './jsonrpc-router.js';
+import { JsonRpcRouter, type RouteContext } from './jsonrpc-router.js';
+import { isX402ExtensionUri } from '../x402/constants.js';
 import type { ResponseMapper } from '../a2x/response-mapper.js';
 import { ResponseMapperFactory } from '../a2x/response-mapper.js';
 import type { RequestContext, AuthResult } from '../types/auth.js';
@@ -199,9 +200,16 @@ export class DefaultRequestHandler {
     // in a JSON-RPC success envelope keyed by `request.id`, per spec
     // a2a-v0.3 §SendStreamingMessageSuccessResponse — every frame on
     // the stream is a full JSONRPCResponse, not a bare event object.
+    const routeContext: RouteContext | undefined = context
+      ? { activatedExtensions: [...parseActivatedExtensions(context.headers)] }
+      : undefined;
+
     if (this.router.isStreamMethod(request.method)) {
       try {
-        const inner = this.router.routeStream(request) as AsyncGenerator<unknown>;
+        const inner = this.router.routeStream(
+          request,
+          routeContext,
+        ) as AsyncGenerator<unknown>;
         return this._wrapStreamInJsonRpc(request.id, inner);
       } catch (err) {
         return this._toErrorResponse(request.id, err);
@@ -210,7 +218,7 @@ export class DefaultRequestHandler {
 
     // Synchronous method → return JSONRPCResponse
     try {
-      return await this.router.route(request);
+      return await this.router.route(request, routeContext);
     } catch (err) {
       return this._toErrorResponse(request.id, err);
     }
@@ -407,9 +415,20 @@ export class DefaultRequestHandler {
     if (required.length === 0) return null;
 
     const activated = parseActivatedExtensions(context.headers);
+    // The x402 extension URIs form an activation family: activating any
+    // member satisfies a required family URI, so a client that speaks only
+    // one generation (V1 via the v0.2 URI, or V2 via the foundation URI) is
+    // not rejected by an agent that advertises both as required.
+    const anyX402Activated = [...activated].some((uri) =>
+      isX402ExtensionUri(uri),
+    );
     const missing = required
       .map((ext) => ext.uri)
-      .filter((uri) => !activated.has(uri));
+      .filter((uri) => {
+        if (activated.has(uri)) return false;
+        if (isX402ExtensionUri(uri) && anyX402Activated) return false;
+        return true;
+      });
 
     if (missing.length === 0) return null;
     return new InvalidRequestError(
@@ -423,18 +442,18 @@ export class DefaultRequestHandler {
     // message/send
     this.router.registerMethod(
       A2A_METHODS.SEND_MESSAGE,
-      async (params) => {
+      async (params, _request, context) => {
         const sendParams = this._validateSendMessageParams(params);
-        return this._handleSendMessage(sendParams);
+        return this._handleSendMessage(sendParams, context);
       },
     );
 
     // message/stream (SSE)
     this.router.registerStreamMethod(
       A2A_METHODS.STREAM_MESSAGE,
-      (params) => {
+      (params, _request, context) => {
         const sendParams = this._validateSendMessageParams(params);
-        return this._handleStreamMessage(sendParams);
+        return this._handleStreamMessage(sendParams, context);
       },
     );
 
@@ -531,7 +550,10 @@ export class DefaultRequestHandler {
 
   // ─── Private: Method Handlers ───
 
-  private async _handleSendMessage(params: SendMessageParams): Promise<unknown> {
+  private async _handleSendMessage(
+    params: SendMessageParams,
+    context?: RouteContext,
+  ): Promise<unknown> {
     const task = await this._resolveTaskForMessage(params);
 
     // Spec a2a-v0.3 §MessageSendConfiguration: clients can register a
@@ -543,6 +565,9 @@ export class DefaultRequestHandler {
     const completedTask = await this.a2xServer.agentExecutor.execute(
       task,
       params.message,
+      context?.activatedExtensions
+        ? { activatedExtensions: context.activatedExtensions }
+        : undefined,
     );
 
     const sliced = sliceHistory(
@@ -608,6 +633,7 @@ export class DefaultRequestHandler {
 
   private async *_handleStreamMessage(
     params: SendMessageParams,
+    context?: RouteContext,
   ): AsyncGenerator<unknown> {
     if (
       this.a2xServer.agentExecutor.runConfig.streamingMode ===
@@ -628,6 +654,9 @@ export class DefaultRequestHandler {
     const eventStream = this.a2xServer.agentExecutor.executeStream(
       task,
       params.message,
+      context?.activatedExtensions
+        ? { activatedExtensions: context.activatedExtensions }
+        : undefined,
     );
 
     const bus = this.a2xServer.taskEventBus;

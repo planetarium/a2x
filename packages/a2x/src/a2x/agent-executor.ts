@@ -61,7 +61,11 @@ export class AgentExecutor {
    * Execute the agent synchronously (non-streaming).
    * Returns the completed Task.
    */
-  async execute(task: Task, message: Message): Promise<Task> {
+  async execute(
+    task: Task,
+    message: Message,
+    options?: { activatedExtensions?: readonly string[] },
+  ): Promise<Task> {
     const contextId = task.contextId ?? task.id;
 
     const session = await this.runner.createSession();
@@ -84,6 +88,9 @@ export class AgentExecutor {
       for await (const event of this.runner.runAsync(session, message, abortController.signal, {
         taskId: task.id,
         contextId,
+        ...(options?.activatedExtensions
+          ? { activatedExtensions: options.activatedExtensions }
+          : {}),
       })) {
         switch (event.type) {
           case 'text':
@@ -213,6 +220,7 @@ export class AgentExecutor {
   async *executeStream(
     task: Task,
     message: Message,
+    options?: { activatedExtensions?: readonly string[] },
   ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
     const contextId = task.contextId ?? task.id;
 
@@ -242,6 +250,9 @@ export class AgentExecutor {
       for await (const event of this.runner.runAsync(session, message, abortController.signal, {
         taskId: task.id,
         contextId,
+        ...(options?.activatedExtensions
+          ? { activatedExtensions: options.activatedExtensions }
+          : {}),
       })) {
         switch (event.type) {
           case 'text':

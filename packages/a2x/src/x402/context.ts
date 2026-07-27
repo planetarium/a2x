@@ -83,23 +83,31 @@ import type { AgentEvent } from '../agent/base-agent.js';
 import type { InvocationContext } from '../runner/context.js';
 import {
   X402_ERROR_CODES,
+  X402_EXTENSION_URI,
   X402_PAYMENT_STATUS,
+  X402_FOUNDATION_EXTENSION_URI,
   mapVerifyFailureToCode,
   type X402ErrorCode,
 } from './constants.js';
 import { resolveFacilitator, type FacilitatorUrlConfig } from './facilitator.js';
 import {
+  X402_DEFAULT_GENERATION,
+  payloadNetwork,
+  type X402Generation,
+} from './generations.js';
+import {
   buildX402PaymentCompletedMetadata,
   buildX402PaymentFailedMetadata,
-  normalizeX402Accept,
+  buildX402PaymentRequiredMetadata,
   parseX402PaymentSubmission,
   pickX402Requirement,
   validateX402PayloadShape,
-  x402RequestPayment,
   type X402PaymentSubmission,
   type X402RequestPaymentInput,
   type X402ValidationIssue,
 } from './payment.js';
+import { encodeRequirementV1 } from './wire-v1.js';
+import { encodeRequirementV2 } from './wire-v2.js';
 import {
   BaseX402Store,
   InMemoryX402Store,
@@ -132,6 +140,15 @@ export interface X402ContextOptions {
    * facilitator.
    */
   facilitator?: X402Facilitator | FacilitatorUrlConfig;
+  /**
+   * Wire generation to emit when the client's activated extension set
+   * doesn't pin one (e.g. a transport that stripped `X-A2A-Extensions`).
+   * Defaults to V1 — the migration-safe choice, since the foundation URI is
+   * generation-neutral and emitting V2 to a client that only pinned the neutral
+   * URI (or sent no header) would be a silent wire break. Deployments whose
+   * clients all speak V2 opt in with `2`.
+   */
+  defaultGeneration?: X402Generation;
 }
 
 // ─── requestPayment input ───
@@ -243,12 +260,38 @@ export abstract class BaseX402Context {
   abstract readonly facilitator: X402Facilitator;
 
   /**
+   * Wire generation emitted when the client's activation doesn't pin one.
+   * Overridable by subclasses / `X402Context` options. Defaults to V2.
+   */
+  defaultGeneration: X402Generation = X402_DEFAULT_GENERATION;
+
+  /**
+   * Select the wire generation to emit for this round-trip from the client's
+   * activated extension URIs. The foundation URI is generation-neutral, so
+   * only the legacy v0.2 URI (activated on its own) pins V1; everything else
+   * falls back to `defaultGeneration`. This URI→generation mapping is an
+   * a2x negotiation profile, not part of the foundation transport spec.
+   */
+  protected pickEmissionGeneration(
+    activatedExtensions: readonly string[] | undefined,
+  ): X402Generation {
+    const activated = activatedExtensions ?? [];
+    // The legacy v0.2 URI pins V1 — but only when the client did NOT also
+    // activate the (generation-neutral) foundation URI, which signals a
+    // dual-capable client. Everything else falls back to `defaultGeneration`.
+    const pinsV1 =
+      activated.includes(X402_EXTENSION_URI) &&
+      !activated.includes(X402_FOUNDATION_EXTENSION_URI);
+    return pinsV1 ? 1 : this.defaultGeneration;
+  }
+
+  /**
    * Persist the offering with status `'offered'` and yield the spec's
    * `request-input` event. The agent's one call site for "ask the
    * client to pay".
    */
   async *requestPayment(
-    ctx: { taskId?: string },
+    ctx: { taskId?: string; activatedExtensions?: readonly string[] },
     input: X402ContextRequestPaymentInput,
   ): AsyncGenerator<AgentEvent> {
     if (!input.accepts || input.accepts.length === 0) {
@@ -263,10 +306,17 @@ export abstract class BaseX402Context {
           'AgentExecutor populates it when running under an A2A task.',
       );
     }
+    const generation = this.pickEmissionGeneration(ctx.activatedExtensions);
+    // Encode up-front so a misconfigured offering (e.g. a CAIP-2 network with
+    // no V1 bare-name mapping under a V1 offer) throws a clean configuration
+    // error here — before we persist an entry that would then be unusable and
+    // make the resume turn's `classify` fail too.
+    const metadata = buildX402PaymentRequiredMetadata(input, { generation });
     const now = new Date();
     const entry: X402StoreEntry = {
       taskId,
       accepts: input.accepts,
+      offeredGeneration: generation,
       status: 'offered',
       storedAt: now,
       updatedAt: now,
@@ -275,7 +325,11 @@ export abstract class BaseX402Context {
         : {}),
     };
     await this.store.put(entry);
-    yield* x402RequestPayment(input);
+    yield {
+      type: 'request-input',
+      metadata,
+      message: input.description ?? 'Payment is required to use this service.',
+    };
   }
 
   /**
@@ -338,7 +392,52 @@ export abstract class BaseX402Context {
       return result;
     }
 
-    const requirements = entry.accepts.map(normalizeX402Accept);
+    // Reject a submission whose generation is unsupported, or disagrees with
+    // what we offered: an unparseable `x402Version`, or a V1 payload against a
+    // V2 offering (or vice versa), can never match and must fail before the
+    // facilitator — with the spec's `invalid_x402_version` code, not a
+    // misleading network-mismatch.
+    const offeredGeneration = entry.offeredGeneration ?? 1;
+    if (
+      submission.generation === undefined ||
+      submission.generation !== offeredGeneration
+    ) {
+      const submitted =
+        submission.generation ??
+        (submission.payload as { x402Version?: unknown }).x402Version;
+      const result: X402Classification = {
+        kind: 'unmatched',
+        submission,
+        offering: entry.accepts,
+        code: X402_ERROR_CODES.INVALID_X402_VERSION,
+        reason: `Submitted x402Version ${String(submitted)} is unsupported or does not match the offered generation ${offeredGeneration}.`,
+      };
+      await this._recordClassifyOutcome(ctx.taskId, result);
+      return result;
+    }
+
+    // Normalize the stored offering to the generation it was published under,
+    // so the requirement handed to verify/settle matches the wire generation
+    // of the client's payload. A codec throw (e.g. a CAIP-2 network with no
+    // V1 bare-name mapping) is a server-side configuration error surfaced as a
+    // clean failure rather than an unhandled exception from classify.
+    let requirements: X402PaymentRequirements[];
+    try {
+      requirements = entry.accepts.map((a) =>
+        offeredGeneration === 2 ? encodeRequirementV2(a) : encodeRequirementV1(a),
+      );
+    } catch (err) {
+      const result: X402Classification = {
+        kind: 'unmatched',
+        submission,
+        offering: entry.accepts,
+        code: X402_ERROR_CODES.INVALID_PAYLOAD,
+        reason: `Stored offering cannot be encoded for generation ${offeredGeneration}: ${err instanceof Error ? err.message : String(err)}`,
+      };
+      await this._recordClassifyOutcome(ctx.taskId, result);
+      return result;
+    }
+
     const requirement = pickX402Requirement(submission.payload, requirements);
     if (!requirement) {
       const result: X402Classification = {
@@ -379,10 +478,31 @@ export abstract class BaseX402Context {
     ctx: { taskId?: string },
     classified: X402ValidClassification,
   ): Promise<X402VerifyResponse> {
-    const result = await this.facilitator.verify(
-      classified.submission.payload!,
-      classified.requirement,
-    );
+    let result: X402VerifyResponse;
+    try {
+      result = await this.facilitator.verify(
+        classified.submission.payload!,
+        classified.requirement,
+      );
+    } catch (err) {
+      // A genuine transport/schema error (not a structured `isValid:false`,
+      // which the adapter already unwraps) still records a failure so the
+      // store never sticks at `offered`/`verified` and the caller gets an
+      // actionable negative result instead of an exception.
+      const reason = err instanceof Error ? err.message : 'Facilitator verify failed.';
+      if (ctx.taskId) {
+        await this.store.update(ctx.taskId, {
+          status: 'failed',
+          failure: {
+            point: 'verify',
+            code: X402_ERROR_CODES.VERIFY_FAILED,
+            reason,
+            failedAt: new Date(),
+          },
+        });
+      }
+      return { isValid: false, invalidReason: reason };
+    }
     if (ctx.taskId) {
       if (result.isValid) {
         await this.store.update(ctx.taskId, {
@@ -419,15 +539,46 @@ export abstract class BaseX402Context {
     classified: X402ValidClassification,
   ): Promise<X402SettleResponse> {
     const payload = classified.submission.payload!;
-    const raw = await this.facilitator.settle(payload, classified.requirement);
+    let raw: Awaited<ReturnType<X402Facilitator['settle']>>;
+    try {
+      raw = await this.facilitator.settle(payload, classified.requirement);
+    } catch (err) {
+      // A settle exception (transport/schema error, possibly after the
+      // transfer was broadcast) must not leave the entry stuck at `verified`
+      // with no record. Mark it failed and return a negative receipt.
+      const reason = err instanceof Error ? err.message : 'Facilitator settle failed.';
+      if (ctx.taskId) {
+        await this.store.update(ctx.taskId, {
+          status: 'failed',
+          failure: {
+            point: 'settle',
+            code: X402_ERROR_CODES.SETTLEMENT_FAILED,
+            reason,
+            failedAt: new Date(),
+          },
+        });
+      }
+      return {
+        success: false,
+        transaction: '',
+        network: payloadNetwork(payload),
+        ...(classified.submission.authorization?.from
+          ? { payer: classified.submission.authorization.from }
+          : {}),
+        errorReason: reason,
+      };
+    }
+    const payer =
+      classified.submission.authorization?.from ??
+      (raw.payer as string | undefined);
     const receipt: X402SettleResponse = {
       success: raw.success,
       transaction: raw.transaction ?? '',
-      network: payload.network,
-      payer:
-        classified.submission.authorization?.from ??
-        (raw.payer as string | undefined) ??
-        'unknown',
+      // V1 carries `network` top-level; V2 reads it from `accepted`.
+      network: payloadNetwork(payload),
+      // Omit `payer` when neither the authorization nor the facilitator
+      // supplies it — never fabricate a placeholder address.
+      ...(payer ? { payer } : {}),
       ...(raw.errorReason ? { errorReason: raw.errorReason } : {}),
     };
 
@@ -437,7 +588,7 @@ export abstract class BaseX402Context {
         const stored: X402EntryReceipt = {
           transaction: receipt.transaction,
           network: receipt.network,
-          payer: receipt.payer,
+          ...(receipt.payer ? { payer: receipt.payer } : {}),
           settledAt,
         };
         await this.store.update(ctx.taskId, {
@@ -540,6 +691,9 @@ export class X402Context extends BaseX402Context {
   constructor(options: X402ContextOptions = {}) {
     super();
     this.store = options.store ?? new InMemoryX402Store();
+    if (options.defaultGeneration !== undefined) {
+      this.defaultGeneration = options.defaultGeneration;
+    }
     const spec = options.facilitator;
     this.facilitator =
       spec && typeof spec === 'object' && 'verify' in spec && 'settle' in spec

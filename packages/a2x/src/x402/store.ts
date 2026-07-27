@@ -17,6 +17,7 @@
  */
 
 import type { X402ErrorCode } from './constants.js';
+import type { X402Generation } from './generations.js';
 import type { X402Accept } from './types.js';
 
 /**
@@ -43,13 +44,14 @@ export type X402EntryStatus =
  *
  *  - `transaction` — on-chain tx hash; the canonical lookup key.
  *  - `network` — which chain settled, for multi-chain deployments.
- *  - `payer` — payer wallet address (x402-v1 §5.3.2 requires this on every receipt).
+ *  - `payer` — payer wallet address. Optional: x402 V2 marks it optional and
+ *    a facilitator may omit it; the SDK never fabricates a placeholder.
  *  - `settledAt` — wall-clock instant the SDK observed the settlement returning.
  */
 export interface X402EntryReceipt {
   transaction: string;
   network: string;
-  payer: string;
+  payer?: string;
   settledAt: Date;
 }
 
@@ -78,6 +80,14 @@ export interface X402StoreEntry {
   taskId: string;
   /** Offering the merchant advertised on turn 1. Immutable once set. */
   accepts: X402Accept[];
+  /**
+   * Wire generation the offering was published under (1 or 2), decided by
+   * the client's activated extension at `requestPayment` time. The resume
+   * turn decodes the submission and normalizes requirements against this.
+   * Immutable once set; absent on entries written before dual-stack (treat
+   * as generation 1).
+   */
+  offeredGeneration?: X402Generation;
   /** Current lifecycle stage. Updated in place as the round-trip progresses. */
   status: X402EntryStatus;
   /** When the entry was first put. Immutable. */

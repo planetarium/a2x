@@ -8,14 +8,26 @@ import {
   type A2AError,
 } from '../types/errors.js';
 
+/**
+ * Per-request routing context threaded from the transport layer to method
+ * handlers. Carries request-scoped state that isn't part of the JSON-RPC
+ * envelope — e.g. the A2A extension URIs the client activated via the
+ * `X-A2A-Extensions` header.
+ */
+export interface RouteContext {
+  activatedExtensions?: readonly string[];
+}
+
 export type MethodHandler = (
   params: unknown,
   request: JSONRPCRequest,
+  context?: RouteContext,
 ) => Promise<unknown>;
 
 export type StreamMethodHandler = (
   params: unknown,
   request: JSONRPCRequest,
+  context?: RouteContext,
 ) => AsyncGenerator<unknown>;
 
 export class JsonRpcRouter {
@@ -46,7 +58,10 @@ export class JsonRpcRouter {
   /**
    * Route a JSON-RPC request to the appropriate handler.
    */
-  async route(request: JSONRPCRequest): Promise<JSONRPCResponse> {
+  async route(
+    request: JSONRPCRequest,
+    context?: RouteContext,
+  ): Promise<JSONRPCResponse> {
     const handler = this.handlers.get(request.method);
     if (!handler) {
       const error = new MethodNotFoundError(
@@ -60,7 +75,7 @@ export class JsonRpcRouter {
     }
 
     try {
-      const result = await handler(request.params, request);
+      const result = await handler(request.params, request, context);
       return {
         jsonrpc: '2.0',
         id: request.id,
@@ -81,14 +96,17 @@ export class JsonRpcRouter {
   /**
    * Route a streaming JSON-RPC request, returning an AsyncGenerator.
    */
-  routeStream(request: JSONRPCRequest): AsyncGenerator<unknown> {
+  routeStream(
+    request: JSONRPCRequest,
+    context?: RouteContext,
+  ): AsyncGenerator<unknown> {
     const handler = this.streamHandlers.get(request.method);
     if (!handler) {
       throw new MethodNotFoundError(
         `Stream method '${request.method}' not found`,
       );
     }
-    return handler(request.params, request);
+    return handler(request.params, request, context);
   }
 
   /**
