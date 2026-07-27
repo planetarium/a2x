@@ -85,7 +85,6 @@ import {
   X402_ERROR_CODES,
   X402_EXTENSION_URI,
   X402_PAYMENT_STATUS,
-  X402_FOUNDATION_EXTENSION_URI,
   mapVerifyFailureToCode,
   type X402ErrorCode,
 } from './constants.js';
@@ -268,20 +267,21 @@ export abstract class BaseX402Context {
   /**
    * Select the wire generation to emit for this round-trip from the client's
    * activated extension URIs. The foundation URI is generation-neutral, so
-   * only the legacy v0.2 URI (activated on its own) pins V1; everything else
-   * falls back to `defaultGeneration`. This URI→generation mapping is an
-   * a2x negotiation profile, not part of the foundation transport spec.
+   * only the legacy v0.2 URI pins a generation (V1); everything else falls
+   * back to `defaultGeneration`. This URI→generation mapping is an a2x
+   * negotiation profile, not part of the foundation transport spec.
    */
   protected pickEmissionGeneration(
     activatedExtensions: readonly string[] | undefined,
   ): X402Generation {
     const activated = activatedExtensions ?? [];
-    // The legacy v0.2 URI pins V1 — but only when the client did NOT also
-    // activate the (generation-neutral) foundation URI, which signals a
-    // dual-capable client. Everything else falls back to `defaultGeneration`.
-    const pinsV1 =
-      activated.includes(X402_EXTENSION_URI) &&
-      !activated.includes(X402_FOUNDATION_EXTENSION_URI);
+    // The v0.2 URI is a2x's V1 pin, and it wins whenever it is present —
+    // including alongside the foundation URI. Treating "both activated" as
+    // "dual-capable, send V2" would be fail-open: a client that activated the
+    // V1 pin has told us it decodes V1, but nothing in either URI proves it
+    // decodes V2. A genuinely V2-preferring client activates the foundation
+    // URI alone (which is what `A2XClient` does once a card advertises it).
+    const pinsV1 = activated.includes(X402_EXTENSION_URI);
     return pinsV1 ? 1 : this.defaultGeneration;
   }
 

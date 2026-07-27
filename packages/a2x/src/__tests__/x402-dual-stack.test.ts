@@ -122,6 +122,24 @@ describe('server emission generation from activation', () => {
     expect(required.x402Version).toBe(1);
   });
 
+  it('honors the V1 pin even when the foundation URI is activated alongside it', async () => {
+    // A V1-only client that activates both URIs must not be handed V2. The
+    // v0.2 URI is a2x's V1 pin; nothing in either URI proves the client can
+    // decode V2, so "both activated" must not be read as dual-capable.
+    const ctx = v2Context();
+    const meta = await drainMetadata(
+      ctx.requestPayment(
+        {
+          taskId: 't1',
+          activatedExtensions: [X402_EXTENSION_URI, X402_FOUNDATION_EXTENSION_URI],
+        },
+        { accepts: [ACCEPT] },
+      ),
+    );
+    const required = meta[X402_METADATA_KEYS.REQUIRED] as X402PaymentRequiredResponse;
+    expect(required.x402Version).toBe(1);
+  });
+
   it('emits V2 on the neutral fallback only when the server opted into V2', async () => {
     const ctx = v2Context();
     const meta = await drainMetadata(
