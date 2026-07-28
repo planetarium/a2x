@@ -153,10 +153,10 @@ Most capability flags on the AgentCard are derived automatically:
 Two capabilities need explicit builder calls — both are append-only / boolean:
 
 ```ts
-import { X402_EXTENSION_URI } from '@a2x/sdk/x402';
+import { X402_FOUNDATION_EXTENSION_URI } from '@a2x/sdk/x402';
 
 a2xServer
-  .addExtension({ uri: X402_EXTENSION_URI, required: true })
+  .addExtension({ uri: X402_FOUNDATION_EXTENSION_URI, required: true })
   // or: .addExtension('https://example.com/ext', { required: true })
   .setStateTransitionHistory(true); // v0.3 only; dropped on v1.0 cards
 ```
