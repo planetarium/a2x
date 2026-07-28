@@ -61,9 +61,9 @@ export * from './client/index.js';
 // Remote
 export * from './remote/index.js';
 
-// x402 (a2a-x402 v0.2 payment support) is NOT re-exported here. It lives
-// behind the dedicated `@a2x/sdk/x402` subpath so callers who don't use
-// payments don't have to install the `x402` and `viem` peer dependencies
-// just to load the main entry. Import from `@a2x/sdk/x402` directly:
+// x402 (a2a-x402 payment support) is NOT re-exported here. It lives behind
+// the dedicated `@a2x/sdk/x402` subpath so callers who don't use payments
+// don't have to install the `@x402/core`, `@x402/evm`, and `viem` peer
+// dependencies just to load the main entry. Import from `@a2x/sdk/x402`:
 //
 //   import { X402Context, parseX402PaymentSubmission, ... } from '@a2x/sdk/x402';

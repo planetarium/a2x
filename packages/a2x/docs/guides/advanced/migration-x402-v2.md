@@ -250,6 +250,6 @@ The 0.13.x → next migration is mechanical for any *single* shape but the cross
 ## Reference
 
 - [x402 Payments overview](./x402-payments.md) — the full guide for the new surface.
-- [Spec a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402/blob/main/spec/v0.2.md)
+- [Spec a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402/blob/main/spec/v0.2/spec.md)
 - [Issue #162](https://github.com/planetarium/a2x/issues/162) — the design discussion that motivated this change.
 - Sample diffs: `samples/nextjs-x402` (always-paid), `samples/nextjs-x402-agent-driven` (LLM tool-use-driven).

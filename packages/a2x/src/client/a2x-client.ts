@@ -68,13 +68,14 @@ import type {
 // ─── Types ───
 
 /**
- * a2a-x402 v0.2 client options. When supplied to `A2XClientOptions.x402`,
+ * a2a-x402 client options. When supplied to `A2XClientOptions.x402`,
  * `A2XClient` transparently runs the Standalone Flow: when the agent
  * returns `payment-required`, the client signs one of the merchant's
  * `accepts[]` requirements and resubmits with the signed payload, then
  * surfaces only the final task to the caller.
  *
- * Spec: `specification/a2a-x402-v0.2.md`.
+ * The client signs whichever generation the agent emits — see
+ * `specification/x402-transport-a2a-v1.md` and `-v2.md`.
  */
 export interface A2XClientX402Options {
   /** viem LocalAccount used to sign EIP-3009 authorizations. */
@@ -156,7 +157,7 @@ export interface A2XClientOptions {
    */
   extensions?: string[];
   /**
-   * Enables transparent a2a-x402 v0.2 payment handling. Omit when calling
+   * Enables transparent a2a-x402 payment handling. Omit when calling
    * agents that don't gate on x402; the client behaves as a plain A2A
    * client in that case.
    */
@@ -719,13 +720,12 @@ export class A2XClient {
   private _activateX402Extension(): void {
     if (!this._x402) return;
     // A caller-registered v0.2 URI is an explicit V1 pin, so leave the
-    // activation set untouched. Adding the foundation URI alongside it would
-    // *break* the pin rather than preserve it: the server reads the v0.2 URI
-    // as "pin V1" only when the (generation-neutral) foundation URI is absent,
-    // so sending both lands on the server's `defaultGeneration` — handing
-    // V1-only tooling a V2 envelope it cannot decode. The x402 activation
-    // family means the v0.2 URI alone still satisfies an agent that requires
-    // the foundation URI.
+    // activation set untouched. An a2x server honors that pin even alongside
+    // the foundation URI, but a third-party server need not: the foundation
+    // URI is generation-neutral, so "both activated" is only unambiguous if
+    // the peer shares a2x's pin-wins rule. Sending the pin alone is what makes
+    // it legible to any peer. The x402 activation family means the v0.2 URI
+    // alone still satisfies an agent that requires the foundation URI.
     if (!this._x402UriAutoSeeded) return;
     const card = this._resolved?.card as
       | { capabilities?: { extensions?: Array<{ uri?: string }> } }

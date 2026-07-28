@@ -1,6 +1,6 @@
 # x402 Payments
 
-Charge per call with on-chain cryptocurrency payments. A2X implements the x402 A2A transport on top of A2A tasks, speaking **both generations** of the x402 protocol on the wire: the legacy V1 envelopes ([a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402/blob/main/spec/v0.2.md)) and the V2 envelopes defined by the [x402 Foundation A2A transport](https://github.com/x402-foundation/x402/blob/main/specs/transports-v2/a2a.md).
+Charge per call with on-chain cryptocurrency payments. A2X implements the x402 A2A transport on top of A2A tasks, speaking **both generations** of the x402 protocol on the wire: the legacy V1 envelopes ([a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402/blob/main/spec/v0.2/spec.md)) and the V2 envelopes defined by the [x402 Foundation A2A transport](https://github.com/x402-foundation/x402/blob/main/specs/transports-v2/a2a.md).
 
 The flow: the merchant agent responds to an unpaid request with `input-required` + `x402.payment.required`. The client signs a `PaymentPayload` with its wallet and resubmits the same task. The merchant validates the payload, verifies it via an x402 **facilitator**, settles on-chain, and attaches the settlement receipt to the completed task. This flow is identical across generations — only the JSON envelope shapes differ (see [Protocol generations](#protocol-generations-v1--v2)).
 
@@ -75,7 +75,7 @@ import {
 } from '@a2x/sdk';
 import {
   X402Context,
-  X402_EXTENSION_URI,
+  X402_FOUNDATION_EXTENSION_URI,
   X402_ERROR_CODES,
 } from '@a2x/sdk/x402';
 
@@ -158,8 +158,13 @@ const executor = new AgentExecutor({
 const agent = new A2XServer({ taskStore: new InMemoryTaskStore(), executor })
   .setName('Paid Agent')
   .setDescription('Charges per call')
-  .addExtension({ uri: X402_EXTENSION_URI, required: true });
+  .addExtension({ uri: X402_FOUNDATION_EXTENSION_URI, required: true });
 ```
+
+Declare the foundation URI, not the legacy `X402_EXTENSION_URI`. The two are an
+activation family, so a legacy v0.2 client still passes the `required` check —
+but advertising v0.2 keeps a2x clients pinned to V1, which silently overrides a
+server configured with `defaultGeneration: 2`.
 
 ### `X402Context` API
 
