@@ -1,5 +1,5 @@
 /**
- * Server-side helpers for a2a-x402 v0.2 payment flows.
+ * Server-side helpers for a2a-x402 payment flows.
  *
  * The SDK exposes the spec's mechanics as **stateless helpers** — never as
  * a flow. Each helper does one step (parse, match, validate, build
@@ -18,7 +18,8 @@
  * and never bundles verify + settle. Agents call `facilitator.verify()`
  * and `facilitator.settle()` directly.
  *
- * Spec: specification/a2a-x402-v0.2.md
+ * Spec: specification/x402-transport-a2a-v1.md, -v2.md — the encoders here
+ * cover both generations, selected by the `generation` option.
  */
 
 import type { AgentEvent } from '../agent/base-agent.js';

@@ -1,12 +1,15 @@
 /**
- * a2a-x402 v0.2 protocol constants.
+ * a2a-x402 protocol constants, shared by both wire generations.
  *
  * The x402 Payments Extension bolts HTTP 402 "Payment Required" semantics
  * onto A2A tasks. Clients advertise the extension URI in their AgentCard
  * `capabilities.extensions` array and transport payment state through
  * message metadata using the `x402.payment.*` keys defined below.
  *
- * Spec: specification/a2a-x402-v0.2.md
+ * The `x402.payment.*` keys and the extension URIs below are generation-neutral
+ * — see `generations.ts` for the V1/V2 split.
+ *
+ * Spec: specification/x402-transport-a2a-v1.md, -v2.md
  */
 
 /**

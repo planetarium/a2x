@@ -1,8 +1,13 @@
 /**
- * `@a2x/sdk/x402` — a2a-x402 v0.2 payment support.
+ * `@a2x/sdk/x402` — a2a-x402 payment support (protocol generations V1 and V2).
  *
- * Adds on-chain payment gating to A2A agents using the Coinbase x402
- * protocol. See `specification/a2a-x402-v0.2.md` for the wire format.
+ * Adds on-chain payment gating to A2A agents using the x402 protocol. Wire
+ * formats: `specification/x402-transport-a2a-v1.md` (plus its
+ * `specification/a2a-x402-v0.2.md` lineage) for V1, and
+ * `specification/x402-transport-a2a-v2.md` for V2. Generation is signalled by
+ * `x402Version` inside the envelope, not by the extension URI; the server picks
+ * it (V1 unless it opts into `defaultGeneration: 2`) and the client signs
+ * whatever it receives.
  *
  * The SDK exposes spec mechanics as **stateless helpers**, never as a
  * flow: the agent owns when to request payment, what offerings it
@@ -19,7 +24,7 @@
  *   x402RequestPayment, parseX402PaymentSubmission, pickX402Requirement,
  *   validateX402PayloadShape, normalizeX402Accept,
  *   buildX402PaymentCompletedMetadata, buildX402PaymentFailedMetadata,
- *   mapVerifyFailureToCode, resolveFacilitator, X402_EXTENSION_URI,
+ *   mapVerifyFailureToCode, resolveFacilitator, X402_FOUNDATION_EXTENSION_URI,
  * } from '@a2x/sdk';
  *
  * const ACCEPTS = [{
@@ -113,8 +118,13 @@
  * const facilitator = resolveFacilitator();
  * const agent = new A2XServer({ taskStore, executor })
  *   .setName('Paid Agent')
- *   .addExtension({ uri: X402_EXTENSION_URI, required: true });
+ *   .addExtension({ uri: X402_FOUNDATION_EXTENSION_URI, required: true });
  * ```
+ *
+ * Declare the foundation URI, not the legacy `X402_EXTENSION_URI`: a2x treats
+ * the two as an activation family, so a legacy v0.2 client still passes the
+ * `required` check, while advertising v0.2 instead would keep a2x clients
+ * pinned to V1 — silently overriding a `defaultGeneration: 2` server.
  *
  * Minimal client setup (unchanged):
  *

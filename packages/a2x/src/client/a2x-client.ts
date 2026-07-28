@@ -68,13 +68,14 @@ import type {
 // ─── Types ───
 
 /**
- * a2a-x402 v0.2 client options. When supplied to `A2XClientOptions.x402`,
+ * a2a-x402 client options. When supplied to `A2XClientOptions.x402`,
  * `A2XClient` transparently runs the Standalone Flow: when the agent
  * returns `payment-required`, the client signs one of the merchant's
  * `accepts[]` requirements and resubmits with the signed payload, then
  * surfaces only the final task to the caller.
  *
- * Spec: `specification/a2a-x402-v0.2.md`.
+ * The client signs whichever generation the agent emits — see
+ * `specification/x402-transport-a2a-v1.md` and `-v2.md`.
  */
 export interface A2XClientX402Options {
   /** viem LocalAccount used to sign EIP-3009 authorizations. */
@@ -156,7 +157,7 @@ export interface A2XClientOptions {
    */
   extensions?: string[];
   /**
-   * Enables transparent a2a-x402 v0.2 payment handling. Omit when calling
+   * Enables transparent a2a-x402 payment handling. Omit when calling
    * agents that don't gate on x402; the client behaves as a plain A2A
    * client in that case.
    */
