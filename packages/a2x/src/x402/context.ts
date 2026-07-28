@@ -260,7 +260,8 @@ export abstract class BaseX402Context {
 
   /**
    * Wire generation emitted when the client's activation doesn't pin one.
-   * Overridable by subclasses / `X402Context` options. Defaults to V2.
+   * Overridable by subclasses / `X402Context` options. Defaults to
+   * `X402_DEFAULT_GENERATION` (**V1** — see its rationale).
    */
   defaultGeneration: X402Generation = X402_DEFAULT_GENERATION;
 

@@ -178,7 +178,9 @@ on what the client negotiated:
 ```ts
 async *run(ctx: InvocationContext) {
   if (ctx.activatedExtensions?.includes(X402_FOUNDATION_EXTENSION_URI)) {
-    // client speaks x402 V2
+    // client activated x402 — note this says nothing about the generation:
+    // the foundation URI is generation-neutral. Only the legacy v0.2 URI
+    // carries a generation signal, and it pins V1.
   }
 }
 ```
@@ -197,7 +199,9 @@ yield* x402.requestPayment(
 `new X402Context({ defaultGeneration })` sets the generation emitted when the
 client's activation pins none — which is the common case, since the foundation
 x402 URI is generation-neutral (only the legacy v0.2 URI pins V1). Defaults to
-`2` (a2x's negotiation profile is V2-first); set `1` for legacy V1-only fleets.
+`1`: emitting V2 to a peer that never proved it decodes V2 would be a silent
+wire break, so V2 is opt-in. Set `2` once every client in the deployment speaks
+it. See [x402 payments](./x402-payments.md) for the full negotiation profile.
 
 ## Serving the handler
 

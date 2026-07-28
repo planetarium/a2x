@@ -88,9 +88,10 @@ export function buildX402PaymentRequiredMetadata(
       'buildX402PaymentRequiredMetadata: at least one entry in `accepts` is required',
     );
   }
-  // Defaults to V1 for backward compatibility. The negotiation layer
-  // (`X402Context.requestPayment`) selects the generation from the client's
-  // activated extension and passes it explicitly, defaulting to V2.
+  // Defaults to V1 for backward compatibility, for direct callers that pass no
+  // generation. The negotiation layer (`X402Context.requestPayment`) always
+  // passes one explicitly, selected from the client's activated extensions and
+  // falling back to `X402_DEFAULT_GENERATION`.
   const generation = options?.generation ?? 1;
   const errorOpt = input.previousError ? { error: input.previousError } : {};
   const required =

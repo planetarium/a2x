@@ -719,13 +719,12 @@ export class A2XClient {
   private _activateX402Extension(): void {
     if (!this._x402) return;
     // A caller-registered v0.2 URI is an explicit V1 pin, so leave the
-    // activation set untouched. Adding the foundation URI alongside it would
-    // *break* the pin rather than preserve it: the server reads the v0.2 URI
-    // as "pin V1" only when the (generation-neutral) foundation URI is absent,
-    // so sending both lands on the server's `defaultGeneration` — handing
-    // V1-only tooling a V2 envelope it cannot decode. The x402 activation
-    // family means the v0.2 URI alone still satisfies an agent that requires
-    // the foundation URI.
+    // activation set untouched. An a2x server honors that pin even alongside
+    // the foundation URI, but a third-party server need not: the foundation
+    // URI is generation-neutral, so "both activated" is only unambiguous if
+    // the peer shares a2x's pin-wins rule. Sending the pin alone is what makes
+    // it legible to any peer. The x402 activation family means the v0.2 URI
+    // alone still satisfies an agent that requires the foundation URI.
     if (!this._x402UriAutoSeeded) return;
     const card = this._resolved?.card as
       | { capabilities?: { extensions?: Array<{ uri?: string }> } }
