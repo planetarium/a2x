@@ -14,7 +14,14 @@
 
 /**
  * URI declared by `spec/v0.2/spec.md` of the a2a-x402 extension repo. a2x
- * treats activating it as an explicit pin to the **V1** wire generation.
+ * treats a client that activates it as **V1-only**: every wire structure that
+ * spec defines is V1-shaped (`x402Version: 1`, bare network names,
+ * `maxAmountRequired`), and no document anywhere pairs this URI with V2
+ * envelopes. A V1 server accepts the activation; a V2 server refuses to serve
+ * it (see `BaseX402Context.requestPayment`) rather than emit envelopes the
+ * client cannot decode — or worse, emit V2 under a URI whose defining spec
+ * says V1, which would reproduce the exact URI/generation ambiguity the
+ * foundation URI already suffers from.
  *
  * Counterintuitively this is the *newer* extension spec of the two URIs here:
  * both come from the same upstream repo (`google-agentic-commerce/a2a-x402`),
@@ -30,9 +37,10 @@
  * `X402_FOUNDATION_EXTENSION_URI` instead.
  *
  * @deprecated as an AgentCard-advertised URI — advertise
- * `X402_FOUNDATION_EXTENSION_URI` instead. Registering it from a client to
- * pin the V1 wire generation (`extensions: [X402_EXTENSION_URI]`) remains
- * supported and is the documented way for a V1-only client to opt out of V2.
+ * `X402_FOUNDATION_EXTENSION_URI` instead. Registering it from a client
+ * (`extensions: [X402_EXTENSION_URI]`) remains supported as an explicit
+ * "this client decodes V1 only" declaration: V1 agents serve it, V2 agents
+ * fail it fast with `invalid_x402_version`.
  */
 export const X402_EXTENSION_URI =
   'https://github.com/google-agentic-commerce/a2a-x402/blob/main/spec/v0.2';
@@ -58,12 +66,12 @@ export const X402_EXTENSION_URI =
  *
  * a2x advertises this as the canonical x402 extension. It is **not** an input
  * to generation selection: activating it is not proof the client speaks V2,
- * only that it speaks x402-on-A2A, so a client that activates it (and nothing
- * else) gets the server's configured `defaultGeneration` — V1 unless the
- * operator opted in. This is why a2x keeps the legacy v0.2 URI
- * (`X402_EXTENSION_URI`) as an explicit V1 pin for clients that can only
- * decode V1 envelopes; see `x402PinnedGeneration`, the single place that
- * maps a URI to a generation.
+ * only that it speaks x402-on-A2A. Because no activation URI can express a
+ * generation, an a2x server does not negotiate one — it emits the single
+ * generation its deployment configured (`X402ContextOptions.generation`),
+ * which is how every other known implementation behaves too (the upstream
+ * `x402_a2a` reference lineage is V1-only, Bindu is V2-only; both activate
+ * this same URI).
  */
 export const X402_FOUNDATION_EXTENSION_URI =
   'https://github.com/google-a2a/a2a-x402/v0.1';
@@ -85,15 +93,6 @@ export const X402_EXTENSION_URIS: readonly string[] = [
   X402_FOUNDATION_EXTENSION_URI,
   X402_EXTENSION_URI,
 ];
-
-/**
- * The wire generation an activation URI *pins*, if any. Only the legacy v0.2
- * URI pins a generation (V1) — the foundation URI is generation-neutral and
- * returns `undefined` (the server falls back to its `defaultGeneration`).
- */
-export function x402PinnedGeneration(uri: string): 1 | undefined {
-  return uri === X402_EXTENSION_URI ? 1 : undefined;
-}
 
 /** True when the URI is a member of the x402 activation family. */
 export function isX402ExtensionUri(uri: string): boolean {

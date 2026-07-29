@@ -1,9 +1,10 @@
 /**
- * Dual-stack (V1/V2) negotiation and signing.
+ * Dual-codec (V1/V2) emission and signing.
  *
- * Covers: server emission generation driven by the client's activated
- * extension, the full V2 Standalone round-trip with real @x402/evm signing,
- * the generation-mismatch guard, and EIP-3009 signature recovery for both
+ * Covers: single-generation emission (the server speaks exactly its
+ * configured generation; a V2 server refuses a V1-only activation), the full
+ * V2 Standalone round-trip with real @x402/evm signing, the
+ * generation-mismatch guard, and EIP-3009 signature recovery for both
  * generations (the acceptance gate for migrating the signing path).
  */
 import { describe, expect, it } from 'vitest';
@@ -50,12 +51,12 @@ function mockFacilitator(): X402Facilitator {
   };
 }
 
-// A server that has opted into V2 (defaultGeneration: 2). Since the foundation
-// URI is generation-neutral, V2 emission is a server opt-in, not a per-URI
+// A server that has opted into V2 (generation: 2). Since the foundation URI
+// is generation-neutral, V2 emission is a deployment opt-in, not a per-URI
 // signal — these tests model an operator that advertises the foundation URI
 // and configured V2.
 function v2Context(facilitator: X402Facilitator = mockFacilitator()): X402Context {
-  return new X402Context({ facilitator, defaultGeneration: 2 });
+  return new X402Context({ facilitator, generation: 2 });
 }
 
 async function drainMetadata(
@@ -86,8 +87,8 @@ function requiredTask(required: X402PaymentRequiredResponse): Task {
   } as unknown as Task;
 }
 
-describe('server emission generation from activation', () => {
-  it('emits V2 when the server opted into V2 and the client activated the foundation URI', async () => {
+describe('single-generation emission', () => {
+  it('emits V2 when the server is configured for V2 and the client activated the foundation URI', async () => {
     const ctx = v2Context();
     const meta = await drainMetadata(
       ctx.requestPayment(
@@ -100,7 +101,7 @@ describe('server emission generation from activation', () => {
     expect(required.accepts[0]!.network).toBe('eip155:84532');
   });
 
-  it('emits V1 when the client activated only the legacy URI', async () => {
+  it('serves a v0.2-activated (V1-only) client on a V1 server', async () => {
     const ctx = new X402Context({ facilitator: mockFacilitator() });
     const meta = await drainMetadata(
       ctx.requestPayment(
@@ -113,7 +114,7 @@ describe('server emission generation from activation', () => {
     expect(required.accepts[0]!.network).toBe('base-sepolia');
   });
 
-  it('falls back to V1 when no x402 URI pins a generation (migration-safe default)', async () => {
+  it('emits V1 out of the box when nothing is configured or activated', async () => {
     const ctx = new X402Context({ facilitator: mockFacilitator() });
     const meta = await drainMetadata(
       ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }),
@@ -122,31 +123,57 @@ describe('server emission generation from activation', () => {
     expect(required.x402Version).toBe(1);
   });
 
-  it('honors the V1 pin even when the foundation URI is activated alongside it', async () => {
-    // A V1-only client that activates both URIs must not be handed V2. The
-    // v0.2 URI is a2x's V1 pin; nothing in either URI proves the client can
-    // decode V2, so "both activated" must not be read as dual-capable.
-    const ctx = v2Context();
-    const meta = await drainMetadata(
-      ctx.requestPayment(
-        {
-          taskId: 't1',
-          activatedExtensions: [X402_EXTENSION_URI, X402_FOUNDATION_EXTENSION_URI],
-        },
-        { accepts: [ACCEPT] },
-      ),
-    );
-    const required = meta[X402_METADATA_KEYS.REQUIRED] as X402PaymentRequiredResponse;
-    expect(required.x402Version).toBe(1);
-  });
-
-  it('emits V2 on the neutral fallback only when the server opted into V2', async () => {
+  it('emits V2 on a V2 server even when the activation header carries no x402 URI', async () => {
+    // The activation channel cannot express a generation, so the configured
+    // generation applies regardless of what (if anything) was activated.
     const ctx = v2Context();
     const meta = await drainMetadata(
       ctx.requestPayment({ taskId: 't1' }, { accepts: [ACCEPT] }),
     );
     const required = meta[X402_METADATA_KEYS.REQUIRED] as X402PaymentRequiredResponse;
     expect(required.x402Version).toBe(2);
+  });
+
+  it('refuses a v0.2-activated (V1-only) client on a V2 server with invalid_x402_version', async () => {
+    // The v0.2 URI's defining spec pairs it with V1 wire structures only, so
+    // activating it declares a V1-only client. A V2 server must not emit V2
+    // to it (undecodable) nor downgrade to V1 (a generation this deployment
+    // did not configure) — it fails fast with a generation-neutral error.
+    const ctx = v2Context();
+    const events: AgentEvent[] = [];
+    for await (const ev of ctx.requestPayment(
+      { taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] },
+      { accepts: [ACCEPT] },
+    )) {
+      events.push(ev);
+    }
+    expect(events).toHaveLength(1);
+    const failed = events[0]!;
+    expect(failed.type).toBe('error');
+    const meta = (failed as { metadata?: Record<string, unknown> }).metadata!;
+    expect(meta[X402_METADATA_KEYS.STATUS]).toBe('payment-failed');
+    expect(meta[X402_METADATA_KEYS.ERROR]).toBe('invalid_x402_version');
+    // No offering was made, so nothing must be stored for the task.
+    expect(await ctx.store.get('t1')).toBeUndefined();
+  });
+
+  it('refuses on a V2 server even when the foundation URI is activated alongside v0.2', async () => {
+    // "Both activated" must not be read as dual-capable: activating the v0.2
+    // URI proves the client decodes V1, while neither URI proves it decodes
+    // V2. The V1-only declaration wins whenever it is present.
+    const ctx = v2Context();
+    const events: AgentEvent[] = [];
+    for await (const ev of ctx.requestPayment(
+      {
+        taskId: 't1',
+        activatedExtensions: [X402_FOUNDATION_EXTENSION_URI, X402_EXTENSION_URI],
+      },
+      { accepts: [ACCEPT] },
+    )) {
+      events.push(ev);
+    }
+    expect(events).toHaveLength(1);
+    expect(events[0]!.type).toBe('error');
   });
 });
 
@@ -228,7 +255,7 @@ describe('EIP-3009 signature recovery (both generations)', () => {
     it(`${label} payload signature recovers to the signer`, async () => {
       const ctx = new X402Context({
         facilitator: mockFacilitator(),
-        defaultGeneration: expectedVersion,
+        generation: expectedVersion,
       });
       await drainMetadata(
         ctx.requestPayment(

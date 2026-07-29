@@ -90,9 +90,8 @@ export function buildX402PaymentRequiredMetadata(
     );
   }
   // Defaults to V1 for backward compatibility, for direct callers that pass no
-  // generation. The negotiation layer (`X402Context.requestPayment`) always
-  // passes one explicitly, selected from the client's activated extensions and
-  // falling back to `X402_DEFAULT_GENERATION`.
+  // generation. `X402Context.requestPayment` always passes the server's
+  // configured generation explicitly.
   const generation = options?.generation ?? 1;
   const errorOpt = input.previousError ? { error: input.previousError } : {};
   const required =

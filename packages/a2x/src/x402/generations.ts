@@ -25,17 +25,21 @@ export type X402Generation = 1 | 2;
 export const X402_SUPPORTED_VERSIONS: readonly X402Generation[] = [1, 2];
 
 /**
- * Fallback generation `X402Context` emits when the client's activation set
- * pins no x402 generation — which is the common case, since the foundation URI
- * is generation-neutral (only the legacy v0.2 URI pins a generation), plus the
- * no-header / stripped-header cases.
+ * Generation `X402Context` speaks when the deployment doesn't configure one.
  *
- * **V1** by default: emitting V2 on a signal the peer has not proven it speaks
- * V2 (the neutral foundation URI, or no header at all) would hand a V1-only
- * client an envelope it cannot parse — a silent, fail-open wire break. A
- * deployment whose clients all speak V2 opts in explicitly with
- * `new X402Context({ defaultGeneration: 2 })` (and advertises the foundation
- * URI on its card so its own clients upgrade).
+ * A server emits exactly one generation — its configured
+ * `X402ContextOptions.generation` — because the activation channel cannot
+ * express a generation request: the foundation URI is generation-neutral and
+ * there is no URI that means "send me V2". Every known peer implementation is
+ * likewise single-generation (the upstream `x402_a2a` reference lineage
+ * speaks V1 only, Bindu speaks V2 only), so per-request negotiation has
+ * nothing to negotiate with.
+ *
+ * **V1** by default: it is what the upstream reference library and its
+ * derivatives decode, and handing V2 to a peer that never proved it speaks V2
+ * would be a silent wire break. A deployment whose clients speak V2 opts in
+ * with `new X402Context({ generation: 2 })` (and advertises the foundation
+ * URI on its card).
  */
 export const X402_DEFAULT_GENERATION: X402Generation = 1;
 

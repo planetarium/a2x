@@ -90,9 +90,10 @@ class EchoAgent extends BaseAgent {
         ? { facilitator: { url: process.env.X402_FACILITATOR_URL } }
         : {}),
       store: new InMemoryX402Store(),
-      // Opt into x402 V2: this sample advertises the foundation URI (below),
-      // so its clients activate it and negotiate V2. The SDK default is V1.
-      defaultGeneration: 2,
+      // This deployment speaks x402 V2 (the SDK default is V1). A V1-only
+      // client that activates the legacy v0.2 URI is refused with a clear
+      // invalid_x402_version failure instead of receiving V2 it can't parse.
+      generation: 2,
   });
   }
 

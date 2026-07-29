@@ -425,7 +425,7 @@ describe('A2XClient — card-based x402 generation activation', () => {
     const { fetch, calls } = fetchWithCardExtensions([
       X402_FOUNDATION_EXTENSION_URI,
     ]);
-    // Caller deliberately pins V1 (e.g. tooling that only decodes V1 envelopes).
+    // Caller deliberately declares V1-only (e.g. tooling that only decodes V1).
     const client = new A2XClient('https://example.com', {
       fetch,
       x402: { signer: TEST_ACCOUNT },
@@ -437,10 +437,9 @@ describe('A2XClient — card-based x402 generation activation', () => {
     const rpcCall = calls.find((c) => c.url.endsWith('/a2a'))!;
     const header = rpcCall.headers['x-a2a-extensions'] ?? '';
     expect(header).toContain(X402_EXTENSION_URI);
-    // Keeping the v0.2 URI is not enough — the pin must also survive. The
-    // server reads the v0.2 URI as "pin V1", so adding the foundation URI
-    // beside it used to flip the round-trip to the server's defaultGeneration
-    // and hand V1-only tooling a V2 envelope.
+    // The caller-registered v0.2 URI is a deliberate "V1 only" declaration.
+    // It must go out alone: adding the foundation URI beside it would blur
+    // the declaration for peers that read the activation set differently.
     expect(header).not.toContain(X402_FOUNDATION_EXTENSION_URI);
   });
 });

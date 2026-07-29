@@ -4,7 +4,7 @@ An [A2A](https://a2a-protocol.org) agent built with Next.js, `@a2x/sdk`, and the
 
 The decision to charge is **driven by the LLM at runtime**: free chat / free-tool-only turns pass through without payment, any paid tool in the planned batch triggers the gate before any tool actually runs.
 
-The agent declares the x402 extension once, under the canonical URI the [x402 Foundation](https://github.com/x402-foundation/x402) A2A transport mandates, and **speaks both protocol generations** on the wire. It opts into V2 via `new X402Context({ defaultGeneration: 2 })`; a legacy client that activates a2x's older v0.2 URI is recognized as the same extension and gets V1.
+The agent declares the x402 extension once, under the canonical URI the [x402 Foundation](https://github.com/x402-foundation/x402) A2A transport mandates, and **speaks x402 V2** on the wire (`new X402Context({ generation: 2 })`; the SDK default is V1). A legacy client that activates a2x's older v0.2 URI is recognized as the same extension but declares itself V1-only, so this V2 agent refuses it with a clear `invalid_x402_version` failure instead of sending envelopes it cannot decode.
 
 ## When to reach for this pattern
 

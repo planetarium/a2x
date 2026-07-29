@@ -14,7 +14,7 @@ A self-contained TypeScript SDK for building [A2A (Agent-to-Agent)](https://a2a-
 - **SSE streaming** — First-class `message/stream` support via Server-Sent Events.
 - **Multi-modal artifacts** — Agents can yield `text`, `file`, and `data` events; the default executor maps each into A2A `TextPart` / `FilePart` / `DataPart` artifacts.
 - **Built-in auth** — API Key, Bearer, OAuth 2.0 (Authorization Code, Client Credentials, Device Code), OpenID Connect, and Mutual TLS.
-- **x402 payments** — Charge per call with on-chain cryptocurrency payments, speaking both x402 protocol generations (legacy V1 and the [x402 Foundation](https://github.com/x402-foundation/x402) V2 transport) with automatic per-interaction negotiation. Express payment gating inline in `agent.run()` with `x402RequestPayment()`; the agent calls `facilitator.verify()` and `facilitator.settle()` directly using the SDK's stateless helpers — no SDK-owned flow, full control over what runs between verify and settle.
+- **x402 payments** — Charge per call with on-chain cryptocurrency payments, supporting both x402 protocol generations (legacy V1 and the [x402 Foundation](https://github.com/x402-foundation/x402) V2 transport) — each deployment speaks one, V1 by default, V2 via `new X402Context({ generation: 2 })`. Express payment gating inline in `agent.run()` with `x402RequestPayment()`; the agent calls `facilitator.verify()` and `facilitator.settle()` directly using the SDK's stateless helpers — no SDK-owned flow, full control over what runs between verify and settle.
 - **Zero runtime dependencies** — Core module uses only Node.js built-in APIs.
 - **TypeScript-first** — Full type safety with types derived from A2A JSON Schema.
 
@@ -309,7 +309,7 @@ Supported schemes: `ApiKeyAuthorization`, `HttpBearerAuthorization`, `OAuth2Auth
 
 ## x402 Payments
 
-Gate agent calls behind on-chain cryptocurrency payments. A2X speaks both x402 protocol generations — legacy V1 ([a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402)) and the [x402 Foundation](https://github.com/x402-foundation/x402) V2 transport — and negotiates per interaction via extension-URI activation.
+Gate agent calls behind on-chain cryptocurrency payments. A2X supports both x402 protocol generations — legacy V1 ([a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402)) and the [x402 Foundation](https://github.com/x402-foundation/x402) V2 transport. A server speaks the one its deployment configures (V1 by default; `new X402Context({ generation: 2 })` for V2), and the client signs whichever generation it receives.
 
 Install the optional peers:
 
@@ -321,7 +321,7 @@ Server (the agent owns the flow; `X402Context` bundles the offering store + faci
 
 ```typescript
 import { AgentExecutor, BaseAgent, StreamingMode } from '@a2x/sdk';
-import { X402Context, X402_EXTENSION_URI } from '@a2x/sdk/x402';
+import { X402Context, X402_FOUNDATION_EXTENSION_URI } from '@a2x/sdk/x402';
 
 const ACCEPTS = [{
   network: 'base-sepolia',
@@ -388,7 +388,7 @@ const executor = new AgentExecutor({
 });
 
 const agent = new A2XServer({ taskStore, executor })
-  .addExtension({ uri: X402_EXTENSION_URI, required: true });
+  .addExtension({ uri: X402_FOUNDATION_EXTENSION_URI, required: true });
 ```
 
 For deployments that need full bespoke control (multiple facilitators, custom store routing, inserting logic mid-validation), the lower-level stateless helpers `X402Context` is built on (`parseX402PaymentSubmission`, `pickX402Requirement`, `validateX402PayloadShape`, `buildX402Payment*Metadata`, …) remain exported.

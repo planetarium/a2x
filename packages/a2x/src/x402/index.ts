@@ -5,9 +5,10 @@
  * formats: `specification/x402-transport-a2a-v1.md` (plus its
  * `specification/a2a-x402-v0.2.md` lineage) for V1, and
  * `specification/x402-transport-a2a-v2.md` for V2. Generation is signalled by
- * `x402Version` inside the envelope, not by the extension URI; the server picks
- * it (V1 unless it opts into `defaultGeneration: 2`) and the client signs
- * whatever it receives.
+ * `x402Version` inside the envelope, not by the extension URI. A server
+ * speaks exactly one generation — V1 unless the deployment opts into
+ * `new X402Context({ generation: 2 })` — and the client signs whatever it
+ * receives.
  *
  * The SDK exposes spec mechanics as **stateless helpers**, never as a
  * flow: the agent owns when to request payment, what offerings it
@@ -121,10 +122,11 @@
  *   .addExtension({ uri: X402_FOUNDATION_EXTENSION_URI, required: true });
  * ```
  *
- * Declare the foundation URI, not the legacy `X402_EXTENSION_URI`: a2x treats
- * the two as an activation family, so a legacy v0.2 client still passes the
- * `required` check, while advertising v0.2 instead would keep a2x clients
- * pinned to V1 — silently overriding a `defaultGeneration: 2` server.
+ * Declare the foundation URI, not the legacy `X402_EXTENSION_URI`: it is the
+ * URI the foundation transport mandates, and a2x treats the two as an
+ * activation family, so a legacy v0.2 client still passes the `required`
+ * check on a V1 server. (On a `generation: 2` server a v0.2 activation is
+ * refused at `requestPayment` — that URI declares a V1-only client.)
  *
  * Minimal client setup (unchanged):
  *
@@ -153,7 +155,6 @@ export {
   X402_ERROR_CODES,
   X402_DEFAULT_TIMEOUT_SECONDS,
   mapVerifyFailureToCode,
-  x402PinnedGeneration,
   isX402ExtensionUri,
   type X402PaymentStatus,
   type X402ErrorCode,

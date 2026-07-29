@@ -63,7 +63,7 @@ Adding `X402_EXTENSION_URI` as a second entry reports one capability as two exte
 
 a2x's request handler treats the x402 URIs as an **activation family**: activating *any* member satisfies the required x402 extension. This is an **a2x-server-specific relaxation** of A2A's per-extension `required` rule — a non-a2x server enforces `required` per URI. It exists so a legacy `a2a-x402 v0.2` client (which activates only the v0.2 URI) still passes an agent that requires the canonical URI.
 
-Generation is **not** selected by which URI is activated (the canonical URI is generation-neutral — see [x402 Payments](./x402-payments.md#protocol-generations-v1--v2)); only the legacy v0.2 URI pins a generation, and it pins V1 whenever it is present — including alongside the foundation URI, since activating it proves the client decodes V1 while neither URI proves it decodes V2. Read the activated set inside the agent from `context.activatedExtensions` (see [Manual Wiring](./manual-wiring.md#reading-activated-extensions)).
+Generation is **not** selected by which URI is activated (the canonical URI is generation-neutral — see [x402 Payments](./x402-payments.md#protocol-generations-v1--v2)); the server emits the single generation its deployment configured. The one signal the channel carries is the legacy v0.2 URI, which declares a V1-only client — whenever it is present, including alongside the foundation URI, a `generation: 2` server refuses the activation with `invalid_x402_version` rather than emit envelopes the client cannot decode. Read the activated set inside the agent from `context.activatedExtensions` (see [Manual Wiring](./manual-wiring.md#reading-activated-extensions)).
 
 ## Input-required round-trips for non-payment domains
 

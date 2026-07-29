@@ -83,9 +83,10 @@ import type { AgentEvent } from '../agent/base-agent.js';
 import type { InvocationContext } from '../runner/context.js';
 import {
   X402_ERROR_CODES,
+  X402_EXTENSION_URI,
+  X402_FOUNDATION_EXTENSION_URI,
   X402_PAYMENT_STATUS,
   mapVerifyFailureToCode,
-  x402PinnedGeneration,
   type X402ErrorCode,
 } from './constants.js';
 import { resolveFacilitator, type FacilitatorUrlConfig } from './facilitator.js';
@@ -140,14 +141,19 @@ export interface X402ContextOptions {
    */
   facilitator?: X402Facilitator | FacilitatorUrlConfig;
   /**
-   * Wire generation to emit when the client's activated extension set
-   * doesn't pin one (e.g. a transport that stripped `X-A2A-Extensions`).
-   * Defaults to V1 — the migration-safe choice, since the foundation URI is
-   * generation-neutral and emitting V2 to a client that only pinned the neutral
-   * URI (or sent no header) would be a silent wire break. Deployments whose
-   * clients all speak V2 opt in with `2`.
+   * The single wire generation this server speaks. Defaults to V1 — the
+   * generation the upstream `x402_a2a` reference lineage decodes; deployments
+   * whose clients speak V2 (the x402 Foundation `transports-v2` wire) opt in
+   * with `2`.
+   *
+   * This is a deployment-level declaration, not a negotiation default: the
+   * activation channel has no way to request a generation (the foundation URI
+   * is generation-neutral), so the server emits exactly this generation. The
+   * one activation signal that exists is the legacy v0.2 URI, which declares
+   * a V1-only client — a `generation: 2` server refuses to serve it (see
+   * `requestPayment`) instead of emitting envelopes it cannot decode.
    */
-  defaultGeneration?: X402Generation;
+  generation?: X402Generation;
 }
 
 // ─── requestPayment input ───
@@ -259,39 +265,11 @@ export abstract class BaseX402Context {
   abstract readonly facilitator: X402Facilitator;
 
   /**
-   * Wire generation emitted when the client's activation doesn't pin one.
-   * Overridable by subclasses / `X402Context` options. Defaults to
+   * The single wire generation this server speaks. Overridable by
+   * subclasses / `X402Context` options. Defaults to
    * `X402_DEFAULT_GENERATION` (**V1** — see its rationale).
    */
-  defaultGeneration: X402Generation = X402_DEFAULT_GENERATION;
-
-  /**
-   * Select the wire generation to emit for this round-trip from the client's
-   * activated extension URIs. The foundation URI is generation-neutral, so
-   * only the legacy v0.2 URI pins a generation (V1); everything else falls
-   * back to `defaultGeneration`. This URI→generation mapping is an a2x
-   * negotiation profile, not part of the foundation transport spec.
-   */
-  protected pickEmissionGeneration(
-    activatedExtensions: readonly string[] | undefined,
-  ): X402Generation {
-    // Which URI pins which generation lives solely in `x402PinnedGeneration`.
-    // Re-deriving it here is how the two halves drifted apart before: the
-    // client thought keeping the v0.2 URI preserved a V1 pin while the server
-    // only honored that pin when the canonical URI was absent.
-    //
-    // A pin wins whenever it is present, including alongside the canonical
-    // URI. Reading "both activated" as "dual-capable, send V2" would be
-    // fail-open — activating the V1 pin proves the client decodes V1, while
-    // neither URI proves it decodes V2. A V2-preferring client activates the
-    // canonical URI alone, which is what `A2XClient` does once a card
-    // advertises it.
-    for (const uri of activatedExtensions ?? []) {
-      const pinned = x402PinnedGeneration(uri);
-      if (pinned !== undefined) return pinned;
-    }
-    return this.defaultGeneration;
-  }
+  generation: X402Generation = X402_DEFAULT_GENERATION;
 
   /**
    * Persist the offering with status `'offered'` and yield the spec's
@@ -314,7 +292,27 @@ export abstract class BaseX402Context {
           'AgentExecutor populates it when running under an A2A task.',
       );
     }
-    const generation = this.pickEmissionGeneration(ctx.activatedExtensions);
+    // A client that activated the legacy v0.2 URI has declared itself
+    // V1-only: spec v0.2 defines V1-shaped wire structures exclusively, and
+    // no document pairs that URI with V2 envelopes. A V2 server therefore
+    // fails such a client fast — with a decodable, generation-neutral error —
+    // rather than emit V2 it cannot parse, or downgrade to a generation this
+    // deployment did not configure (A2A extensions: an agent "MUST NOT fall
+    // back to a different version").
+    if (
+      this.generation === 2 &&
+      ctx.activatedExtensions?.includes(X402_EXTENSION_URI)
+    ) {
+      yield this.failedEvent({
+        code: X402_ERROR_CODES.INVALID_X402_VERSION,
+        reason:
+          `This agent speaks x402 generation 2, but the activated extension ${X402_EXTENSION_URI} ` +
+          `declares a V1-only client. If this client decodes V2 envelopes, activate ` +
+          `${X402_FOUNDATION_EXTENSION_URI} instead.`,
+      });
+      return;
+    }
+    const generation = this.generation;
     // Encode up-front so a misconfigured offering (e.g. a CAIP-2 network with
     // no V1 bare-name mapping under a V1 offer) throws a clean configuration
     // error here — before we persist an entry that would then be unusable and
@@ -702,8 +700,8 @@ export class X402Context extends BaseX402Context {
   constructor(options: X402ContextOptions = {}) {
     super();
     this.store = options.store ?? new InMemoryX402Store();
-    if (options.defaultGeneration !== undefined) {
-      this.defaultGeneration = options.defaultGeneration;
+    if (options.generation !== undefined) {
+      this.generation = options.generation;
     }
     const spec = options.facilitator;
     this.facilitator =
