@@ -3,7 +3,7 @@
  * SDK's x402 server flow can stay agnostic of the underlying package
  * surface.
  *
- * One client serves both generations: `HTTPFacilitatorClient.verify/settle`
+ * One client serves both protocol versions: `HTTPFacilitatorClient.verify/settle`
  * echo the payload's `x402Version`, and its response schemas accept both
  * bare-name (V1) and CAIP-2 (V2) networks — so a single facilitator client
  * verifies and settles V1 and V2 payments with no up-conversion.

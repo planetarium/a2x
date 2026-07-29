@@ -17,7 +17,7 @@
  */
 
 import type { X402ErrorCode } from './constants.js';
-import type { X402Generation } from './generations.js';
+import type { X402Version } from './versions.js';
 import type { X402Accept } from './types.js';
 
 /**
@@ -81,13 +81,13 @@ export interface X402StoreEntry {
   /** Offering the merchant advertised on turn 1. Immutable once set. */
   accepts: X402Accept[];
   /**
-   * Wire generation the offering was published under (1 or 2), decided by
-   * the client's activated extension at `requestPayment` time. The resume
-   * turn decodes the submission and normalizes requirements against this.
-   * Immutable once set; absent on entries written before dual-stack (treat
-   * as generation 1).
+   * Wire version the offering was published under (1 or 2) — the server's
+   * configured `x402Version` at `requestPayment` time. The resume turn
+   * decodes the submission and normalizes requirements against this.
+   * Immutable once set; absent on entries written before dual-version
+   * support (treat as version 1).
    */
-  offeredGeneration?: X402Generation;
+  offeredX402Version?: X402Version;
   /** Current lifecycle stage. Updated in place as the round-trip progresses. */
   status: X402EntryStatus;
   /** When the entry was first put. Immutable. */

@@ -1,22 +1,21 @@
 /**
- * Unit tests for the dual-generation seam: network normalization,
- * generation detection + accessors, and the V1/V2 wire codecs.
+ * Unit tests for the dual-version seam: network normalization,
+ * version detection + accessors, and the V1/V2 wire codecs.
  */
 import { describe, expect, it } from 'vitest';
 import {
-  detectGeneration,
+  detectX402Version,
   isSupportedVersion,
   payloadMatchesRequirement,
   payloadNetwork,
   requirementAmount,
-  X402_DEFAULT_GENERATION,
-} from '../x402/generations.js';
+  X402_DEFAULT_VERSION,
+} from '../x402/versions.js';
 import { isCaip2, sameNetwork, toBareName, toCaip2 } from '../x402/networks.js';
 import {
   X402_EXTENSION_URI,
   X402_FOUNDATION_EXTENSION_URI,
   isX402ExtensionUri,
-  x402PinnedGeneration,
 } from '../x402/constants.js';
 import { encodePaymentRequiredV1, encodeRequirementV1 } from '../x402/wire-v1.js';
 import { encodePaymentRequiredV2, encodeRequirementV2 } from '../x402/wire-v2.js';
@@ -65,23 +64,7 @@ describe('networks', () => {
   });
 });
 
-// `x402PinnedGeneration` is the single URI→generation mapping in the SDK —
-// `BaseX402Context.pickEmissionGeneration` reads it rather than re-deriving
-// the rule. Keeping the mapping in one place is what stops the client and
-// server halves from drifting apart.
-describe('activation URI → generation mapping', () => {
-  it('pins V1 for the legacy v0.2 URI', () => {
-    expect(x402PinnedGeneration(X402_EXTENSION_URI)).toBe(1);
-  });
-
-  it('pins nothing for the canonical URI — it is generation-neutral', () => {
-    expect(x402PinnedGeneration(X402_FOUNDATION_EXTENSION_URI)).toBeUndefined();
-  });
-
-  it('pins nothing for an unrelated extension URI', () => {
-    expect(x402PinnedGeneration('https://example.org/some-other-ext')).toBeUndefined();
-  });
-
+describe('x402 activation family', () => {
   it('recognizes both URIs as x402 activation-family members', () => {
     expect(isX402ExtensionUri(X402_EXTENSION_URI)).toBe(true);
     expect(isX402ExtensionUri(X402_FOUNDATION_EXTENSION_URI)).toBe(true);
@@ -89,28 +72,28 @@ describe('activation URI → generation mapping', () => {
   });
 });
 
-describe('generation detection + accessors', () => {
+describe('version detection + accessors', () => {
   it('supported versions', () => {
     expect(isSupportedVersion(1)).toBe(true);
     expect(isSupportedVersion(2)).toBe(true);
     expect(isSupportedVersion(3)).toBe(false);
-    expect(X402_DEFAULT_GENERATION).toBe(1);
+    expect(X402_DEFAULT_VERSION).toBe(1);
   });
 
-  it('detects generation from an envelope or bare version', () => {
-    expect(detectGeneration({ x402Version: 1 })).toBe(1);
-    expect(detectGeneration({ x402Version: 2 })).toBe(2);
-    expect(detectGeneration(2)).toBe(2);
-    expect(detectGeneration({ x402Version: 3 })).toBeUndefined();
-    expect(detectGeneration(undefined)).toBeUndefined();
+  it('detects version from an envelope or bare version', () => {
+    expect(detectX402Version({ x402Version: 1 })).toBe(1);
+    expect(detectX402Version({ x402Version: 2 })).toBe(2);
+    expect(detectX402Version(2)).toBe(2);
+    expect(detectX402Version({ x402Version: 3 })).toBeUndefined();
+    expect(detectX402Version(undefined)).toBeUndefined();
   });
 
-  it('reads amount across generations', () => {
+  it('reads amount across versions', () => {
     expect(requirementAmount(encodeRequirementV1(ACCEPT))).toBe('10000');
     expect(requirementAmount(encodeRequirementV2(ACCEPT))).toBe('10000');
   });
 
-  it('reads network + matches requirement across generations', () => {
+  it('reads network + matches requirement across versions', () => {
     const v1Payload: X402PaymentPayloadV1 = {
       x402Version: 1,
       scheme: 'exact',
@@ -124,7 +107,7 @@ describe('generation detection + accessors', () => {
     };
     expect(payloadNetwork(v1Payload)).toBe('base-sepolia');
     expect(payloadNetwork(v2Payload)).toBe('eip155:84532');
-    // Cross-generation network equivalence: a V1 payload matches a V2
+    // Cross-version network equivalence: a V1 payload matches a V2
     // requirement for the same chain and vice versa.
     expect(payloadMatchesRequirement(v1Payload, encodeRequirementV2(ACCEPT))).toBe(
       true,

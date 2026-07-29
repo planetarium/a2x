@@ -416,9 +416,12 @@ export class DefaultRequestHandler {
 
     const activated = parseActivatedExtensions(context.headers);
     // The x402 extension URIs form an activation family: activating any
-    // member satisfies a required family URI, so a client that speaks only
-    // one generation (V1 via the v0.2 URI, or V2 via the foundation URI) is
-    // not rejected by an agent that advertises both as required.
+    // member satisfies a required family URI, so a legacy client that only
+    // knows the v0.2 URI still passes an agent that requires the foundation
+    // URI. Version compatibility is not checked here — the transport
+    // layer doesn't know which version the deployment speaks; a V2
+    // server refuses a v0.2 (V1-only) activation in
+    // `BaseX402Context.requestPayment`.
     const anyX402Activated = [...activated].some((uri) =>
       isX402ExtensionUri(uri),
     );

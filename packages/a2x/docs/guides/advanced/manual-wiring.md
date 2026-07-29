@@ -173,21 +173,23 @@ wired but you want to hide the capability.
 
 The extension URIs the client activated via the `X-A2A-Extensions` header are
 threaded onto `InvocationContext.activatedExtensions`, so an agent can branch
-on what the client negotiated:
+on what the client activated:
 
 ```ts
 async *run(ctx: InvocationContext) {
   if (ctx.activatedExtensions?.includes(X402_FOUNDATION_EXTENSION_URI)) {
-    // client activated x402 — note this says nothing about the generation:
-    // the foundation URI is generation-neutral. Only the legacy v0.2 URI
-    // carries a generation signal, and it pins V1.
+    // client activated x402 — note this says nothing about the version:
+    // the foundation URI is version-neutral. The only version signal
+    // the channel carries is the legacy v0.2 URI, which declares a V1-only
+    // client.
   }
 }
 ```
 
-The x402 module uses this to pick the wire generation it emits. When you drive
-`X402Context` yourself, forward the activated set into `requestPayment` so it
-emits the negotiated generation and records it against the task:
+When you drive `X402Context` yourself, forward the activated set into
+`requestPayment` — an `x402Version: 2` context uses it to refuse a V1-only
+(v0.2-activated) client with a clean `invalid_x402_version` failure instead of
+emitting envelopes it cannot decode:
 
 ```ts
 yield* x402.requestPayment(
@@ -196,12 +198,12 @@ yield* x402.requestPayment(
 );
 ```
 
-`new X402Context({ defaultGeneration })` sets the generation emitted when the
-client's activation pins none — which is the common case, since the foundation
-x402 URI is generation-neutral (only the legacy v0.2 URI pins V1). Defaults to
-`1`: emitting V2 to a peer that never proved it decodes V2 would be a silent
-wire break, so V2 is opt-in. Set `2` once every client in the deployment speaks
-it. See [x402 payments](./x402-payments.md) for the full negotiation profile.
+`new X402Context({ x402Version })` sets the single wire version the server
+speaks; the activation channel cannot request one (the foundation URI is
+version-neutral), so this is a deployment-level choice, not a per-request
+negotiation. Defaults to `1` — the version the upstream reference lineage
+decodes. Set `2` once every client in the deployment speaks V2. See
+[x402 payments](./x402-payments.md) for the full version model.
 
 ## Serving the handler
 

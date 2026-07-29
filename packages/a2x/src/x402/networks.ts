@@ -9,7 +9,7 @@
  *
  *  1. `X402Accept` normalization — agents configure `network` once (usually
  *     a bare name) and the V2 codec must emit the CAIP-2 form.
- *  2. Cross-generation equivalence — a wallet configured for `"base-sepolia"`
+ *  2. Cross-version equivalence — a wallet configured for `"base-sepolia"`
  *     must match a V2 requirement on `"eip155:84532"` when selecting a
  *     requirement or applying a budget filter.
  *  3. V1 emission — a CAIP-2 value entering a V1 requirement must be
@@ -97,7 +97,7 @@ export function toBareName(network: string): string {
 
 /**
  * True when two network ids refer to the same chain, regardless of whether
- * each is expressed as a bare name or CAIP-2. Used for cross-generation
+ * each is expressed as a bare name or CAIP-2. Used for cross-version
  * requirement selection and budget matching.
  */
 export function sameNetwork(a: string, b: string): boolean {

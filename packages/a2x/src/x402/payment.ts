@@ -19,7 +19,7 @@
  * and `facilitator.settle()` directly.
  *
  * Spec: specification/x402-transport-a2a-v1.md, -v2.md — the encoders here
- * cover both generations, selected by the `generation` option.
+ * cover both protocol versions, selected by the `x402Version` option.
  */
 
 import type { AgentEvent } from '../agent/base-agent.js';
@@ -31,12 +31,12 @@ import {
   type X402ErrorCode,
 } from './constants.js';
 import {
-  detectGeneration,
+  detectX402Version,
   payloadMatchesRequirement,
   requirementAmount,
   requirementPayTo,
-  type X402Generation,
-} from './generations.js';
+  type X402Version,
+} from './versions.js';
 import { sameNetwork } from './networks.js';
 import { encodePaymentRequiredV1, encodeRequirementV1 } from './wire-v1.js';
 import { encodePaymentRequiredV2 } from './wire-v2.js';
@@ -82,7 +82,7 @@ export interface X402RequestPaymentInput {
  */
 export function buildX402PaymentRequiredMetadata(
   input: X402RequestPaymentInput,
-  options?: { generation?: X402Generation },
+  options?: { x402Version?: X402Version },
 ): Record<string, unknown> {
   if (!input.accepts || input.accepts.length === 0) {
     throw new Error(
@@ -90,13 +90,12 @@ export function buildX402PaymentRequiredMetadata(
     );
   }
   // Defaults to V1 for backward compatibility, for direct callers that pass no
-  // generation. The negotiation layer (`X402Context.requestPayment`) always
-  // passes one explicitly, selected from the client's activated extensions and
-  // falling back to `X402_DEFAULT_GENERATION`.
-  const generation = options?.generation ?? 1;
+  // version. `X402Context.requestPayment` always passes the server's
+  // configured x402Version explicitly.
+  const x402Version = options?.x402Version ?? 1;
   const errorOpt = input.previousError ? { error: input.previousError } : {};
   const required =
-    generation === 2
+    x402Version === 2
       ? encodePaymentRequiredV2(input.accepts, errorOpt)
       : encodePaymentRequiredV1(input.accepts, errorOpt);
   return {
@@ -118,7 +117,7 @@ export function buildX402PaymentRequiredMetadata(
  */
 export async function* x402RequestPayment(
   input: X402RequestPaymentInput,
-  options?: { generation?: X402Generation },
+  options?: { x402Version?: X402Version },
 ): AsyncGenerator<AgentEvent> {
   yield {
     type: 'request-input',
@@ -132,15 +131,15 @@ export async function* x402RequestPayment(
 /**
  * Structured view of a payment message's x402 metadata. `status` reflects
  * the value of `x402.payment.status` on the incoming message; `payload`,
- * `authorization`, and `generation` are populated when the client submitted
+ * `authorization`, and `x402Version` are populated when the client submitted
  * a signed payment (status === `payment-submitted`).
  */
 export interface X402PaymentSubmission {
   status: string;
   payload?: X402PaymentPayload;
   authorization?: X402EvmAuthorization;
-  /** Wire generation of the submitted payload (1 or 2), when present. */
-  generation?: X402Generation;
+  /** The submitted payload's `x402Version` (1 or 2), when present. */
+  x402Version?: X402Version;
 }
 
 /**
@@ -159,13 +158,13 @@ export function parseX402PaymentSubmission(
     | X402PaymentPayload
     | undefined;
   const authorization = extractAuthorization(payload);
-  const generation = payload ? detectGeneration(payload) : undefined;
+  const x402Version = payload ? detectX402Version(payload) : undefined;
 
   return {
     status,
     ...(payload ? { payload } : {}),
     ...(authorization ? { authorization } : {}),
-    ...(generation ? { generation } : {}),
+    ...(x402Version ? { x402Version } : {}),
   };
 }
 

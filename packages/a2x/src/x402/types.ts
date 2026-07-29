@@ -1,30 +1,30 @@
 /**
- * a2a-x402 type definitions — dual generation (x402 V1 and V2).
+ * a2a-x402 type definitions — dual-version (x402 V1 and V2).
  *
- * a2x speaks two generations of the x402 protocol on the wire:
+ * a2x speaks two versions of the x402 protocol on the wire:
  *
  *  - **V1** (`x402Version: 1`) — bare network names (`"base-sepolia"`),
  *    `maxAmountRequired`, and `resource`/`description`/`mimeType` inline in
- *    each requirement. This is the generation a2a-x402 v0.2 pinned to.
+ *    each requirement. This is the version a2a-x402 v0.2 pinned to.
  *  - **V2** (`x402Version: 2`) — CAIP-2 network ids (`"eip155:84532"`),
  *    `amount`, a hoisted top-level `resource` object, and a `PaymentPayload`
  *    that echoes the chosen requirement under `accepted`. This is the
- *    generation the x402 Foundation A2A transport defines.
+ *    version the x402 Foundation A2A transport defines.
  *
  * The wire shapes are defined locally (not imported from a signing package)
  * so this type surface stays stable regardless of which optional peer
- * (`@x402/core` / `@x402/evm`) is installed, and so the two generations can
+ * (`@x402/core` / `@x402/evm`) is installed, and so the two versions can
  * be modelled as an explicit discriminated union keyed on `x402Version`.
  *
  * The five `x402.payment.*` metadata keys, the payment status lifecycle, and
- * the EIP-3009 signing typed-data are identical across both generations —
+ * the EIP-3009 signing typed-data are identical across both protocol versions —
  * only the requirements/payload envelopes differ.
  */
 
 /**
  * Blockchain network identifier. V1 uses bare names (`"base-sepolia"`),
  * V2 uses CAIP-2 (`"eip155:84532"`). Typed permissively so callers may
- * supply either; the wire codecs normalize to the generation being emitted.
+ * supply either; the wire codecs normalize to the version being emitted.
  */
 export type X402Network =
   | 'base'
@@ -48,7 +48,7 @@ export interface X402EvmAuthorization {
   nonce: string;
 }
 
-/** Inner signed payload for the `exact` EVM scheme — same shape in both generations. */
+/** Inner signed payload for the `exact` EVM scheme — same shape in both protocol versions. */
 export interface X402ExactEvmPayload {
   signature: string;
   authorization: X402EvmAuthorization;
@@ -135,30 +135,30 @@ export interface X402PaymentPayloadV2 {
   extensions?: Record<string, unknown>;
 }
 
-// ─── Generation unions ───
+// ─── Version unions ───
 
 /**
- * A payment option in either generation. Discriminate by presence of
+ * A payment option in either version. Discriminate by presence of
  * `maxAmountRequired` (V1) vs `amount` (V2), or read fields through the
- * generation-agnostic accessors in `generations.ts`.
+ * version-agnostic accessors in `versions.ts`.
  */
 export type X402PaymentRequirements =
   | X402PaymentRequirementsV1
   | X402PaymentRequirementsV2;
 
-/** The `payment-required` payload in either generation. Discriminate on `x402Version`. */
+/** The `payment-required` payload in either version. Discriminate on `x402Version`. */
 export type X402PaymentRequiredResponse =
   | X402PaymentRequiredResponseV1
   | X402PaymentRequiredResponseV2;
 
-/** The signed `PaymentPayload` in either generation. Discriminate on `x402Version`. */
+/** The signed `PaymentPayload` in either version. Discriminate on `x402Version`. */
 export type X402PaymentPayload = X402PaymentPayloadV1 | X402PaymentPayloadV2;
 
 // ─── Facilitator responses ───
 
 /**
  * Facilitator `verify` result. `isValid`/`invalidReason` are shared across
- * both generations; the extra fields are passed through untouched.
+ * both protocol versions; the extra fields are passed through untouched.
  */
 export interface X402VerifyResponse {
   isValid: boolean;
@@ -186,7 +186,7 @@ export interface X402FacilitatorSettleResponse {
 
 /**
  * Settlement receipt attached to `message.metadata['x402.payment.receipts']`
- * on the task's final message. Generation-invariant.
+ * on the task's final message. Version-invariant.
  */
 export interface X402SettleResponse {
   success: boolean;
@@ -214,7 +214,7 @@ export interface X402SettleResponse {
  * `HTTPFacilitatorClient` (and x402 v1's `useFacilitator()`), abstracted so
  * callers can plug in a different backend (mock facilitator in tests, a
  * custom routing proxy, a different vendor). The facilitator is handed the
- * raw wire payload and the requirement of whichever generation the task
+ * raw wire payload and the requirement of whichever version the task
  * negotiated; both `HTTPFacilitatorClient` and the reference facilitators
  * dispatch on `x402Version` internally.
  */
@@ -235,7 +235,7 @@ export interface X402Facilitator {
  * everything else the spec demands (scheme, mime type, timeout, extra).
  *
  * `network` may be a bare name (`"base-sepolia"`) or CAIP-2
- * (`"eip155:84532"`); the wire codec normalizes it to the generation being
+ * (`"eip155:84532"`); the wire codec normalizes it to the version being
  * emitted, so agents configure it once and it works under both V1 and V2.
  *
  * `resource` and `description` are required: strict facilitators reject

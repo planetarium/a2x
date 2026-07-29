@@ -50,7 +50,7 @@ import {
   X402_METADATA_KEYS,
   X402_PAYMENT_STATUS,
 } from '../x402/constants.js';
-import { requirementAmount } from '../x402/generations.js';
+import { requirementAmount } from '../x402/versions.js';
 import { isEvmNetwork } from '../x402/networks.js';
 import {
   signX402Payment,
@@ -74,7 +74,7 @@ import type {
  * `accepts[]` requirements and resubmits with the signed payload, then
  * surfaces only the final task to the caller.
  *
- * The client signs whichever generation the agent emits — see
+ * The client signs whichever version the agent emits — see
  * `specification/x402-transport-a2a-v1.md` and `-v2.md`.
  */
 export interface A2XClientX402Options {
@@ -251,8 +251,8 @@ export class A2XClient {
     if (this._x402 && !this._extensions.has(X402_EXTENSION_URI)) {
       // Spec a2a-x402 v0.2 §8: clients MUST activate the extension via
       // `X-A2A-Extensions`. Auto-register so callers don't have to — but only
-      // when the caller didn't already register it explicitly, so a
-      // deliberate V1 pin is not later dropped by the card-based upgrade.
+      // when the caller didn't already register it explicitly, so a deliberate
+      // V1-only declaration is not later dropped by the card-based upgrade.
       this._extensions.add(X402_EXTENSION_URI);
       this._x402UriAutoSeeded = true;
     }
@@ -710,22 +710,21 @@ export class A2XClient {
   }
 
   /**
-   * Pick the x402 generation to activate from the resolved AgentCard. The
-   * constructor seeds the legacy v0.2 (V1) URI as a backward-compatible
-   * baseline; if the card advertises the V2 URI, upgrade to it (activating a
-   * single generation URI). Signing dispatches on the generation of the
-   * envelope actually received, so a server that ignores the header is still
-   * handled correctly.
+   * Pick the x402 URI to activate from the resolved AgentCard. The
+   * constructor seeds the legacy v0.2 URI as a backward-compatible baseline;
+   * if the card advertises the foundation URI, upgrade to it. Signing
+   * dispatches on the version of the envelope actually received, so the
+   * activated URI never constrains what this client can decode.
    */
   private _activateX402Extension(): void {
     if (!this._x402) return;
-    // A caller-registered v0.2 URI is an explicit V1 pin, so leave the
-    // activation set untouched. An a2x server honors that pin even alongside
-    // the foundation URI, but a third-party server need not: the foundation
-    // URI is generation-neutral, so "both activated" is only unambiguous if
-    // the peer shares a2x's pin-wins rule. Sending the pin alone is what makes
-    // it legible to any peer. The x402 activation family means the v0.2 URI
-    // alone still satisfies an agent that requires the foundation URI.
+    // A caller-registered v0.2 URI is an explicit "this client decodes V1
+    // only" declaration, so leave the activation set untouched. A V1 server
+    // serves it; a V2 server fails it fast with `invalid_x402_version`
+    // instead of emitting envelopes the caller said it cannot parse.
+    // Sending the v0.2 URI alone (not alongside the foundation URI) is what
+    // keeps the declaration legible to any peer. The x402 activation family
+    // means it still satisfies an agent that requires the foundation URI.
     if (!this._x402UriAutoSeeded) return;
     const card = this._resolved?.card as
       | { capabilities?: { extensions?: Array<{ uri?: string }> } }
@@ -844,7 +843,7 @@ function isWithinBudget(
   maxAmount: bigint,
 ): boolean {
   try {
-    // Read through the generation-agnostic accessor: V2 requirements carry
+    // Read through the version-agnostic accessor: V2 requirements carry
     // `amount`, not `maxAmountRequired` — reading the V1 field directly would
     // throw here and the catch below would silently disable the budget cap.
     return BigInt(requirementAmount(requirement)) <= maxAmount;
