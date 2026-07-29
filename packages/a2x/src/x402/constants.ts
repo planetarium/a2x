@@ -28,6 +28,11 @@
  *
  * Retained for the transition window; new deployments should advertise
  * `X402_FOUNDATION_EXTENSION_URI` instead.
+ *
+ * @deprecated as an AgentCard-advertised URI — advertise
+ * `X402_FOUNDATION_EXTENSION_URI` instead. Registering it from a client to
+ * pin the V1 wire generation (`extensions: [X402_EXTENSION_URI]`) remains
+ * supported and is the documented way for a V1-only client to opt out of V2.
  */
 export const X402_EXTENSION_URI =
   'https://github.com/google-agentic-commerce/a2a-x402/blob/main/spec/v0.2';

@@ -247,6 +247,54 @@ describe('DefaultRequestHandler — extension activation enforcement (spec §3.1
     expect(result.error!.code).toBe(-32600);
   });
 
+  // The card shape the samples ship: the foundation URI alone, required. A
+  // legacy v0.2-only client must still pass via the activation family.
+  function buildFoundationOnlyHandler(): DefaultRequestHandler {
+    const agent = new EchoAgent();
+    const runner = new InMemoryRunner({ agent, appName: 'test' });
+    const executor = new AgentExecutor({
+      runner,
+      runConfig: { streamingMode: StreamingMode.SSE },
+    });
+    const a2x = new A2XServer({
+      taskStore: new InMemoryTaskStore(),
+      executor,
+      protocolVersion: '0.3',
+    })
+      .setName('x')
+      .setDescription('x')
+      .setDefaultUrl('https://example.com/a2a')
+      .addExtension({ uri: X402_FOUNDATION_EXTENSION_URI, required: true });
+    return new DefaultRequestHandler(a2x);
+  }
+
+  it('accepts a client activating the foundation URI against a foundation-only agent', async () => {
+    const handler = buildFoundationOnlyHandler();
+    const result = (await handler.handle(sendBody, {
+      headers: { 'x-a2a-extensions': X402_FOUNDATION_EXTENSION_URI },
+    })) as { result?: unknown; error?: unknown };
+    expect(result.error).toBeUndefined();
+    expect(result.result).toBeDefined();
+  });
+
+  it('accepts a legacy client (activates only the v0.2 URI) against a foundation-only agent', async () => {
+    const handler = buildFoundationOnlyHandler();
+    const result = (await handler.handle(sendBody, {
+      headers: { 'x-a2a-extensions': X402_EXTENSION_URI },
+    })) as { result?: unknown; error?: unknown };
+    expect(result.error).toBeUndefined();
+    expect(result.result).toBeDefined();
+  });
+
+  it('rejects a foundation-only agent when no x402 URI is activated', async () => {
+    const handler = buildFoundationOnlyHandler();
+    const result = (await handler.handle(sendBody, { headers: {} })) as {
+      error?: { code: number };
+    };
+    expect(result.error).toBeDefined();
+    expect(result.error!.code).toBe(-32600);
+  });
+
   it('accepts the request when required=false even without the header', async () => {
     const handler = buildHandler(false);
     const result = (await handler.handle(sendBody, { headers: {} })) as {

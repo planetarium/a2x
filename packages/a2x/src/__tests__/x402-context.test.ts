@@ -18,6 +18,7 @@ import {
   InMemoryX402Store,
   X402Context,
   type X402StoreEntry,
+  type X402ValidClassification,
 } from '../x402/index.js';
 import type {
   X402Accept,
@@ -394,6 +395,40 @@ describe('X402Context.verify and X402Context.settle', () => {
     expect(entry?.receipt?.transaction).toBe('0xtx');
     expect(entry?.receipt?.payer).toBe('0x1234567890123456789012345678901234567890');
     expect(entry?.receipt?.settledAt).toBeInstanceOf(Date);
+  });
+
+  it('settle falls back to the requirement network for a V2 payload with no accepted echo', async () => {
+    // `accepted` is required by the V2 type, but a wire peer can omit it at
+    // runtime; the receipt must then name the network from the matched
+    // requirement instead of ''.
+    const ctx = new X402Context({ facilitator: makeMockFacilitator() });
+    const payload = {
+      x402Version: 2,
+      payload: {
+        signature: '0xabc',
+        authorization: {
+          from: '0x1234567890123456789012345678901234567890',
+          to: ACCEPT.payTo,
+          value: '10000',
+          validAfter: '0',
+          validBefore: '9999999999',
+          nonce: '0xnonce',
+        },
+      },
+    } as unknown as X402PaymentPayload;
+    const classified: X402ValidClassification = {
+      kind: 'valid',
+      submission: { status: X402_PAYMENT_STATUS.SUBMITTED, payload, generation: 2 },
+      requirement: {
+        scheme: 'exact',
+        network: 'eip155:84532',
+        asset: ACCEPT.asset,
+        amount: ACCEPT.amount,
+        payTo: ACCEPT.payTo,
+      },
+    };
+    const receipt = await ctx.settle({}, classified);
+    expect(receipt.network).toBe('eip155:84532');
   });
 
   it('settle records failure with point=settle when facilitator returns success=false', async () => {
