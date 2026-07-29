@@ -569,7 +569,7 @@ export abstract class BaseX402Context {
       return {
         success: false,
         transaction: '',
-        network: payloadNetwork(payload),
+        network: payloadNetwork(payload) || classified.requirement.network,
         ...(classified.submission.authorization?.from
           ? { payer: classified.submission.authorization.from }
           : {}),
@@ -582,8 +582,11 @@ export abstract class BaseX402Context {
     const receipt: X402SettleResponse = {
       success: raw.success,
       transaction: raw.transaction ?? '',
-      // V1 carries `network` top-level; V2 reads it from `accepted`.
-      network: payloadNetwork(payload),
+      // V1 carries `network` top-level; V2 reads it from `accepted`. A V2
+      // payload with no `accepted` echo cannot name a network, so fall back
+      // to the matched requirement — already encoded for the offered
+      // generation by `classify`, hence in the right per-generation form.
+      network: payloadNetwork(payload) || classified.requirement.network,
       // Omit `payer` when neither the authorization nor the facilitator
       // supplies it — never fabricate a placeholder address.
       ...(payer ? { payer } : {}),

@@ -111,6 +111,9 @@ export function payloadCommitment(
 /**
  * Network the payment settled/authorized on, read from the payload for
  * receipt construction. V1 has it top-level; V2 reads it from `accepted`.
+ * Returns `''` when the payload cannot name one (a V2 payload with no
+ * `accepted` echo) — callers holding the matched requirement should fall
+ * back to `requirement.network`.
  */
 export function payloadNetwork(payload: X402PaymentPayload): string {
   return payloadCommitment(payload)?.network ?? '';
