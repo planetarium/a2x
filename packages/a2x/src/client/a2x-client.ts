@@ -50,7 +50,7 @@ import {
   X402_METADATA_KEYS,
   X402_PAYMENT_STATUS,
 } from '../x402/constants.js';
-import { requirementAmount } from '../x402/generations.js';
+import { requirementAmount } from '../x402/versions.js';
 import { isEvmNetwork } from '../x402/networks.js';
 import {
   signX402Payment,
@@ -74,7 +74,7 @@ import type {
  * `accepts[]` requirements and resubmits with the signed payload, then
  * surfaces only the final task to the caller.
  *
- * The client signs whichever generation the agent emits — see
+ * The client signs whichever version the agent emits — see
  * `specification/x402-transport-a2a-v1.md` and `-v2.md`.
  */
 export interface A2XClientX402Options {
@@ -713,7 +713,7 @@ export class A2XClient {
    * Pick the x402 URI to activate from the resolved AgentCard. The
    * constructor seeds the legacy v0.2 URI as a backward-compatible baseline;
    * if the card advertises the foundation URI, upgrade to it. Signing
-   * dispatches on the generation of the envelope actually received, so the
+   * dispatches on the version of the envelope actually received, so the
    * activated URI never constrains what this client can decode.
    */
   private _activateX402Extension(): void {
@@ -843,7 +843,7 @@ function isWithinBudget(
   maxAmount: bigint,
 ): boolean {
   try {
-    // Read through the generation-agnostic accessor: V2 requirements carry
+    // Read through the version-agnostic accessor: V2 requirements carry
     // `amount`, not `maxAmountRequired` — reading the V1 field directly would
     // throw here and the catch below would silently disable the budget cap.
     return BigInt(requirementAmount(requirement)) <= maxAmount;

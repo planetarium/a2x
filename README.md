@@ -37,7 +37,7 @@ npm install @a2x/sdk
 - **Framework-agnostic** — Works with Express, Fastify, Hono, Next.js, or any HTTP framework.
 - **SSE streaming** — First-class support for `message/stream` via Server-Sent Events.
 - **Multi-modal artifacts** — Agents can yield `text`, `file`, and `data` `AgentEvent`s; the default executor maps each to a `TextPart` / `FilePart` / `DataPart` artifact on the wire.
-- **x402 payments** — Charge per call with on-chain cryptocurrency payments — declared inline in `agent.run()` via the `request-input` AgentEvent. Optional `@a2x/sdk/x402` subpath. Supports both x402 protocol generations (legacy V1 and the [x402 Foundation](https://github.com/x402-foundation/x402) V2 transport) — each deployment speaks one, V1 by default, V2 via `new X402Context({ generation: 2 })`.
+- **x402 payments** — Charge per call with on-chain cryptocurrency payments — declared inline in `agent.run()` via the `request-input` AgentEvent. Optional `@a2x/sdk/x402` subpath. Supports both x402 protocol versions (legacy V1 and the [x402 Foundation](https://github.com/x402-foundation/x402) V2 transport) — each deployment speaks one, V1 by default, V2 via `new X402Context({ x402Version: 2 })`.
 - **Zero runtime dependencies** — Core module uses only Node.js built-in APIs.
 - **TypeScript-first** — Full type safety with types derived directly from A2A JSON Schema and proto definitions.
 

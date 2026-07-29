@@ -1,6 +1,6 @@
 # nextjs-x402 sample
 
-An [A2A](https://a2a-protocol.org) agent built with Next.js and `@a2x/sdk` where every call is paywalled using x402. The agent declares the x402 extension once, under the canonical URI the [x402 Foundation](https://github.com/x402-foundation/x402) A2A transport mandates, and **speaks x402 V2** on the wire (`new X402Context({ generation: 2 })`; the SDK default is V1). A legacy client that activates a2x's older v0.2 URI is recognized as the same extension but declares itself V1-only, so this V2 agent refuses it with a clear `invalid_x402_version` failure instead of sending envelopes it cannot decode.
+An [A2A](https://a2a-protocol.org) agent built with Next.js and `@a2x/sdk` where every call is paywalled using x402. The agent declares the x402 extension once, under the canonical URI the [x402 Foundation](https://github.com/x402-foundation/x402) A2A transport mandates, and **speaks x402 V2** on the wire (`new X402Context({ x402Version: 2 })`; the SDK default is V1). A legacy client that activates a2x's older v0.2 URI is recognized as the same extension but declares itself V1-only, so this V2 agent refuses it with a clear `invalid_x402_version` failure instead of sending envelopes it cannot decode.
 
 The agent itself is a trivial echo — the interesting bit is the x402 payment flow:
 

@@ -1,13 +1,13 @@
 /**
- * a2a-x402 protocol constants, shared by both wire generations.
+ * a2a-x402 protocol constants, shared by both wire versions.
  *
  * The x402 Payments Extension bolts HTTP 402 "Payment Required" semantics
  * onto A2A tasks. Clients advertise the extension URI in their AgentCard
  * `capabilities.extensions` array and transport payment state through
  * message metadata using the `x402.payment.*` keys defined below.
  *
- * The `x402.payment.*` keys and the extension URIs below are generation-neutral
- * — see `generations.ts` for the V1/V2 split.
+ * The `x402.payment.*` keys and the extension URIs below are version-neutral
+ * — see `versions.ts` for the V1/V2 split.
  *
  * Spec: specification/x402-transport-a2a-v1.md, -v2.md
  */
@@ -20,7 +20,7 @@
  * envelopes. A V1 server accepts the activation; a V2 server refuses to serve
  * it (see `BaseX402Context.requestPayment`) rather than emit envelopes the
  * client cannot decode — or worse, emit V2 under a URI whose defining spec
- * says V1, which would reproduce the exact URI/generation ambiguity the
+ * says V1, which would reproduce the exact URI/version ambiguity the
  * foundation URI already suffers from.
  *
  * Counterintuitively this is the *newer* extension spec of the two URIs here:
@@ -50,10 +50,10 @@ export const X402_EXTENSION_URI =
  * `spec/v0.1/spec.md` of the a2a-x402 extension repo, and by the foundation's
  * `transports-v2/a2a.md` (and its V1 predecessor) verbatim.
  *
- * IMPORTANT: this URI is **generation-neutral** — the foundation V1 *and* V2
- * transport docs declare the *same* URI, so the generation is signalled by
+ * IMPORTANT: this URI is **version-neutral** — the foundation V1 *and* V2
+ * transport docs declare the *same* URI, so the version is signalled by
  * `x402Version` *inside* the envelope, not by the URI. The `v0.1` in the path
- * is the *extension spec's* version, not the x402 protocol generation.
+ * is the *extension spec's* version, not the x402 protocol version.
  *
  * Note this is the *older* of the two extension specs a2x knows: the same
  * upstream repo also ships v0.2, which declares `X402_EXTENSION_URI`. The
@@ -65,10 +65,10 @@ export const X402_EXTENSION_URI =
  * fetchable document (it has no `/tree/` or `/blob/` segment).
  *
  * a2x advertises this as the canonical x402 extension. It is **not** an input
- * to generation selection: activating it is not proof the client speaks V2,
+ * to version selection: activating it is not proof the client speaks V2,
  * only that it speaks x402-on-A2A. Because no activation URI can express a
- * generation, an a2x server does not negotiate one — it emits the single
- * generation its deployment configured (`X402ContextOptions.generation`),
+ * version, an a2x server does not negotiate one — it emits the single
+ * x402 protocol version its deployment configured (`X402ContextOptions.x402Version`),
  * which is how every other known implementation behaves too (the upstream
  * `x402_a2a` reference lineage is V1-only, Bindu is V2-only; both activate
  * this same URI).

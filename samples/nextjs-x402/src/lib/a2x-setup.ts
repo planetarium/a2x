@@ -93,7 +93,7 @@ class EchoAgent extends BaseAgent {
       // This deployment speaks x402 V2 (the SDK default is V1). A V1-only
       // client that activates the legacy v0.2 URI is refused with a clear
       // invalid_x402_version failure instead of receiving V2 it can't parse.
-      generation: 2,
+      x402Version: 2,
   });
   }
 

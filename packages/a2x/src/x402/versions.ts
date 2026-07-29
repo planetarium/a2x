@@ -1,13 +1,13 @@
 /**
- * x402 generation model — the seam between a2x's generation-agnostic logic
- * and the two wire generations (V1 / V2).
+ * x402 protocol-version model — the seam between a2x's version-agnostic logic
+ * and the two wire versions (V1 / V2).
  *
  * a2x's server/client logic (matching, validation, budget, receipts) is
- * written once against generation-agnostic accessors; the only places that
- * know about a specific generation's envelope are the wire codecs
+ * written once against version-agnostic accessors; the only places that
+ * know about a specific version's envelope are the wire codecs
  * (`wire-v1.ts` / `wire-v2.ts`) and these accessors. Detection is total:
  * both `payment-required` and `payment-payload` envelopes carry
- * `x402Version`, so any object can be classified as generation 1 or 2.
+ * `x402Version`, so any object can be classified as x402Version 1 or 2.
  */
 
 import { sameNetwork } from './networks.js';
@@ -18,50 +18,50 @@ import type {
   X402PaymentRequirementsV2,
 } from './types.js';
 
-/** The two x402 protocol generations a2x speaks on the wire. */
-export type X402Generation = 1 | 2;
+/** The two x402 protocol versions a2x speaks on the wire. */
+export type X402Version = 1 | 2;
 
-/** Generations this SDK can emit, sign, and settle. */
-export const X402_SUPPORTED_VERSIONS: readonly X402Generation[] = [1, 2];
+/** Protocol versions this SDK can emit, sign, and settle. */
+export const X402_SUPPORTED_VERSIONS: readonly X402Version[] = [1, 2];
 
 /**
- * Generation `X402Context` speaks when the deployment doesn't configure one.
+ * Version `X402Context` speaks when the deployment doesn't configure one.
  *
- * A server emits exactly one generation — its configured
- * `X402ContextOptions.generation` — because the activation channel cannot
- * express a generation request: the foundation URI is generation-neutral and
+ * A server emits exactly one version — its configured
+ * `X402ContextOptions.x402Version` — because the activation channel cannot
+ * express a version request: the foundation URI is version-neutral and
  * there is no URI that means "send me V2". Every known peer implementation is
- * likewise single-generation (the upstream `x402_a2a` reference lineage
+ * likewise single-version (the upstream `x402_a2a` reference lineage
  * speaks V1 only, Bindu speaks V2 only), so per-request negotiation has
  * nothing to negotiate with.
  *
  * **V1** by default: it is what the upstream reference library and its
  * derivatives decode, and handing V2 to a peer that never proved it speaks V2
  * would be a silent wire break. A deployment whose clients speak V2 opts in
- * with `new X402Context({ generation: 2 })` (and advertises the foundation
+ * with `new X402Context({ x402Version: 2 })` (and advertises the foundation
  * URI on its card).
  */
-export const X402_DEFAULT_GENERATION: X402Generation = 1;
+export const X402_DEFAULT_VERSION: X402Version = 1;
 
-/** True when `version` is a generation this SDK supports. */
-export function isSupportedVersion(version: unknown): version is X402Generation {
+/** True when `version` is an x402Version this SDK supports. */
+export function isSupportedVersion(version: unknown): version is X402Version {
   return version === 1 || version === 2;
 }
 
 /**
  * Classify a `payment-required` / `payment-payload` envelope (or a bare
- * `x402Version`) by generation. Returns `undefined` for anything that is
- * not a supported generation, so callers can reject with the spec's
+ * `x402Version`) by x402Version. Returns `undefined` for anything that is
+ * not a supported version, so callers can reject with the spec's
  * `invalid_x402_version` code.
  */
-export function detectGeneration(
+export function detectX402Version(
   input: { x402Version?: unknown } | number | undefined,
-): X402Generation | undefined {
+): X402Version | undefined {
   const version = typeof input === 'number' ? input : input?.x402Version;
   return isSupportedVersion(version) ? version : undefined;
 }
 
-// ─── Generation-agnostic requirement accessors ───
+// ─── Version-agnostic requirement accessors ───
 
 function isV2Requirement(
   req: X402PaymentRequirements,
@@ -69,7 +69,7 @@ function isV2Requirement(
   return typeof (req as X402PaymentRequirementsV2).amount === 'string';
 }
 
-/** Maximum payable amount, whichever generation the requirement is in. */
+/** Maximum payable amount, whichever version the requirement is in. */
 export function requirementAmount(req: X402PaymentRequirements): string {
   return isV2Requirement(req)
     ? req.amount
@@ -91,7 +91,7 @@ export function requirementPayTo(req: X402PaymentRequirements): string {
   return req.payTo;
 }
 
-// ─── Generation-agnostic payload accessors ───
+// ─── Version-agnostic payload accessors ───
 
 /**
  * The requirement the client committed to when signing: V1 carries
@@ -125,7 +125,7 @@ export function payloadNetwork(payload: X402PaymentPayload): string {
 
 /**
  * True when a payment payload matches an offered requirement — same scheme
- * and same network (cross-generation network equivalence applied, so a V1
+ * and same network (cross-version network equivalence applied, so a V1
  * bare name and a V2 CAIP-2 id for the same chain match).
  */
 export function payloadMatchesRequirement(

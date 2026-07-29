@@ -91,10 +91,10 @@ import {
 } from './constants.js';
 import { resolveFacilitator, type FacilitatorUrlConfig } from './facilitator.js';
 import {
-  X402_DEFAULT_GENERATION,
+  X402_DEFAULT_VERSION,
   payloadNetwork,
-  type X402Generation,
-} from './generations.js';
+  type X402Version,
+} from './versions.js';
 import {
   buildX402PaymentCompletedMetadata,
   buildX402PaymentFailedMetadata,
@@ -141,19 +141,22 @@ export interface X402ContextOptions {
    */
   facilitator?: X402Facilitator | FacilitatorUrlConfig;
   /**
-   * The single wire generation this server speaks. Defaults to V1 — the
-   * generation the upstream `x402_a2a` reference lineage decodes; deployments
-   * whose clients speak V2 (the x402 Foundation `transports-v2` wire) opt in
-   * with `2`.
+   * The single x402 protocol version this server speaks, emitted verbatim as
+   * the envelopes' `x402Version` field. Defaults to `1` — the version the
+   * upstream `x402_a2a` reference lineage decodes; deployments whose clients
+   * speak V2 (the x402 Foundation `transports-v2` wire) opt in with `2`.
    *
-   * This is a deployment-level declaration, not a negotiation default: the
-   * activation channel has no way to request a generation (the foundation URI
-   * is generation-neutral), so the server emits exactly this generation. The
-   * one activation signal that exists is the legacy v0.2 URI, which declares
-   * a V1-only client — a `generation: 2` server refuses to serve it (see
-   * `requestPayment`) instead of emitting envelopes it cannot decode.
+   * Not to be confused with the *extension spec* versions (v0.1 / v0.2) in
+   * the activation URIs — those version the A2A-layer extension document,
+   * not the envelope. This is a deployment-level declaration, not a
+   * negotiation default: the activation channel has no way to request a
+   * version (the foundation URI is version-neutral), so the server emits
+   * exactly this version. The one activation signal that exists is the
+   * legacy v0.2 URI, which declares a V1-only client — an `x402Version: 2`
+   * server refuses to serve it (see `requestPayment`) instead of emitting
+   * envelopes it cannot decode.
    */
-  generation?: X402Generation;
+  x402Version?: X402Version;
 }
 
 // ─── requestPayment input ───
@@ -265,11 +268,11 @@ export abstract class BaseX402Context {
   abstract readonly facilitator: X402Facilitator;
 
   /**
-   * The single wire generation this server speaks. Overridable by
+   * The single x402 protocol version this server speaks. Overridable by
    * subclasses / `X402Context` options. Defaults to
-   * `X402_DEFAULT_GENERATION` (**V1** — see its rationale).
+   * `X402_DEFAULT_VERSION` (**1** — see its rationale).
    */
-  generation: X402Generation = X402_DEFAULT_GENERATION;
+  x402Version: X402Version = X402_DEFAULT_VERSION;
 
   /**
    * Persist the offering with status `'offered'` and yield the spec's
@@ -295,34 +298,34 @@ export abstract class BaseX402Context {
     // A client that activated the legacy v0.2 URI has declared itself
     // V1-only: spec v0.2 defines V1-shaped wire structures exclusively, and
     // no document pairs that URI with V2 envelopes. A V2 server therefore
-    // fails such a client fast — with a decodable, generation-neutral error —
-    // rather than emit V2 it cannot parse, or downgrade to a generation this
+    // fails such a client fast — with a decodable, version-neutral error —
+    // rather than emit V2 it cannot parse, or downgrade to a version this
     // deployment did not configure (A2A extensions: an agent "MUST NOT fall
     // back to a different version").
     if (
-      this.generation === 2 &&
+      this.x402Version === 2 &&
       ctx.activatedExtensions?.includes(X402_EXTENSION_URI)
     ) {
       yield this.failedEvent({
         code: X402_ERROR_CODES.INVALID_X402_VERSION,
         reason:
-          `This agent speaks x402 generation 2, but the activated extension ${X402_EXTENSION_URI} ` +
+          `This agent speaks x402Version 2, but the activated extension ${X402_EXTENSION_URI} ` +
           `declares a V1-only client. If this client decodes V2 envelopes, activate ` +
           `${X402_FOUNDATION_EXTENSION_URI} instead.`,
       });
       return;
     }
-    const generation = this.generation;
+    const x402Version = this.x402Version;
     // Encode up-front so a misconfigured offering (e.g. a CAIP-2 network with
     // no V1 bare-name mapping under a V1 offer) throws a clean configuration
     // error here — before we persist an entry that would then be unusable and
     // make the resume turn's `classify` fail too.
-    const metadata = buildX402PaymentRequiredMetadata(input, { generation });
+    const metadata = buildX402PaymentRequiredMetadata(input, { x402Version });
     const now = new Date();
     const entry: X402StoreEntry = {
       taskId,
       accepts: input.accepts,
-      offeredGeneration: generation,
+      offeredX402Version: x402Version,
       status: 'offered',
       storedAt: now,
       updatedAt: now,
@@ -398,39 +401,39 @@ export abstract class BaseX402Context {
       return result;
     }
 
-    // Reject a submission whose generation is unsupported, or disagrees with
+    // Reject a submission whose x402Version is unsupported, or disagrees with
     // what we offered: an unparseable `x402Version`, or a V1 payload against a
     // V2 offering (or vice versa), can never match and must fail before the
     // facilitator — with the spec's `invalid_x402_version` code, not a
     // misleading network-mismatch.
-    const offeredGeneration = entry.offeredGeneration ?? 1;
+    const offeredX402Version = entry.offeredX402Version ?? 1;
     if (
-      submission.generation === undefined ||
-      submission.generation !== offeredGeneration
+      submission.x402Version === undefined ||
+      submission.x402Version !== offeredX402Version
     ) {
       const submitted =
-        submission.generation ??
+        submission.x402Version ??
         (submission.payload as { x402Version?: unknown }).x402Version;
       const result: X402Classification = {
         kind: 'unmatched',
         submission,
         offering: entry.accepts,
         code: X402_ERROR_CODES.INVALID_X402_VERSION,
-        reason: `Submitted x402Version ${String(submitted)} is unsupported or does not match the offered generation ${offeredGeneration}.`,
+        reason: `Submitted x402Version ${String(submitted)} is unsupported or does not match the offered x402Version ${offeredX402Version}.`,
       };
       await this._recordClassifyOutcome(ctx.taskId, result);
       return result;
     }
 
-    // Normalize the stored offering to the generation it was published under,
-    // so the requirement handed to verify/settle matches the wire generation
-    // of the client's payload. A codec throw (e.g. a CAIP-2 network with no
+    // Normalize the stored offering to the x402Version it was published under,
+    // so the requirement handed to verify/settle matches the wire version of
+    // the client's payload. A codec throw (e.g. a CAIP-2 network with no
     // V1 bare-name mapping) is a server-side configuration error surfaced as a
     // clean failure rather than an unhandled exception from classify.
     let requirements: X402PaymentRequirements[];
     try {
       requirements = entry.accepts.map((a) =>
-        offeredGeneration === 2 ? encodeRequirementV2(a) : encodeRequirementV1(a),
+        offeredX402Version === 2 ? encodeRequirementV2(a) : encodeRequirementV1(a),
       );
     } catch (err) {
       const result: X402Classification = {
@@ -438,7 +441,7 @@ export abstract class BaseX402Context {
         submission,
         offering: entry.accepts,
         code: X402_ERROR_CODES.INVALID_PAYLOAD,
-        reason: `Stored offering cannot be encoded for generation ${offeredGeneration}: ${err instanceof Error ? err.message : String(err)}`,
+        reason: `Stored offering cannot be encoded for x402Version ${offeredX402Version}: ${err instanceof Error ? err.message : String(err)}`,
       };
       await this._recordClassifyOutcome(ctx.taskId, result);
       return result;
@@ -583,7 +586,7 @@ export abstract class BaseX402Context {
       // V1 carries `network` top-level; V2 reads it from `accepted`. A V2
       // payload with no `accepted` echo cannot name a network, so fall back
       // to the matched requirement — already encoded for the offered
-      // generation by `classify`, hence in the right per-generation form.
+      // version by `classify`, hence in the right per-version form.
       network: payloadNetwork(payload) || classified.requirement.network,
       // Omit `payer` when neither the authorization nor the facilitator
       // supplies it — never fabricate a placeholder address.
@@ -700,8 +703,8 @@ export class X402Context extends BaseX402Context {
   constructor(options: X402ContextOptions = {}) {
     super();
     this.store = options.store ?? new InMemoryX402Store();
-    if (options.generation !== undefined) {
-      this.generation = options.generation;
+    if (options.x402Version !== undefined) {
+      this.x402Version = options.x402Version;
     }
     const spec = options.facilitator;
     this.facilitator =

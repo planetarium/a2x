@@ -178,8 +178,8 @@ on what the client activated:
 ```ts
 async *run(ctx: InvocationContext) {
   if (ctx.activatedExtensions?.includes(X402_FOUNDATION_EXTENSION_URI)) {
-    // client activated x402 — note this says nothing about the generation:
-    // the foundation URI is generation-neutral. The only generation signal
+    // client activated x402 — note this says nothing about the version:
+    // the foundation URI is version-neutral. The only version signal
     // the channel carries is the legacy v0.2 URI, which declares a V1-only
     // client.
   }
@@ -187,7 +187,7 @@ async *run(ctx: InvocationContext) {
 ```
 
 When you drive `X402Context` yourself, forward the activated set into
-`requestPayment` — a `generation: 2` context uses it to refuse a V1-only
+`requestPayment` — an `x402Version: 2` context uses it to refuse a V1-only
 (v0.2-activated) client with a clean `invalid_x402_version` failure instead of
 emitting envelopes it cannot decode:
 
@@ -198,12 +198,12 @@ yield* x402.requestPayment(
 );
 ```
 
-`new X402Context({ generation })` sets the single wire generation the server
+`new X402Context({ x402Version })` sets the single wire version the server
 speaks; the activation channel cannot request one (the foundation URI is
-generation-neutral), so this is a deployment-level choice, not a per-request
-negotiation. Defaults to `1` — the generation the upstream reference lineage
+version-neutral), so this is a deployment-level choice, not a per-request
+negotiation. Defaults to `1` — the version the upstream reference lineage
 decodes. Set `2` once every client in the deployment speaks V2. See
-[x402 payments](./x402-payments.md) for the full generation model.
+[x402 payments](./x402-payments.md) for the full version model.
 
 ## Serving the handler
 

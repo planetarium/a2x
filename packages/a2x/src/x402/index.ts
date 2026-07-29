@@ -1,13 +1,13 @@
 /**
- * `@a2x/sdk/x402` — a2a-x402 payment support (protocol generations V1 and V2).
+ * `@a2x/sdk/x402` — a2a-x402 payment support (protocol versions V1 and V2).
  *
  * Adds on-chain payment gating to A2A agents using the x402 protocol. Wire
  * formats: `specification/x402-transport-a2a-v1.md` (plus its
  * `specification/a2a-x402-v0.2.md` lineage) for V1, and
- * `specification/x402-transport-a2a-v2.md` for V2. Generation is signalled by
+ * `specification/x402-transport-a2a-v2.md` for V2. Version is signalled by
  * `x402Version` inside the envelope, not by the extension URI. A server
- * speaks exactly one generation — V1 unless the deployment opts into
- * `new X402Context({ generation: 2 })` — and the client signs whatever it
+ * speaks exactly one version — V1 unless the deployment opts into
+ * `new X402Context({ x402Version: 2 })` — and the client signs whatever it
  * receives.
  *
  * The SDK exposes spec mechanics as **stateless helpers**, never as a
@@ -125,7 +125,7 @@
  * Declare the foundation URI, not the legacy `X402_EXTENSION_URI`: it is the
  * URI the foundation transport mandates, and a2x treats the two as an
  * activation family, so a legacy v0.2 client still passes the `required`
- * check on a V1 server. (On a `generation: 2` server a v0.2 activation is
+ * check on a V1 server. (On an `x402Version: 2` server a v0.2 activation is
  * refused at `requestPayment` — that URI declares a V1-only client.)
  *
  * Minimal client setup (unchanged):
@@ -162,8 +162,8 @@ export {
 
 export {
   X402_SUPPORTED_VERSIONS,
-  X402_DEFAULT_GENERATION,
-  detectGeneration,
+  X402_DEFAULT_VERSION,
+  detectX402Version,
   isSupportedVersion,
   requirementAmount,
   requirementNetwork,
@@ -171,8 +171,8 @@ export {
   requirementPayTo,
   payloadNetwork,
   payloadMatchesRequirement,
-  type X402Generation,
-} from './generations.js';
+  type X402Version,
+} from './versions.js';
 
 export type {
   X402Accept,

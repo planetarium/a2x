@@ -1,8 +1,8 @@
 # x402 Payments
 
-Charge per call with on-chain cryptocurrency payments. A2X implements the x402 A2A transport on top of A2A tasks, speaking **both generations** of the x402 protocol on the wire: the legacy V1 envelopes ([a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402/blob/main/spec/v0.2/spec.md)) and the V2 envelopes defined by the [x402 Foundation A2A transport](https://github.com/x402-foundation/x402/blob/main/specs/transports-v2/a2a.md).
+Charge per call with on-chain cryptocurrency payments. A2X implements the x402 A2A transport on top of A2A tasks, speaking **both versions** of the x402 protocol on the wire: the legacy V1 envelopes ([a2a-x402 v0.2](https://github.com/google-agentic-commerce/a2a-x402/blob/main/spec/v0.2/spec.md)) and the V2 envelopes defined by the [x402 Foundation A2A transport](https://github.com/x402-foundation/x402/blob/main/specs/transports-v2/a2a.md).
 
-The flow: the merchant agent responds to an unpaid request with `input-required` + `x402.payment.required`. The client signs a `PaymentPayload` with its wallet and resubmits the same task. The merchant validates the payload, verifies it via an x402 **facilitator**, settles on-chain, and attaches the settlement receipt to the completed task. This flow is identical across generations — only the JSON envelope shapes differ (see [Protocol generations](#protocol-generations-v1--v2)).
+The flow: the merchant agent responds to an unpaid request with `input-required` + `x402.payment.required`. The client signs a `PaymentPayload` with its wallet and resubmits the same task. The merchant validates the payload, verifies it via an x402 **facilitator**, settles on-chain, and attaches the settlement receipt to the completed task. This flow is identical across versions — only the JSON envelope shapes differ (see [Protocol versions](#protocol-versions-v1--v2)).
 
 > **What changed in this release.** The SDK no longer ships a payment *flow* — only stateless helpers. The agent owns when to request payment, what was offered, how to validate the submission, whether to retry, and what to do between `verify` and `settle`. The previous `x402PaymentHook` / `inputRoundTripHooks` API is removed; see [Migrating from X402PaymentExecutor / x402PaymentHook](./migration-x402-v2.md) for the migration steps.
 
@@ -26,24 +26,24 @@ moved from `x402` to `@x402/core` + `@x402/evm`.
 
 The failed load isn't cached, so a long-running server recovers on the next attempt once the peers are installed — no restart needed.
 
-## Protocol generations (V1 / V2)
+## Protocol versions (V1 / V2)
 
-The two wire generations differ only in envelope shape:
+The two wire versions differ only in envelope shape:
 
 - **V1** (`x402Version: 1`) — bare network names (`base-sepolia`), `maxAmountRequired`, `resource`/`description`/`mimeType` inline.
 - **V2** (`x402Version: 2`) — CAIP-2 networks (`eip155:84532`), `amount`, a hoisted top-level `resource` object, and a `PaymentPayload` that echoes the chosen requirement under `accepted`.
 
-The five `x402.payment.*` metadata keys, the payment status lifecycle, and the EIP-3009 signing typed-data are identical across generations.
+The five `x402.payment.*` metadata keys, the payment status lifecycle, and the EIP-3009 signing typed-data are identical across versions.
 
-> **Generation is signalled by `x402Version` in the envelope, not by the extension URI.** The URI the foundation transport mandates (`X402_FOUNDATION_EXTENSION_URI`, `github.com/google-a2a/a2a-x402/v0.1`) is **generation-neutral** — the foundation's V1 and V2 transport docs declare the *same* URI, and the `v0.1` there is the *extension spec's* version, not the x402 protocol generation. There is no URI that means "send me V2", so a generation cannot be requested over the activation channel at all.
+> **Version is signalled by `x402Version` in the envelope, not by the extension URI.** The URI the foundation transport mandates (`X402_FOUNDATION_EXTENSION_URI`, `github.com/google-a2a/a2a-x402/v0.1`) is **version-neutral** — the foundation's V1 and V2 transport docs declare the *same* URI, and the `v0.1` there is the *extension spec's* version, not the x402 protocol version. There is no URI that means "send me V2", so a version cannot be requested over the activation channel at all.
 >
-> The two URIs a2x knows are the two spec versions of one upstream extension (`google-agentic-commerce/a2a-x402`; the `google-a2a` path redirects there). v0.1 declares the URI above; v0.2 declares `X402_EXTENSION_URI`. A2A mandates a new URI per breaking version, so they are distinct identifiers rather than aliases — but the foundation transport standardized on v0.1, so **a2x advertises the older extension spec while emitting the newer wire generation**. That reads backwards and is intentional. Neither URI is registered in A2A's official `a2a-protocol.org/extensions/` namespace.
+> The two URIs a2x knows are the two spec versions of one upstream extension (`google-agentic-commerce/a2a-x402`; the `google-a2a` path redirects there). v0.1 declares the URI above; v0.2 declares `X402_EXTENSION_URI`. A2A mandates a new URI per breaking version, so they are distinct identifiers rather than aliases — but the foundation transport standardized on v0.1, so **a2x advertises the older extension spec while emitting the newer wire version**. That reads backwards and is intentional. Neither URI is registered in A2A's official `a2a-protocol.org/extensions/` namespace.
 
-**A server speaks exactly one generation.** Because no activation URI can express a generation, a2x does not negotiate one per request — the server emits its configured `generation` (**V1** by default — the generation the upstream `x402_a2a` reference lineage decodes) and the **client signs whatever generation it receives**. This matches how every other known implementation behaves: deployed x402-over-A2A peers are all single-generation (the reference-library lineage is V1-only, [Bindu](https://github.com/GetBindu/Bindu) is V2-only), so the generation is a property of the deployment, not of the round-trip.
+**A server speaks exactly one version.** Because no activation URI can express a version, a2x does not negotiate one per request — the server emits its configured `x402Version` (**V1** by default — the version the upstream `x402_a2a` reference lineage decodes) and the **client signs whatever version it receives**. This matches how every other known implementation behaves: deployed x402-over-A2A peers are all single-version (the reference-library lineage is V1-only, [Bindu](https://github.com/GetBindu/Bindu) is V2-only), so the version is a property of the deployment, not of the round-trip.
 
-So **out of the box a2x↔a2x runs V1.** To run V2, the server opts in: `new X402Context({ generation: 2 })` **and** advertise `X402_FOUNDATION_EXTENSION_URI` on its AgentCard.
+So **out of the box a2x↔a2x runs V1.** To run V2, the server opts in: `new X402Context({ x402Version: 2 })` **and** advertise `X402_FOUNDATION_EXTENSION_URI` on its AgentCard.
 
-The one generation signal the activation channel does carry is the legacy v0.2 URI: its defining spec pairs it exclusively with V1 wire structures, so activating it declares a **V1-only client**. A V1 server serves it normally. A V2 server **refuses it fast** — `requestPayment` yields a `payment-failed` event with `invalid_x402_version` (in generation-neutral metadata the client can decode) instead of emitting V2 envelopes the client said it cannot parse. Per A2A's extension rules an agent must not silently fall back to a different version, and a2x doesn't: a deployment that needs to serve both populations runs a V1 endpoint and a V2 endpoint.
+The one version signal the activation channel does carry is the legacy v0.2 URI: its defining spec pairs it exclusively with V1 wire structures, so activating it declares a **V1-only client**. A V1 server serves it normally. A V2 server **refuses it fast** — `requestPayment` yields a `payment-failed` event with `invalid_x402_version` (in version-neutral metadata the client can decode) instead of emitting V2 envelopes the client said it cannot parse. Per A2A's extension rules an agent must not silently fall back to a different version, and a2x doesn't: a deployment that needs to serve both populations runs a V1 endpoint and a V2 endpoint.
 
 To declare V1-only from an a2x client (e.g. tooling built against V1 envelopes), register the URI yourself:
 
@@ -165,14 +165,14 @@ const agent = new A2XServer({ taskStore: new InMemoryTaskStore(), executor })
 
 Declare the foundation URI, not the legacy `X402_EXTENSION_URI`. The two are an
 activation family, so a legacy v0.2 client still passes the `required` check on
-a V1 agent — while a `generation: 2` agent refuses its activation at
+a V1 agent — while an `x402Version: 2` agent refuses its activation at
 `requestPayment` with a clear `invalid_x402_version` failure.
 
 ### `X402Context` API
 
 | Member | What it does |
 |---|---|
-| `new X402Context({ store?, facilitator?, generation? })` | Construct once. `store` defaults to `new InMemoryX402Store()`. `facilitator` accepts a `FacilitatorUrlConfig`, a custom `X402Facilitator` impl, or `undefined` (defaults to `https://x402.org/facilitator`). `generation` is the single wire generation this server speaks (default `1`). |
+| `new X402Context({ store?, facilitator?, x402Version? })` | Construct once. `store` defaults to `new InMemoryX402Store()`. `facilitator` accepts a `FacilitatorUrlConfig`, a custom `X402Facilitator` impl, or `undefined` (defaults to `https://x402.org/facilitator`). `x402Version` is the single wire version this server speaks (default `1`). |
 | `x402.requestPayment(ctx, { accepts, description?, previousError?, expiresInSeconds? })` | Async generator. Persists the offering keyed by `ctx.taskId` (with optional TTL) and yields the `request-input` event. |
 | `x402.classify(ctx)` | Returns a tagged union: `'no-submission'`, `'rejected'`, `'no-stored-offering'`, `'unmatched'`, `'invalid-shape'`, or `'valid'`. Switch on `kind` to decide what to do. |
 | `x402.verify(ctx, classified)` | Calls `facilitator.verify(...)`. Records `status: 'verified'` on success, or `status: 'failed'` with `failure.point: 'verify'` on failure. |
@@ -604,8 +604,8 @@ When the merchant agent declares the extension with `required: true` on its Agen
 
 ## Supported scope
 
-- **Both x402 protocol generations** (V1 `x402Version: 1` and V2 `x402Version: 2`). The server emits the one its deployment configured; the client signs whichever it receives.
-- **Standalone Flow.** The Embedded Flow (x402 nested in an AP2 `CartMandate` / `PaymentMandate`) and its signing models are not implemented in either generation — those were described in a2a-x402 v0.2 but have no counterpart in the foundation V2 transport, so their V2 semantics are currently undefined.
+- **Both x402 protocol versions** (V1 `x402Version: 1` and V2 `x402Version: 2`). The server emits the one its deployment configured; the client signs whichever it receives.
+- **Standalone Flow.** The Embedded Flow (x402 nested in an AP2 `CartMandate` / `PaymentMandate`) and its signing models are not implemented in either version — those were described in a2a-x402 v0.2 but have no counterpart in the foundation V2 transport, so their V2 semantics are currently undefined.
 - **`exact` scheme, EVM networks** (`base`, `base-sepolia`, `polygon`, `avalanche`, …). Adding Solana support means passing a Solana-compatible signer in a later release.
 
 ## Reference

@@ -347,7 +347,7 @@ describe('DefaultRequestHandler — extension activation enforcement (spec §3.1
   });
 });
 
-describe('A2XClient — card-based x402 generation activation', () => {
+describe('A2XClient — card-based x402 version activation', () => {
   // recordingFetch returns a card with `capabilities: {}`; this variant lets
   // the card advertise x402 extension URIs so the client's card-based upgrade
   // (`_activateX402Extension`) can be exercised.

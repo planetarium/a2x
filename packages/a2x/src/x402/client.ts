@@ -26,7 +26,7 @@ import {
   X402NoSupportedRequirementError,
   X402PaymentRequiredError,
 } from './errors.js';
-import { detectGeneration } from './generations.js';
+import { detectX402Version } from './versions.js';
 import { isEvmNetwork } from './networks.js';
 import { importX402Peer } from './peer.js';
 import type {
@@ -38,9 +38,9 @@ import type {
 
 /**
  * The subset of `@x402/core`'s `x402Client` the SDK drives. One client,
- * registered with the exact EVM scheme for both generations, signs V1 and
+ * registered with the exact EVM scheme for both protocol versions, signs V1 and
  * V2 payments — `createPaymentPayload` dispatches on the requirement's
- * generation and returns the structured payload directly (no base64/header
+ * version and returns the structured payload directly (no base64/header
  * round-trip; that dance only exists for HTTP-header transports).
  */
 interface X402ClientRuntime {
@@ -72,7 +72,7 @@ function _loadRuntime(signer: LocalAccount): Promise<X402ClientRuntime> {
       const { x402Client } = core as unknown as X402CoreClientModule;
       const { registerExactEvmScheme } = evm as unknown as X402EvmClientModule;
       const client = new x402Client();
-      // Registers BOTH generations (V2 eip155:* wildcard + V1 bare networks)
+      // Registers BOTH versions (V2 eip155:* wildcard + V1 bare networks)
       // on the one client; createPaymentPayload then self-dispatches.
       registerExactEvmScheme(client, { signer });
       return client;
@@ -168,10 +168,10 @@ export async function signX402Payment(
     );
   }
 
-  // Reject unsupported generations early so callers see the spec error code
+  // Reject unsupported versions early so callers see the spec error code
   // (`invalid_x402_version`) instead of an opaque exception deep inside the
   // signing scheme. The SDK speaks x402Version 1 and 2.
-  if (!detectGeneration(required)) {
+  if (!detectX402Version(required)) {
     throw new X402InvalidVersionError(required.x402Version as unknown as number);
   }
 

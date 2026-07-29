@@ -418,7 +418,7 @@ describe('X402Context.verify and X402Context.settle', () => {
     } as unknown as X402PaymentPayload;
     const classified: X402ValidClassification = {
       kind: 'valid',
-      submission: { status: X402_PAYMENT_STATUS.SUBMITTED, payload, generation: 2 },
+      submission: { status: X402_PAYMENT_STATUS.SUBMITTED, payload, x402Version: 2 },
       requirement: {
         scheme: 'exact',
         network: 'eip155:84532',

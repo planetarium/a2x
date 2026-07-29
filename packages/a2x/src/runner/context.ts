@@ -62,7 +62,7 @@ export interface InvocationContext {
    * A2A extension URIs the client activated via the `X-A2A-Extensions`
    * header on this turn. Populated by the default `AgentExecutor` from the
    * request context; used by extensions to negotiate behavior (e.g. the
-   * x402 extension selects its wire generation from the activated URI).
+   * x402 extension selects its wire version from the activated URI).
    * Empty/undefined when no request framing supplied one.
    */
   activatedExtensions?: readonly string[];
