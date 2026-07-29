@@ -92,6 +92,8 @@ import {
 import { resolveFacilitator, type FacilitatorUrlConfig } from './facilitator.js';
 import {
   X402_DEFAULT_VERSION,
+  X402_SUPPORTED_VERSIONS,
+  isSupportedVersion,
   payloadNetwork,
   type X402Version,
 } from './versions.js';
@@ -704,6 +706,15 @@ export class X402Context extends BaseX402Context {
     super();
     this.store = options.store ?? new InMemoryX402Store();
     if (options.x402Version !== undefined) {
+      // Fail fast on a misconfigured version (reachable from plain JS or
+      // `any`): silently proceeding would encode V1 while persisting the
+      // bogus value as `offeredX402Version`, making every later submission
+      // fail `classify` with a misleading `invalid_x402_version`.
+      if (!isSupportedVersion(options.x402Version)) {
+        throw new Error(
+          `X402Context: unsupported x402Version ${String(options.x402Version)} — supported versions: ${X402_SUPPORTED_VERSIONS.join(', ')}`,
+        );
+      }
       this.x402Version = options.x402Version;
     }
     const spec = options.facilitator;

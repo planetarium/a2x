@@ -114,6 +114,18 @@ describe('single-version emission', () => {
     expect(required.accepts[0]!.network).toBe('base-sepolia');
   });
 
+  it('throws at construction for an unsupported x402Version', () => {
+    // Reachable from plain JS / `any` — failing fast beats persisting a bogus
+    // offeredX402Version that makes every later submission fail classify.
+    expect(
+      () =>
+        new X402Context({
+          facilitator: mockFacilitator(),
+          x402Version: 3 as unknown as 1,
+        }),
+    ).toThrow(/unsupported x402Version 3/);
+  });
+
   it('emits V1 out of the box when nothing is configured or activated', async () => {
     const ctx = new X402Context({ facilitator: mockFacilitator() });
     const meta = await drainMetadata(
