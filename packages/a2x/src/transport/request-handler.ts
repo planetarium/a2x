@@ -149,7 +149,7 @@ export class DefaultRequestHandler {
       const requested = readA2AVersionHeader(context.headers);
       if (
         requested !== undefined &&
-        requested !== this.a2xServer.protocolVersion
+        toMajorMinor(requested) !== this.a2xServer.protocolVersion
       ) {
         const error = new VersionNotSupportedError(
           `A2A protocol version '${requested}' is not supported; this endpoint serves '${this.a2xServer.protocolVersion}'`,
@@ -1388,4 +1388,16 @@ function readA2AVersionHeader(
     }
   }
   return undefined;
+}
+
+/**
+ * Reduce a version string to its Major.Minor prefix — spec a2a-v1.0
+ * requires agents to match the requested `A2A-Version` on Major.Minor,
+ * so `0.3.0` must pin the same version as `0.3`. Strings without a
+ * numeric Major.Minor prefix are returned as-is (and will fail the
+ * version match, which is the correct outcome for garbage input).
+ */
+function toMajorMinor(version: string): string {
+  const match = /^(\d+)\.(\d+)/.exec(version);
+  return match ? `${match[1]}.${match[2]}` : version;
 }

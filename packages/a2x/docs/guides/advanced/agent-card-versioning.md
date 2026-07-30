@@ -56,7 +56,7 @@ Three behaviors to know, and where they diverge from strict spec text:
 
 - **Legacy method names as an SDK extension.** A v1.0 server also keeps accepting the v0.3 spellings, so existing v0.3-speaking clients (including `A2XClient`) continue to work against it. This aliasing is an A2X extension — the v1.0 spec's dual-version mechanism is `A2A-Version` negotiation, not method aliases. A `protocolVersion: '0.3'` server stays strictly v0.3 and rejects v1.0 spellings with `-32601`.
 - **Extension activation header.** v1.0 renamed `X-A2A-Extensions` to `A2A-Extensions` (spec §3.2.6). Servers of either version accept both spellings; the required-extension rejection message names the header matching the server's version.
-- **`A2A-Version` header.** A client may pin the protocol version per request (spec §3.2.6/§9.2). When the pinned version doesn't match the server's `protocolVersion`, the server returns `VersionNotSupportedError` (`-32009`). When the header is absent, the server serves its configured version — the spec's "assume 0.3 when the header is empty" rule presumes per-request encoding selection, which a single-version `A2XServer` deliberately does not do.
+- **`A2A-Version` header.** A client may pin the protocol version per request (spec §3.2.6/§9.2). The pin is matched on `Major.Minor` per spec — `0.3.0` pins the same version as `0.3`. When the pinned version doesn't match the server's `protocolVersion`, the server returns `VersionNotSupportedError` (`-32009`). When the header is absent, the server serves its configured version — the spec's "assume 0.3 when the header is empty" rule presumes per-request encoding selection, which a single-version `A2XServer` deliberately does not do.
 
 ## When this matters to you
 

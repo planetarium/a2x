@@ -255,6 +255,30 @@ describe('A2A-Version header (spec a2a-v1.0 §3.2.6 / §9.2)', () => {
     expect(result.error).toBeUndefined();
   });
 
+  it('matches on Major.Minor — accepts a patch-qualified pin like 0.3.0', async () => {
+    const handler = new DefaultRequestHandler(buildServer('0.3'));
+    const result = (await handler.handle(sendBody('message/send'), {
+      headers: { 'a2a-version': '0.3.0' },
+    })) as ErrorResult & TaskResult;
+    expect(result.error).toBeUndefined();
+  });
+
+  it('matches on Major.Minor — accepts 1.0.2 on a 1.0 server', async () => {
+    const handler = new DefaultRequestHandler(buildServer('1.0'));
+    const result = (await handler.handle(sendBody('SendMessage'), {
+      headers: { 'a2a-version': '1.0.2' },
+    })) as ErrorResult & TaskResult;
+    expect(result.error).toBeUndefined();
+  });
+
+  it('rejects a non-numeric version pin with -32009', async () => {
+    const handler = new DefaultRequestHandler(buildServer('1.0'));
+    const result = (await handler.handle(sendBody('SendMessage'), {
+      headers: { 'a2a-version': 'not-a-version' },
+    })) as ErrorResult;
+    expect(result.error!.code).toBe(-32009);
+  });
+
   it('serves the configured version when the header is absent', async () => {
     const handler = new DefaultRequestHandler(buildServer('1.0'));
     const result = (await handler.handle(sendBody('message/send'), {
