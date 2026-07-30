@@ -1,5 +1,17 @@
 # @a2x/sdk
 
+## 0.17.0
+
+### Minor Changes
+
+- [#194](https://github.com/planetarium/a2x/pull/194) [`9413a55`](https://github.com/planetarium/a2x/commit/9413a55baf7c16d0fd85779b85545059fb1ac836) Thanks [@longfin](https://github.com/longfin)! - Servers now read the A2A v1.0 `A2A-Version` header (spec a2a-v1.0 §3.2.6 / §9.2). The pinned version is matched on `Major.Minor` per spec (`0.3.0` pins the same version as `0.3`); a pin that doesn't match the server's `protocolVersion` is rejected with the new `VersionNotSupportedError` (`-32009`, exported and added to `A2A_ERROR_CODES` as `VERSION_NOT_SUPPORTED`). Requests without the header keep being served in the server's configured version. ([#193](https://github.com/planetarium/a2x/issues/193))
+
+- [#194](https://github.com/planetarium/a2x/pull/194) [`9413a55`](https://github.com/planetarium/a2x/commit/9413a55baf7c16d0fd85779b85545059fb1ac836) Thanks [@longfin](https://github.com/longfin)! - `protocolVersion: '1.0'` servers now accept the A2A v1.0 JSON-RPC method names (`SendMessage`, `SendStreamingMessage`, `GetTask`, `CancelTask`, `SubscribeToTask`, `CreateTaskPushNotificationConfig`, `GetTaskPushNotificationConfig`, `ListTaskPushNotificationConfigs`, `DeleteTaskPushNotificationConfig`, `GetExtendedAgentCard`) per spec a2a-v1.0 §9.4, and normalize the v1.0 `ROLE_USER` / `ROLE_AGENT` message roles on inbound messages. v0.3 method spellings remain accepted on v1.0 servers as a legacy-compat extension; `protocolVersion: '0.3'` servers are unchanged and keep rejecting v1.0 spellings. The v1.0 method table is exported as `A2A_METHODS_V10`. ([#193](https://github.com/planetarium/a2x/issues/193))
+
+### Patch Changes
+
+- [#194](https://github.com/planetarium/a2x/pull/194) [`9413a55`](https://github.com/planetarium/a2x/commit/9413a55baf7c16d0fd85779b85545059fb1ac836) Thanks [@longfin](https://github.com/longfin)! - Servers now accept the A2A v1.0 `A2A-Extensions` extension-activation header (spec a2a-v1.0 §3.2.6) in addition to the v0.3-era `X-A2A-Extensions` spelling. Previously a strictly conformant v1.0 client activating a required extension via `A2A-Extensions` was rejected with `-32600`. The required-extension rejection message now names the header matching the server's `protocolVersion`. ([#193](https://github.com/planetarium/a2x/issues/193))
+
 ## 0.16.0
 
 ### Minor Changes
