@@ -9,7 +9,7 @@ import {
 import { getResponseParser } from '../client/response-parser.js';
 import { parseSSEStream } from '../client/sse-parser.js';
 import { TaskState } from '../types/task.js';
-import { A2A_ERROR_CODES } from '../types/errors.js';
+import { A2A_ERROR_CODES, VersionNotSupportedError } from '../types/errors.js';
 import type { AgentCardV03, AgentCardV10 } from '../types/agent-card.js';
 
 // ─── Test Fixtures ───
@@ -581,6 +581,17 @@ describe('A2XClient', () => {
       const client = new A2XClient(V03_CARD, { fetch: mockFetch });
 
       await expect(client.sendMessage(createSendMessageParams('Hi'))).rejects.toThrow('Task not found');
+    });
+
+    it('should throw VersionNotSupportedError on -32009 error', async () => {
+      const mockFetch = createMockFetch(
+        createJsonRpcError(A2A_ERROR_CODES.VERSION_NOT_SUPPORTED, 'Version not supported'),
+      );
+      const client = new A2XClient(V03_CARD, { fetch: mockFetch });
+
+      await expect(client.sendMessage(createSendMessageParams('Hi'))).rejects.toThrow(
+        VersionNotSupportedError,
+      );
     });
 
     it('should throw InternalError on HTTP failure', async () => {
