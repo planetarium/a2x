@@ -8,7 +8,7 @@ A self-contained TypeScript SDK for building [A2A (Agent-to-Agent)](https://a2a-
 ## Why a2x?
 
 - **Auto-extraction** — `A2XServer` infers AgentCard fields from your runtime objects. No manual JSON authoring.
-- **Multi-version AgentCard** — Generate v0.3 and v1.0 AgentCards from the same instance.
+- **Multi-version AgentCard** — Generate v0.3 and v1.0 AgentCards from the same instance. A v1.0 server accepts the v1.0 JSON-RPC method names (`SendMessage`, `GetTask`, …), the `A2A-Extensions` header, and `A2A-Version` pinning, while still serving v0.3-speaking clients.
 - **Multi-provider** — Anthropic Claude, OpenAI GPT, and Google Gemini out of the box.
 - **Framework-agnostic** — Works with Express, Fastify, Hono, Next.js, or any HTTP framework.
 - **SSE streaming** — First-class `message/stream` support via Server-Sent Events.

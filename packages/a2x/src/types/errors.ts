@@ -19,6 +19,7 @@ export const A2A_ERROR_CODES = {
   CONTENT_TYPE_NOT_SUPPORTED: -32005,
   INVALID_AGENT_RESPONSE: -32006,
   AUTHENTICATED_EXTENDED_CARD_NOT_CONFIGURED: -32007,
+  VERSION_NOT_SUPPORTED: -32009,
 } as const;
 
 // ─── Base A2A Error Class ───
@@ -142,6 +143,18 @@ export class AuthenticatedExtendedCardNotConfiguredError extends A2AError {
     message = 'Authenticated extended card not configured',
     data?: unknown,
   ) {
+    super(message, data);
+  }
+}
+
+/**
+ * Spec a2a-v1.0 §3.3.2: the protocol version requested via the
+ * `A2A-Version` service parameter is not supported by this interface.
+ */
+export class VersionNotSupportedError extends A2AError {
+  readonly code = A2A_ERROR_CODES.VERSION_NOT_SUPPORTED;
+
+  constructor(message = 'A2A protocol version not supported', data?: unknown) {
     super(message, data);
   }
 }

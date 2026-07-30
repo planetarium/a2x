@@ -29,6 +29,7 @@ import {
   ContentTypeNotSupportedError,
   InvalidAgentResponseError,
   AuthenticatedExtendedCardNotConfiguredError,
+  VersionNotSupportedError,
   A2A_ERROR_CODES,
 } from '../types/errors.js';
 import { TaskState } from '../types/task.js';
@@ -179,6 +180,7 @@ const ERROR_CODE_MAP: Record<number, new (message?: string, data?: unknown) => A
   [A2A_ERROR_CODES.CONTENT_TYPE_NOT_SUPPORTED]: ContentTypeNotSupportedError,
   [A2A_ERROR_CODES.INVALID_AGENT_RESPONSE]: InvalidAgentResponseError,
   [A2A_ERROR_CODES.AUTHENTICATED_EXTENDED_CARD_NOT_CONFIGURED]: AuthenticatedExtendedCardNotConfiguredError,
+  [A2A_ERROR_CODES.VERSION_NOT_SUPPORTED]: VersionNotSupportedError,
 };
 
 // ─── v0.3 Request Formatting ───

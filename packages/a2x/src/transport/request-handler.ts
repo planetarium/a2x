@@ -22,7 +22,7 @@ import type {
   PushNotificationConfig,
   TaskPushNotificationConfig,
 } from '../types/jsonrpc.js';
-import { A2A_METHODS } from '../types/jsonrpc.js';
+import { A2A_METHODS, A2A_METHODS_V10 } from '../types/jsonrpc.js';
 import type { AgentCardV03, AgentCardV10 } from '../types/agent-card.js';
 import type {
   TaskStatusUpdateEvent,
@@ -39,8 +39,10 @@ import {
   TaskNotCancelableError,
   TaskNotFoundError,
   UnsupportedOperationError,
+  VersionNotSupportedError,
   type A2AError,
 } from '../types/errors.js';
+import { V10_ROLE_TO_INTERNAL } from '../types/common.js';
 import { StreamingMode } from '../a2x/agent-executor.js';
 import { JsonRpcRouter, type RouteContext } from './jsonrpc-router.js';
 import { isX402ExtensionUri } from '../x402/constants.js';
@@ -54,6 +56,17 @@ import { TaskState } from '../types/task.js';
 export type HandleResult =
   | JSONRPCResponse
   | AsyncGenerator<unknown>;
+
+/**
+ * v1.0 method name → canonical (v0.3) method name used by the dispatch
+ * table. Internal to the handler — the public constants are the two
+ * method tables themselves (`A2A_METHODS`, `A2A_METHODS_V10`).
+ */
+const V10_METHOD_TO_CANONICAL: ReadonlyMap<string, string> = new Map(
+  (Object.keys(A2A_METHODS_V10) as (keyof typeof A2A_METHODS_V10)[]).map(
+    (key) => [A2A_METHODS_V10[key], A2A_METHODS[key]],
+  ),
+);
 
 export class DefaultRequestHandler {
   private readonly a2xServer: A2XServer;
@@ -125,6 +138,43 @@ export class DefaultRequestHandler {
       };
     }
 
+    // Spec a2a-v1.0 §3.2.6 / §9.2: a client may pin the protocol version
+    // via the `A2A-Version` header. One A2XServer speaks exactly one
+    // version, so a mismatching pin gets `VersionNotSupportedError`
+    // (-32009) instead of a silently mis-encoded payload. An absent
+    // header keeps serving the configured version — the spec's
+    // "assume 0.3 when empty" rule presumes per-request encoding, which
+    // this server deliberately does not do.
+    if (context) {
+      const requested = readA2AVersionHeader(context.headers);
+      if (
+        requested !== undefined &&
+        toMajorMinor(requested) !== this.a2xServer.protocolVersion
+      ) {
+        const error = new VersionNotSupportedError(
+          `A2A protocol version '${requested}' is not supported; this endpoint serves '${this.a2xServer.protocolVersion}'`,
+        );
+        return {
+          jsonrpc: '2.0',
+          id: request.id,
+          error: error.toJSONRPCError(),
+        };
+      }
+    }
+
+    // Spec a2a-v1.0 §9.4 renames every JSON-RPC method (`SendMessage`,
+    // `GetTask`, …). Normalize v1.0 spellings to the canonical v0.3
+    // dispatch names up front so auth special-casing and routing below
+    // see a single method vocabulary. v0.3 spellings stay accepted on a
+    // v1.0 server as a legacy-compat extension; a v0.3 server remains
+    // strictly v0.3 and rejects v1.0 spellings with -32601.
+    if (this.a2xServer.protocolVersion === '1.0') {
+      const canonical = V10_METHOD_TO_CANONICAL.get(request.method);
+      if (canonical !== undefined) {
+        request = { ...request, method: canonical };
+      }
+    }
+
     // Authenticate if context is provided and security requirements exist.
     // Capture authResult so special-case handlers (e.g. the authenticated
     // extended card) can consume the resolved principal/scopes.
@@ -159,7 +209,8 @@ export class DefaultRequestHandler {
 
     // Enforce `required: true` extension activation per spec a2a-x402 v0.2
     // §3.1 / §8. Clients must list the extension URI in the
-    // `X-A2A-Extensions` header; unactivated clients get a -32600
+    // `X-A2A-Extensions` (v0.3) / `A2A-Extensions` (v1.0) header;
+    // unactivated clients get a -32600
     // InvalidRequest. Skipped when no request context is provided
     // (in-process / test invocations without HTTP framing).
     if (context) {
@@ -400,10 +451,11 @@ export class DefaultRequestHandler {
   }
 
   /**
-   * Parse the `X-A2A-Extensions` header (comma-separated list) and
-   * validate that every `required: true` extension declared on the
-   * AgentCard is present. Returns an `InvalidRequestError` when any
-   * required extension is missing, `null` on success.
+   * Parse the extension activation header (`X-A2A-Extensions` /
+   * `A2A-Extensions`, comma-separated list) and validate that every
+   * `required: true` extension declared on the AgentCard is present.
+   * Returns an `InvalidRequestError` when any required extension is
+   * missing, `null` on success.
    *
    * Spec a2a-x402 v0.2 §3.1 / §8: clients MUST list activated extension
    * URIs, and agents should reject requests that omit a required one.
@@ -434,8 +486,12 @@ export class DefaultRequestHandler {
       });
 
     if (missing.length === 0) return null;
+    const headerName =
+      this.a2xServer.protocolVersion === '1.0'
+        ? 'A2A-Extensions'
+        : 'X-A2A-Extensions';
     return new InvalidRequestError(
-      `Required A2A extensions not activated. Include these URIs in the X-A2A-Extensions header: ${missing.join(', ')}`,
+      `Required A2A extensions not activated. Include these URIs in the ${headerName} header: ${missing.join(', ')}`,
     );
   }
 
@@ -891,6 +947,17 @@ export class DefaultRequestHandler {
       );
     }
 
+    // Spec a2a-v1.0 §Role: v1.0 clients send `ROLE_USER` / `ROLE_AGENT`.
+    // Normalize to the internal lower-case roles so task history and
+    // LLM-provider converters (which branch on `role === 'agent'`) see
+    // one vocabulary regardless of client generation.
+    if (this.a2xServer.protocolVersion === '1.0') {
+      const internalRole = V10_ROLE_TO_INTERNAL.get(message.role as string);
+      if (internalRole !== undefined) {
+        message.role = internalRole;
+      }
+    }
+
     return params as SendMessageParams;
   }
 
@@ -1277,17 +1344,22 @@ function sliceHistory(task: Task, limit?: number): Task {
 }
 
 /**
- * Parse the `X-A2A-Extensions` header into a set of URIs. Header names
- * are case-insensitive; values may be comma-separated or repeated. Runs
- * against the generic `RequestContext.headers` map populated by the
- * transport adapter (Next.js / Express / etc.).
+ * Parse the extension activation header into a set of URIs. v0.3 clients
+ * send `X-A2A-Extensions` (v0.3 extensions topic doc); v1.0 renamed it to
+ * `A2A-Extensions` (spec a2a-v1.0 §3.2.6). Both spellings are accepted
+ * regardless of the server's protocol version — the header a client
+ * picked identifies the client generation, not the payload encoding.
+ * Header names are case-insensitive; values may be comma-separated or
+ * repeated. Runs against the generic `RequestContext.headers` map
+ * populated by the transport adapter (Next.js / Express / etc.).
  */
 function parseActivatedExtensions(
   headers: Record<string, string | string[] | undefined>,
 ): Set<string> {
   const activated = new Set<string>();
   for (const [name, value] of Object.entries(headers)) {
-    if (name.toLowerCase() !== 'x-a2a-extensions') continue;
+    const lower = name.toLowerCase();
+    if (lower !== 'x-a2a-extensions' && lower !== 'a2a-extensions') continue;
     const raw = Array.isArray(value) ? value : value ? [value] : [];
     for (const entry of raw) {
       for (const uri of entry.split(',').map((s) => s.trim())) {
@@ -1296,4 +1368,36 @@ function parseActivatedExtensions(
     }
   }
   return activated;
+}
+
+/**
+ * Read the `A2A-Version` service parameter (spec a2a-v1.0 §3.2.6),
+ * transmitted as an HTTP header per §9.2. Returns the trimmed value, or
+ * `undefined` when the header is absent or blank. When the header is
+ * repeated, the first non-blank value wins.
+ */
+function readA2AVersionHeader(
+  headers: Record<string, string | string[] | undefined>,
+): string | undefined {
+  for (const [name, value] of Object.entries(headers)) {
+    if (name.toLowerCase() !== 'a2a-version') continue;
+    const raw = Array.isArray(value) ? value : value ? [value] : [];
+    for (const entry of raw) {
+      const trimmed = entry.trim();
+      if (trimmed.length > 0) return trimmed;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Reduce a version string to its Major.Minor prefix — spec a2a-v1.0
+ * requires agents to match the requested `A2A-Version` on Major.Minor,
+ * so `0.3.0` must pin the same version as `0.3`. Strings without a
+ * numeric Major.Minor prefix are returned as-is (and will fail the
+ * version match, which is the correct outcome for garbage input).
+ */
+function toMajorMinor(version: string): string {
+  const match = /^(\d+)\.(\d+)/.exec(version);
+  return match ? `${match[1]}.${match[2]}` : version;
 }

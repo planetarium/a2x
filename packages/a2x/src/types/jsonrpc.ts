@@ -48,6 +48,25 @@ export const A2A_METHODS = {
   GET_EXTENDED_CARD: 'agent/getAuthenticatedExtendedCard',
 } as const;
 
+/**
+ * Spec a2a-v1.0 §9.4: the v1.0 JSON-RPC binding renames every method.
+ * Keys mirror `A2A_METHODS` so the two tables stay in one-to-one
+ * correspondence. `ListTasks` (§9.4.4) has no v0.3 counterpart and is
+ * not implemented, so it is deliberately absent.
+ */
+export const A2A_METHODS_V10 = {
+  SEND_MESSAGE: 'SendMessage',
+  STREAM_MESSAGE: 'SendStreamingMessage',
+  GET_TASK: 'GetTask',
+  CANCEL_TASK: 'CancelTask',
+  RESUBSCRIBE: 'SubscribeToTask',
+  SET_PUSH_CONFIG: 'CreateTaskPushNotificationConfig',
+  GET_PUSH_CONFIG: 'GetTaskPushNotificationConfig',
+  LIST_PUSH_CONFIGS: 'ListTaskPushNotificationConfigs',
+  DELETE_PUSH_CONFIG: 'DeleteTaskPushNotificationConfig',
+  GET_EXTENDED_CARD: 'GetExtendedAgentCard',
+} as const;
+
 // ─── SendMessage Parameters ───
 
 export interface SendMessageParams {

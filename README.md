@@ -29,7 +29,7 @@ npm install @a2x/sdk
 ## Key Features
 
 - **Auto-extraction** — `A2XServer` infers AgentCard fields (`name`, `description`, `capabilities.streaming`) from your runtime objects. No manual duplication.
-- **Multi-version AgentCard** — Speak A2A v0.3 or v1.0 by constructing `new A2XServer({ ..., protocolVersion: '0.3' | '1.0' })`. Card and wire stay consistent for the chosen version.
+- **Multi-version AgentCard** — Speak A2A v0.3 or v1.0 by constructing `new A2XServer({ ..., protocolVersion: '0.3' | '1.0' })`. Card and wire stay consistent for the chosen version; a v1.0 server accepts the v1.0 JSON-RPC method names (`SendMessage`, `GetTask`, …), the `A2A-Extensions` header, and `A2A-Version` pinning, while still serving v0.3-speaking clients.
 - **Builder pattern** — Override any auto-extracted value with chainable methods (`setName()`, `addSkill()`, `addSecurityScheme()`, etc.).
 - **ADK-compatible patterns** — Familiar `LlmAgent`, `SequentialAgent`, `ParallelAgent`, `LoopAgent`, `FunctionTool`, `AgentTool`, `Runner`, and `Session` APIs.
 - **Client SDK** — `A2XClient` for interacting with any A2A-compliant agent, with built-in auth scheme support.
