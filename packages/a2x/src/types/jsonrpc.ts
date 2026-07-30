@@ -67,17 +67,6 @@ export const A2A_METHODS_V10 = {
   GET_EXTENDED_CARD: 'GetExtendedAgentCard',
 } as const;
 
-/**
- * v1.0 method name → canonical (v0.3) method name used by the dispatch
- * table. The request handler normalizes inbound v1.0 spellings through
- * this map on `protocolVersion: '1.0'` servers.
- */
-export const V10_METHOD_TO_CANONICAL: ReadonlyMap<string, string> = new Map(
-  (Object.keys(A2A_METHODS_V10) as (keyof typeof A2A_METHODS_V10)[]).map(
-    (key) => [A2A_METHODS_V10[key], A2A_METHODS[key]],
-  ),
-);
-
 // ─── SendMessage Parameters ───
 
 export interface SendMessageParams {

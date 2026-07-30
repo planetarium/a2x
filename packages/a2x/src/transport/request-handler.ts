@@ -22,7 +22,7 @@ import type {
   PushNotificationConfig,
   TaskPushNotificationConfig,
 } from '../types/jsonrpc.js';
-import { A2A_METHODS, V10_METHOD_TO_CANONICAL } from '../types/jsonrpc.js';
+import { A2A_METHODS, A2A_METHODS_V10 } from '../types/jsonrpc.js';
 import type { AgentCardV03, AgentCardV10 } from '../types/agent-card.js';
 import type {
   TaskStatusUpdateEvent,
@@ -56,6 +56,17 @@ import { TaskState } from '../types/task.js';
 export type HandleResult =
   | JSONRPCResponse
   | AsyncGenerator<unknown>;
+
+/**
+ * v1.0 method name → canonical (v0.3) method name used by the dispatch
+ * table. Internal to the handler — the public constants are the two
+ * method tables themselves (`A2A_METHODS`, `A2A_METHODS_V10`).
+ */
+const V10_METHOD_TO_CANONICAL: ReadonlyMap<string, string> = new Map(
+  (Object.keys(A2A_METHODS_V10) as (keyof typeof A2A_METHODS_V10)[]).map(
+    (key) => [A2A_METHODS_V10[key], A2A_METHODS[key]],
+  ),
+);
 
 export class DefaultRequestHandler {
   private readonly a2xServer: A2XServer;
