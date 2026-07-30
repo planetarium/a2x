@@ -48,6 +48,36 @@ export const A2A_METHODS = {
   GET_EXTENDED_CARD: 'agent/getAuthenticatedExtendedCard',
 } as const;
 
+/**
+ * Spec a2a-v1.0 §9.4: the v1.0 JSON-RPC binding renames every method.
+ * Keys mirror `A2A_METHODS` so the two tables stay in one-to-one
+ * correspondence. `ListTasks` (§9.4.4) has no v0.3 counterpart and is
+ * not implemented, so it is deliberately absent.
+ */
+export const A2A_METHODS_V10 = {
+  SEND_MESSAGE: 'SendMessage',
+  STREAM_MESSAGE: 'SendStreamingMessage',
+  GET_TASK: 'GetTask',
+  CANCEL_TASK: 'CancelTask',
+  RESUBSCRIBE: 'SubscribeToTask',
+  SET_PUSH_CONFIG: 'CreateTaskPushNotificationConfig',
+  GET_PUSH_CONFIG: 'GetTaskPushNotificationConfig',
+  LIST_PUSH_CONFIGS: 'ListTaskPushNotificationConfigs',
+  DELETE_PUSH_CONFIG: 'DeleteTaskPushNotificationConfig',
+  GET_EXTENDED_CARD: 'GetExtendedAgentCard',
+} as const;
+
+/**
+ * v1.0 method name → canonical (v0.3) method name used by the dispatch
+ * table. The request handler normalizes inbound v1.0 spellings through
+ * this map on `protocolVersion: '1.0'` servers.
+ */
+export const V10_METHOD_TO_CANONICAL: ReadonlyMap<string, string> = new Map(
+  (Object.keys(A2A_METHODS_V10) as (keyof typeof A2A_METHODS_V10)[]).map(
+    (key) => [A2A_METHODS_V10[key], A2A_METHODS[key]],
+  ),
+);
+
 // ─── SendMessage Parameters ───
 
 export interface SendMessageParams {

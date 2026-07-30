@@ -171,7 +171,8 @@ wired but you want to hide the capability.
 
 ### Reading activated extensions
 
-The extension URIs the client activated via the `X-A2A-Extensions` header are
+The extension URIs the client activated via the `X-A2A-Extensions` (v0.3) or
+`A2A-Extensions` (v1.0) header are
 threaded onto `InvocationContext.activatedExtensions`, so an agent can branch
 on what the client activated:
 
