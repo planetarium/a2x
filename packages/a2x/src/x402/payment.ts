@@ -207,22 +207,68 @@ export function parseX402PaymentSubmission(
 }
 
 /**
- * Payer wallet address carried by an EVM payload, whichever scheme signed it:
- * `authorization.from` (`exact`, EIP-3009) or `permit2Authorization.from`
- * (`upto`, Permit2 witness). Returns `undefined` when the payload carries
- * neither — the SDK never fabricates a placeholder address.
+ * Payer wallet address carried by an EVM payload.
+ *
+ * **Pass `scheme` whenever the matched requirement is known.** A payload is
+ * client-controlled and nothing stops it carrying *both* an EIP-3009
+ * `authorization` and a Permit2 `permit2Authorization`. Picking by shape then
+ * lets a decoy key name someone else as the payer: a valid `upto` payload with
+ * a bolted-on `authorization: { from: <attacker> }` would otherwise attribute
+ * the payment to the attacker on the receipt and in the audit store. Reading
+ * the field the *matched requirement's scheme* actually signs closes that off:
+ *
+ *  - `'upto'` → `permit2Authorization.from` only;
+ *  - `'exact'` → `authorization.from`, or `permit2Authorization.from` when the
+ *    requirement selected Permit2 transfers (see `usesPermit2Transfer`);
+ *  - anything else (or `scheme` omitted) → best-effort shape sniffing.
+ *
+ * Returns `undefined` when the payload carries no payer for that scheme — the
+ * SDK never fabricates a placeholder address.
  */
 export function extractX402Payer(
   payload: X402PaymentPayload | undefined,
+  scheme?: string,
 ): string | undefined {
-  return payload ? extractPayer(payload) : undefined;
+  if (!payload) return undefined;
+  if (scheme === 'upto') {
+    return nonEmptyString(extractPermit2Authorization(payload)?.from);
+  }
+  if (scheme === 'exact') {
+    return (
+      nonEmptyString(extractAuthorization(payload)?.from) ??
+      nonEmptyString(extractPermit2Authorization(payload)?.from)
+    );
+  }
+  return extractPayer(payload);
+}
+
+/**
+ * Payer for a submission whose requirement has already been matched. Same
+ * dispatch as `extractX402Payer`, applied to the parsed submission so
+ * downstream consumers (receipts, the audit store) read a scheme-verified
+ * address rather than the shape-sniffed one `parseX402PaymentSubmission`
+ * could only guess at.
+ *
+ * @internal Not part of `@a2x/sdk/x402`'s public surface.
+ */
+export function withRequirementScopedPayer(
+  submission: X402PaymentSubmission,
+  requirement: X402PaymentRequirements,
+): X402PaymentSubmission {
+  const { payer: _shapeSniffed, ...rest } = submission;
+  const payer = extractX402Payer(
+    submission.payload,
+    schemeTransferKind(requirement),
+  );
+  return { ...rest, ...(payer ? { payer } : {}) };
 }
 
 /**
  * The ceiling the payer actually signed, read off the payload:
- * `permit2Authorization.permitted.amount` (`upto`) or `authorization.value`
- * (`exact`). Returns `undefined` when the payload names no cap — callers
- * clamping a metered charge fall back to the offered requirement's amount.
+ * `permit2Authorization.permitted.amount` (`upto`, and `exact` under Permit2
+ * transfers) or `authorization.value` (`exact`/EIP-3009). Returns `undefined`
+ * when the payload names no cap — callers clamping a metered charge fall back
+ * to the offered requirement's amount.
  *
  * @internal Not part of `@a2x/sdk/x402`'s public surface.
  */
@@ -234,6 +280,51 @@ export function payloadAuthorizedAmount(
   if (typeof permit2 === 'string') return permit2;
   const value = extractAuthorization(payload)?.value;
   return typeof value === 'string' ? value : undefined;
+}
+
+/**
+ * True when the requirement asks for a Permit2 transfer rather than EIP-3009.
+ *
+ * `upto` is Permit2 by construction. `exact` is EIP-3009 *by default*, but
+ * `@x402/evm`'s `ExactEvmScheme` switches to a Permit2 witness payload when
+ * the requirement carries `extra.assetTransferMethod === 'permit2'` — which
+ * several stablecoins in its `DEFAULT_STABLECOINS` table (MegaETH, Mezo,
+ * Radius, Igra) are configured with. Validating those against EIP-3009 would
+ * reject a perfectly conformant payment.
+ *
+ * @internal Not part of `@a2x/sdk/x402`'s public surface.
+ */
+export function usesPermit2Transfer(
+  requirement: X402PaymentRequirements,
+): boolean {
+  return requirement.extra?.assetTransferMethod === 'permit2';
+}
+
+/** Which payload shape a requirement's scheme + transfer method implies. */
+function schemeTransferKind(requirement: X402PaymentRequirements): string {
+  const scheme = requirementScheme(requirement);
+  if (scheme === 'exact' && usesPermit2Transfer(requirement)) return 'upto';
+  return scheme;
+}
+
+/**
+ * Parse an atomic-unit amount strictly.
+ *
+ * `BigInt` alone is far too permissive for wire data: `BigInt('')` is `0n`,
+ * and `'0x10'`, `'0b11'`, `'+5'` and `' 5 '` all parse. An empty meter
+ * reading silently settling zero — or a hex string settling 16× the intended
+ * charge — is exactly the class of bug the clamp exists to prevent, so only a
+ * non-empty run of decimal digits is accepted here.
+ *
+ * @internal Not part of `@a2x/sdk/x402`'s public surface.
+ */
+export function parseAtomicAmount(value: unknown): bigint | undefined {
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) return undefined;
+  return BigInt(value);
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
 // ─── Helpers: matching + validation ───
@@ -274,25 +365,27 @@ export interface X402ValidationIssue {
 
 /**
  * Local shape validation against the agreed-upon requirement, dispatched on
- * the requirement's `scheme`. Returns an **array of issues** (empty array =
- * no problems) so the caller can decide what to do with each — reject, log,
- * ignore for VIP users, etc.
+ * the payload shape the requirement implies. Returns an **array of issues**
+ * (empty array = no problems) so the caller can decide what to do with each —
+ * reject, log, ignore for VIP users, etc.
  *
- * `exact` (EIP-3009) checks:
+ * **EIP-3009** — `exact` with the default `assetTransferMethod`:
  *  - the payload carries an `authorization` object;
  *  - `authorization.to` equals `requirement.payTo` (case-insensitive);
  *  - `authorization.value` does not exceed the requirement's amount.
  *
- * `upto` (Permit2 witness) checks:
+ * **Permit2 witness** — `upto`, and `exact` when the requirement carries
+ * `extra.assetTransferMethod === 'permit2'` (see `usesPermit2Transfer`):
  *  - the payload carries a `permit2Authorization` object and a `signature`;
  *  - `witness.to` equals `requirement.payTo` (case-insensitive) — the
  *    recipient binding that stops a signature being replayed to another payee;
  *  - `permitted.token` equals `requirement.asset` (case-insensitive);
- *  - `permitted.amount` is a positive integer not exceeding the requirement's
- *    amount (a zero authorization can never fund a metered charge);
+ *  - `permitted.amount` is a positive decimal integer not exceeding the
+ *    requirement's amount (a zero authorization can never fund a metered
+ *    charge);
  *  - `from` (the payer) is present.
  *
- * Any other scheme falls back to the `exact` checks — the SDK has no ground
+ * Any other scheme falls back to the EIP-3009 checks — the SDK has no ground
  * truth for its wire shape, and failing closed is the safe default. Override
  * `BaseX402Context.validatePayloadShape` to teach the pipeline a new scheme.
  *
@@ -303,13 +396,13 @@ export function validateX402PayloadShape(
   payload: X402PaymentPayload,
   requirement: X402PaymentRequirements,
 ): X402ValidationIssue[] {
-  if (requirementScheme(requirement) === 'upto') {
-    return validateUptoPayloadShape(payload, requirement);
+  if (schemeTransferKind(requirement) === 'upto') {
+    return validatePermit2PayloadShape(payload, requirement);
   }
-  return validateExactPayloadShape(payload, requirement);
+  return validateEip3009PayloadShape(payload, requirement);
 }
 
-function validateExactPayloadShape(
+function validateEip3009PayloadShape(
   payload: X402PaymentPayload,
   requirement: X402PaymentRequirements,
 ): X402ValidationIssue[] {
@@ -357,7 +450,7 @@ function validateExactPayloadShape(
   return issues;
 }
 
-function validateUptoPayloadShape(
+function validatePermit2PayloadShape(
   payload: X402PaymentPayload,
   requirement: X402PaymentRequirements,
 ): X402ValidationIssue[] {
@@ -370,7 +463,8 @@ function validateUptoPayloadShape(
     issues.push({
       code: X402_ERROR_CODES.INVALID_PAYLOAD,
       reason:
-        'Payload does not carry a Permit2 `permit2Authorization`, which the `upto` scheme requires.',
+        `Payload does not carry a Permit2 \`permit2Authorization\`, which the ` +
+        `\`${requirementScheme(requirement)}\` scheme requires here.`,
     });
     return issues;
   }
@@ -414,31 +508,28 @@ function validateUptoPayloadShape(
 
   const amount = auth.permitted?.amount;
   const maxAmount = requirementAmount(requirement);
-  if (typeof amount !== 'string') {
+  // Strict decimal parsing, not bare BigInt: `''` would read as 0n and
+  // `'0x10'` as 16, letting a hostile payload smuggle a cap the merchant
+  // never validated against.
+  const authorized = parseAtomicAmount(amount);
+  if (authorized === undefined) {
     issues.push({
       code: X402_ERROR_CODES.INVALID_AMOUNT,
-      reason: 'Permit2 authorization is missing a string `permitted.amount`.',
+      reason: `Permit2 authorized amount ${JSON.stringify(amount)} is not a decimal integer string.`,
+    });
+  } else if (authorized <= 0n) {
+    // An `upto` authorization for 0 can never fund a metered charge — reject
+    // it here rather than let settle clamp everything to "0".
+    issues.push({
+      code: X402_ERROR_CODES.INVALID_AMOUNT,
+      reason: `Authorized amount ${amount} must be greater than zero.`,
     });
   } else {
-    try {
-      const authorized = BigInt(amount);
-      if (authorized <= 0n) {
-        // An `upto` authorization for 0 can never fund a metered charge —
-        // reject it here rather than let settle clamp everything to "0".
-        issues.push({
-          code: X402_ERROR_CODES.INVALID_AMOUNT,
-          reason: `Authorized amount ${amount} must be greater than zero.`,
-        });
-      } else if (authorized > BigInt(maxAmount)) {
-        issues.push({
-          code: X402_ERROR_CODES.INVALID_AMOUNT,
-          reason: `Authorized amount ${amount} exceeds maximum ${maxAmount}.`,
-        });
-      }
-    } catch {
+    const offered = parseAtomicAmount(maxAmount);
+    if (offered !== undefined && authorized > offered) {
       issues.push({
-        code: X402_ERROR_CODES.INVALID_PAYLOAD,
-        reason: 'Permit2 authorized amount is not a valid number.',
+        code: X402_ERROR_CODES.INVALID_AMOUNT,
+        reason: `Authorized amount ${amount} exceeds maximum ${maxAmount}.`,
       });
     }
   }

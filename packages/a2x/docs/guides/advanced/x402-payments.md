@@ -287,22 +287,29 @@ class TelemetryContext extends BaseX402Context {
   readonly store: BaseX402Store = new InMemoryX402Store();
   readonly facilitator = resolveFacilitator();
 
-  async verify(payload, requirement) {
+  async verify(ctx, classified) {
     const start = Date.now();
     try {
-      return await super.verify(payload, requirement);
+      return await super.verify(ctx, classified);
     } finally {
       metrics.histogram('x402.verify.duration_ms', Date.now() - start);
     }
   }
 
-  async settle(submission, requirement) {
-    const receipt = await super.settle(submission, requirement);
-    auditLog.write({ kind: 'x402.settle', taskId: submission.payload?.network, receipt });
+  // Forward `opts` — see the warning below.
+  async settle(ctx, classified, opts) {
+    const receipt = await super.settle(ctx, classified, opts);
+    auditLog.write({ kind: 'x402.settle', taskId: ctx.taskId, receipt });
     return receipt;
   }
 }
 ```
+
+> **If you already subclass `settle`, add the third parameter.** An override
+> written against the old two-argument signature silently drops
+> `opts.amountAtomic`, so every metered call settles the full offered ceiling
+> instead of the metered charge — the clamp cannot help, because the amount
+> never reaches it. Accept `opts` and pass it to `super.settle(...)`.
 
 `BaseX402Context` provides concrete implementations for every method, so subclasses only override what they need. `X402Context` is itself a minimal subclass that fills in `store` + `facilitator` defaults; you can model your subclass the same way.
 
@@ -407,7 +414,7 @@ class MeteredAgent extends BaseAgent {
 }
 ```
 
-`upto` is a **V2-only** scheme (`new X402Context({ x402Version: 2 })`). It is live on the default facilitator (`https://x402.org/facilitator`), which lists an `upto` kind for `eip155:84532` on `GET /supported` with the `extra.facilitatorAddress` your offering must echo. Unlike `exact`, the SDK does **not** synthesize a default `extra` for `upto` — the EIP-712 domain default is meaningless there, so an offering that omits `extra` ships no `extra` at all and the client's signer will refuse it.
+`upto` is a **V2-only** scheme and the SDK enforces that: encoding an `upto` offering under `x402Version: 1` throws a configuration error from `requestPayment`, before anything is persisted. Neither `@x402/core`'s client (which has no V1 registration for it) nor the reference facilitator's Permit2 settlement (which reads V2 fields) has a V1 path, so a V1 upto offer could only dead-end mid-payment. Configure `new X402Context({ x402Version: 2 })`. It is live on the default facilitator (`https://x402.org/facilitator`), which lists an `upto` kind for `eip155:84532` on `GET /supported` with the `extra.facilitatorAddress` your offering must echo. Unlike `exact`, the SDK does **not** synthesize a default `extra` for `upto` — the EIP-712 domain default is meaningless there, so an offering that omits `extra` ships no `extra` at all and the client's signer will refuse it.
 
 #### The clamp guarantee
 
@@ -417,15 +424,23 @@ class MeteredAgent extends BaseAgent {
 2. the amount you offered — your own advertised ceiling;
 3. the payer's signed authorization cap (`permit2Authorization.permitted.amount`).
 
-The clamp lives in the SDK on purpose: a metering bug (an off-by-a-decimal token count, a stale price table) can then only ever *undercharge*. Comparison is BigInt, so 30-digit atomic values are exact, and the correct field is written for the requirement's wire version (`amount` under V2, `maxAmountRequired` under V1). `"0"` is a legal charge — zero metered usage settles zero. A negative or non-integer `amountAtomic` throws rather than settling something nobody computed.
+The clamp lives in the SDK on purpose: a metering bug (an off-by-a-decimal token count, a stale price table) can then only ever *undercharge*. Comparison is BigInt, so 30-digit atomic values are exact. `"0"` is a legal charge — zero metered usage settles zero.
+
+`amountAtomic` must be a plain decimal integer string; anything else throws rather than settling an amount nobody computed. This is stricter than `BigInt` on purpose — `BigInt('')` is `0n` and `BigInt('0x10')` is `16`, so an empty meter reading would silently settle nothing and a hex string would settle 16× the intended charge.
+
+Metering an **`exact`** requirement also throws. That scheme binds the payer's signature to one specific value, so a facilitator rejects any settle whose amount disagrees with it — better to fail on the call than after the work is done and the charge has been refused.
 
 The facilitator enforces the same bound on-chain; the SDK clamp is defence in depth, not a substitute for it.
 
 #### What the payer's payload looks like
 
-An `upto` payload carries `permit2Authorization` + `signature` instead of the `exact` scheme's EIP-3009 `authorization`. `classify` dispatches shape validation on the matched requirement's scheme and checks the Permit2 equivalents: the signature is present, `witness.to` matches your `payTo` (the binding that stops a signature being replayed to another payee), `permitted.token` matches your `asset`, `permitted.amount` is positive and within the offer, and the payer `from` is present.
+An `upto` payload carries `permit2Authorization` + `signature` instead of the `exact` scheme's EIP-3009 `authorization` — the `X402UptoEvmPayload` and `X402Permit2Authorization` types (exported from `@a2x/sdk/x402`, alongside `X402ExactEvmPayload` for the EIP-3009 shape) describe it. `classify` dispatches shape validation on the matched requirement and checks the Permit2 equivalents: the signature is present, `witness.to` matches your `payTo` (the binding that stops a signature being replayed to another payee), `permitted.token` matches your `asset`, `permitted.amount` is a positive decimal integer within the offer, and the payer `from` is present. Addresses compare case-insensitively, so a checksummed signature matches a lowercase `payTo`.
 
-`parseX402PaymentSubmission` surfaces both shapes: `submission.authorization` for `exact`, `submission.permit2Authorization` for `upto`, and `submission.payer` scheme-agnostically. Receipts backfill `payer` from whichever one the payload carries when the facilitator omits it.
+> The same Permit2 checks apply to an **`exact`** requirement whose `extra` sets `assetTransferMethod: 'permit2'` — `@x402/evm`'s exact scheme signs a Permit2 witness rather than EIP-3009 for those assets (several of its built-in stablecoins are configured that way), and validating them against EIP-3009 would reject a conformant payment.
+
+`parseX402PaymentSubmission` surfaces both shapes: `submission.authorization` for EIP-3009, `submission.permit2Authorization` for Permit2, and `submission.payer` scheme-agnostically. Receipts backfill `payer` from whichever the payload carries when the facilitator omits it.
+
+Once `classify` has matched a requirement, `payer` is read from the field **that requirement's scheme actually signs** — not sniffed from whichever key is present. A payload is client-controlled and may carry both an `authorization` and a `permit2Authorization`; without scheme-driven extraction a decoy key could name someone else as the payer on the receipt and in your audit store. `extractX402Payer(payload, scheme?)` applies the same dispatch when you drive the pipeline yourself; pass `scheme` whenever you know it.
 
 #### Reconciliation: the settled `amount`
 
@@ -438,7 +453,9 @@ if (entry?.status === 'completed') {
 }
 ```
 
-Under a usage-based scheme this is the key reconciliation datum and it is **not** recoverable from `entry.accepts`, which records the authorized maximum. The SDK fills it from the facilitator's reported amount, falling back to the amount it asked the facilitator to settle (the offered amount for `exact`, the clamped metered charge for `upto`).
+Under a usage-based scheme this is the key reconciliation datum and it is **not** recoverable from `entry.accepts`, which records the authorized maximum.
+
+It records **only what the facilitator confirmed**. When the facilitator reports no amount (every V1 facilitator, and some V2 ones), the key is absent rather than backfilled from what the SDK asked to settle — a request is not evidence of a settlement, and an audit trail that cannot tell the two apart is worse than one with a gap. Check for the key before relying on it.
 
 #### Teaching the pipeline another scheme
 
@@ -715,6 +732,8 @@ await client.sendMessage({
 The signing runtime registers `@x402/evm`'s `upto` client scheme alongside `exact`, so an `upto` offer *can* be signed. **The default selector will not choose one on its own**, and that is deliberate.
 
 Signing `exact` authorizes one amount and nothing else. Signing `upto` authorizes the merchant to draw **anything up to** the offered amount, at its discretion, after the fact. Silently upgrading a wallet from the first to the second changes what the payer consented to, so the SDK refuses to make that substitution unprompted — the server-side [clamp](#the-clamp-guarantee) is the merchant's own guard rail, not a promise to the payer. `X402NoSupportedRequirementError` is what you get if `upto` is the only offer and you did not opt in.
+
+The fallback additionally requires a **CAIP-2** network (`eip155:<chainId>`). `upto` is V2-only, so a bare-name V1 offer is never eligible however it is advertised.
 
 Two ways to pay one:
 

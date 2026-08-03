@@ -21,6 +21,7 @@ import {
 } from '../x402/index.js';
 import { encodeRequirementV1 } from '../x402/wire-v1.js';
 import { encodeRequirementV2 } from '../x402/wire-v2.js';
+import { withRequirementAmount } from '../x402/versions.js';
 import type {
   X402Accept,
   X402Facilitator,
@@ -168,6 +169,30 @@ describe('validateX402PayloadShape — upto', () => {
     expect(issues[0]!.reason).toContain('payer address');
   });
 
+  it('matches witness.to and permitted.token case-insensitively', () => {
+    // Signers emit EIP-55 checksummed addresses; merchants routinely configure
+    // lowercase ones. A case-sensitive compare would reject every real payment.
+    const issues = validateX402PayloadShape(
+      uptoPayload({ to: PAY_TO.toUpperCase().replace('0X', '0x'), token: ASSET.toLowerCase() }),
+      encodeRequirementV2({
+        ...UPTO_ACCEPT,
+        payTo: PAY_TO.toLowerCase(),
+        asset: ASSET.toUpperCase().replace('0X', '0x'),
+      }),
+    );
+    expect(issues).toEqual([]);
+  });
+
+  it.each(['0x10', ' 100', '-5', '+5', '', '1e3'])(
+    'rejects a leniently-parseable permitted.amount %j',
+    (amount) => {
+      const issues = validateX402PayloadShape(uptoPayload({ amount }), requirement);
+      expect(issues).toHaveLength(1);
+      expect(issues[0]!.code).toBe(X402_ERROR_CODES.INVALID_AMOUNT);
+      expect(issues[0]!.reason).toContain('decimal integer string');
+    },
+  );
+
   it('does not report an EIP-3009 payload as "non-EVM"', () => {
     const exactShaped = {
       x402Version: 2,
@@ -235,6 +260,40 @@ describe('validateX402PayloadShape — exact path unchanged', () => {
     expect(issues).toHaveLength(1);
     expect(issues[0]!.reason).toContain('EIP-3009');
     expect(issues[0]!.reason).not.toContain('Non-EVM');
+  });
+});
+
+describe('validateX402PayloadShape — exact with Permit2 asset transfers', () => {
+  // `@x402/evm`'s ExactEvmScheme emits a Permit2 witness payload (not EIP-3009)
+  // whenever the requirement sets this, which several of its DEFAULT_STABLECOINS
+  // do. Validating those against EIP-3009 rejects a conformant payment.
+  const permit2Exact = encodeRequirementV2({
+    ...UPTO_ACCEPT,
+    scheme: 'exact',
+    extra: { assetTransferMethod: 'permit2' },
+  });
+
+  it('accepts a Permit2 payload when assetTransferMethod is permit2', () => {
+    expect(validateX402PayloadShape(uptoPayload(), permit2Exact)).toEqual([]);
+  });
+
+  it('still applies the recipient binding on that path', () => {
+    const issues = validateX402PayloadShape(
+      uptoPayload({ to: '0x9999999999999999999999999999999999999999' }),
+      permit2Exact,
+    );
+    expect(issues[0]!.code).toBe(X402_ERROR_CODES.INVALID_PAY_TO);
+  });
+
+  it('keeps the EIP-3009 requirement when the flag is absent', () => {
+    const plainExact = encodeRequirementV2({
+      ...UPTO_ACCEPT,
+      scheme: 'exact',
+      extra: undefined,
+    });
+    const issues = validateX402PayloadShape(uptoPayload(), plainExact);
+    expect(issues).toHaveLength(1);
+    expect(issues[0]!.reason).toContain('EIP-3009');
   });
 });
 
@@ -396,52 +455,116 @@ describe('X402Context.settle — metered amount', () => {
     expect(Number(cap) === Number(metered)).toBe(true); // the trap this guards
   });
 
-  it('writes maxAmountRequired, not amount, on a V1 requirement', async () => {
+  it('writes maxAmountRequired, not amount, for a V1-shaped requirement', () => {
+    // `upto` itself is V2-only, but the clamp's field selection is a generic
+    // utility that must keep writing the right field per wire version.
+    const v1 = encodeRequirementV1({ ...UPTO_ACCEPT, scheme: 'exact' });
+    const clamped = withRequirementAmount(v1, '777') as {
+      maxAmountRequired?: string;
+      amount?: string;
+    };
+    expect(clamped.maxAmountRequired).toBe('777');
+    expect(clamped.amount).toBeUndefined();
+  });
+
+  it.each([
+    ['', /decimal integer string/],
+    [' 5 ', /decimal integer string/],
+    ['0x10', /decimal integer string/],
+    ['+5', /decimal integer string/],
+    ['-1', /decimal integer string/],
+    ['1.5', /decimal integer string/],
+  ] as const)(
+    'throws on a leniently-parseable metered amount %j',
+    async (amountAtomic, message) => {
+      const x402 = await offeredContext(makeFacilitator());
+      const classified = await classifiedUpto(x402);
+      await expect(
+        x402.settle({ taskId: 't-upto' }, classified, { amountAtomic }),
+      ).rejects.toThrow(message);
+    },
+  );
+
+  it('refuses to meter an exact requirement', async () => {
     const facilitator = makeFacilitator();
     const x402 = new X402Context({
       facilitator,
       store: new InMemoryX402Store(),
-      // V1 offering with an upto scheme — clamping must respect the V1 field.
-      x402Version: 1,
+      x402Version: 2,
     });
-    const ctx = { taskId: 't-v1' };
-    for await (const _ of x402.requestPayment(ctx, {
-      accepts: [{ ...UPTO_ACCEPT, network: 'base-sepolia' }],
+    const exactAccept: X402Accept = {
+      ...UPTO_ACCEPT,
+      scheme: 'exact',
+      extra: undefined,
+    };
+    for await (const _ of x402.requestPayment({ taskId: 't-exact' }, {
+      accepts: [exactAccept],
     })) {
       // drain
     }
-    const v1Payload = {
-      x402Version: 1,
-      network: 'base-sepolia',
-      scheme: 'upto',
-      payload: { signature: '0xsig', permit2Authorization: permit2Authorization() },
+    const exactRequirement = encodeRequirementV2(exactAccept);
+    const payload = {
+      x402Version: 2,
+      accepted: exactRequirement,
+      payload: {
+        signature: '0xsig',
+        authorization: {
+          from: PAYER,
+          to: PAY_TO,
+          value: OFFERED,
+          validAfter: '0',
+          validBefore: '9999999999',
+          nonce: '0x1',
+        },
+      },
     } as unknown as X402PaymentPayload;
-    const result = await x402.classify({
-      taskId: 't-v1',
-      message: submittedMessage(v1Payload),
+    const classified = await x402.classify({
+      taskId: 't-exact',
+      message: submittedMessage(payload),
     });
-    expect(result.kind).toBe('valid');
-    await x402.settle({ taskId: 't-v1' }, result as X402ValidClassification, {
-      amountAtomic: '777',
-    });
-    const seen = facilitator.seen[0] as {
-      maxAmountRequired?: string;
-      amount?: string;
-    };
-    expect(seen.maxAmountRequired).toBe('777');
-    expect(seen.amount).toBeUndefined();
+    expect(classified.kind).toBe('valid');
+    await expect(
+      x402.settle({ taskId: 't-exact' }, classified as X402ValidClassification, {
+        amountAtomic: '10',
+      }),
+    ).rejects.toThrow(/metered settlement requires a usage-based scheme/);
+    // Nothing was sent to the facilitator — the guard fires before settle.
+    expect(facilitator.seen).toHaveLength(0);
   });
 
-  it('throws on a negative or unparseable metered amount', async () => {
+  it('clamps to the offer when the payload names no signed cap', async () => {
+    // The offer bound is the only clamp left when the payload carries no
+    // parseable authorization cap, so exercise it in isolation.
+    class PermissiveContext extends X402Context {
+      protected override validatePayloadShape() {
+        return [];
+      }
+    }
     const facilitator = makeFacilitator();
-    const x402 = await offeredContext(facilitator);
-    const classified = await classifiedUpto(x402);
-    await expect(
-      x402.settle({ taskId: 't-upto' }, classified, { amountAtomic: '-1' }),
-    ).rejects.toThrow(/must not be negative/);
-    await expect(
-      x402.settle({ taskId: 't-upto' }, classified, { amountAtomic: '1.5' }),
-    ).rejects.toThrow(/integer string/);
+    const x402 = new PermissiveContext({
+      facilitator,
+      store: new InMemoryX402Store(),
+      x402Version: 2,
+    });
+    for await (const _ of x402.requestPayment({ taskId: 't-nocap' }, {
+      accepts: [UPTO_ACCEPT],
+    })) {
+      // drain
+    }
+    const capless = {
+      x402Version: 2,
+      accepted: encodeRequirementV2(UPTO_ACCEPT),
+      payload: { signature: '0xsig' },
+    } as unknown as X402PaymentPayload;
+    const classified = await x402.classify({
+      taskId: 't-nocap',
+      message: submittedMessage(capless),
+    });
+    expect(classified.kind).toBe('valid');
+    await x402.settle({ taskId: 't-nocap' }, classified as X402ValidClassification, {
+      amountAtomic: '99999999999',
+    });
+    expect((facilitator.seen[0] as { amount: string }).amount).toBe(OFFERED);
   });
 });
 
@@ -480,28 +603,111 @@ describe('X402Context.settle — payer backfill and stored amount', () => {
     expect(submission!.authorization).toBeUndefined();
   });
 
-  it('persists the settled amount on the store entry', async () => {
+  it('persists the facilitator-confirmed amount, not what we asked to settle', async () => {
+    // The facilitator is the authority: it reports 4000 though we metered 4242.
     const facilitator = makeFacilitator(async () => ({
       success: true,
       transaction: '0xtx',
       network: 'eip155:84532',
-      amount: '4242',
+      amount: '4000',
     }));
     const x402 = await offeredContext(facilitator);
     const classified = await classifiedUpto(x402);
     await x402.settle({ taskId: 't-upto' }, classified, { amountAtomic: '4242' });
     const entry = await x402.store.get('t-upto');
     expect(entry!.status).toBe('completed');
-    expect(entry!.receipt!.amount).toBe('4242');
+    expect(entry!.receipt!.amount).toBe('4000');
     expect(entry!.receipt!.payer).toBe(PAYER);
   });
 
-  it('falls back to the settled requirement amount when the facilitator omits it', async () => {
+  it('leaves the stored amount absent when the facilitator omits it', async () => {
     const facilitator = makeFacilitator();
     const x402 = await offeredContext(facilitator);
     const classified = await classifiedUpto(x402);
     await x402.settle({ taskId: 't-upto' }, classified, { amountAtomic: '99' });
-    expect((await x402.store.get('t-upto'))!.receipt!.amount).toBe('99');
+    const receipt = (await x402.store.get('t-upto'))!.receipt!;
+    expect(receipt).not.toHaveProperty('amount');
+  });
+
+  it('persists a facilitator-reported amount on a plain exact settle too', async () => {
+    const facilitator = makeFacilitator(async () => ({
+      success: true,
+      transaction: '0xtx',
+      network: 'eip155:84532',
+      amount: OFFERED,
+    }));
+    const exactAccept: X402Accept = {
+      ...UPTO_ACCEPT,
+      scheme: 'exact',
+      extra: undefined,
+    };
+    const x402 = new X402Context({
+      facilitator,
+      store: new InMemoryX402Store(),
+      x402Version: 2,
+    });
+    for await (const _ of x402.requestPayment({ taskId: 't-x' }, {
+      accepts: [exactAccept],
+    })) {
+      // drain
+    }
+    const payload = {
+      x402Version: 2,
+      accepted: encodeRequirementV2(exactAccept),
+      payload: {
+        signature: '0xsig',
+        authorization: {
+          from: PAYER,
+          to: PAY_TO,
+          value: OFFERED,
+          validAfter: '0',
+          validBefore: '9999999999',
+          nonce: '0x1',
+        },
+      },
+    } as unknown as X402PaymentPayload;
+    const classified = await x402.classify({
+      taskId: 't-x',
+      message: submittedMessage(payload),
+    });
+    await x402.settle({ taskId: 't-x' }, classified as X402ValidClassification);
+    expect((await x402.store.get('t-x'))!.receipt!.amount).toBe(OFFERED);
+  });
+
+  it('reads the payer from permit2Authorization even when a decoy authorization is attached', async () => {
+    const ATTACKER = '0xbadbadbadbadbadbadbadbadbadbadbadbadbad0';
+    const facilitator = makeFacilitator(async () => ({
+      success: true,
+      transaction: '0xtx',
+      network: 'eip155:84532',
+    }));
+    const x402 = await offeredContext(facilitator);
+    // A conformant upto payload with an extra EIP-3009 key bolted on. Shape
+    // sniffing would let the decoy name the payer on the receipt and in the
+    // audit store; scheme-driven extraction must ignore it.
+    const spoofed = {
+      x402Version: 2,
+      accepted: encodeRequirementV2(UPTO_ACCEPT),
+      payload: {
+        signature: '0xsig',
+        permit2Authorization: permit2Authorization(),
+        authorization: {
+          from: ATTACKER,
+          to: PAY_TO,
+          value: OFFERED,
+          validAfter: '0',
+          validBefore: '9999999999',
+          nonce: '0x1',
+        },
+      },
+    } as unknown as X402PaymentPayload;
+    const classified = await classifiedUpto(x402, spoofed);
+    expect(classified.submission.payer).toBe(PAYER);
+    const receipt = await x402.settle({ taskId: 't-upto' }, classified, {
+      amountAtomic: '10',
+    });
+    expect(receipt.payer).toBe(PAYER);
+    expect((await x402.store.get('t-upto'))!.receipt!.payer).toBe(PAYER);
   });
 });
 
@@ -521,20 +727,38 @@ describe('wire codecs — upto requirements', () => {
     });
   });
 
-  it('round-trips an upto requirement under V1 too', () => {
-    const encoded = encodeRequirementV1({
-      ...UPTO_ACCEPT,
-      network: 'base-sepolia',
+  it('refuses to encode an upto requirement under V1', () => {
+    // `upto` has no V1 client registration in `@x402/evm` and the reference
+    // facilitator's Permit2 settlement reads V2 fields, so a V1 upto offering
+    // is a dead end. Fail at configuration time, not mid-payment.
+    expect(() =>
+      encodeRequirementV1({ ...UPTO_ACCEPT, network: 'base-sepolia' }),
+    ).toThrow(/x402 V2 only/);
+  });
+
+  it('rejects a V1 upto offering at requestPayment, before anything is stored', async () => {
+    const x402 = new X402Context({
+      facilitator: makeFacilitator(),
+      store: new InMemoryX402Store(),
+      x402Version: 1,
     });
-    expect(encoded.scheme).toBe('upto');
-    expect(encoded.maxAmountRequired).toBe(OFFERED);
-    expect(encoded.extra).toEqual({ facilitatorAddress: FACILITATOR_ADDRESS });
+    const drain = async () => {
+      for await (const _ of x402.requestPayment({ taskId: 't-v1' }, {
+        accepts: [{ ...UPTO_ACCEPT, network: 'base-sepolia' }],
+      })) {
+        // drain
+      }
+    };
+    await expect(drain()).rejects.toThrow(/x402 V2 only/);
+    expect(await x402.store.get('t-v1')).toBeUndefined();
   });
 
   it('does not synthesize an EIP-712 domain for a non-exact scheme', () => {
     const { extra: _extra, ...withoutExtra } = UPTO_ACCEPT;
     expect(encodeRequirementV2(withoutExtra)).not.toHaveProperty('extra');
-    expect(encodeRequirementV1(withoutExtra)).not.toHaveProperty('extra');
+    expect(
+      encodeRequirementV1({ ...withoutExtra, scheme: 'other', network: 'base-sepolia' }),
+    ).not.toHaveProperty('extra');
   });
 
   it('still defaults the EIP-712 domain for exact', () => {

@@ -100,8 +100,10 @@ export interface A2XClientX402Options {
     requirements: X402PaymentRequirements[],
   ) => X402PaymentRequirements | undefined;
   /**
-   * Let the default selector fall back to an EVM `upto` (usage-based) offer
-   * when the merchant advertises no affordable `exact` one. Default `false`.
+   * Let the default selector fall back to a CAIP-2 EVM `upto` (usage-based)
+   * offer when the merchant advertises no affordable `exact` one — `upto` is
+   * an x402 V2 scheme, so V1 (bare-name) offers are never eligible.
+   * Default `false`.
    *
    * Opt-in because an `upto` signature authorizes the merchant to draw
    * anything up to `amount`, not that exact amount — a broader consent than

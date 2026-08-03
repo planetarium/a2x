@@ -230,6 +230,69 @@ describe('signX402Payment', () => {
     ).rejects.toBeInstanceOf(X402NoSupportedRequirementError);
   });
 
+  it('signs a real V2 upto offer with the actual @x402/evm UptoEvmScheme', async () => {
+    // The rest of the upto signing coverage mocks the peer; this one drives the
+    // real runtime end to end. Signing is entirely local — a plain LocalAccount
+    // exposes no `readContract`, so the gas-sponsoring extension paths bail out
+    // before they would need an RPC endpoint.
+    const facilitatorAddress = '0x4444444444444444444444444444444444444444';
+    const uptoAccept = {
+      scheme: 'upto',
+      network: 'eip155:84532',
+      asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+      amount: '1000000',
+      payTo: PAY_TO,
+      maxTimeoutSeconds: 300,
+      extra: { facilitatorAddress },
+    };
+    const task: Task = {
+      id: 't1',
+      contextId: 'c1',
+      status: {
+        state: TaskState.INPUT_REQUIRED,
+        timestamp: new Date().toISOString(),
+        message: {
+          messageId: 'msg-upto',
+          role: 'agent',
+          parts: [{ text: 'pay up' }],
+          metadata: {
+            [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REQUIRED,
+            [X402_METADATA_KEYS.REQUIRED]: {
+              x402Version: 2,
+              resource: { url: 'https://example.com/protected' },
+              accepts: [uptoAccept],
+            },
+          },
+        },
+      },
+    };
+
+    const signed = await signX402Payment(task, {
+      signer: TEST_ACCOUNT,
+      allowUpto: true,
+    });
+
+    expect(signed.requirement).toEqual(uptoAccept);
+    const inner = signed.payload.payload as unknown as {
+      signature: string;
+      permit2Authorization: {
+        from: string;
+        permitted: { token: string; amount: string };
+        witness: { to: string; facilitator: string };
+      };
+    };
+    // A real secp256k1 signature, not a stub.
+    expect(inner.signature).toMatch(/^0x[0-9a-f]{130}$/i);
+    const auth = inner.permit2Authorization;
+    expect(auth.from.toLowerCase()).toBe(TEST_ACCOUNT.address.toLowerCase());
+    expect(auth.permitted.amount).toBe('1000000');
+    expect(auth.permitted.token.toLowerCase()).toBe(uptoAccept.asset.toLowerCase());
+    expect(auth.witness.to.toLowerCase()).toBe(PAY_TO.toLowerCase());
+    expect(auth.witness.facilitator.toLowerCase()).toBe(facilitatorAddress);
+    // The field names the SDK's validation and payer backfill depend on.
+    expect(signed.payload).toHaveProperty('x402Version', 2);
+  });
+
   it('throws X402InvalidVersionError when the merchant claims a non-1 x402Version (spec §6/§9)', async () => {
     // x402-v1 §9 lists `invalid_x402_version`; the x402 npm package
     // pins `x402Versions: [1]`, so signing a non-1 requirement would

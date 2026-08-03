@@ -68,6 +68,9 @@ type X402EvmUptoClientModule = {
 /** CAIP-2 wildcard `@x402/evm` registers its V2 schemes under. */
 const EVM_CAIP2_WILDCARD = 'eip155:*';
 
+/** A concrete CAIP-2 EVM network id — the only form a V2-only scheme can use. */
+const CAIP2_EVM_NETWORK = /^eip155:\d+$/;
+
 // Memoize one x402Client per signer identity — constructing the client and
 // registering the scheme is not free, and callers typically reuse a signer.
 const _runtimeBySigner = new WeakMap<LocalAccount, Promise<X402ClientRuntime>>();
@@ -122,8 +125,8 @@ export interface SignX402PaymentOptions {
     requirements: X402PaymentRequirements[],
   ) => X402PaymentRequirements | undefined;
   /**
-   * Let the **default** selector fall back to an EVM `upto` offer when the
-   * merchant advertises no payable `exact` one. Default `false`.
+   * Let the **default** selector fall back to a CAIP-2 EVM `upto` offer when
+   * the merchant advertises no payable `exact` one. Default `false`.
    *
    * Off by default deliberately: signing an `upto` offer authorizes the
    * merchant to draw **anything up to** `amount`, whereas `exact` authorizes
@@ -310,6 +313,10 @@ export function rejectX402Payment(task: Task): {
  * that substitution on its own. With `allowUpto`, `upto` is still only a
  * *fallback*: a payable `exact` offer always wins.
  *
+ * The `upto` fallback additionally requires a **CAIP-2** network. `upto` is a
+ * V2-only scheme with no V1 registration in `@x402/evm`, so a bare-name
+ * (V1) upto offer could only fail deep inside the signing runtime.
+ *
  * @internal Not part of `@a2x/sdk/x402`'s public surface.
  */
 export function defaultSelect(
@@ -321,6 +328,6 @@ export function defaultSelect(
   );
   if (exact || !options?.allowUpto) return exact;
   return requirements.find(
-    (r) => r.scheme === 'upto' && isEvmNetwork(r.network),
+    (r) => r.scheme === 'upto' && CAIP2_EVM_NETWORK.test(r.network),
   );
 }

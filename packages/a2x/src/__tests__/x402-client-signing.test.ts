@@ -57,12 +57,16 @@ vi.mock('../x402/peer.js', () => ({
 }));
 
 // `_loadRuntime` memoizes one runtime per signer identity, so every test that
-// inspects scheme registration or a fresh envelope uses its own signer.
-function freshSigner(seed: string) {
-  return privateKeyToAccount(`0x${seed.repeat(64).slice(0, 64)}` as `0x${string}`);
+// inspects scheme registration or a fresh envelope uses its own signer. Keys
+// are padded counters — repeating a high hex digit 64 times overflows the
+// secp256k1 group order.
+function freshSigner(seed: number) {
+  return privateKeyToAccount(
+    `0x${seed.toString(16).padStart(64, '0')}` as `0x${string}`,
+  );
 }
 
-const SIGNER = freshSigner('3');
+const SIGNER = freshSigner(0x3333);
 
 const V2_ACCEPT = {
   scheme: 'exact',
@@ -132,7 +136,7 @@ describe('signX402Payment envelope forwarding', () => {
 
   it('registers the upto EVM scheme on the runtime alongside exact', async () => {
     captured.registered = [];
-    await signX402Payment(v2RequiredTask(), { signer: freshSigner('a') });
+    await signX402Payment(v2RequiredTask(), { signer: freshSigner(0xa) });
     expect(captured.registered).toEqual([['eip155:*', 'upto']]);
   });
 });
@@ -141,14 +145,14 @@ describe('signX402Payment upto selection policy', () => {
   it('refuses to auto-pick an upto offer without allowUpto', async () => {
     await expect(
       signX402Payment(v2RequiredTask([V2_UPTO_ACCEPT]), {
-        signer: freshSigner('b'),
+        signer: freshSigner(0xb),
       }),
     ).rejects.toThrow(X402NoSupportedRequirementError);
   });
 
   it('falls back to upto under allowUpto when no exact offer exists', async () => {
     const signed = await signX402Payment(v2RequiredTask([V2_UPTO_ACCEPT]), {
-      signer: freshSigner('c'),
+      signer: freshSigner(0xc),
       allowUpto: true,
     });
     expect(signed.requirement).toEqual(V2_UPTO_ACCEPT);
@@ -160,16 +164,36 @@ describe('signX402Payment upto selection policy', () => {
   it('still prefers a payable exact offer when allowUpto is set', async () => {
     const signed = await signX402Payment(
       v2RequiredTask([V2_UPTO_ACCEPT, V2_ACCEPT]),
-      { signer: freshSigner('d'), allowUpto: true },
+      { signer: freshSigner(0xd), allowUpto: true },
     );
     expect(signed.requirement).toEqual(V2_ACCEPT);
+  });
+
+  it('never falls back to a bare-name (V1) upto offer, even with allowUpto', async () => {
+    // `upto` is V2-only; a bare-name network could only fail deep inside the
+    // signing runtime, so the selector must not choose it at all.
+    await expect(
+      signX402Payment(
+        v2RequiredTask([{ ...V2_UPTO_ACCEPT, network: 'base-sepolia' }]),
+        { signer: freshSigner(0xf), allowUpto: true },
+      ),
+    ).rejects.toThrow(X402NoSupportedRequirementError);
+  });
+
+  it('throws when allowUpto is set but no EVM offer exists at all', async () => {
+    await expect(
+      signX402Payment(
+        v2RequiredTask([{ ...V2_UPTO_ACCEPT, network: 'solana:mainnet' }]),
+        { signer: freshSigner(0x9), allowUpto: true },
+      ),
+    ).rejects.toThrow(X402NoSupportedRequirementError);
   });
 
   it('signs an upto offer chosen by an explicit selectRequirement', async () => {
     const signed = await signX402Payment(
       v2RequiredTask([V2_ACCEPT, V2_UPTO_ACCEPT]),
       {
-        signer: freshSigner('e'),
+        signer: freshSigner(0xe),
         // No allowUpto — an explicit selector is the caller's own decision.
         selectRequirement: (reqs) => reqs.find((r) => r.scheme === 'upto'),
       },

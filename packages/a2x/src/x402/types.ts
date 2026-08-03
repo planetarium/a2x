@@ -319,11 +319,16 @@ export interface X402Accept {
    */
   extra?: Record<string, unknown>;
   /**
-   * Payment scheme. Defaults to `"exact"` (a fixed charge signed as an
-   * EIP-3009 authorization). `"upto"` is the x402 V2 usage-based scheme: the
-   * payer signs a Permit2 witness authorizing **up to** `amount`, and the
-   * merchant settles the metered charge via
-   * `X402Context.settle(ctx, classified, { amountAtomic })`.
+   * Payment scheme. Defaults to `"exact"` (a fixed charge, signed as an
+   * EIP-3009 authorization — or as a Permit2 witness when `extra` sets
+   * `assetTransferMethod: 'permit2'`).
+   *
+   * `"upto"` is the usage-based scheme: the payer signs a Permit2 witness
+   * authorizing **up to** `amount`, and the merchant settles the metered
+   * charge via `X402Context.settle(ctx, classified, { amountAtomic })`. It is
+   * **x402 V2 only** — encoding an `upto` offering under `x402Version: 1`
+   * throws, because neither the signing runtime nor the reference facilitator
+   * has a V1 path for it.
    *
    * Other scheme strings pass through the pipeline untouched — payload-shape
    * validation for them is up to the caller (override

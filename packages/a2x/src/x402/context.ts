@@ -96,6 +96,7 @@ import {
   isSupportedVersion,
   payloadNetwork,
   requirementAmount,
+  requirementScheme,
   withRequirementAmount,
   type X402Version,
 } from './versions.js';
@@ -103,10 +104,12 @@ import {
   buildX402PaymentCompletedMetadata,
   buildX402PaymentFailedMetadata,
   buildX402PaymentRequiredMetadata,
+  parseAtomicAmount,
   parseX402PaymentSubmission,
   payloadAuthorizedAmount,
   pickX402Requirement,
   validateX402PayloadShape,
+  withRequirementScopedPayer,
   type X402PaymentSubmission,
   type X402RequestPaymentInput,
   type X402ValidationIssue,
@@ -466,14 +469,21 @@ export abstract class BaseX402Context {
       return result;
     }
 
+    // Now that a requirement is matched, the payer can be read from the field
+    // that requirement's scheme actually signs, rather than sniffed from
+    // whichever key happens to be on the payload. A payload carrying *both* an
+    // EIP-3009 `authorization` and a Permit2 `permit2Authorization` would
+    // otherwise let the decoy name the payer on the receipt and in the store.
+    const scoped = withRequirementScopedPayer(submission, requirement);
+
     // Hook runs BEFORE any store write, so a subclass that accepts a payload
     // the built-in validator rejects never has to repair a `failed` entry.
-    const issues = this.validatePayloadShape(submission.payload, requirement);
+    const issues = this.validatePayloadShape(scoped.payload!, requirement);
     if (issues.length > 0) {
       const first = issues[0]!;
       const result: X402Classification = {
         kind: 'invalid-shape',
-        submission,
+        submission: scoped,
         requirement,
         issues,
         code: first.code,
@@ -483,7 +493,7 @@ export abstract class BaseX402Context {
       return result;
     }
 
-    return { kind: 'valid', submission, requirement };
+    return { kind: 'valid', submission: scoped, requirement };
   }
 
   /**
@@ -583,6 +593,11 @@ export abstract class BaseX402Context {
    * the merchant charges only what was consumed. The requirement forwarded to
    * the facilitator is a clone with its amount replaced. See
    * `meteredRequirement` for the clamp guarantee.
+   *
+   * Metering an `exact` requirement **throws**: `exact` binds the signature to
+   * one specific value, and facilitators reject a settle whose requirement
+   * amount disagrees with the signed `authorization.value`. Failing here — not
+   * after the work is done and the facilitator has rejected it — is the point.
    */
   async settle(
     ctx: { taskId?: string },
@@ -667,13 +682,13 @@ export abstract class BaseX402Context {
           transaction: receipt.transaction,
           network: receipt.network,
           ...(receipt.payer ? { payer: receipt.payer } : {}),
-          // Under a usage-based scheme the settled amount is the key
-          // reconciliation datum, and it is *not* recoverable from
-          // `entry.accepts` (which holds the authorized maximum). Prefer what
-          // the facilitator reported; fall back to the amount we asked it to
-          // settle, which is the offered amount for `exact` and the clamped
-          // metered charge for `upto`.
-          amount: receipt.amount ?? requirementAmount(requirement),
+          // Only the facilitator-confirmed amount. Under a usage-based scheme
+          // this is the key reconciliation datum and is not recoverable from
+          // `entry.accepts` (which holds the authorized maximum) — but what we
+          // *asked* to settle is not evidence of what settled, so when the
+          // facilitator omits it the key stays absent rather than recording an
+          // inference as fact.
+          ...(receipt.amount !== undefined ? { amount: receipt.amount } : {}),
           settledAt,
         };
         await this.store.update(ctx.taskId, {
@@ -715,43 +730,53 @@ export abstract class BaseX402Context {
    * (`maxAmountRequired` under V1, `amount` under V2). Comparison is BigInt,
    * so 30-digit atomic values are exact.
    *
-   * Throws on a non-integer or negative `amountAtomic` rather than silently
-   * settling something else — an unparseable meter reading is a merchant bug,
-   * and coercing it would charge the payer an amount nobody computed.
+   * Throws when `amountAtomic` is not a plain decimal integer string. Bare
+   * `BigInt` would accept `''` as zero and `'0x10'` as sixteen — an empty
+   * meter reading silently settling nothing, or a hex string settling 16× the
+   * intended charge, is precisely what the clamp exists to prevent.
+   *
+   * Also throws when the requirement's scheme is `exact`: that scheme binds
+   * the signature to one value, so a facilitator rejects any settle whose
+   * amount disagrees with it. Failing fast beats discovering it after the work
+   * is already done.
    */
   protected meteredRequirement(
     requirement: X402PaymentRequirements,
     payload: X402PaymentPayload,
     amountAtomic: string,
   ): X402PaymentRequirements {
-    let metered: bigint;
-    try {
-      metered = BigInt(amountAtomic);
-    } catch {
+    if (requirementScheme(requirement) === 'exact') {
       throw new Error(
-        `${this.constructor.name}.settle: amountAtomic must be an integer string in the ` +
-          `asset's smallest unit, got ${JSON.stringify(amountAtomic)}`,
+        `${this.constructor.name}.settle: metered settlement requires a usage-based scheme; ` +
+          `the matched requirement uses "exact", which binds the payer's signature to a ` +
+          `single amount. Offer scheme "upto" to charge a metered amount.`,
       );
     }
-    if (metered < 0n) {
+    const metered = parseAtomicAmount(amountAtomic);
+    if (metered === undefined) {
       throw new Error(
-        `${this.constructor.name}.settle: amountAtomic must not be negative, got ${amountAtomic}`,
+        `${this.constructor.name}.settle: amountAtomic must be a decimal integer string in ` +
+          `the asset's smallest unit (no sign, hex, or whitespace), got ` +
+          `${JSON.stringify(amountAtomic)}`,
       );
     }
 
     const bounds: bigint[] = [metered];
-    // A malformed offered amount would throw here; it came from our own
-    // encoded offering, so that is a configuration error worth surfacing.
-    bounds.push(BigInt(requirementAmount(requirement)));
-    const signedCap = payloadAuthorizedAmount(payload);
-    if (signedCap !== undefined) {
-      try {
-        bounds.push(BigInt(signedCap));
-      } catch {
-        // A non-numeric cap is client-controlled garbage that shape validation
-        // already rejects; ignore it rather than let it raise the ceiling.
-      }
+    const offered = parseAtomicAmount(requirementAmount(requirement));
+    if (offered === undefined) {
+      // Came from our own encoded offering — a configuration error, not a
+      // client one, and silently skipping the bound would drop a clamp.
+      throw new Error(
+        `${this.constructor.name}.settle: the matched requirement's amount ` +
+          `${JSON.stringify(requirementAmount(requirement))} is not a decimal integer string.`,
+      );
     }
+    bounds.push(offered);
+    // A non-decimal cap is client-controlled garbage that shape validation
+    // already rejects; skip it rather than let it raise the ceiling.
+    const signedCap = parseAtomicAmount(payloadAuthorizedAmount(payload));
+    if (signedCap !== undefined) bounds.push(signedCap);
+
     const clamped = bounds.reduce((a, b) => (a < b ? a : b));
     return withRequirementAmount(requirement, clamped.toString());
   }
