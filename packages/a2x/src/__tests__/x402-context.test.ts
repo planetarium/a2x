@@ -389,12 +389,60 @@ describe('X402Context.verify and X402Context.settle', () => {
     expect(receipt.network).toBe('base-sepolia');
     // Fallback to authorization.from since facilitator omitted payer.
     expect(receipt.payer).toBe('0x1234567890123456789012345678901234567890');
+    // A V1 facilitator reports no amount — the key must stay absent, not `undefined`.
+    expect('amount' in receipt).toBe(false);
 
     const entry = await ctx.store.get('t1');
     expect(entry?.status).toBe('completed');
     expect(entry?.receipt?.transaction).toBe('0xtx');
     expect(entry?.receipt?.payer).toBe('0x1234567890123456789012345678901234567890');
     expect(entry?.receipt?.settledAt).toBeInstanceOf(Date);
+  });
+
+  it('settle carries the facilitator amount onto the receipt', async () => {
+    // Usage-based schemes settle less than the signed authorization, so the
+    // metered charge must reach the payer's receipt verbatim.
+    const facilitator: X402Facilitator = {
+      verify: vi.fn(async () => ({ isValid: true } as Awaited<ReturnType<X402Facilitator['verify']>>)),
+      settle: vi.fn(async () => ({
+        success: true,
+        transaction: '0xtx',
+        network: 'base-sepolia',
+        amount: '2500',
+      } as Awaited<ReturnType<X402Facilitator['settle']>>)),
+    };
+    const ctx = new X402Context({ facilitator });
+    await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
+    const classified = await ctx.classify({
+      taskId: 't1',
+      message: buildSubmittedMessage(),
+    });
+    if (classified.kind !== 'valid') throw new Error('expected valid');
+    const receipt = await ctx.settle({ taskId: 't1' }, classified);
+    expect(receipt.amount).toBe('2500');
+  });
+
+  it('settle carries the facilitator amount onto a failure receipt', async () => {
+    const facilitator: X402Facilitator = {
+      verify: vi.fn(async () => ({ isValid: true } as Awaited<ReturnType<X402Facilitator['verify']>>)),
+      settle: vi.fn(async () => ({
+        success: false,
+        transaction: '',
+        network: 'base-sepolia',
+        errorReason: 'on-chain reverted',
+        amount: '2500',
+      } as Awaited<ReturnType<X402Facilitator['settle']>>)),
+    };
+    const ctx = new X402Context({ facilitator });
+    await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
+    const classified = await ctx.classify({
+      taskId: 't1',
+      message: buildSubmittedMessage(),
+    });
+    if (classified.kind !== 'valid') throw new Error('expected valid');
+    const receipt = await ctx.settle({ taskId: 't1' }, classified);
+    expect(receipt.success).toBe(false);
+    expect(receipt.amount).toBe('2500');
   });
 
   it('settle falls back to the requirement network for a V2 payload with no accepted echo', async () => {

@@ -594,6 +594,10 @@ export abstract class BaseX402Context {
       // supplies it — never fabricate a placeholder address.
       ...(payer ? { payer } : {}),
       ...(raw.errorReason ? { errorReason: raw.errorReason } : {}),
+      // V2 facilitators report what was actually settled, which can be less
+      // than the signed authorization under usage-based schemes — pass it
+      // through on success and failure alike. V1 facilitators never set it.
+      ...(raw.amount !== undefined ? { amount: raw.amount } : {}),
     };
 
     if (ctx.taskId) {

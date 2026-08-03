@@ -205,6 +205,13 @@ export interface X402SettleResponse {
   payer?: string;
   /** Short error code (e.g. `VERIFY_FAILED`) when `success` is false. */
   errorReason?: string;
+  /**
+   * Amount actually settled, in the asset's smallest unit, as reported by the
+   * facilitator. **Optional** — only x402 V2 facilitators report it. It is the
+   * payer's only record of what they were charged under usage-based schemes,
+   * where the settled amount can be less than the signed authorization.
+   */
+  amount?: string;
 }
 
 /**
