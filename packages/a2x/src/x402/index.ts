@@ -246,6 +246,7 @@ export {
   signX402Payment,
   rejectX402Payment,
   getX402PaymentRequirements,
+  getX402PaymentExtensions,
   getX402Receipts,
   getX402Status,
 } from './client.js';

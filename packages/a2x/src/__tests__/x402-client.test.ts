@@ -11,6 +11,7 @@ import {
   X402PaymentRequiredError,
 } from '../x402/errors.js';
 import {
+  getX402PaymentExtensions,
   getX402PaymentRequirements,
   getX402Receipts,
   getX402Status,
@@ -82,6 +83,41 @@ describe('getX402PaymentRequirements', () => {
       status: { state: TaskState.COMPLETED, timestamp: new Date().toISOString() },
     };
     expect(getX402PaymentRequirements(task)).toBeUndefined();
+  });
+});
+
+describe('getX402PaymentExtensions', () => {
+  function v2RequiredTask(extensions?: unknown): Task {
+    const task = paymentRequiredTask([BASE_ACCEPT]);
+    const meta = task.status.message!.metadata as Record<string, unknown>;
+    meta[X402_METADATA_KEYS.REQUIRED] = {
+      x402Version: 2,
+      resource: { url: 'https://example.com/protected' },
+      accepts: [],
+      ...(extensions !== undefined ? { extensions } : {}),
+    };
+    return task;
+  }
+
+  it('returns the envelope-level extensions from a V2 payment-required task', () => {
+    const extensions = { eip2612GasSponsoring: {}, erc20ApprovalGasSponsoring: {} };
+    expect(getX402PaymentExtensions(v2RequiredTask(extensions))).toEqual(extensions);
+  });
+
+  it('returns undefined when the V2 envelope carries no extensions', () => {
+    expect(getX402PaymentExtensions(v2RequiredTask())).toBeUndefined();
+  });
+
+  it('returns undefined for a V1 envelope — V1 has no extensions field', () => {
+    expect(getX402PaymentExtensions(paymentRequiredTask([BASE_ACCEPT]))).toBeUndefined();
+  });
+
+  it('returns undefined when the task is not asking for payment', () => {
+    const task: Task = {
+      id: 't1',
+      status: { state: TaskState.COMPLETED, timestamp: new Date().toISOString() },
+    };
+    expect(getX402PaymentExtensions(task)).toBeUndefined();
   });
 });
 

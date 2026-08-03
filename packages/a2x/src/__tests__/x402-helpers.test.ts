@@ -123,6 +123,26 @@ describe('buildX402PaymentRequiredMetadata', () => {
     expect(required.error).toBe('INSUFFICIENT_FUNDS');
   });
 
+  it('carries `extensions` into the V2 required block', () => {
+    const md = buildX402PaymentRequiredMetadata(
+      { accepts: [SAMPLE_ACCEPT], extensions: { eip2612GasSponsoring: {} } },
+      { x402Version: 2 },
+    );
+    const required = md[X402_METADATA_KEYS.REQUIRED] as {
+      extensions?: Record<string, unknown>;
+    };
+    expect(required.extensions).toEqual({ eip2612GasSponsoring: {} });
+  });
+
+  it('ignores `extensions` under V1 — the V1 envelope has no such field', () => {
+    const md = buildX402PaymentRequiredMetadata({
+      accepts: [SAMPLE_ACCEPT],
+      extensions: { eip2612GasSponsoring: {} },
+    });
+    const required = md[X402_METADATA_KEYS.REQUIRED] as Record<string, unknown>;
+    expect('extensions' in required).toBe(false);
+  });
+
   it('throws when accepts is empty', () => {
     expect(() => buildX402PaymentRequiredMetadata({ accepts: [] })).toThrow(
       /at least one entry/,

@@ -17,6 +17,7 @@ import {
   X402_METADATA_KEYS,
   X402_FOUNDATION_EXTENSION_URI,
   requirementAmount,
+  getX402PaymentExtensions,
   signX402Payment,
   type X402Accept,
   type X402Facilitator,
@@ -99,6 +100,22 @@ describe('single-version emission', () => {
     const required = meta[X402_METADATA_KEYS.REQUIRED] as X402PaymentRequiredResponse;
     expect(required.x402Version).toBe(2);
     expect(required.accepts[0]!.network).toBe('eip155:84532');
+  });
+
+  it('advertises facilitator `extensions` on the V2 envelope', async () => {
+    const ctx = v2Context();
+    const meta = await drainMetadata(
+      ctx.requestPayment(
+        { taskId: 't1', activatedExtensions: [X402_FOUNDATION_EXTENSION_URI] },
+        { accepts: [ACCEPT], extensions: { eip2612GasSponsoring: {} } },
+      ),
+    );
+    const required = meta[X402_METADATA_KEYS.REQUIRED] as X402PaymentRequiredResponse;
+    // A client reading this off the task hands it to @x402/core as the
+    // PaymentPayloadContext extensions, which is what unlocks gasless permits.
+    expect(getX402PaymentExtensions(requiredTask(required))).toEqual({
+      eip2612GasSponsoring: {},
+    });
   });
 
   it('serves a v0.2-activated (V1-only) client on a V1 server', async () => {

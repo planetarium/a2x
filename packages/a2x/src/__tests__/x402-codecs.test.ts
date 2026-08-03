@@ -156,6 +156,21 @@ describe('wire codecs', () => {
     expect(encodePaymentRequiredV2([ACCEPT], { error: 'boom' }).error).toBe('boom');
   });
 
+  it('carries envelope-level `extensions` through the V2 codec', () => {
+    const extensions = { eip2612GasSponsoring: {}, 'builder-code': { id: 'a2x' } };
+    const req = encodePaymentRequiredV2([ACCEPT], { extensions });
+    expect(req.extensions).toEqual(extensions);
+  });
+
+  it('omits `extensions` from the V2 envelope when not supplied', () => {
+    expect('extensions' in encodePaymentRequiredV2([ACCEPT])).toBe(false);
+  });
+
+  it('leaves the V1 envelope untouched — it has no `extensions` field', () => {
+    // The option is V2-only; V1 callers never see the key on the wire.
+    expect('extensions' in encodePaymentRequiredV1([ACCEPT])).toBe(false);
+  });
+
   it('defaults `extra` to the asset-correct EIP-712 domain', () => {
     // Base Sepolia USDC → name "USDC"; Base mainnet USDC → name "USD Coin".
     const sepolia = encodeRequirementV1({ ...ACCEPT });

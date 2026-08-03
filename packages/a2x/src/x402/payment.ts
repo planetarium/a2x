@@ -70,6 +70,16 @@ export interface X402RequestPaymentInput {
    * `X402PaymentRequiredResponse.error` carries the human-readable cause.
    */
   previousError?: string;
+  /**
+   * Envelope-level `extensions` advertising facilitator capabilities to the
+   * client (e.g. `{ eip2612GasSponsoring: {} }`, which lets a Permit2 payer
+   * sign a gasless EIP-2612 permit instead of an on-chain approval). Mirror
+   * here whatever the facilitator reports as supported.
+   *
+   * **V2 only** — the V1 envelope has no such field, so this is a no-op
+   * under `x402Version: 1`.
+   */
+  extensions?: Record<string, unknown>;
 }
 
 /**
@@ -96,7 +106,10 @@ export function buildX402PaymentRequiredMetadata(
   const errorOpt = input.previousError ? { error: input.previousError } : {};
   const required =
     x402Version === 2
-      ? encodePaymentRequiredV2(input.accepts, errorOpt)
+      ? encodePaymentRequiredV2(input.accepts, {
+          ...errorOpt,
+          ...(input.extensions ? { extensions: input.extensions } : {}),
+        })
       : encodePaymentRequiredV1(input.accepts, errorOpt);
   return {
     [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REQUIRED,
