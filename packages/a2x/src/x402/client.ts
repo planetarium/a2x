@@ -148,9 +148,12 @@ export function getX402PaymentExtensions(
   const required = getX402PaymentRequirements(task);
   if (required?.x402Version !== 2) return undefined;
   const extensions = required.extensions;
-  // The envelope is remote-controlled: only hand back a real object so callers
-  // can spread it into a context without guarding against a scalar.
-  return extensions && typeof extensions === 'object' ? extensions : undefined;
+  // The envelope is remote-controlled: only hand back a real plain object so
+  // callers can spread it into a context without guarding against a scalar —
+  // or an array, which `typeof` alone would let through.
+  return extensions && typeof extensions === 'object' && !Array.isArray(extensions)
+    ? extensions
+    : undefined;
 }
 
 /**

@@ -112,6 +112,24 @@ describe('getX402PaymentExtensions', () => {
     expect(getX402PaymentExtensions(paymentRequiredTask([BASE_ACCEPT]))).toBeUndefined();
   });
 
+  it('returns undefined for a nonconformant V1 envelope that smuggles extensions', () => {
+    const task = paymentRequiredTask([BASE_ACCEPT]);
+    const meta = task.status.message!.metadata as Record<string, unknown>;
+    (meta[X402_METADATA_KEYS.REQUIRED] as Record<string, unknown>).extensions = {
+      eip2612GasSponsoring: {},
+    };
+    expect(getX402PaymentExtensions(task)).toBeUndefined();
+  });
+
+  it.each([
+    ['an array', ['eip2612GasSponsoring']],
+    ['a string', 'eip2612GasSponsoring'],
+    ['a number', 1],
+    ['null', null],
+  ])('returns undefined when the remote envelope carries %s instead of an object', (_label, hostile) => {
+    expect(getX402PaymentExtensions(v2RequiredTask(hostile))).toBeUndefined();
+  });
+
   it('returns undefined when the task is not asking for payment', () => {
     const task: Task = {
       id: 't1',

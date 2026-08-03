@@ -488,8 +488,11 @@ On a successful payment, the completed task's status message carries:
 
 Every receipt carries a `payer` field per x402-v1 §5.3.2. A V2 facilitator may
 also report `amount` — the amount actually settled, in the asset's smallest unit
-— and the SDK passes it through onto the receipt (on failure receipts too, when
-the facilitator supplies it). For the `exact` scheme it equals the offered
+— and the SDK passes it through onto the receipt. This covers the success
+receipt and failure receipts built from a structured `success: false` response
+body; when a facilitator rejects settlement with a non-2xx status, `@x402/core`
+surfaces it as a thrown error that does not preserve `amount`, so those failure
+receipts cannot carry it. For the `exact` scheme it equals the offered
 amount; under usage-based schemes it is the metered charge and can be less than
 the signed authorization, so it is the payer's record of what they were charged.
 V1 facilitators never set it, so the field is absent on V1 receipts. Failures

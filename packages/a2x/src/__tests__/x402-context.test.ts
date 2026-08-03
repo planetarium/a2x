@@ -422,6 +422,30 @@ describe('X402Context.verify and X402Context.settle', () => {
     expect(receipt.amount).toBe('2500');
   });
 
+  it('settle preserves a zero amount — "0" is a report, not an omission', async () => {
+    // Zero metered usage under a usage-based scheme settles as amount "0";
+    // a truthiness check would drop it and leave the payer unable to tell
+    // "charged nothing" from "amount unreported".
+    const facilitator: X402Facilitator = {
+      verify: vi.fn(async () => ({ isValid: true } as Awaited<ReturnType<X402Facilitator['verify']>>)),
+      settle: vi.fn(async () => ({
+        success: true,
+        transaction: '0xtx',
+        network: 'base-sepolia',
+        amount: '0',
+      } as Awaited<ReturnType<X402Facilitator['settle']>>)),
+    };
+    const ctx = new X402Context({ facilitator });
+    await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
+    const classified = await ctx.classify({
+      taskId: 't1',
+      message: buildSubmittedMessage(),
+    });
+    if (classified.kind !== 'valid') throw new Error('expected valid');
+    const receipt = await ctx.settle({ taskId: 't1' }, classified);
+    expect(receipt.amount).toBe('0');
+  });
+
   it('settle carries the facilitator amount onto a failure receipt', async () => {
     const facilitator: X402Facilitator = {
       verify: vi.fn(async () => ({ isValid: true } as Awaited<ReturnType<X402Facilitator['verify']>>)),
