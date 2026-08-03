@@ -7,7 +7,7 @@
  * the byte shape a2a-x402 v0.2 clients and the V1 facilitator expect.
  */
 
-import { defaultEip712Extra } from './assets.js';
+import { schemeExtra } from './assets.js';
 import { X402_DEFAULT_TIMEOUT_SECONDS } from './constants.js';
 import { toBareName } from './networks.js';
 import type {
@@ -20,8 +20,22 @@ import type {
 export function encodeRequirementV1(
   accept: X402Accept,
 ): X402PaymentRequirementsV1 {
+  const scheme = accept.scheme ?? 'exact';
+  // `upto` exists only in x402 V2. `@x402/core`'s client has no `registerV1`
+  // path for it, and the reference facilitator's Permit2 settlement reads V2
+  // fields (`accepted.scheme`, `requirements.amount`), so a V1 upto offering
+  // can be neither signed nor settled. Refusing it here — at the encode step,
+  // before `requestPayment` persists an entry — turns a silent dead end into a
+  // configuration error the operator can act on.
+  if (scheme === 'upto') {
+    throw new Error(
+      'encodeRequirementV1: the "upto" scheme is x402 V2 only and cannot be encoded ' +
+        'under x402Version 1. Configure the server with `new X402Context({ x402Version: 2 })` ' +
+        'to offer usage-based payments.',
+    );
+  }
   return {
-    scheme: accept.scheme ?? 'exact',
+    scheme,
     network: toBareName(accept.network),
     maxAmountRequired: accept.amount,
     resource: accept.resource,
@@ -30,7 +44,7 @@ export function encodeRequirementV1(
     payTo: accept.payTo,
     maxTimeoutSeconds: accept.maxTimeoutSeconds ?? X402_DEFAULT_TIMEOUT_SECONDS,
     asset: accept.asset,
-    extra: accept.extra ?? defaultEip712Extra(accept.asset),
+    ...schemeExtra(scheme, accept),
   };
 }
 

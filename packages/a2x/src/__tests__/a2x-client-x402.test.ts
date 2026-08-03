@@ -92,6 +92,47 @@ function paymentRequiredTask(): unknown {
   };
 }
 
+/** A V2 `payment-required` whose only option is a usage-based `upto` offer. */
+function uptoRequiredTask(): unknown {
+  return {
+    kind: 'task',
+    id: 't1',
+    contextId: 'c1',
+    status: {
+      state: 'input-required',
+      timestamp: new Date().toISOString(),
+      message: {
+        messageId: 'x402-upto-1',
+        role: 'agent',
+        parts: [{ kind: 'text', text: 'pay up to' }],
+        metadata: {
+          [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REQUIRED,
+          [X402_METADATA_KEYS.REQUIRED]: {
+            x402Version: 2,
+            resource: { url: 'https://example.com/protected' },
+            accepts: [
+              {
+                scheme: 'upto',
+                network: 'eip155:84532',
+                asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+                amount: '1000',
+                payTo: '0x000000000000000000000000000000000000dEaD',
+                maxTimeoutSeconds: 300,
+                extra: {
+                  facilitatorAddress:
+                    '0x4444444444444444444444444444444444444444',
+                },
+              },
+            ],
+          },
+        },
+      },
+    },
+    artifacts: [],
+    history: [],
+  };
+}
+
 function completedTaskWithReceipt(): unknown {
   return {
     kind: 'task',
@@ -295,6 +336,48 @@ describe('A2XClient.sendMessage — native x402 dance', () => {
         message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
       }),
     ).rejects.toBeInstanceOf(X402NoSupportedRequirementError);
+  });
+
+  it('does not sign an upto-only offer unless allowUpto is set', async () => {
+    const { fetch } = scriptedFetch([() => jsonRpcOk(uptoRequiredTask())]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: { signer: TEST_ACCOUNT },
+    });
+    await expect(
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      }),
+    ).rejects.toBeInstanceOf(X402NoSupportedRequirementError);
+  });
+
+  it('signs an upto-only offer when allowUpto is set', async () => {
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(uptoRequiredTask()),
+      () => jsonRpcOk(completedTaskWithReceipt()),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: { signer: TEST_ACCOUNT, allowUpto: true },
+    });
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+
+    expect(task.status.state).toBe('completed');
+    expect(rpcRequests).toHaveLength(2);
+    const followup = rpcRequests[1]!.body as {
+      params: { message: { metadata: Record<string, unknown> } };
+    };
+    const meta = followup.params.message.metadata;
+    expect(meta[X402_METADATA_KEYS.STATUS]).toBe(X402_PAYMENT_STATUS.SUBMITTED);
+    const payload = meta[X402_METADATA_KEYS.PAYLOAD] as {
+      payload: { permit2Authorization: { from: string } };
+    };
+    // A real Permit2 witness, signed by the configured account.
+    expect(payload.payload.permit2Authorization.from.toLowerCase()).toBe(
+      TEST_ACCOUNT.address.toLowerCase(),
+    );
   });
 
   it('honours a caller-supplied selectRequirement', async () => {

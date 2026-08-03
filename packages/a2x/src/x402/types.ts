@@ -54,6 +54,43 @@ export interface X402ExactEvmPayload {
   authorization: X402EvmAuthorization;
 }
 
+/**
+ * EVM Permit2 witness authorization signed for the `upto` scheme (x402 V2
+ * usage-based payments). Field names mirror `@x402/evm`'s `upto/client`
+ * output verbatim — the facilitator reads them by name.
+ *
+ * `permitted.amount` is the **maximum** the payer authorized, not the charge:
+ * the merchant settles the metered amount and the facilitator enforces that it
+ * does not exceed this cap.
+ */
+export interface X402Permit2Authorization {
+  /** Payer wallet address — the `payer` on the resulting receipt. */
+  from: string;
+  permitted: {
+    /** Token contract the transfer draws from. */
+    token: string;
+    /** Maximum authorized amount, in the asset's smallest unit. */
+    amount: string;
+  };
+  /** Permit2 proxy authorized to pull the transfer. */
+  spender: string;
+  nonce: string;
+  deadline: string;
+  witness: {
+    /** Recipient the authorization is bound to — must equal the requirement's `payTo`. */
+    to: string;
+    /** Facilitator allowed to execute the transfer (`extra.facilitatorAddress`). */
+    facilitator: string;
+    validAfter: string;
+  };
+}
+
+/** Inner signed payload for the `upto` EVM scheme (x402 V2 only). */
+export interface X402UptoEvmPayload {
+  signature: string;
+  permit2Authorization: X402Permit2Authorization;
+}
+
 // ─── V1 wire shapes (x402Version: 1) ───
 
 /** A single V1 payment option. */
@@ -89,7 +126,7 @@ export interface X402PaymentPayloadV1 {
   scheme: string;
   /** Bare network name. */
   network: string;
-  payload: X402ExactEvmPayload | Record<string, unknown>;
+  payload: X402ExactEvmPayload | X402UptoEvmPayload | Record<string, unknown>;
 }
 
 // ─── V2 wire shapes (x402Version: 2) ───
@@ -131,7 +168,7 @@ export interface X402PaymentPayloadV2 {
   x402Version: 2;
   resource?: X402ResourceInfo;
   accepted: X402PaymentRequirementsV2;
-  payload: X402ExactEvmPayload | Record<string, unknown>;
+  payload: X402ExactEvmPayload | X402UptoEvmPayload | Record<string, unknown>;
   extensions?: Record<string, unknown>;
 }
 
@@ -198,9 +235,10 @@ export interface X402SettleResponse {
    * Address of the payer's wallet. **Optional** — x402 V2 (and the foundation
    * A2A transport's failure examples) mark `payer` optional, and V2 receipts
    * from third-party servers may omit it. The SDK propagates whatever the
-   * facilitator returns; for EVM "exact" payloads it fills it from
-   * `authorization.from` when the facilitator omits it, and leaves it absent
-   * otherwise (never a placeholder like `'unknown'`).
+   * facilitator returns; for EVM payloads it fills it from the signed
+   * authorization's payer (`authorization.from` for `exact`,
+   * `permit2Authorization.from` for `upto`) when the facilitator omits it, and
+   * leaves it absent otherwise (never a placeholder like `'unknown'`).
    */
   payer?: string;
   /** Short error code (e.g. `VERIFY_FAILED`) when `success` is false. */
@@ -273,8 +311,28 @@ export interface X402Accept {
   mimeType?: string;
   /** Payment expiry window in seconds. Defaults to 300. */
   maxTimeoutSeconds?: number;
-  /** Scheme-specific extra fields (EIP-712 name/version for USDC etc.). */
+  /**
+   * Scheme-specific extra fields. For `exact` this is the EIP-712 domain
+   * (`name` / `version`) and the SDK fills in a default per asset when
+   * omitted. For `upto` it MUST carry `facilitatorAddress` — the client's
+   * Permit2 witness binds to it — and the SDK never substitutes a default.
+   */
   extra?: Record<string, unknown>;
-  /** Payment scheme. Only `"exact"` is defined by the x402 spec. */
-  scheme?: 'exact';
+  /**
+   * Payment scheme. Defaults to `"exact"` (a fixed charge, signed as an
+   * EIP-3009 authorization — or as a Permit2 witness when `extra` sets
+   * `assetTransferMethod: 'permit2'`).
+   *
+   * `"upto"` is the usage-based scheme: the payer signs a Permit2 witness
+   * authorizing **up to** `amount`, and the merchant settles the metered
+   * charge via `X402Context.settle(ctx, classified, { amountAtomic })`. It is
+   * **x402 V2 only** — encoding an `upto` offering under `x402Version: 1`
+   * throws, because neither the signing runtime nor the reference facilitator
+   * has a V1 path for it.
+   *
+   * Other scheme strings pass through the pipeline untouched — payload-shape
+   * validation for them is up to the caller (override
+   * `BaseX402Context.validatePayloadShape`).
+   */
+  scheme?: 'exact' | 'upto' | (string & {});
 }

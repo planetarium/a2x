@@ -14,6 +14,8 @@
  * default — callers using a different token MUST supply their own `extra`.
  */
 
+import type { X402Accept } from './types.js';
+
 export interface X402Eip712Extra {
   name: string;
   version: string;
@@ -37,4 +39,23 @@ const KNOWN_ASSET_EIP712: Record<string, X402Eip712Extra> = {
  */
 export function defaultEip712Extra(asset: string): X402Eip712Extra {
   return { ...(KNOWN_ASSET_EIP712[asset.toLowerCase()] ?? FALLBACK_EXTRA) };
+}
+
+/**
+ * The `extra` key (or its absence) for an encoded requirement.
+ *
+ * `extra` is scheme-specific and the EIP-712 domain default above only means
+ * something to `exact`/EIP-3009. Other schemes put unrelated data there —
+ * `upto` carries the `facilitatorAddress` the payer's Permit2 witness binds
+ * to — so synthesizing a signing domain for them would emit a field the
+ * client cannot interpret (and, worse, would look like a valid `extra` to a
+ * scheme that requires a real one). A caller-supplied `extra` always wins;
+ * otherwise the default applies to `exact` only and the key is omitted.
+ */
+export function schemeExtra(
+  scheme: string,
+  accept: X402Accept,
+): { extra?: Record<string, unknown> } {
+  if (accept.extra) return { extra: accept.extra };
+  return scheme === 'exact' ? { extra: defaultEip712Extra(accept.asset) } : {};
 }

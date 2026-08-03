@@ -192,6 +192,9 @@ export type {
   X402VerifyResponse,
   X402Network,
   X402EvmAuthorization,
+  X402ExactEvmPayload,
+  X402Permit2Authorization,
+  X402UptoEvmPayload,
 } from './types.js';
 
 // Server-side surface: stateless helpers.
@@ -199,6 +202,7 @@ export {
   buildX402PaymentRequiredMetadata,
   x402RequestPayment,
   parseX402PaymentSubmission,
+  extractX402Payer,
   pickX402Requirement,
   validateX402PayloadShape,
   normalizeX402Accept,

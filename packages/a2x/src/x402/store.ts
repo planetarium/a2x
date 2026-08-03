@@ -40,18 +40,27 @@ export type X402EntryStatus =
 
 /**
  * The internal receipt the store retains after a successful settlement.
- * Trimmed to the four fields needed for audit / reconciliation:
+ * Trimmed to the fields needed for audit / reconciliation:
  *
  *  - `transaction` — on-chain tx hash; the canonical lookup key.
  *  - `network` — which chain settled, for multi-chain deployments.
  *  - `payer` — payer wallet address. Optional: x402 V2 marks it optional and
  *    a facilitator may omit it; the SDK never fabricates a placeholder.
+ *  - `amount` — what was actually charged, in the asset's smallest unit, **as
+ *    confirmed by the facilitator**. Under usage-based schemes (`upto`) this
+ *    is the metered charge and is not recoverable from `entry.accepts`, which
+ *    records the authorized maximum. Optional, and absent whenever the
+ *    facilitator reported no amount (all V1 facilitators): what the SDK asked
+ *    to settle is not evidence of what settled, so the key is left off rather
+ *    than filled with an inference. Also absent on entries written by older
+ *    SDK versions.
  *  - `settledAt` — wall-clock instant the SDK observed the settlement returning.
  */
 export interface X402EntryReceipt {
   transaction: string;
   network: string;
   payer?: string;
+  amount?: string;
   settledAt: Date;
 }
 

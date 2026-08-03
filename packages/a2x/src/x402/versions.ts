@@ -76,12 +76,28 @@ export function requirementAmount(req: X402PaymentRequirements): string {
     : (req as X402PaymentRequirementsV1).maxAmountRequired;
 }
 
+/**
+ * Clone `req` with its amount replaced, writing whichever field the
+ * requirement's encoded version uses (`maxAmountRequired` for V1, `amount`
+ * for V2). Used by metered settlement under usage-based schemes.
+ *
+ * @internal Not part of `@a2x/sdk/x402`'s public surface.
+ */
+export function withRequirementAmount(
+  req: X402PaymentRequirements,
+  amount: string,
+): X402PaymentRequirements {
+  return isV2Requirement(req)
+    ? { ...req, amount }
+    : { ...(req as X402PaymentRequirementsV1), maxAmountRequired: amount };
+}
+
 /** Network id (bare name for V1, CAIP-2 for V2). */
 export function requirementNetwork(req: X402PaymentRequirements): string {
   return req.network;
 }
 
-/** Payment scheme (`"exact"`). */
+/** Payment scheme (`"exact"`, `"upto"`, …). */
 export function requirementScheme(req: X402PaymentRequirements): string {
   return req.scheme;
 }

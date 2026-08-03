@@ -52,8 +52,8 @@ import {
   X402_PAYMENT_STATUS,
 } from '../x402/constants.js';
 import { requirementAmount } from '../x402/versions.js';
-import { isEvmNetwork } from '../x402/networks.js';
 import {
+  defaultSelect,
   signX402Payment,
   rejectX402Payment,
   getX402PaymentRequirements,
@@ -93,12 +93,26 @@ export interface A2XClientX402Options {
   maxAmount?: bigint;
   /**
    * Custom predicate to pick a requirement out of the merchant's
-   * `accepts[]` (already filtered by `maxAmount` if set). Default:
-   * prefer `scheme === 'exact'`, else first remaining.
+   * `accepts[]` (already filtered by `maxAmount` if set). Default: the first
+   * EVM `scheme === 'exact'` option (see `allowUpto`).
    */
   selectRequirement?: (
     requirements: X402PaymentRequirements[],
   ) => X402PaymentRequirements | undefined;
+  /**
+   * Let the default selector fall back to a CAIP-2 EVM `upto` (usage-based)
+   * offer when the merchant advertises no affordable `exact` one — `upto` is
+   * an x402 V2 scheme, so V1 (bare-name) offers are never eligible.
+   * Default `false`.
+   *
+   * Opt-in because an `upto` signature authorizes the merchant to draw
+   * anything up to `amount`, not that exact amount — a broader consent than
+   * the wallet gave by setting `maxAmount`. `maxAmount` still applies (it
+   * bounds the authorized maximum), and a payable `exact` offer always wins.
+   *
+   * Ignored when `selectRequirement` is supplied.
+   */
+  allowUpto?: boolean;
   /**
    * Hook invoked after the merchant publishes `payment-required` and
    * before the client signs. Useful for prompting the user to confirm,
@@ -560,9 +574,11 @@ export class A2XClient {
           ? reqs
           : reqs.filter((r) => isWithinBudget(r, x402.maxAmount!));
       if (userSelect) return userSelect(affordable);
-      // Only auto-pick an option the EVM signer can fulfil (see defaultSelect
-      // in x402/client.ts); undefined surfaces as X402NoSupportedRequirementError.
-      return affordable.find((r) => r.scheme === 'exact' && isEvmNetwork(r.network));
+      // Only auto-pick an option the EVM signer can fulfil, exact-first and
+      // never `upto` unless opted in — see defaultSelect in x402/client.ts for
+      // the safety rationale. undefined surfaces as
+      // X402NoSupportedRequirementError.
+      return defaultSelect(affordable, { allowUpto: x402.allowUpto });
     };
     return signX402Payment(task, {
       signer: x402.signer,

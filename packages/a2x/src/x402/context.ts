@@ -95,15 +95,21 @@ import {
   X402_SUPPORTED_VERSIONS,
   isSupportedVersion,
   payloadNetwork,
+  requirementAmount,
+  requirementScheme,
+  withRequirementAmount,
   type X402Version,
 } from './versions.js';
 import {
   buildX402PaymentCompletedMetadata,
   buildX402PaymentFailedMetadata,
   buildX402PaymentRequiredMetadata,
+  parseAtomicAmount,
   parseX402PaymentSubmission,
+  payloadAuthorizedAmount,
   pickX402Requirement,
   validateX402PayloadShape,
+  withRequirementScopedPayer,
   type X402PaymentSubmission,
   type X402RequestPaymentInput,
   type X402ValidationIssue,
@@ -120,6 +126,7 @@ import {
 import type {
   X402Accept,
   X402Facilitator,
+  X402PaymentPayload,
   X402PaymentRequirements,
   X402SettleResponse,
   X402VerifyResponse,
@@ -462,12 +469,21 @@ export abstract class BaseX402Context {
       return result;
     }
 
-    const issues = validateX402PayloadShape(submission.payload, requirement);
+    // Now that a requirement is matched, the payer can be read from the field
+    // that requirement's scheme actually signs, rather than sniffed from
+    // whichever key happens to be on the payload. A payload carrying *both* an
+    // EIP-3009 `authorization` and a Permit2 `permit2Authorization` would
+    // otherwise let the decoy name the payer on the receipt and in the store.
+    const scoped = withRequirementScopedPayer(submission, requirement);
+
+    // Hook runs BEFORE any store write, so a subclass that accepts a payload
+    // the built-in validator rejects never has to repair a `failed` entry.
+    const issues = this.validatePayloadShape(scoped.payload!, requirement);
     if (issues.length > 0) {
       const first = issues[0]!;
       const result: X402Classification = {
         kind: 'invalid-shape',
-        submission,
+        submission: scoped,
         requirement,
         issues,
         code: first.code,
@@ -477,7 +493,33 @@ export abstract class BaseX402Context {
       return result;
     }
 
-    return { kind: 'valid', submission, requirement };
+    return { kind: 'valid', submission: scoped, requirement };
+  }
+
+  /**
+   * Per-scheme payload shape validation, called by `classify` on the matched
+   * requirement **before** anything is written to the store. Defaults to
+   * `validateX402PayloadShape` (EIP-3009 for `exact`, Permit2 for `upto`).
+   *
+   * Override to teach the pipeline a scheme the SDK doesn't know:
+   *
+   * ```ts
+   * class MyContext extends X402Context {
+   *   protected validatePayloadShape(payload, requirement) {
+   *     if (requirement.scheme === 'my-scheme') return myChecks(payload, requirement);
+   *     return super.validatePayloadShape(payload, requirement);
+   *   }
+   * }
+   * ```
+   *
+   * Returning an empty array makes `classify` resolve to `'valid'` and leaves
+   * the entry at `offered` — no store surgery needed.
+   */
+  protected validatePayloadShape(
+    payload: X402PaymentPayload,
+    requirement: X402PaymentRequirements,
+  ): X402ValidationIssue[] {
+    return validateX402PayloadShape(payload, requirement);
   }
 
   /**
@@ -543,16 +585,44 @@ export abstract class BaseX402Context {
    * Returns the result already in the wire-conformant
    * `X402SettleResponse` shape (spec §5.5). Fills the required
    * `payer` field from the EVM authorization when the facilitator
-   * omits it.
+   * omits it (`authorization.from` for `exact`, `permit2Authorization.from`
+   * for `upto`).
+   *
+   * Pass `opts.amountAtomic` to settle a **metered** charge — the usage-based
+   * (`upto`) flow, where the payer signed an authorization up to a maximum and
+   * the merchant charges only what was consumed. The requirement forwarded to
+   * the facilitator is a clone with its amount replaced. See
+   * `meteredRequirement` for the clamp guarantee.
+   *
+   * Metering an `exact` requirement **throws**: `exact` binds the signature to
+   * one specific value, and facilitators reject a settle whose requirement
+   * amount disagrees with the signed `authorization.value`. Failing here — not
+   * after the work is done and the facilitator has rejected it — is the point.
    */
   async settle(
     ctx: { taskId?: string },
     classified: X402ValidClassification,
+    opts?: {
+      /**
+       * Actual charge in the asset's smallest unit. Clamped down to the
+       * offered amount and to the payer's signed cap; `"0"` is legal (zero
+       * metered usage). Omit to settle the full offered amount.
+       */
+      amountAtomic?: string;
+    },
   ): Promise<X402SettleResponse> {
     const payload = classified.submission.payload!;
+    const requirement =
+      opts?.amountAtomic === undefined
+        ? classified.requirement
+        : this.meteredRequirement(
+            classified.requirement,
+            payload,
+            opts.amountAtomic,
+          );
     let raw: Awaited<ReturnType<X402Facilitator['settle']>>;
     try {
-      raw = await this.facilitator.settle(payload, classified.requirement);
+      raw = await this.facilitator.settle(payload, requirement);
     } catch (err) {
       // A settle exception (transport/schema error, possibly after the
       // transfer was broadcast) must not leave the entry stuck at `verified`
@@ -572,16 +642,17 @@ export abstract class BaseX402Context {
       return {
         success: false,
         transaction: '',
-        network: payloadNetwork(payload) || classified.requirement.network,
-        ...(classified.submission.authorization?.from
-          ? { payer: classified.submission.authorization.from }
+        network: payloadNetwork(payload) || requirement.network,
+        ...(classified.submission.payer
+          ? { payer: classified.submission.payer }
           : {}),
         errorReason: reason,
       };
     }
+    // The submitted authorization is authoritative on who paid — it is what
+    // the signature commits to — so it wins over the facilitator's echo.
     const payer =
-      classified.submission.authorization?.from ??
-      (raw.payer as string | undefined);
+      classified.submission.payer ?? (raw.payer as string | undefined);
     const receipt: X402SettleResponse = {
       success: raw.success,
       transaction: raw.transaction ?? '',
@@ -589,7 +660,7 @@ export abstract class BaseX402Context {
       // payload with no `accepted` echo cannot name a network, so fall back
       // to the matched requirement — already encoded for the offered
       // version by `classify`, hence in the right per-version form.
-      network: payloadNetwork(payload) || classified.requirement.network,
+      network: payloadNetwork(payload) || requirement.network,
       // Omit `payer` when neither the authorization nor the facilitator
       // supplies it — never fabricate a placeholder address.
       ...(payer ? { payer } : {}),
@@ -611,6 +682,13 @@ export abstract class BaseX402Context {
           transaction: receipt.transaction,
           network: receipt.network,
           ...(receipt.payer ? { payer: receipt.payer } : {}),
+          // Only the facilitator-confirmed amount. Under a usage-based scheme
+          // this is the key reconciliation datum and is not recoverable from
+          // `entry.accepts` (which holds the authorized maximum) — but what we
+          // *asked* to settle is not evidence of what settled, so when the
+          // facilitator omits it the key stays absent rather than recording an
+          // inference as fact.
+          ...(receipt.amount !== undefined ? { amount: receipt.amount } : {}),
           settledAt,
         };
         await this.store.update(ctx.taskId, {
@@ -631,6 +709,76 @@ export abstract class BaseX402Context {
     }
 
     return receipt;
+  }
+
+  /**
+   * Clone `requirement` with its amount replaced by the metered charge,
+   * clamped down to the minimum of:
+   *
+   *  1. `amountAtomic` — what the merchant metered;
+   *  2. the offered requirement's amount — the merchant's own advertised cap;
+   *  3. the payer's signed authorization cap
+   *     (`permit2Authorization.permitted.amount` for `upto`,
+   *     `authorization.value` for `exact`), when the payload names one.
+   *
+   * The clamp lives in the SDK on purpose: a merchant metering bug (an
+   * off-by-a-decimal token count, a stale price table) can then only ever
+   * *undercharge*. The facilitator enforces the same bound on-chain — this is
+   * defence in depth, not a substitute for it.
+   *
+   * Writes whichever amount field the requirement's encoded version uses
+   * (`maxAmountRequired` under V1, `amount` under V2). Comparison is BigInt,
+   * so 30-digit atomic values are exact.
+   *
+   * Throws when `amountAtomic` is not a plain decimal integer string. Bare
+   * `BigInt` would accept `''` as zero and `'0x10'` as sixteen — an empty
+   * meter reading silently settling nothing, or a hex string settling 16× the
+   * intended charge, is precisely what the clamp exists to prevent.
+   *
+   * Also throws when the requirement's scheme is `exact`: that scheme binds
+   * the signature to one value, so a facilitator rejects any settle whose
+   * amount disagrees with it. Failing fast beats discovering it after the work
+   * is already done.
+   */
+  protected meteredRequirement(
+    requirement: X402PaymentRequirements,
+    payload: X402PaymentPayload,
+    amountAtomic: string,
+  ): X402PaymentRequirements {
+    if (requirementScheme(requirement) === 'exact') {
+      throw new Error(
+        `${this.constructor.name}.settle: metered settlement requires a usage-based scheme; ` +
+          `the matched requirement uses "exact", which binds the payer's signature to a ` +
+          `single amount. Offer scheme "upto" to charge a metered amount.`,
+      );
+    }
+    const metered = parseAtomicAmount(amountAtomic);
+    if (metered === undefined) {
+      throw new Error(
+        `${this.constructor.name}.settle: amountAtomic must be a decimal integer string in ` +
+          `the asset's smallest unit (no sign, hex, or whitespace), got ` +
+          `${JSON.stringify(amountAtomic)}`,
+      );
+    }
+
+    const bounds: bigint[] = [metered];
+    const offered = parseAtomicAmount(requirementAmount(requirement));
+    if (offered === undefined) {
+      // Came from our own encoded offering — a configuration error, not a
+      // client one, and silently skipping the bound would drop a clamp.
+      throw new Error(
+        `${this.constructor.name}.settle: the matched requirement's amount ` +
+          `${JSON.stringify(requirementAmount(requirement))} is not a decimal integer string.`,
+      );
+    }
+    bounds.push(offered);
+    // A non-decimal cap is client-controlled garbage that shape validation
+    // already rejects; skip it rather than let it raise the ceiling.
+    const signedCap = parseAtomicAmount(payloadAuthorizedAmount(payload));
+    if (signedCap !== undefined) bounds.push(signedCap);
+
+    const clamped = bounds.reduce((a, b) => (a < b ? a : b));
+    return withRequirementAmount(requirement, clamped.toString());
   }
 
   /** Best-effort removal of the stored entry — call after task termination. */

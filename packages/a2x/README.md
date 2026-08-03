@@ -15,6 +15,7 @@ A self-contained TypeScript SDK for building [A2A (Agent-to-Agent)](https://a2a-
 - **Multi-modal artifacts** — Agents can yield `text`, `file`, and `data` events; the default executor maps each into A2A `TextPart` / `FilePart` / `DataPart` artifacts.
 - **Built-in auth** — API Key, Bearer, OAuth 2.0 (Authorization Code, Client Credentials, Device Code), OpenID Connect, and Mutual TLS.
 - **x402 payments** — Charge per call with on-chain cryptocurrency payments, supporting both x402 protocol versions (legacy V1 and the [x402 Foundation](https://github.com/x402-foundation/x402) V2 transport) — each deployment speaks one, V1 by default, V2 via `new X402Context({ x402Version: 2 })`. Express payment gating inline in `agent.run()` with `x402RequestPayment()`; the agent calls `facilitator.verify()` and `facilitator.settle()` directly using the SDK's stateless helpers — no SDK-owned flow, full control over what runs between verify and settle.
+- **Usage-based payments** — Native support for the x402 V2 `upto` scheme: the payer signs a Permit2 authorization up to a maximum, the agent meters the work and settles only the actual charge with `settle(ctx, classified, { amountAtomic })`, clamped SDK-side so a metering bug can never overcharge. Bill by LLM tokens instead of a flat fee.
 - **Zero runtime dependencies** — Core module uses only Node.js built-in APIs.
 - **TypeScript-first** — Full type safety with types derived from A2A JSON Schema.
 
