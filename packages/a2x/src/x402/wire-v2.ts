@@ -47,7 +47,7 @@ function resourceFrom(accept: X402Accept): X402ResourceInfo {
 /** Encode a list of offerings into the V2 `payment-required` payload. */
 export function encodePaymentRequiredV2(
   accepts: X402Accept[],
-  options?: { error?: string },
+  options?: { error?: string; extensions?: Record<string, unknown> },
 ): X402PaymentRequiredResponseV2 {
   const first = accepts[0];
   if (!first) {
@@ -72,5 +72,14 @@ export function encodePaymentRequiredV2(
     resource: resourceFrom(first),
     accepts: accepts.map(encodeRequirementV2),
     ...(options?.error ? { error: options.error } : {}),
+    // Omit the key entirely when unset or empty: `extensions` advertises
+    // facilitator capabilities, and client schemes treat an absent key and an
+    // empty object the same, so emitting `{}` would only add noise to the
+    // wire. Merchants mirroring the facilitator's `GET /supported` naturally
+    // pass `{}` when nothing is advertised — this is the single enforcement
+    // point for that policy (callers may forward `{}` freely).
+    ...(options?.extensions && Object.keys(options.extensions).length > 0
+      ? { extensions: options.extensions }
+      : {}),
   };
 }

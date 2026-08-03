@@ -594,6 +594,14 @@ export abstract class BaseX402Context {
       // supplies it — never fabricate a placeholder address.
       ...(payer ? { payer } : {}),
       ...(raw.errorReason ? { errorReason: raw.errorReason } : {}),
+      // V2 facilitators report what was actually settled, which can be less
+      // than the signed authorization under usage-based schemes — pass it
+      // through whenever the facilitator's response body carries it (success
+      // or a structured `success: false` result). A non-2xx failure surfaces
+      // as a thrown `SettleError` whose constructor drops `amount` upstream
+      // in `@x402/core`, so the exception path above cannot recover it.
+      // V1 facilitators never set it.
+      ...(raw.amount !== undefined ? { amount: raw.amount } : {}),
     };
 
     if (ctx.taskId) {

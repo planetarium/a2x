@@ -134,6 +134,29 @@ export function getX402PaymentRequirements(
 }
 
 /**
+ * Read the envelope-level `extensions` the merchant advertised on a
+ * `payment-required` task — the facilitator capabilities `@x402/core`'s
+ * `PaymentPayloadContext` consumes (e.g. `eip2612GasSponsoring`, which lets a
+ * Permit2 payer sign a gasless permit instead of an on-chain approval).
+ *
+ * **V2 only.** The V1 envelope has no such field, so V1 tasks (and tasks not
+ * asking for payment) return `undefined`.
+ */
+export function getX402PaymentExtensions(
+  task: Task,
+): Record<string, unknown> | undefined {
+  const required = getX402PaymentRequirements(task);
+  if (required?.x402Version !== 2) return undefined;
+  const extensions = required.extensions;
+  // The envelope is remote-controlled: only hand back a real plain object so
+  // callers can spread it into a context without guarding against a scalar —
+  // or an array, which `typeof` alone would let through.
+  return extensions && typeof extensions === 'object' && !Array.isArray(extensions)
+    ? extensions
+    : undefined;
+}
+
+/**
  * Extract the payment receipts from a completed task. Returns an empty
  * array when the task never went through x402.
  */

@@ -173,7 +173,7 @@ a V1 agent — while an `x402Version: 2` agent refuses its activation at
 | Member | What it does |
 |---|---|
 | `new X402Context({ store?, facilitator?, x402Version? })` | Construct once. `store` defaults to `new InMemoryX402Store()`. `facilitator` accepts a `FacilitatorUrlConfig`, a custom `X402Facilitator` impl, or `undefined` (defaults to `https://x402.org/facilitator`). `x402Version` is the single wire version this server speaks (default `1`). |
-| `x402.requestPayment(ctx, { accepts, description?, previousError?, expiresInSeconds? })` | Async generator. Persists the offering keyed by `ctx.taskId` (with optional TTL) and yields the `request-input` event. |
+| `x402.requestPayment(ctx, { accepts, description?, previousError?, extensions?, expiresInSeconds? })` | Async generator. Persists the offering keyed by `ctx.taskId` (with optional TTL) and yields the `request-input` event. `extensions` advertises facilitator capabilities on the V2 envelope (see [Advertising facilitator extensions](#advertising-facilitator-extensions-v2)). |
 | `x402.classify(ctx)` | Returns a tagged union: `'no-submission'`, `'rejected'`, `'no-stored-offering'`, `'unmatched'`, `'invalid-shape'`, or `'valid'`. Switch on `kind` to decide what to do. |
 | `x402.verify(ctx, classified)` | Calls `facilitator.verify(...)`. Records `status: 'verified'` on success, or `status: 'failed'` with `failure.point: 'verify'` on failure. |
 | `x402.settle(ctx, classified)` | Calls `facilitator.settle(...)` and returns a wire-conformant `X402SettleResponse`. Records `status: 'completed'` + the trimmed receipt on success, or `status: 'failed'` with `failure.point: 'settle'` on failure. |
@@ -338,6 +338,24 @@ const ACCEPTS = [
 ];
 ```
 
+### Advertising facilitator extensions (V2)
+
+The V2 `payment-required` envelope carries a top-level `extensions` object the merchant uses to tell the client which optional facilitator capabilities are available for this payment. Pass it as `extensions` on `requestPayment` (or on `x402RequestPayment` / `buildX402PaymentRequiredMetadata`):
+
+```ts
+yield* this.x402.requestPayment(context, {
+  accepts: ACCEPTS,
+  extensions: {
+    eip2612GasSponsoring: {},
+    erc20ApprovalGasSponsoring: {},
+  },
+});
+```
+
+The concrete payoff is gas sponsoring. `@x402/evm`'s client schemes only sign a **gasless EIP-2612 permit** when `extensions.eip2612GasSponsoring` is present — otherwise the payer falls back to an on-chain `approve(...)` and pays gas for it. Advertise whatever your facilitator reports as supported; the default facilitator (`https://x402.org/facilitator`) reports `builder-code`, `eip2612GasSponsoring`, and `erc20ApprovalGasSponsoring` on `GET /supported`.
+
+This is **V2 only** — the V1 envelope has no `extensions` field, so the option is a no-op on an `x402Version: 1` server. Omit it and the key is left off the wire entirely.
+
 ### Conditional pricing
 
 The "is this call paid?" decision lives in `agent.run()`. Inspect anything you need — message content, headers, session state, an external policy service — and either yield `x402RequestPayment(...)` or proceed for free.
@@ -468,7 +486,17 @@ On a successful payment, the completed task's status message carries:
 }
 ```
 
-Every receipt carries a `payer` field per x402-v1 §5.3.2. Failures surface under `x402.payment.error` with one of the codes below.
+Every receipt carries a `payer` field per x402-v1 §5.3.2. A V2 facilitator may
+also report `amount` — the amount actually settled, in the asset's smallest unit
+— and the SDK passes it through onto the receipt. This covers the success
+receipt and failure receipts built from a structured `success: false` response
+body; when a facilitator rejects settlement with a non-2xx status, `@x402/core`
+surfaces it as a thrown error that does not preserve `amount`, so those failure
+receipts cannot carry it. For the `exact` scheme it equals the offered
+amount; under usage-based schemes it is the metered charge and can be less than
+the signed authorization, so it is the payer's record of what they were charged.
+V1 facilitators never set it, so the field is absent on V1 receipts. Failures
+surface under `x402.payment.error` with one of the codes below.
 
 | Code | Source | Meaning |
 |---|---|---|
@@ -582,6 +610,21 @@ await client.sendMessage({
 });
 ```
 
+### Reading advertised extensions
+
+`getX402PaymentExtensions(task)` returns the V2 envelope's top-level `extensions` — the facilitator capabilities the merchant advertised (see [Advertising facilitator extensions](#advertising-facilitator-extensions-v2)). Hand it to `@x402/core` as the `PaymentPayloadContext` extensions when you drive signing yourself:
+
+```ts
+import { getX402PaymentExtensions } from '@a2x/sdk/x402';
+
+const extensions = getX402PaymentExtensions(first);
+if (extensions?.eip2612GasSponsoring) {
+  // the facilitator will sponsor the permit — no on-chain approve needed
+}
+```
+
+Returns `undefined` for a V1 envelope (which has no such field), for a V2 envelope that advertised nothing, and for a task that isn't asking for payment. `signX402Payment` and the built-in `A2XClient` flow already forward the field to the signing runtime, so this helper is only needed when you inspect or re-route it yourself.
+
 ### Reading receipts
 
 ```ts
@@ -589,6 +632,8 @@ import { getX402Receipts } from '@a2x/sdk/x402';
 
 for (const receipt of getX402Receipts(task)) {
   console.log(receipt.success, receipt.transaction, receipt.network);
+  // Present only when the facilitator reported a settled amount (x402 V2).
+  if (receipt.amount !== undefined) console.log('charged:', receipt.amount);
 }
 ```
 
