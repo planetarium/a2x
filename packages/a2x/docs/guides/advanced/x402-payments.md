@@ -633,7 +633,7 @@ import { getX402Receipts } from '@a2x/sdk/x402';
 for (const receipt of getX402Receipts(task)) {
   console.log(receipt.success, receipt.transaction, receipt.network);
   // Present only when the facilitator reported a settled amount (x402 V2).
-  if (receipt.amount) console.log('charged:', receipt.amount);
+  if (receipt.amount !== undefined) console.log('charged:', receipt.amount);
 }
 ```
 

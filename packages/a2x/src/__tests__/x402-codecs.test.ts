@@ -166,6 +166,13 @@ describe('wire codecs', () => {
     expect('extensions' in encodePaymentRequiredV2([ACCEPT])).toBe(false);
   });
 
+  it('omits `extensions` from the V2 envelope when supplied empty', () => {
+    // Merchants mirroring the facilitator's `GET /supported` pass `{}` when
+    // nothing is advertised; absent and `{}` mean the same to client schemes,
+    // so the codec drops the key rather than emitting noise.
+    expect('extensions' in encodePaymentRequiredV2([ACCEPT], { extensions: {} })).toBe(false);
+  });
+
   it('leaves the V1 envelope untouched — it has no `extensions` field', () => {
     // The option is V2-only; V1 callers never see the key on the wire.
     expect('extensions' in encodePaymentRequiredV1([ACCEPT])).toBe(false);

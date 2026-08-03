@@ -72,9 +72,14 @@ export function encodePaymentRequiredV2(
     resource: resourceFrom(first),
     accepts: accepts.map(encodeRequirementV2),
     ...(options?.error ? { error: options.error } : {}),
-    // Omit the key entirely when unset: `extensions` advertises facilitator
-    // capabilities, and client schemes treat an absent key and an empty object
-    // the same, so emitting `{}` would only add noise to the wire.
-    ...(options?.extensions ? { extensions: options.extensions } : {}),
+    // Omit the key entirely when unset or empty: `extensions` advertises
+    // facilitator capabilities, and client schemes treat an absent key and an
+    // empty object the same, so emitting `{}` would only add noise to the
+    // wire. Merchants mirroring the facilitator's `GET /supported` naturally
+    // pass `{}` when nothing is advertised — this is the single enforcement
+    // point for that policy (callers may forward `{}` freely).
+    ...(options?.extensions && Object.keys(options.extensions).length > 0
+      ? { extensions: options.extensions }
+      : {}),
   };
 }
