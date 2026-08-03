@@ -38,24 +38,35 @@ import type {
 
 /**
  * The subset of `@x402/core`'s `x402Client` the SDK drives. One client,
- * registered with the exact EVM scheme for both protocol versions, signs V1 and
- * V2 payments — `createPaymentPayload` dispatches on the requirement's
- * version and returns the structured payload directly (no base64/header
- * round-trip; that dance only exists for HTTP-header transports).
+ * registered with the exact EVM scheme for both protocol versions plus the
+ * upto EVM scheme (V2-only), signs V1 and V2 payments —
+ * `createPaymentPayload` dispatches on the requirement's version and scheme
+ * and returns the structured payload directly (no base64/header round-trip;
+ * that dance only exists for HTTP-header transports).
  */
 interface X402ClientRuntime {
   createPaymentPayload(paymentRequired: unknown): Promise<X402PaymentPayload>;
+  register(network: string, scheme: unknown): unknown;
 }
 
 type X402CoreClientModule = {
   x402Client: new () => X402ClientRuntime;
 };
-type X402EvmClientModule = {
+type X402EvmExactClientModule = {
   registerExactEvmScheme: (
     client: X402ClientRuntime,
     config: { signer: LocalAccount },
   ) => X402ClientRuntime;
 };
+// `@x402/evm/upto/client` ships no `registerUptoEvmScheme` counterpart (as of
+// 2.19) — only the scheme class — so a2x registers it on the CAIP-2 EVM
+// wildcard itself. `upto` is a V2-only scheme, so there is no `registerV1`.
+type X402EvmUptoClientModule = {
+  UptoEvmScheme: new (signer: LocalAccount) => unknown;
+};
+
+/** CAIP-2 wildcard `@x402/evm` registers its V2 schemes under. */
+const EVM_CAIP2_WILDCARD = 'eip155:*';
 
 // Memoize one x402Client per signer identity — constructing the client and
 // registering the scheme is not free, and callers typically reuse a signer.
@@ -65,16 +76,23 @@ function _loadRuntime(signer: LocalAccount): Promise<X402ClientRuntime> {
   let existing = _runtimeBySigner.get(signer);
   if (!existing) {
     existing = (async () => {
-      const [core, evm] = await Promise.all([
+      const [core, evmExact, evmUpto] = await Promise.all([
         importX402Peer(['@x402', 'core/client'].join('/')),
         importX402Peer(['@x402', 'evm/exact/client'].join('/')),
+        importX402Peer(['@x402', 'evm/upto/client'].join('/')),
       ]);
       const { x402Client } = core as unknown as X402CoreClientModule;
-      const { registerExactEvmScheme } = evm as unknown as X402EvmClientModule;
+      const { registerExactEvmScheme } =
+        evmExact as unknown as X402EvmExactClientModule;
+      const { UptoEvmScheme } = evmUpto as unknown as X402EvmUptoClientModule;
       const client = new x402Client();
       // Registers BOTH versions (V2 eip155:* wildcard + V1 bare networks)
       // on the one client; createPaymentPayload then self-dispatches.
       registerExactEvmScheme(client, { signer });
+      // Registering `upto` here does not make the client *choose* it — see
+      // `defaultSelect`'s safety policy. It only means an explicitly selected
+      // upto requirement can actually be signed.
+      client.register(EVM_CAIP2_WILDCARD, new UptoEvmScheme(signer));
       return client;
     })();
     // Don't memoize a failure: `X402PeerMissingError` tells the operator to
@@ -95,12 +113,29 @@ export interface SignX402PaymentOptions {
   signer: LocalAccount;
   /**
    * Predicate run over the merchant's `accepts[]` to pick which requirement
-   * to sign. Default: the first requirement whose network+scheme is
-   * "exact"/supported by the signer. Override for multi-network wallets.
+   * to sign. Default: the first EVM `exact` requirement (see
+   * `allowUpto` for the usage-based fallback). Override for
+   * multi-network wallets — an explicitly returned requirement is always
+   * signed, whatever its scheme.
    */
   selectRequirement?: (
     requirements: X402PaymentRequirements[],
   ) => X402PaymentRequirements | undefined;
+  /**
+   * Let the **default** selector fall back to an EVM `upto` offer when the
+   * merchant advertises no payable `exact` one. Default `false`.
+   *
+   * Off by default deliberately: signing an `upto` offer authorizes the
+   * merchant to draw **anything up to** `amount`, whereas `exact` authorizes
+   * that one amount and nothing else. Silently upgrading a wallet from
+   * "spend 0.01 USDC" to "spend up to 0.01 USDC, merchant decides" is a
+   * change in what the payer consented to, so it is opt-in. The clamp on the
+   * server side is the merchant's own guard rail, not a promise to the payer.
+   *
+   * Ignored when `selectRequirement` is supplied — an explicit selector has
+   * already made the decision.
+   */
+  allowUpto?: boolean;
 }
 
 export interface SignedX402Payment {
@@ -198,7 +233,10 @@ export async function signX402Payment(
     throw new X402InvalidVersionError(required.x402Version as unknown as number);
   }
 
-  const select = options.selectRequirement ?? defaultSelect;
+  const select =
+    options.selectRequirement ??
+    ((reqs: X402PaymentRequirements[]) =>
+      defaultSelect(reqs, { allowUpto: options.allowUpto }));
   const accepts = required.accepts as X402PaymentRequirements[];
   const requirement = select(accepts);
   if (!requirement) {
@@ -255,15 +293,34 @@ export function rejectX402Payment(task: Task): {
   };
 }
 
-function defaultSelect(
+/**
+ * The SDK's built-in requirement selection policy, shared by
+ * `signX402Payment` and `A2XClient`'s standalone flow.
+ *
+ * **Exact-first, and never auto-pick `upto`.** Only options the signer can
+ * actually fulfil are considered (EVM networks) — in a multi-rail V2 offer,
+ * blindly taking the first entry would hand the signer a network it can't
+ * sign, throwing deep inside `createPaymentPayload`; returning `undefined`
+ * instead surfaces the clean `X402NoSupportedRequirementError`.
+ *
+ * `upto` is excluded unless `allowUpto` is set, because signing it authorizes
+ * spending **up to** the offered amount at the merchant's discretion rather
+ * than that exact amount. A wallet that would happily pay a fixed 0.01 USDC
+ * has not thereby agreed to a variable charge, so the SDK refuses to make
+ * that substitution on its own. With `allowUpto`, `upto` is still only a
+ * *fallback*: a payable `exact` offer always wins.
+ *
+ * @internal Not part of `@a2x/sdk/x402`'s public surface.
+ */
+export function defaultSelect(
   requirements: X402PaymentRequirements[],
+  options?: { allowUpto?: boolean },
 ): X402PaymentRequirements | undefined {
-  // Only pick an option the signer can actually fulfil (EVM `exact`). In a
-  // multi-rail V2 offer, blindly taking the first `exact` and narrowing to it
-  // would hand the signer a network it can't sign, throwing deep inside
-  // createPaymentPayload; returning undefined instead surfaces the clean
-  // X402NoSupportedRequirementError.
-  return requirements.find(
+  const exact = requirements.find(
     (r) => r.scheme === 'exact' && isEvmNetwork(r.network),
+  );
+  if (exact || !options?.allowUpto) return exact;
+  return requirements.find(
+    (r) => r.scheme === 'upto' && isEvmNetwork(r.network),
   );
 }

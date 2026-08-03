@@ -10,7 +10,7 @@
  * single `payment-required` are expected to describe the same resource.
  */
 
-import { defaultEip712Extra } from './assets.js';
+import { schemeExtra } from './assets.js';
 import { X402_DEFAULT_TIMEOUT_SECONDS } from './constants.js';
 import { toCaip2 } from './networks.js';
 import type {
@@ -24,14 +24,15 @@ import type {
 export function encodeRequirementV2(
   accept: X402Accept,
 ): X402PaymentRequirementsV2 {
+  const scheme = accept.scheme ?? 'exact';
   return {
-    scheme: accept.scheme ?? 'exact',
+    scheme,
     network: toCaip2(accept.network),
     asset: accept.asset,
     amount: accept.amount,
     payTo: accept.payTo,
     maxTimeoutSeconds: accept.maxTimeoutSeconds ?? X402_DEFAULT_TIMEOUT_SECONDS,
-    extra: accept.extra ?? defaultEip712Extra(accept.asset),
+    ...schemeExtra(scheme, accept),
   };
 }
 

@@ -7,7 +7,7 @@
  * the byte shape a2a-x402 v0.2 clients and the V1 facilitator expect.
  */
 
-import { defaultEip712Extra } from './assets.js';
+import { schemeExtra } from './assets.js';
 import { X402_DEFAULT_TIMEOUT_SECONDS } from './constants.js';
 import { toBareName } from './networks.js';
 import type {
@@ -20,8 +20,9 @@ import type {
 export function encodeRequirementV1(
   accept: X402Accept,
 ): X402PaymentRequirementsV1 {
+  const scheme = accept.scheme ?? 'exact';
   return {
-    scheme: accept.scheme ?? 'exact',
+    scheme,
     network: toBareName(accept.network),
     maxAmountRequired: accept.amount,
     resource: accept.resource,
@@ -30,7 +31,7 @@ export function encodeRequirementV1(
     payTo: accept.payTo,
     maxTimeoutSeconds: accept.maxTimeoutSeconds ?? X402_DEFAULT_TIMEOUT_SECONDS,
     asset: accept.asset,
-    extra: accept.extra ?? defaultEip712Extra(accept.asset),
+    ...schemeExtra(scheme, accept),
   };
 }
 
