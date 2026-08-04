@@ -1,5 +1,12 @@
 # sample-nextjs-x402-agent-driven
 
+## 0.1.8
+
+### Patch Changes
+
+- Updated dependencies [[`33c4f56`](https://github.com/planetarium/a2x/commit/33c4f5606ff3ef6f3c83058867bee1b64ce6af9c), [`ccea931`](https://github.com/planetarium/a2x/commit/ccea931b7ea936b1d1f990172370c865319e9bb6), [`33c4f56`](https://github.com/planetarium/a2x/commit/33c4f5606ff3ef6f3c83058867bee1b64ce6af9c)]:
+  - @a2x/sdk@0.18.0
+
 ## 0.1.7
 
 ### Patch Changes

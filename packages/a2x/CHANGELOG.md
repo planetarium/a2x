@@ -1,5 +1,36 @@
 # @a2x/sdk
 
+## 0.18.0
+
+### Minor Changes
+
+- [#202](https://github.com/planetarium/a2x/pull/202) [`ccea931`](https://github.com/planetarium/a2x/commit/ccea931b7ea936b1d1f990172370c865319e9bb6) Thanks [@longfin](https://github.com/longfin)! - Native support for the x402 V2 `upto` scheme (usage-based payments), where the payer signs a Permit2 authorization **up to** a maximum and the merchant settles only the metered charge — bill by LLM token consumption instead of a flat per-call fee. ([#199](https://github.com/planetarium/a2x/issues/199))
+
+  - `X402Accept.scheme` now types `'exact' | 'upto' | (string & {})` instead of pinning `'exact'`.
+  - `validateX402PayloadShape` dispatches on the payload shape the matched requirement implies. Permit2 requirements (`upto`, and `exact` whose `extra` sets `assetTransferMethod: 'permit2'` — which `@x402/evm` uses for several of its built-in stablecoins) are validated as Permit2: `permit2Authorization` + `signature` present, `witness.to` bound to `payTo`, `permitted.token` matching the asset, a positive in-range `permitted.amount`, and a payer `from`. Everything else keeps the EIP-3009 checks. Unrecognized payloads no longer report the misleading "Non-EVM payloads are not yet supported" — a Permit2 payload is an EVM payload.
+  - `BaseX402Context.settle(ctx, classified, { amountAtomic })` settles a metered amount. The SDK clamps it down to the minimum of the metered value, the offered amount, and the payer's signed authorization cap, using BigInt comparison — a merchant metering bug can therefore only ever undercharge. `"0"` is a legal charge. `amountAtomic` must be a plain decimal integer string: bare `BigInt` would read `''` as zero and `'0x10'` as sixteen, so anything else throws. Metering an `exact` requirement also throws, since that scheme binds the signature to a single value and facilitators reject a mismatched settle — the SDK fails on the call rather than after the work is done.
+  - Shape validation moved behind a `protected validatePayloadShape(payload, requirement)` hook on `BaseX402Context`, called by `classify` **before** the store records `status: 'failed'`, so a subclass teaching the pipeline a new scheme no longer has to repair the store afterwards.
+  - `payer` is now resolved from the field the matched requirement's scheme actually signs, rather than sniffed from whichever key the payload carries. A payload presenting both an EIP-3009 `authorization` and a Permit2 `permit2Authorization` could otherwise let the decoy name the payer on the receipt and in the audit store. `parseX402PaymentSubmission` exposes `payer` and `permit2Authorization`; the new `extractX402Payer(payload, scheme?)` applies the same dispatch for callers driving the pipeline themselves.
+  - `X402EntryReceipt` gains an optional `amount` — the settled charge, persisted on the store entry. It records only what the **facilitator confirmed**; when the facilitator reports no amount the key is absent rather than backfilled from what the SDK asked to settle. Under a usage-based scheme it is the key reconciliation datum and is not recoverable from `entry.accepts`, which holds the authorized maximum.
+  - The wire codecs no longer synthesize an EIP-712 domain into `extra` for non-`exact` schemes. That default is `exact`/EIP-3009-specific, and emitting it would have shadowed the `facilitatorAddress` an `upto` requirement must carry.
+  - New exported types: `X402Permit2Authorization`, `X402UptoEvmPayload`, `X402ExactEvmPayload`.
+
+  `upto` is **x402 V2 only** and the SDK enforces it: encoding an `upto` offering under `x402Version: 1` throws a configuration error from `requestPayment` before anything is persisted, and the client selector never picks a bare-name (V1) upto offer. Neither `@x402/core`'s client nor the reference facilitator has a V1 path for the scheme, so a V1 offering could only dead-end mid-payment.
+
+  Client signing registers `@x402/evm`'s `UptoEvmScheme` alongside the exact scheme, so an `upto` offer can be signed. **The default selector still never auto-picks one** — signing `upto` authorizes spending up to the maximum at the merchant's discretion, a broader consent than `exact`, so it stays opt-in via the new `allowUpto` option on `SignX402PaymentOptions` and `A2XClient`'s `x402` config (a payable CAIP-2 `exact` offer always wins), or via an explicit `selectRequirement`.
+
+  **Subclassers:** an override of `BaseX402Context.settle` written against the old two-argument signature silently drops `amountAtomic` and settles the full offered ceiling. Accept the third `opts` parameter and forward it to `super.settle(...)`.
+
+  `upto` requires `@x402/evm` >= 2.19, which the existing peer range (`>=2.19.0 <3`) already mandates — no peer-range change.
+
+- [#200](https://github.com/planetarium/a2x/pull/200) [`33c4f56`](https://github.com/planetarium/a2x/commit/33c4f5606ff3ef6f3c83058867bee1b64ce6af9c) Thanks [@longfin](https://github.com/longfin)! - x402 V2 `payment-required` envelopes can now carry the top-level `extensions` field. `X402RequestPaymentInput` (and therefore `x402RequestPayment`, `buildX402PaymentRequiredMetadata`, and `X402Context.requestPayment`) accepts an `extensions` object that `encodePaymentRequiredV2` emits verbatim; it is a no-op under `x402Version: 1`, whose envelope has no such field. This is how a merchant advertises facilitator capabilities such as `eip2612GasSponsoring` — without it, `@x402/evm` payers fall back to a gas-paying on-chain approval even when the facilitator would sponsor a gasless permit. The new client-side reader `getX402PaymentExtensions(task)` returns the advertised object so callers driving signing manually can hand it to `@x402/core`'s `PaymentPayloadContext`. ([#197](https://github.com/planetarium/a2x/issues/197))
+
+### Patch Changes
+
+- [#200](https://github.com/planetarium/a2x/pull/200) [`33c4f56`](https://github.com/planetarium/a2x/commit/33c4f5606ff3ef6f3c83058867bee1b64ce6af9c) Thanks [@longfin](https://github.com/longfin)! - Preserve the facilitator's settled `amount` on x402 settlement receipts.
+
+  `X402Context.settle()` trimmed the facilitator response into the wire receipt and dropped the x402 V2 `amount` field, so the settled amount never reached `x402.payment.receipts` on the task's final message. `X402SettleResponse` now carries an optional `amount`, and `settle()` passes the facilitator's value through on the success receipt and on failure receipts built from a structured `success: false` response body. (Non-2xx settlement failures surface as errors thrown by `@x402/core`, which drops `amount` before the SDK sees it — those failure receipts cannot carry the field.) For the `exact` scheme this matches the offered amount; under usage-based schemes it is the metered charge and is the payer's only record of what they were actually charged. V1 facilitators never report it, so the field stays absent there.
+
 ## 0.17.0
 
 ### Minor Changes
