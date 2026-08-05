@@ -472,6 +472,150 @@ class MyContext extends X402Context {
 
 `classify` calls the hook **before** anything is written to the store, so returning an empty array leaves the entry at `offered` — no `failed` record to repair.
 
+### Batch settlement (prepaid channels)
+
+`exact` and `upto` both settle on-chain once per call. The x402 V2 [`batch-settlement` scheme](https://github.com/coinbase/x402/blob/main/specs/schemes/batch-settlement/scheme_batch_settlement.md) removes that from the per-call path: the payer opens and funds an on-chain **channel** once, then each subsequent call costs only an off-chain **cumulative voucher**. The merchant records vouchers as they arrive and redeems many of them in a single transaction, out of band.
+
+That matters when settlement latency sits in the response critical path, and when per-call gas is large relative to per-call value — metering a 1000-token prompt at ~$3/MTok prices the call at ~$0.003, which is not worth an individual on-chain transfer.
+
+#### Merchant side: inject a resource server as the facilitator
+
+**The SDK does not own the batch lifecycle**, deliberately. Voucher accounting is not bookkeeping that fits behind `X402Context.settle()`: it needs cap enforcement against the payer's signed ceiling, a compare-and-set on the cumulative amount, and a request reservation established during *verify* — all of which live in `@x402/evm`'s **server-side** scheme as `@x402/core` lifecycle hooks. Redemption is a separate background concern that must be a singleton across horizontally-scaled deployments, which is not something a library should start on your behalf.
+
+The seam is `facilitator`. `X402Context` accepts any `{ verify, settle }` pair, and `@x402/core`'s `x402ResourceServer` — which knows how to drive those hooks — exposes a signature-compatible one:
+
+```ts
+import { x402ResourceServer, HTTPFacilitatorClient } from '@x402/core/server';
+import { BatchSettlementEvmScheme } from '@x402/evm/batch-settlement/server';
+import { RedisChannelStorage } from '@x402/evm/batch-settlement/server/redis-storage';
+import { X402Context } from '@a2x/sdk/x402';
+
+const facilitatorClient = new HTTPFacilitatorClient({ url: 'https://x402.org/facilitator' });
+
+const scheme = new BatchSettlementEvmScheme(MERCHANT, {
+  storage: new RedisChannelStorage({ client: redis }),
+  receiverAuthorizerSigner,
+});
+
+const resourceServer = new x402ResourceServer(facilitatorClient)
+  .register('eip155:84532', scheme);
+await resourceServer.initialize();
+
+const x402 = new X402Context({
+  x402Version: 2,
+  facilitator: {
+    verify: (payload, requirement) => resourceServer.verifyPayment(payload, requirement),
+    settle: (payload, requirement) => resourceServer.settlePayment(payload, requirement),
+  },
+});
+```
+
+Your agent's `run()` is then the ordinary pipeline — `classify` → `verify` → `settle` → `completedEvent` — with no batch-specific code. `settle` returns as soon as the voucher is recorded; nothing waits on a block.
+
+Redemption stays yours, on whatever cadence suits your economics:
+
+```ts
+const manager = scheme.createChannelManager(facilitatorClient, 'eip155:84532');
+setInterval(() => manager.claimAndSettle(), 60 * 60 * 1000);   // one singleton, not per-replica
+setInterval(() => manager.refundIdleChannels({ idleSecs: 7 * 24 * 60 * 60 }), 24 * 60 * 60 * 1000);
+```
+
+Your offering must advertise `extra.receiverAuthorizer` (the address authorized to countersign claims) — the payer's channel id is derived from it, and signing fails without it:
+
+```ts
+const ACCEPTS = [{
+  scheme: 'batch-settlement',
+  network: 'eip155:84532',
+  amount: '3000',
+  asset: USDC_BASE_SEPOLIA,
+  payTo: MERCHANT,
+  resource: 'https://api.example.com/chat',
+  description: 'Metered access, settled in batches',
+  extra: {
+    name: 'USDC', version: '2',              // EIP-712 domain for the deposit
+    receiverAuthorizer: RECEIVER_AUTHORIZER,
+  },
+}];
+```
+
+#### Receipts have no transaction hash
+
+A successful voucher settlement returns `success: true` with an **empty** `transaction` — there is no chain write to name yet. Do not read an empty `transaction` as failure; branch on `success`.
+
+What it carries instead is `receipt.extra`, the scheme's post-settlement state, forwarded verbatim from the facilitator:
+
+```ts
+receipt.extra?.channelState   // { channelId, balance, totalClaimed, chargedCumulativeAmount, … }
+```
+
+`exact` and `upto` never populate `extra`. It exists because the payer cannot function without it — see below.
+
+#### Payer side: storage is not optional
+
+Unlike `exact` and `upto`, the payer here is **stateful**, so the scheme is registered only when you supply its config:
+
+```ts
+import { A2XClient } from '@a2x/sdk/client';
+
+const client = new A2XClient(url, {
+  x402: {
+    signer,
+    batchSettlement: { storage: myChannelStorage },
+    allowBatchSettlement: true,
+  },
+});
+```
+
+`storage` is required and has deliberately no default. a2x types its signer as a viem `LocalAccount`, which has no `readContract`, so `@x402/evm`'s on-chain channel recovery never runs — **this storage is the only record that a channel exists**. If it comes back empty against a channel that is already funded, the next call signs a fresh deposit into it: real funds moved, on top of a balance you already have. Implement `X402ClientChannelStorage` over whatever you already persist:
+
+```ts
+import type { X402ClientChannelStorage } from '@a2x/sdk/x402';
+
+const myChannelStorage: X402ClientChannelStorage = {
+  get:    (key)        => db.channels.findUnique({ where: { key } }),
+  set:    (key, state) => db.channels.upsert({ where: { key }, create: { key, ...state }, update: state }),
+  delete: (key)        => db.channels.delete({ where: { key } }),
+};
+```
+
+`@x402/evm` ships `InMemoryClientChannelStorage` and a file-backed one under `@x402/evm/batch-settlement/client/file-storage`; the in-memory one is for tests and short-lived scripts only.
+
+Deposit sizing defaults to 5× the request amount, so one funding covers the next four calls. Tune it with `depositPolicy` (`depositMultiplier`, an integer ≥ 3) or take full control per deposit with `depositStrategy`:
+
+```ts
+batchSettlement: {
+  storage: myChannelStorage,
+  depositPolicy: { depositMultiplier: 20 },
+  depositStrategy: ({ requestAmount, minimumDepositAmount, depositAmount }) => {
+    if (BigInt(requestAmount) > MAX_PER_CALL) return false;   // skip: sign a voucher-only payload
+    return depositAmount;                                     // or any amount >= minimumDepositAmount
+  },
+},
+```
+
+Note that `maxAmount` bounds the **per-request** amount, not the deposit sized from it.
+
+#### Reconciliation is mandatory
+
+`@x402/evm` normally advances the payer's channel state from its own HTTP client's `onPaymentResponse` hook, reading the `PAYMENT-RESPONSE` header. **a2x carries payments over A2A task metadata and never runs that hook**, so the step is explicit.
+
+`A2XClient` does it for you whenever `batchSettlement` is configured, on both the blocking and streaming paths. If you drive the dance yourself with `signX402Payment`, you must call it:
+
+```ts
+import { reconcileX402BatchSettlement, getX402Receipts } from '@a2x/sdk/x402';
+
+const final = await client.sendMessage({ /* … signed follow-up … */ });
+await reconcileX402BatchSettlement(getX402Receipts(final), { storage: myChannelStorage });
+```
+
+Skip it and the payer's cumulative amount never advances: every subsequent call re-signs an identical voucher against a channel it still believes is unfunded — and therefore signs a **fresh deposit** each time. Receipts from other schemes are ignored, so passing a whole task's receipts is safe.
+
+#### Selection is opt-in, and separate from `allowUpto`
+
+The default selector never picks `batch-settlement` on its own. `allowBatchSettlement` is its own flag rather than part of `allowUpto` because the consent differs in kind: `upto` widens *how much* of an authorization the merchant may draw, while funding a channel moves money **before any service is rendered**, recoverable only through a cooperative refund or the idle-channel path.
+
+Preference order under the default selector is `exact` → `upto` → `batch-settlement`: the widest consent wins only when nothing narrower is on offer. Like `upto`, it is V2-only and requires a CAIP-2 network, and an explicit `selectRequirement` bypasses the flag entirely (but still needs `batchSettlement` configured, or the scheme was never registered).
+
 ### Conditional pricing
 
 The "is this call paid?" decision lives in `agent.run()`. Inspect anything you need — message content, headers, session state, an external policy service — and either yield `x402RequestPayment(...)` or proceed for free.
@@ -779,8 +923,13 @@ for (const receipt of getX402Receipts(task)) {
   console.log(receipt.success, receipt.transaction, receipt.network);
   // Present only when the facilitator reported a settled amount (x402 V2).
   if (receipt.amount !== undefined) console.log('charged:', receipt.amount);
+  // Scheme-specific settlement state. `exact` / `upto` never set it;
+  // `batch-settlement` reports `extra.channelState`.
+  if (receipt.extra) console.log('scheme state:', receipt.extra);
 }
 ```
+
+`transaction` is empty on failure — **and also on a successful settlement under a scheme that does not touch the chain per call**, such as a `batch-settlement` voucher. Branch on `success`, never on whether `transaction` is populated.
 
 ## Server-side enforcement
 
@@ -796,7 +945,7 @@ When the merchant agent declares the extension with `required: true` on its Agen
 
 - **Both x402 protocol versions** (V1 `x402Version: 1` and V2 `x402Version: 2`). The server emits the one its deployment configured; the client signs whichever it receives.
 - **Standalone Flow.** The Embedded Flow (x402 nested in an AP2 `CartMandate` / `PaymentMandate`) and its signing models are not implemented in either version — those were described in a2a-x402 v0.2 but have no counterpart in the foundation V2 transport, so their V2 semantics are currently undefined.
-- **`exact` and `upto` schemes, EVM networks** (`base`, `base-sepolia`, `polygon`, `avalanche`, …). `upto` is V2-only and requires `@x402/evm` ≥ 2.19; the client will not auto-select it (see [Paying an `upto` offer](#paying-an-upto-offer)). Other schemes pass through the pipeline untouched — override `BaseX402Context.validatePayloadShape` to validate them. Adding Solana support means passing a Solana-compatible signer in a later release.
+- **`exact`, `upto`, and `batch-settlement` schemes, EVM networks** (`base`, `base-sepolia`, `polygon`, `avalanche`, …). `upto` and `batch-settlement` are V2-only and require `@x402/evm` ≥ 2.19; the client auto-selects neither (see [Paying an `upto` offer](#paying-an-upto-offer) and [Batch settlement](#batch-settlement-prepaid-channels)). For `batch-settlement` the SDK covers the **payer** end-to-end; the merchant end is wired by injecting an `x402ResourceServer` as the facilitator, and redemption stays out of the SDK. Other schemes pass through the pipeline untouched — override `BaseX402Context.validatePayloadShape` to validate them. Adding Solana support means passing a Solana-compatible signer in a later release.
 
 ## Reference
 

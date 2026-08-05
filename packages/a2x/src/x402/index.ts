@@ -249,6 +249,7 @@ export type { FacilitatorUrlConfig } from './facilitator.js';
 export {
   signX402Payment,
   rejectX402Payment,
+  reconcileX402BatchSettlement,
   getX402PaymentRequirements,
   getX402PaymentExtensions,
   getX402Receipts,
@@ -257,6 +258,12 @@ export {
 export type {
   SignX402PaymentOptions,
   SignedX402Payment,
+  X402BatchSettlementOptions,
+  X402BatchSettlementDepositPolicy,
+  X402BatchSettlementDepositStrategy,
+  X402BatchSettlementDepositContext,
+  X402ClientChannelStorage,
+  X402ChannelState,
 } from './client.js';
 
 export {

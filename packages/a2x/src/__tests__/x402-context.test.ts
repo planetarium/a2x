@@ -422,6 +422,70 @@ describe('X402Context.verify and X402Context.settle', () => {
     expect(receipt.amount).toBe('2500');
   });
 
+  it('settle forwards scheme-specific extra onto the receipt', async () => {
+    // `batch-settlement` reports the channel's post-settlement state here, and
+    // it is the payer's only way to advance its cumulative voucher. Trimming
+    // the receipt to a2x-known fields would make every subsequent call re-sign
+    // an identical voucher and re-deposit.
+    const channelState = {
+      channelId: `0x${'cd'.repeat(32)}`,
+      balance: '15000',
+      totalClaimed: '0',
+      chargedCumulativeAmount: '3000',
+    };
+    const facilitator: X402Facilitator = {
+      verify: vi.fn(async () => ({ isValid: true } as Awaited<ReturnType<X402Facilitator['verify']>>)),
+      settle: vi.fn(async () => ({
+        success: true,
+        // A voucher settles off-chain against a funded channel — upstream
+        // returns success with an empty transaction, and that must not be
+        // read as failure.
+        transaction: '',
+        network: 'base-sepolia',
+        extra: { channelState, chargedAmount: '3000' },
+      } as Awaited<ReturnType<X402Facilitator['settle']>>)),
+    };
+    const ctx = new X402Context({ facilitator });
+    await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
+    const classified = await ctx.classify({
+      taskId: 't1',
+      message: buildSubmittedMessage(),
+    });
+    if (classified.kind !== 'valid') throw new Error('expected valid');
+    const receipt = await ctx.settle({ taskId: 't1' }, classified);
+    expect(receipt.success).toBe(true);
+    expect(receipt.transaction).toBe('');
+    expect(receipt.extra).toEqual({ channelState, chargedAmount: '3000' });
+    // Success with no transaction still records a completed entry.
+    expect((await ctx.store.get('t1'))?.status).toBe('completed');
+  });
+
+  it('settle omits extra when the facilitator sends none, or sends a non-object', async () => {
+    // `exact` / `upto` never populate it, and the facilitator response is
+    // remote-controlled — an array or scalar must not reach the receipt typed
+    // as a record.
+    for (const extra of [undefined, 'nope', ['a'], 42]) {
+      const facilitator: X402Facilitator = {
+        verify: vi.fn(async () => ({ isValid: true } as Awaited<ReturnType<X402Facilitator['verify']>>)),
+        settle: vi.fn(async () => ({
+          success: true,
+          transaction: '0xtx',
+          network: 'base-sepolia',
+          extra,
+        } as unknown as Awaited<ReturnType<X402Facilitator['settle']>>)),
+      };
+      const ctx = new X402Context({ facilitator });
+      await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
+      const classified = await ctx.classify({
+        taskId: 't1',
+        message: buildSubmittedMessage(),
+      });
+      if (classified.kind !== 'valid') throw new Error('expected valid');
+      const receipt = await ctx.settle({ taskId: 't1' }, classified);
+      expect('extra' in receipt).toBe(false);
+    }
+  });
+
   it('settle preserves a zero amount — "0" is a report, not an omission', async () => {
     // Zero metered usage under a usage-based scheme settles as amount "0";
     // a truthiness check would drop it and leave the payer unable to tell

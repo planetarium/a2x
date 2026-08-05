@@ -39,6 +39,7 @@ npm install @a2x/sdk
 - **Multi-modal artifacts** — Agents can yield `text`, `file`, and `data` `AgentEvent`s; the default executor maps each to a `TextPart` / `FilePart` / `DataPart` artifact on the wire.
 - **x402 payments** — Charge per call with on-chain cryptocurrency payments — declared inline in `agent.run()` via the `request-input` AgentEvent. Optional `@a2x/sdk/x402` subpath. Supports both x402 protocol versions (legacy V1 and the [x402 Foundation](https://github.com/x402-foundation/x402) V2 transport) — each deployment speaks one, V1 by default, V2 via `new X402Context({ x402Version: 2 })`.
 - **Usage-based payments** — Native support for the x402 V2 `upto` scheme: the payer signs a Permit2 authorization up to a maximum, the agent meters the work and settles only the actual charge via `settle(ctx, classified, { amountAtomic })`, clamped SDK-side so a metering bug can never overcharge. Bill by LLM tokens instead of a flat fee.
+- **Batched payments** — Native payer support for the x402 V2 `batch-settlement` scheme: fund an on-chain channel once, then pay per call with an off-chain voucher. Takes settlement out of the response critical path and amortizes gas across many calls — the difference between viable and not for sub-cent metered pricing. Opt-in via `x402: { batchSettlement: { storage }, allowBatchSettlement: true }`.
 - **Zero runtime dependencies** — Core module uses only Node.js built-in APIs.
 - **TypeScript-first** — Full type safety with types derived directly from A2A JSON Schema and proto definitions.
 

@@ -132,6 +132,15 @@ import type {
   X402VerifyResponse,
 } from './types.js';
 
+/**
+ * True for a real plain object. The facilitator's response is remote-controlled,
+ * so a scalar or array `extra` must not reach the receipt typed as a record —
+ * `typeof x === 'object'` alone would let an array through.
+ */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 // ─── Options ───
 
 export interface X402ContextOptions {
@@ -673,6 +682,12 @@ export abstract class BaseX402Context {
       // in `@x402/core`, so the exception path above cannot recover it.
       // V1 facilitators never set it.
       ...(raw.amount !== undefined ? { amount: raw.amount } : {}),
+      // Scheme-specific settlement state, forwarded verbatim. Stateful schemes
+      // put the payer's next-request inputs here — `batch-settlement`'s
+      // `extra.channelState` is what advances the payer's cumulative voucher —
+      // and a2x cannot enumerate those fields per scheme, so it passes the
+      // block through instead of trimming it.
+      ...(isPlainObject(raw.extra) ? { extra: raw.extra } : {}),
     };
 
     if (ctx.taskId) {

@@ -618,6 +618,187 @@ describe('A2XClient.sendMessage — native x402 dance', () => {
   });
 });
 
+describe('A2XClient.sendMessage — batch-settlement', () => {
+  const CHANNEL_ID = `0x${'cd'.repeat(32)}`;
+
+  /** A V2 `payment-required` whose only option is a `batch-settlement` offer. */
+  function batchRequiredTask(): unknown {
+    return {
+      kind: 'task',
+      id: 't1',
+      contextId: 'c1',
+      status: {
+        state: 'input-required',
+        timestamp: new Date().toISOString(),
+        message: {
+          messageId: 'x402-batch-1',
+          role: 'agent',
+          parts: [{ kind: 'text', text: 'open a channel' }],
+          metadata: {
+            [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REQUIRED,
+            [X402_METADATA_KEYS.REQUIRED]: {
+              x402Version: 2,
+              resource: { url: 'https://example.com/protected' },
+              accepts: [
+                {
+                  scheme: 'batch-settlement',
+                  network: 'eip155:84532',
+                  asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+                  amount: '1000',
+                  payTo: '0x000000000000000000000000000000000000dEaD',
+                  maxTimeoutSeconds: 300,
+                  extra: {
+                    name: 'USDC',
+                    version: '2',
+                    receiverAuthorizer:
+                      '0x5555555555555555555555555555555555555555',
+                  },
+                },
+              ],
+            },
+          },
+        },
+      },
+      artifacts: [],
+      history: [],
+    };
+  }
+
+  /** Terminal task carrying the merchant's post-voucher channel snapshot. */
+  function completedTaskWithChannelReceipt(): unknown {
+    return {
+      kind: 'task',
+      id: 't1',
+      contextId: 'c1',
+      status: {
+        state: 'completed',
+        timestamp: new Date().toISOString(),
+        message: {
+          messageId: 'x402-batch-2',
+          role: 'agent',
+          parts: [{ kind: 'text', text: 'done' }],
+          metadata: {
+            [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.COMPLETED,
+            [X402_METADATA_KEYS.RECEIPTS]: [
+              {
+                success: true,
+                // Voucher settlements never carry a tx hash.
+                transaction: '',
+                network: 'eip155:84532',
+                extra: {
+                  channelState: {
+                    channelId: CHANNEL_ID,
+                    balance: '5000',
+                    totalClaimed: '0',
+                    chargedCumulativeAmount: '1000',
+                  },
+                },
+              },
+            ],
+          },
+        },
+      },
+      artifacts: [],
+      history: [],
+    };
+  }
+
+  function channelStorage() {
+    const channels = new Map<string, Record<string, unknown>>();
+    return {
+      channels,
+      storage: {
+        get: async (key: string) => channels.get(key),
+        set: async (key: string, state: Record<string, unknown>) => {
+          channels.set(key, state);
+        },
+        delete: async (key: string) => {
+          channels.delete(key);
+        },
+      },
+    };
+  }
+
+  it('signs a batch-settlement offer and folds the receipt back into channel storage', async () => {
+    const { channels, storage } = channelStorage();
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(completedTaskWithChannelReceipt()),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    expect(task.status.state).toBe('completed');
+    expect(rpcRequests).toHaveLength(2);
+
+    // No local channel existed, so the first payload funds one: an ERC-3009
+    // deposit bundled with the opening voucher, not a bare voucher.
+    const followup = (
+      rpcRequests[1]!.body as {
+        params: { message: { metadata: Record<string, unknown> } };
+      }
+    ).params.message.metadata;
+    const payload = followup[X402_METADATA_KEYS.PAYLOAD] as {
+      accepted: { scheme: string };
+      payload: { type: string; deposit: { amount: string } };
+    };
+    expect(payload.accepted.scheme).toBe('batch-settlement');
+    expect(payload.payload.type).toBe('deposit');
+    // Default policy funds 5x the request amount, so one deposit covers the
+    // next four calls as pure vouchers.
+    expect(payload.payload.deposit.amount).toBe('5000');
+
+    // The reconcile step is what makes the *next* call a cheap voucher instead
+    // of a second deposit — without it the payer re-funds the same channel
+    // forever, since a LocalAccount cannot read the channel back off-chain.
+    expect(channels.get(CHANNEL_ID.toLowerCase())).toEqual({
+      balance: '5000',
+      totalClaimed: '0',
+      chargedCumulativeAmount: '1000',
+    });
+  });
+
+  it('does not select a batch-settlement offer without allowBatchSettlement', async () => {
+    const { storage } = channelStorage();
+    const { fetch } = scriptedFetch([() => jsonRpcOk(batchRequiredTask())]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: { signer: TEST_ACCOUNT, batchSettlement: { storage } },
+    });
+    await expect(
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      }),
+    ).rejects.toThrow(X402NoSupportedRequirementError);
+  });
+
+  it('leaves storage untouched when no batchSettlement is configured', async () => {
+    // A plain `exact` payer must never pay the cost of the batch peer, and
+    // receipts without channelState must not reach it.
+    const { fetch } = scriptedFetch([
+      () => jsonRpcOk(paymentRequiredTask()),
+      () => jsonRpcOk(completedTaskWithReceipt()),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: { signer: TEST_ACCOUNT },
+    });
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    expect(task.status.state).toBe('completed');
+  });
+});
+
 describe('A2XClient.sendMessageStream — native x402 dance', () => {
   function sseResponse(events: string[]): Response {
     const encoder = new TextEncoder();

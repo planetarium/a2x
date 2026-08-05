@@ -56,14 +56,17 @@ import {
   defaultSelect,
   signX402Payment,
   rejectX402Payment,
+  reconcileX402BatchSettlement,
   getX402PaymentRequirements,
   getX402Receipts,
   type SignedX402Payment,
+  type X402BatchSettlementOptions,
 } from '../x402/client.js';
 import { X402PaymentFailedError } from '../x402/errors.js';
 import type {
   X402PaymentRequirements,
   X402PaymentRequiredResponse,
+  X402SettleResponse,
 } from '../x402/types.js';
 
 // ─── Types ───
@@ -113,6 +116,31 @@ export interface A2XClientX402Options {
    * Ignored when `selectRequirement` is supplied.
    */
   allowUpto?: boolean;
+  /**
+   * Channel storage and deposit policy for the `batch-settlement` scheme,
+   * which pays out of a pre-funded on-chain channel instead of settling each
+   * call. Supplying it registers the scheme (it cannot be constructed from a
+   * signer alone) and makes the client reconcile each task's receipts back
+   * into `storage` — the step that advances the payer's cumulative voucher.
+   *
+   * See `X402BatchSettlementOptions`: `storage` must be durable.
+   */
+  batchSettlement?: X402BatchSettlementOptions;
+  /**
+   * Let the default selector fall back to a CAIP-2 EVM `batch-settlement`
+   * offer when the merchant advertises no affordable `exact` or (under
+   * `allowUpto`) `upto` one. Default `false`, and ignored unless
+   * `batchSettlement` is configured.
+   *
+   * Its own flag rather than part of `allowUpto` because funding a channel is
+   * a prepayment made before any service is rendered, not a wider draw on an
+   * authorization. Note that `maxAmount` bounds the per-request amount, not
+   * the deposit sized from it — see `X402BatchSettlementOptions.depositPolicy`
+   * for that.
+   *
+   * Ignored when `selectRequirement` is supplied.
+   */
+  allowBatchSettlement?: boolean;
   /**
    * Hook invoked after the merchant publishes `payment-required` and
    * before the client signs. Useful for prompting the user to confirm,
@@ -303,6 +331,9 @@ export class A2XClient {
   async sendMessage(params: SendMessageParams): Promise<Task> {
     const first = await this._sendMessageOnce(params);
     if (!this._x402) return first;
+    // The caller may have signed into the *first* message themselves, in which
+    // case the receipt arrives before the dance below ever runs.
+    await this._reconcileX402(first.status.message?.metadata);
     if (first.status.state !== 'input-required') return first;
     if (!getX402PaymentRequirements(first)) return first;
 
@@ -323,6 +354,10 @@ export class A2XClient {
       task = await this._sendMessageOnce(
         this._buildSubmitFollowup(params, task, signed.metadata),
       );
+      // Per attempt, not once after the loop: under `retryOnFailure` an
+      // intermediate attempt can settle before a later one re-prompts, and
+      // that receipt is state the payer must record either way.
+      await this._reconcileX402(task.status.message?.metadata);
 
       // Server may re-issue payment-required when running with
       // retryOnFailure (a2a-x402 v0.2 §9). Loop within the budget; once
@@ -370,6 +405,15 @@ export class A2XClient {
       let pendingTask: Task | undefined;
       for await (const event of this._sendMessageStreamOnce(currentParams, signal)) {
         yield event;
+        if ('status' in event) {
+          // The streaming path never materializes a terminal Task, so channel
+          // state is reconciled off the event that carries the receipts.
+          await this._reconcileX402(
+            event.status?.message?.metadata as
+              | Record<string, unknown>
+              | undefined,
+          );
+        }
         if (
           'status' in event &&
           event.status?.state === 'input-required' &&
@@ -575,15 +619,49 @@ export class A2XClient {
           : reqs.filter((r) => isWithinBudget(r, x402.maxAmount!));
       if (userSelect) return userSelect(affordable);
       // Only auto-pick an option the EVM signer can fulfil, exact-first and
-      // never `upto` unless opted in — see defaultSelect in x402/client.ts for
-      // the safety rationale. undefined surfaces as
+      // never `upto` / `batch-settlement` unless opted in — see defaultSelect
+      // in x402/client.ts for the safety rationale. undefined surfaces as
       // X402NoSupportedRequirementError.
-      return defaultSelect(affordable, { allowUpto: x402.allowUpto });
+      return defaultSelect(affordable, {
+        allowUpto: x402.allowUpto,
+        allowBatchSettlement:
+          x402.allowBatchSettlement && x402.batchSettlement !== undefined,
+      });
     };
     return signX402Payment(task, {
       signer: x402.signer,
       selectRequirement: select,
+      ...(x402.batchSettlement
+        ? { batchSettlement: x402.batchSettlement }
+        : {}),
     });
+  }
+
+  /**
+   * Fold a terminal task's receipts back into `batch-settlement` channel
+   * storage. Runs on every terminal task once `x402.batchSettlement` is
+   * configured, because a2x never executes `@x402/evm`'s own
+   * `onPaymentResponse` hook — see `reconcileX402BatchSettlement`.
+   *
+   * Reconciliation failure must not fail a task the merchant already
+   * completed: the work is done and paid for either way. The next request
+   * re-derives channel state from whatever did persist, so this rethrows
+   * nothing and leaves the caller with the merchant's task.
+   */
+  private async _reconcileX402(
+    metadata: Record<string, unknown> | undefined,
+  ): Promise<void> {
+    const batchSettlement = this._x402?.batchSettlement;
+    if (!batchSettlement) return;
+    const receipts = metadata?.[X402_METADATA_KEYS.RECEIPTS];
+    if (!Array.isArray(receipts) || receipts.length === 0) return;
+    try {
+      await reconcileX402BatchSettlement(receipts as X402SettleResponse[], {
+        storage: batchSettlement.storage,
+      });
+    } catch {
+      // Intentionally swallowed — see the doc comment above.
+    }
   }
 
   /**
