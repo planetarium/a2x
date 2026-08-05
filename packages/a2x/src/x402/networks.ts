@@ -42,6 +42,8 @@ const EVM_NETWORK_CHAIN_ID: Record<string, number> = {
   monad: 143,
   stable: 988,
   'stable-testnet': 2201,
+  celo: 42220,
+  flare: 14,
 };
 
 /** EIP-155 chain id → bare EVM network name (inverse of the table above). */

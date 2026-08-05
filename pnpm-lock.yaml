@@ -46,11 +46,11 @@ importers:
         specifier: ^25.6.0
         version: 25.6.0
       '@x402/core':
-        specifier: ~2.19.0
-        version: 2.19.0
+        specifier: ~2.21.0
+        version: 2.21.0
       '@x402/evm':
-        specifier: ~2.19.0
-        version: 2.19.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)
+        specifier: ~2.21.0
+        version: 2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)
       openai:
         specifier: ^6.34.0
         version: 6.34.0(ws@8.18.3(bufferutil@4.1.0)(utf-8-validate@5.0.10))(zod@3.25.76)
@@ -83,7 +83,7 @@ importers:
         version: 13.1.0
       viem:
         specifier: ^2.48.2
-        version: 2.48.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@4.3.6)
+        version: 2.48.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@3.25.76)
     devDependencies:
       '@types/node':
         specifier: ^22.0.0
@@ -1415,8 +1415,14 @@ packages:
   '@x402/core@2.19.0':
     resolution: {integrity: sha512-IPQIHzIrwvbri1339QWHvwtiTTDbGsrF5Yff0LZfufmVXNdOSYbjY8oz6vZg7+4W13f7/k81NUMAFoDOU4gswQ==}
 
+  '@x402/core@2.21.0':
+    resolution: {integrity: sha512-0djKE7V5/JKDMrjRe5he3DoMFzlbVnUcvMmLAb2j6OoAJDamupkFh6fFrXeoHwjkBIxOFUzjGI4FVixz2dMxSA==}
+
   '@x402/evm@2.19.0':
     resolution: {integrity: sha512-ycbYCjJmLC1I7tRQslAwB73FhJAVMPzsojYunWuR5hk+jKUwgC6djch1ZrKFC1f9lJi7IOiezZtRHj6TWyCCrg==}
+
+  '@x402/evm@2.21.0':
+    resolution: {integrity: sha512-VZtPz26IxhfAQbHHmyG7nCY/0jLH9QIgNqRztT1ae93dc9uSGUyn5bofzA3Wxq7lND3WDFir0QAQ2LBqoFeMrg==}
 
   '@yao-pkg/pkg-fetch@3.5.33':
     resolution: {integrity: sha512-j2UoH+eP4VobfovQg1gkWwDoB4O/tv8rlLnEjUEEHuWXJ5eBLNUIrobMSEp773/2pgUJUfqqPUFIhS1pN8OZuQ==}
@@ -4787,9 +4793,23 @@ snapshots:
     dependencies:
       zod: 3.25.76
 
+  '@x402/core@2.21.0':
+    dependencies:
+      zod: 3.25.76
+
   '@x402/evm@2.19.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)':
     dependencies:
       '@x402/core': 2.19.0
+      viem: 2.55.8(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@3.25.76)
+      zod: 3.25.76
+    transitivePeerDependencies:
+      - bufferutil
+      - typescript
+      - utf-8-validate
+
+  '@x402/evm@2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)':
+    dependencies:
+      '@x402/core': 2.21.0
       viem: 2.55.8(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@3.25.76)
       zod: 3.25.76
     transitivePeerDependencies:
