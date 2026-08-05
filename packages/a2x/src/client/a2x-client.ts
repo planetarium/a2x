@@ -993,13 +993,28 @@ function isDepositWithinBudget(
   if (x402.maxAmount === undefined) return true;
   const batchSettlement = x402.batchSettlement;
   if (!batchSettlement || batchSettlement.depositStrategy) return true;
-  const multiplier = BigInt(
-    batchSettlement.depositPolicy?.depositMultiplier ?? DEFAULT_DEPOSIT_MULTIPLIER,
-  );
+
+  const configured = batchSettlement.depositPolicy?.depositMultiplier;
+  let multiplier: bigint;
+  if (configured === undefined) {
+    multiplier = DEFAULT_DEPOSIT_MULTIPLIER;
+  } else if (Number.isInteger(configured) && configured > 0) {
+    multiplier = BigInt(configured);
+  } else {
+    // Fail closed on a multiplier we cannot use. Two reasons: `BigInt(5.5)`
+    // throws, and this runs inside offer filtering where an exception would
+    // surface as an opaque RangeError out of `sendMessage`; and a cap that
+    // cannot compute the deposit must never report it as affordable. Nothing
+    // payable is lost — `@x402/evm` rejects any multiplier below 3 outright,
+    // so an offer excluded here could not have been signed anyway.
+    return false;
+  }
+
   try {
     return BigInt(requirementAmount(requirement)) * multiplier <= x402.maxAmount;
   } catch {
-    // Unparseable amount — `isWithinBudget` already defers to the signer here.
+    // Unparseable amount — `isWithinBudget` already defers to the signer here,
+    // and diverging would silently drop a requirement it let through.
     return true;
   }
 }

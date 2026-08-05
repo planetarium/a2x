@@ -918,6 +918,79 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     ).rejects.toThrow(X402NoSupportedRequirementError);
   });
 
+  it('fails closed on an unusable depositMultiplier instead of throwing', async () => {
+    // `BigInt(5.5)` throws a RangeError. Raised inside offer filtering that
+    // would surface from `sendMessage` as an opaque runtime error rather than
+    // an x402 one — and a cap that cannot compute the deposit must not report
+    // it affordable. `@x402/evm` rejects any multiplier below 3 anyway, so
+    // excluding the offer loses nothing that could have been signed.
+    for (const depositMultiplier of [5.5, 0, -1, NaN]) {
+      const { storage } = channelStorage();
+      const { fetch } = scriptedFetch([() => jsonRpcOk(batchRequiredTask())]);
+      const client = new A2XClient(AGENT_URL, {
+        fetch,
+        x402: {
+          signer: TEST_ACCOUNT,
+          batchSettlement: { storage, depositPolicy: { depositMultiplier } },
+          allowBatchSettlement: true,
+          maxAmount: 1_000_000n,
+        },
+      });
+      await expect(
+        client.sendMessage({
+          message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+        }),
+        `depositMultiplier: ${depositMultiplier}`,
+      ).rejects.toThrow(X402NoSupportedRequirementError);
+    }
+  });
+
+  it('honors a valid custom depositMultiplier when capping', async () => {
+    // 1000 x 20 = 20000, over a 10000 cap.
+    const { storage } = channelStorage();
+    const { fetch } = scriptedFetch([() => jsonRpcOk(batchRequiredTask())]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage, depositPolicy: { depositMultiplier: 20 } },
+        allowBatchSettlement: true,
+        maxAmount: 10_000n,
+      },
+    });
+    await expect(
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      }),
+    ).rejects.toThrow(X402NoSupportedRequirementError);
+  });
+
+  it('leaves the cap to a caller-supplied depositStrategy', async () => {
+    // The strategy sizes each deposit itself and may return any amount, so
+    // the SDK cannot predict it and does not pretend to.
+    const { storage } = channelStorage();
+    const { fetch } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(completedTaskWithChannelReceipt()),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: {
+          storage,
+          depositStrategy: ({ minimumDepositAmount }) => minimumDepositAmount,
+        },
+        allowBatchSettlement: true,
+        maxAmount: 1000n,
+      },
+    });
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    expect(task.status.state).toBe('completed');
+  });
+
   it('admits the same offer once maxAmount covers the whole deposit', async () => {
     const { storage } = channelStorage();
     const { fetch } = scriptedFetch([
