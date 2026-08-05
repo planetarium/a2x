@@ -34,8 +34,12 @@ a cent.
 - Deposit sizing is tunable via `depositPolicy` (default 5x the request
   amount) or `depositStrategy` for full per-deposit control.
 
-Requires `@x402/evm` >= 2.19, already the declared peer range — no dependency
-change.
+`A2XClient`'s `maxAmount` now bounds the **deposit** for a `batch-settlement`
+offer, not just the request amount — paying one call there authorizes
+`depositMultiplier x` the price (5x by default), so a cap that only bounded
+the per-call amount would let a wallet capped at 1 USDC authorize 5. Offers
+whose deposit exceeds the cap are filtered out. A caller-supplied
+`depositStrategy` sizes deposits itself and is left alone.
 
 Merchant-side wiring is documented rather than shipped: voucher accounting
 needs `@x402/core`'s server lifecycle, and redemption must be a singleton

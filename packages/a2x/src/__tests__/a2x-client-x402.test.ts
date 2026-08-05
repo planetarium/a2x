@@ -781,6 +781,164 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     ).rejects.toThrow(X402NoSupportedRequirementError);
   });
 
+  it('reconciles over streaming even when the consumer breaks on the final event', async () => {
+    // Regression guard. The receipt rides the final status event, and the
+    // idiomatic consumer breaks out of its loop right there — which calls the
+    // generator's return() at the suspended yield. Reconciling *after* the
+    // yield would never run, and the next call would sign a second real
+    // deposit into an already-funded channel.
+    const { channels, storage } = channelStorage();
+    const encoder = new TextEncoder();
+    const sse = (events: unknown[]) =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            for (const ev of events) {
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({ jsonrpc: '2.0', id: 1, result: ev })}\n\n`,
+                ),
+              );
+            }
+            controller.close();
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      );
+
+    const required = batchRequiredTask() as {
+      status: { message: { metadata: Record<string, unknown> } };
+    };
+    const completed = completedTaskWithChannelReceipt() as {
+      status: { message: { metadata: Record<string, unknown> } };
+    };
+    const streams = [
+      sse([
+        {
+          kind: 'status-update',
+          taskId: 't1',
+          contextId: 'c1',
+          status: {
+            state: 'input-required',
+            timestamp: new Date().toISOString(),
+            message: required.status.message,
+          },
+          final: false,
+        },
+      ]),
+      sse([
+        {
+          kind: 'status-update',
+          taskId: 't1',
+          contextId: 'c1',
+          status: {
+            state: 'completed',
+            timestamp: new Date().toISOString(),
+            message: completed.status.message,
+          },
+          final: true,
+        },
+      ]),
+    ];
+    let call = 0;
+    const fetch = (async (input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/agent-card.json') || url.endsWith('/agent.json')) {
+        return agentCardResponse();
+      }
+      return streams[call++]!;
+    }) as unknown as typeof globalThis.fetch;
+
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+
+    for await (const event of client.sendMessageStream({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    })) {
+      // Exactly the pattern that used to lose the receipt.
+      if ('status' in event && event.status?.state === 'completed') break;
+    }
+
+    expect(channels.get(CHANNEL_ID.toLowerCase())).toEqual({
+      balance: '5000',
+      totalClaimed: '0',
+      chargedCumulativeAmount: '1000',
+    });
+  });
+
+  it('ignores receipts from an exchange it did not pay with a voucher', async () => {
+    // The storage key is the *merchant-supplied* channelId, and channel ids
+    // derive from public inputs — so any agent could name the channel this
+    // payer shares with a different merchant. Folding receipts from a task we
+    // never paid would let it plant a bogus cumulative and brick that channel.
+    const { channels, storage } = channelStorage();
+    const { fetch } = scriptedFetch([
+      () => jsonRpcOk(completedTaskWithChannelReceipt()),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    expect(task.status.state).toBe('completed');
+    expect(channels.size).toBe(0);
+  });
+
+  it('filters out an offer whose deposit would exceed maxAmount', async () => {
+    // The offer costs 1000 and passes a 1000 cap on its own, but paying it
+    // signs a 5x deposit authorization. A cap that only bounded the request
+    // amount would let a wallet capped at 1000 authorize 5000.
+    const { storage } = channelStorage();
+    const { fetch } = scriptedFetch([() => jsonRpcOk(batchRequiredTask())]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+        maxAmount: 1000n,
+      },
+    });
+    await expect(
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      }),
+    ).rejects.toThrow(X402NoSupportedRequirementError);
+  });
+
+  it('admits the same offer once maxAmount covers the whole deposit', async () => {
+    const { storage } = channelStorage();
+    const { fetch } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(completedTaskWithChannelReceipt()),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+        maxAmount: 5000n,
+      },
+    });
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    expect(task.status.state).toBe('completed');
+  });
+
   it('leaves storage untouched when no batchSettlement is configured', async () => {
     // A plain `exact` payer must never pay the cost of the batch peer, and
     // receipts without channelState must not reach it.

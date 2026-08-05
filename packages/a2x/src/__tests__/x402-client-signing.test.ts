@@ -25,6 +25,8 @@ const captured: {
   registered: [string, string][];
   batchOptions: Record<string, unknown>[];
   reconciled: { storage: unknown; settle: unknown }[];
+  /** Makes the mocked peer throw for one channel id, as the real one would. */
+  failOnChannelId?: string;
 } = {
   registered: [],
   batchOptions: [],
@@ -73,6 +75,13 @@ vi.mock('../x402/peer.js', () => ({
           }
         },
         processSettleResponse: async (storage: unknown, settle: unknown) => {
+          const id = (
+            (settle as { extra?: { channelState?: { channelId?: string } } })
+              .extra?.channelState ?? {}
+          ).channelId;
+          if (captured.failOnChannelId && id === captured.failOnChannelId) {
+            throw new Error('channel storage write failed');
+          }
           captured.reconciled.push({ storage, settle });
         },
       };
@@ -449,6 +458,43 @@ describe('reconcileX402BatchSettlement', () => {
       { storage: memoryChannelStorage() },
     );
     expect(captured.reconciled).toEqual([]);
+  });
+
+  it('screens out a channelState with no usable channelId', async () => {
+    // The peer keys storage on `channelState.channelId.toLowerCase()` with no
+    // guard of its own, so an unusable id would surface as a bare TypeError
+    // thrown from inside `@x402/evm`.
+    captured.reconciled = [];
+    await reconcileX402BatchSettlement(
+      [
+        { ...channelReceipt, extra: { channelState: {} } },
+        { ...channelReceipt, extra: { channelState: { channelId: 123 } } },
+        { ...channelReceipt, extra: { channelState: { channelId: '' } } },
+        { ...channelReceipt, extra: { channelState: null } },
+      ],
+      { storage: memoryChannelStorage() },
+    );
+    expect(captured.reconciled).toEqual([]);
+  });
+
+  it('still applies the good receipts when one fails, then reports', async () => {
+    // Receipts are remote-controlled. One entry blowing up inside the peer
+    // must not drop a later valid one — a receipt the payer never records
+    // leaves it desynced, and `@x402/evm` cannot self-heal that without a
+    // chain-reading signer.
+    captured.reconciled = [];
+    captured.failOnChannelId = `0x${'99'.repeat(32)}`;
+    const poisoned: X402SettleResponse = {
+      ...channelReceipt,
+      extra: { channelState: { channelId: captured.failOnChannelId } },
+    };
+    const storage = memoryChannelStorage();
+    await expect(
+      reconcileX402BatchSettlement([poisoned, channelReceipt], { storage }),
+    ).rejects.toThrow(AggregateError);
+    // The valid receipt after the failing one was still processed.
+    expect(captured.reconciled.map((r) => r.settle)).toEqual([channelReceipt]);
+    captured.failOnChannelId = undefined;
   });
 
   it('processes every channel receipt on a task, in order', async () => {

@@ -86,6 +86,13 @@ const BATCH_SETTLEMENT_CLIENT_PEER = ['@x402', 'evm/batch-settlement/client'].jo
 );
 
 /**
+ * Wire name of the batch-settlement scheme.
+ *
+ * @internal Not part of `@a2x/sdk/x402`'s public surface.
+ */
+export const BATCH_SETTLEMENT_SCHEME = 'batch-settlement';
+
+/**
  * Persisted state of one `batch-settlement` payment channel, keyed by the
  * lowercased channel id. Structurally `@x402/evm`'s
  * `BatchSettlementClientContext`; declared here so implementing a storage
@@ -572,7 +579,7 @@ export function defaultSelect(
   if (!options?.allowBatchSettlement) return undefined;
   return requirements.find(
     (r) =>
-      r.scheme === 'batch-settlement' && CAIP2_EVM_NETWORK.test(r.network),
+      r.scheme === BATCH_SETTLEMENT_SCHEME && CAIP2_EVM_NETWORK.test(r.network),
   );
 }
 
@@ -603,12 +610,45 @@ export async function reconcileX402BatchSettlement(
   receipts: X402SettleResponse[],
   options: { storage: X402ClientChannelStorage },
 ): Promise<void> {
-  const relevant = receipts.filter((r) => r.success && r.extra?.channelState);
+  const relevant = receipts.filter(
+    (r) => r.success && hasChannelStateKey(r.extra),
+  );
   if (relevant.length === 0) return;
   const mod = (await importX402Peer(
     BATCH_SETTLEMENT_CLIENT_PEER,
   )) as unknown as X402EvmBatchSettlementClientModule;
+  const failures: unknown[] = [];
   for (const receipt of relevant) {
-    await mod.processSettleResponse(options.storage, receipt);
+    // Per receipt, not one try around the loop: the receipts are
+    // remote-controlled, and one malformed entry must not stop a later valid
+    // one from being recorded — a dropped receipt leaves the payer desynced,
+    // which `@x402/evm` cannot self-heal without a chain-reading signer.
+    try {
+      await mod.processSettleResponse(options.storage, receipt);
+    } catch (err) {
+      failures.push(err);
+    }
   }
+  if (failures.length > 0) {
+    throw new AggregateError(
+      failures,
+      `Failed to reconcile ${failures.length} of ${relevant.length} batch-settlement receipt(s).`,
+    );
+  }
+}
+
+/**
+ * True when `extra` carries a `channelState` this SDK can hand to
+ * `@x402/evm` — i.e. with a usable string `channelId`.
+ *
+ * The peer keys storage on `channelState.channelId.toLowerCase()` with no
+ * guard of its own, so a merchant sending `channelState: {}` (or a numeric id)
+ * would throw a bare `TypeError` from inside the peer. Screening here keeps a
+ * malformed receipt an ignored receipt.
+ */
+function hasChannelStateKey(extra: Record<string, unknown> | undefined): boolean {
+  const channelState = extra?.channelState;
+  if (typeof channelState !== 'object' || channelState === null) return false;
+  const id = (channelState as { channelId?: unknown }).channelId;
+  return typeof id === 'string' && id.length > 0;
 }

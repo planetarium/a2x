@@ -57,6 +57,7 @@ import {
   signX402Payment,
   rejectX402Payment,
   reconcileX402BatchSettlement,
+  BATCH_SETTLEMENT_SCHEME,
   getX402PaymentRequirements,
   getX402Receipts,
   type SignedX402Payment,
@@ -92,6 +93,14 @@ export interface A2XClientX402Options {
    * this is filtered out before the selector runs, so a custom
    * `selectRequirement` only sees the affordable subset. If nothing
    * remains, signing throws `X402NoSupportedRequirementError`.
+   *
+   * For `batch-settlement` the cap is applied to the **deposit**, not just
+   * the request amount: paying one call there authorizes
+   * `depositMultiplier x` the price (5x by default), and a cap that only
+   * bounded the per-call amount would let a wallet capped at 1 USDC
+   * authorize 5. An offer whose deposit would exceed the cap is filtered
+   * out. The one case the SDK cannot bound is a caller-supplied
+   * `depositStrategy`, which sizes each deposit itself.
    */
   maxAmount?: bigint;
   /**
@@ -331,9 +340,6 @@ export class A2XClient {
   async sendMessage(params: SendMessageParams): Promise<Task> {
     const first = await this._sendMessageOnce(params);
     if (!this._x402) return first;
-    // The caller may have signed into the *first* message themselves, in which
-    // case the receipt arrives before the dance below ever runs.
-    await this._reconcileX402(first.status.message?.metadata);
     if (first.status.state !== 'input-required') return first;
     if (!getX402PaymentRequirements(first)) return first;
 
@@ -356,8 +362,11 @@ export class A2XClient {
       );
       // Per attempt, not once after the loop: under `retryOnFailure` an
       // intermediate attempt can settle before a later one re-prompts, and
-      // that receipt is state the payer must record either way.
-      await this._reconcileX402(task.status.message?.metadata);
+      // that receipt is state the payer must record either way. Gated on
+      // having actually paid this agent with a voucher — see `_reconcileX402`.
+      if (signed.requirement.scheme === BATCH_SETTLEMENT_SCHEME) {
+        await this._reconcileX402(task.status.message?.metadata);
+      }
 
       // Server may re-issue payment-required when running with
       // retryOnFailure (a2a-x402 v0.2 §9). Loop within the budget; once
@@ -400,20 +409,26 @@ export class A2XClient {
     // re-prompts (a2a-x402 v0.2 §9). Default 0 retries → exactly one
     // sign+resubmit, matching the long-standing client behavior.
     let signsRemaining = (this._x402.maxRetries ?? 0) + 1;
+    // Gates reconciliation on "we actually paid this agent with a voucher".
+    // See `_reconcileX402` for why an ungated fold is a real attack surface.
+    let paidWithBatchSettlement = false;
 
     while (true) {
       let pendingTask: Task | undefined;
       for await (const event of this._sendMessageStreamOnce(currentParams, signal)) {
-        yield event;
-        if ('status' in event) {
-          // The streaming path never materializes a terminal Task, so channel
-          // state is reconciled off the event that carries the receipts.
+        // Reconcile BEFORE the yield, not after. The receipt rides the final
+        // status event, and the idiomatic consumer breaks out of its loop on
+        // exactly that event — which calls this generator's `return()` at the
+        // suspended `yield`, so nothing after it ever runs. Losing the receipt
+        // there costs the payer a second real deposit on the next call.
+        if (paidWithBatchSettlement && 'status' in event) {
           await this._reconcileX402(
             event.status?.message?.metadata as
               | Record<string, unknown>
               | undefined,
           );
         }
+        yield event;
         if (
           'status' in event &&
           event.status?.state === 'input-required' &&
@@ -451,6 +466,8 @@ export class A2XClient {
       signsRemaining -= 1;
 
       const signed = await this._signX402(pendingTask);
+      paidWithBatchSettlement ||=
+        signed.requirement.scheme === BATCH_SETTLEMENT_SCHEME;
       currentParams = this._buildSubmitFollowup(
         params,
         pendingTask,
@@ -616,7 +633,9 @@ export class A2XClient {
       const affordable =
         x402.maxAmount === undefined
           ? reqs
-          : reqs.filter((r) => isWithinBudget(r, x402.maxAmount!));
+          : reqs
+              .filter((r) => isWithinBudget(r, x402.maxAmount!))
+              .filter((r) => isDepositWithinBudget(r, x402));
       if (userSelect) return userSelect(affordable);
       // Only auto-pick an option the EVM signer can fulfil, exact-first and
       // never `upto` / `batch-settlement` unless opted in — see defaultSelect
@@ -638,15 +657,28 @@ export class A2XClient {
   }
 
   /**
-   * Fold a terminal task's receipts back into `batch-settlement` channel
-   * storage. Runs on every terminal task once `x402.batchSettlement` is
-   * configured, because a2x never executes `@x402/evm`'s own
-   * `onPaymentResponse` hook — see `reconcileX402BatchSettlement`.
+   * Fold receipts back into `batch-settlement` channel storage, because a2x
+   * never executes `@x402/evm`'s own `onPaymentResponse` hook — see
+   * `reconcileX402BatchSettlement`.
    *
-   * Reconciliation failure must not fail a task the merchant already
-   * completed: the work is done and paid for either way. The next request
-   * re-derives channel state from whatever did persist, so this rethrows
-   * nothing and leaves the caller with the merchant's task.
+   * **Only ever called for an exchange this client paid with a voucher.** The
+   * storage key is the merchant-supplied `channelState.channelId`, and channel
+   * ids are derived from public inputs, so any agent could compute the one
+   * this payer shares with a *different* merchant. Folding receipts from every
+   * response would let an agent this payer merely messaged plant a bogus
+   * cumulative for someone else's channel — bricking it (a mismatched
+   * cumulative is rejected forever, see below) or forcing an inflated voucher
+   * and top-up. Gating on "we actually paid, with this scheme" keeps the trust
+   * boundary at the merchant the payer chose to transact with.
+   *
+   * Failure does not fail a task the merchant already completed — the work is
+   * done and the voucher is spent either way, and throwing here would only
+   * lose the caller their result on top. But it is **not** harmless: the
+   * server requires the next voucher's cumulative to equal exactly
+   * `charged + amount`, and `@x402/evm`'s self-heal path needs a signer with
+   * `readContract`, which a viem `LocalAccount` does not have. A payer that
+   * misses a receipt therefore stays desynced until its storage is repaired
+   * out of band. Supply durable storage.
    */
   private async _reconcileX402(
     metadata: Record<string, unknown> | undefined,
@@ -930,6 +962,44 @@ export class A2XClient {
     this._resolvedSchemes = await this._authProvider.refresh(
       this._resolvedSchemes,
     );
+    return true;
+  }
+}
+
+/** `@x402/evm`'s default `depositMultiplier` when no policy overrides it. */
+const DEFAULT_DEPOSIT_MULTIPLIER = 5n;
+
+/**
+ * True when a `batch-settlement` requirement's **deposit** also fits the
+ * caller's `maxAmount`. Every other scheme passes through.
+ *
+ * `maxAmount` promises a cap on what the client will authorize, and for the
+ * other schemes the authorization *is* the request amount. Batch settlement
+ * breaks that identity: paying 0.2 USDC signs an ERC-3009 authorization for
+ * `depositMultiplier x` that (5x by default), so a wallet capped at 1 USDC
+ * would otherwise silently authorize 5. Filtering the offer out instead
+ * surfaces `X402NoSupportedRequirementError`, which is the honest outcome —
+ * the payer's cap genuinely cannot cover this offer.
+ *
+ * A caller-supplied `depositStrategy` owns sizing outright and can return any
+ * amount, so the SDK cannot predict the deposit and does not pretend to —
+ * that case is left to the strategy.
+ */
+function isDepositWithinBudget(
+  requirement: X402PaymentRequirements,
+  x402: A2XClientX402Options,
+): boolean {
+  if (requirement.scheme !== BATCH_SETTLEMENT_SCHEME) return true;
+  if (x402.maxAmount === undefined) return true;
+  const batchSettlement = x402.batchSettlement;
+  if (!batchSettlement || batchSettlement.depositStrategy) return true;
+  const multiplier = BigInt(
+    batchSettlement.depositPolicy?.depositMultiplier ?? DEFAULT_DEPOSIT_MULTIPLIER,
+  );
+  try {
+    return BigInt(requirementAmount(requirement)) * multiplier <= x402.maxAmount;
+  } catch {
+    // Unparseable amount — `isWithinBudget` already defers to the signer here.
     return true;
   }
 }
