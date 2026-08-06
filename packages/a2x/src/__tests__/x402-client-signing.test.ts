@@ -290,6 +290,21 @@ describe('signX402Payment batch-settlement registration', () => {
     expect(captured.batchOptions[0]!.storage).toBe(storage);
   });
 
+  it.each([
+    ['an empty options object', {}],
+    ['an explicitly undefined storage', { storage: undefined }],
+    ['a storage with a non-callable method', { storage: { get: true } }],
+  ])('rejects %s instead of selecting upstream in-memory storage', async (_label, config) => {
+    await expect(
+      signX402Payment(v2RequiredTask(), {
+        signer: freshSigner(0x2f),
+        batchSettlement: config as never,
+      }),
+    ).rejects.toThrow(
+      'batchSettlement.storage must provide callable get, set, and delete methods',
+    );
+  });
+
   it('forwards only the tuning options the caller actually set', async () => {
     captured.batchOptions = [];
     await signX402Payment(v2RequiredTask(), {
@@ -545,6 +560,18 @@ describe('reconcileX402BatchSettlement', () => {
       { storage: memoryChannelStorage(), bindings: BIND_A },
     );
     expect(captured.reconciled).toEqual([]);
+  });
+
+  it('skips malformed entries without dropping a later valid receipt', async () => {
+    captured.reconciled = [];
+    const { applied } = await reconcileX402BatchSettlement(
+      [null, 'not-a-receipt', 42, [], channelReceipt] as never,
+      { storage: memoryChannelStorage(), bindings: BIND_A },
+    );
+    expect(applied).toEqual([CHANNEL_A]);
+    expect(captured.reconciled.map((entry) => entry.settle)).toEqual([
+      channelReceipt,
+    ]);
   });
 
   it('screens out a channelState with no canonical channelId', async () => {

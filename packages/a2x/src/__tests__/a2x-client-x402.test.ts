@@ -1227,6 +1227,156 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     expect(error!.reason).toBe('no-matching-receipt');
   });
 
+  it.each(['failed', 'canceled', 'rejected'])(
+    'raises when a terminal %s task omits x402 metadata',
+    async (state) => {
+      const { storage } = channelStorage();
+      const terminalWithoutX402Metadata = () => {
+        const task = completedTaskWithChannelReceipt(FOREIGN_CHANNEL_ID) as {
+          status: {
+            state: string;
+            message: { metadata: Record<string, unknown> };
+          };
+        };
+        task.status.state = state;
+        delete task.status.message.metadata[X402_METADATA_KEYS.STATUS];
+        delete task.status.message.metadata[X402_METADATA_KEYS.RECEIPTS];
+        return task;
+      };
+      const { fetch } = scriptedFetch([
+        () => jsonRpcOk(batchRequiredTask()),
+        () => jsonRpcOk(terminalWithoutX402Metadata()),
+      ]);
+      const client = new A2XClient(AGENT_URL, {
+        fetch,
+        x402: {
+          signer: TEST_ACCOUNT,
+          batchSettlement: { storage },
+          allowBatchSettlement: true,
+        },
+      });
+      const error = await client
+        .sendMessage({
+          message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+        })
+        .then(
+          () => undefined,
+          (reason: unknown) => reason as X402ReconciliationError,
+        );
+      expect(error).toBeInstanceOf(X402ReconciliationError);
+      expect(error!.reason).toBe('no-matching-receipt');
+      expect((error!.task as Task).status.state).toBe(state);
+    },
+  );
+
+  it('quarantines a submitted channel when the blocking response rejects', async () => {
+    const { storage } = channelStorage();
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => {
+        throw new Error('connection reset after submit');
+      },
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+    const error = await client
+      .sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      })
+      .then(
+        () => undefined,
+        (reason: unknown) => reason as X402ReconciliationError,
+      );
+    expect(error).toBeInstanceOf(X402ReconciliationError);
+    expect(error!.reason).toBe('ambiguous-response');
+    expect(error!.channelId).toBe(signedChannelId(rpcRequests));
+    expect(error!.task).toBeUndefined();
+    expect((error as Error & { cause?: unknown }).cause).toEqual(
+      new Error('connection reset after submit'),
+    );
+  });
+
+  it.each(['error', 'eof'])('quarantines a submitted channel on streaming %s', async (ending) => {
+    const { storage } = channelStorage();
+    const encoder = new TextEncoder();
+    const sse = (events: unknown[]) =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            for (const event of events) {
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({ jsonrpc: '2.0', id: 1, result: event })}\n\n`,
+                ),
+              );
+            }
+            controller.close();
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      );
+    const required = batchRequiredTask() as {
+      status: { message: unknown };
+    };
+    const requiredEvent = {
+      kind: 'status-update',
+      taskId: 't1',
+      contextId: 'c1',
+      status: {
+        state: 'input-required',
+        timestamp: new Date().toISOString(),
+        message: required.status.message,
+      },
+      final: false,
+    };
+
+    let call = 0;
+    const rpcRequests: Array<{ body: unknown }> = [];
+    const fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/agent-card.json') || url.endsWith('/agent.json')) {
+        return agentCardResponse();
+      }
+      rpcRequests.push({
+        body: init?.body ? JSON.parse(init.body as string) : undefined,
+      });
+      if (call++ === 0) return sse([requiredEvent]);
+      if (ending === 'error') throw new Error('stream reset after submit');
+      return sse([]);
+    }) as unknown as typeof globalThis.fetch;
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+
+    let error: X402ReconciliationError | undefined;
+    try {
+      for await (const _event of client.sendMessageStream({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      })) {
+        // consume
+      }
+    } catch (reason) {
+      error = reason as X402ReconciliationError;
+    }
+    expect(error).toBeInstanceOf(X402ReconciliationError);
+    expect(error!.reason).toBe('ambiguous-response');
+    expect(error!.channelId).toBe(signedChannelId(rpcRequests));
+  });
+
   it('raises when the merchant inflates the cumulative beyond the signed ceiling', async () => {
     // Reporting 9999 after a 1000 voucher would make the payer's next call
     // sign a cumulative above what it ever authorized, plus a top-up to cover

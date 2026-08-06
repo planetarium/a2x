@@ -15,7 +15,9 @@ a cent.
   register `@x402/evm`'s batch client scheme. Supplying the object **is** the
   opt-in: unlike `exact` and `upto` the scheme cannot be built from a signer
   alone, so it stays unregistered without one.
-- `storage` is required, with deliberately no in-memory default. a2x signs with
+- `storage` is required, with deliberately no in-memory default. The runtime
+  rejects an absent or malformed storage object before upstream can silently
+  select its in-memory fallback. a2x signs with
   a viem `LocalAccount`, which has no `readContract`, so `@x402/evm`'s on-chain
   channel recovery never runs and this storage is the only record a channel
   exists — losing it makes the next call sign a **fresh deposit** into an
@@ -46,10 +48,11 @@ a cent.
   voucher's signed ceiling. Upstream verify and settle establish that exact
   value; accepting a lower one would let a stale historical receipt mask the
   current exchange while the merchant retains the higher-value voucher.
-- A receipt that cannot be recorded — a storage failure, or a settled payment
-  that came back with no usable receipt at all — raises the new
-  `X402ReconciliationError`, carrying the channel id, the merchant's completed
-  task, and a `reason` (`write-failed` / `no-matching-receipt`). Failing loudly
+- A receipt that cannot be recorded — a storage failure, a terminal task with
+  no usable receipt, or a transport/parser/SSE exit after submission — raises
+  the new `X402ReconciliationError`, carrying the channel id, the merchant's
+  terminal task when available, and a `reason` (`write-failed` /
+  `no-matching-receipt` / `ambiguous-response`). Failing loudly
   is deliberate: a lost receipt leaves the channel desynced with no self-heal
   path (`@x402/evm`'s corrective recovery needs a chain-reading signer, which a
   `LocalAccount` is not), so the next call is rejected for a cumulative
@@ -73,9 +76,12 @@ is checked before signing. A funded channel can therefore keep paying with
 voucher-only payloads under the cap without being rejected by its original
 deposit estimate.
 
-A completed A2A task after a batch voucher was submitted also requires a
-matching receipt even when the merchant omits `x402.payment.status`; otherwise
-the remote peer could suppress both marker and receipt and silently leave the
+Every terminal A2A task after a batch voucher was submitted also requires a
+matching receipt even when the merchant omits `x402.payment.status`. The same
+channel is surfaced for quarantine if the blocking response fails or a
+follow-up SSE stream errors, is aborted, or reaches EOF before a receipt or
+retry prompt;
+otherwise the remote peer could retain the voucher while silently leaving the
 payer's channel state stale.
 
 Merchant-side wiring is documented rather than shipped: `X402Context` now

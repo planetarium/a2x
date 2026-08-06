@@ -32,7 +32,7 @@ import {
   VersionNotSupportedError,
   A2A_ERROR_CODES,
 } from '../types/errors.js';
-import { TaskState } from '../types/task.js';
+import { TaskState, TERMINAL_STATES } from '../types/task.js';
 import type { ResolvedAgentCard } from './agent-card-resolver.js';
 import {
   resolveAgentCard,
@@ -161,11 +161,13 @@ export interface A2XClientX402Options {
    * receipt could not be folded back into channel storage.
    *
    * Without a handler the SDK throws `X402ReconciliationError`, which carries
-   * the merchant's completed task so the caller still has the result it paid
-   * for. That default is deliberate: a lost receipt leaves the channel
-   * desynced with no self-heal path, so the next call is rejected for a
-   * cumulative mismatch or opens a **fresh on-chain deposit**, and an operator
-   * who is never told cannot quarantine the channel first.
+   * the merchant's terminal task when one arrived. A transport, parsing, or
+   * premature stream-end failure instead uses `reason: 'ambiguous-response'`:
+   * the merchant may hold the voucher even though no task came back. That
+   * default is deliberate: a lost receipt leaves the channel desynced with no
+   * self-heal path, so the next call is rejected for a cumulative mismatch or
+   * opens a **fresh on-chain deposit**, and an operator who is never told
+   * cannot quarantine the channel first.
    *
    * Supply this to record the failure and continue — e.g. page an operator and
    * mark the channel unusable — rather than surfacing it to the caller.
@@ -380,16 +382,30 @@ export class A2XClient {
       }
 
       const signed = await this._signX402(task);
-      task = await this._sendMessageOnce(
-        this._buildSubmitFollowup(params, task, signed.metadata),
-      );
+      const binding = getX402BatchSettlementBinding(signed.payload);
+      try {
+        task = await this._sendMessageOnce(
+          this._buildSubmitFollowup(params, task, signed.metadata),
+        );
+      } catch (cause) {
+        // Submission may already have reached the merchant before transport,
+        // JSON parsing, or response validation failed. The signed voucher is
+        // therefore potentially spendable even though no task came back.
+        await this._reconcileX402(undefined, binding, undefined, {
+          responseEnded: true,
+          cause,
+        });
+        // A handler may deliberately absorb the quarantine error. Preserve
+        // the original request failure in that case.
+        throw cause;
+      }
       // Per attempt, not once after the loop: under `retryOnFailure` an
       // intermediate attempt can settle before a later one re-prompts, and
       // that receipt is state the payer must record either way. Bound to the
       // channel *this attempt* signed — see `_reconcileX402`.
       await this._reconcileX402(
         task.status.message?.metadata,
-        getX402BatchSettlementBinding(signed.payload),
+        binding,
         task,
       );
 
@@ -441,50 +457,74 @@ export class A2XClient {
 
     while (true) {
       let pendingTask: Task | undefined;
-      for await (const event of this._sendMessageStreamOnce(currentParams, signal)) {
-        // Reconcile BEFORE the yield, not after. The receipt rides the final
-        // status event, and the idiomatic consumer breaks out of its loop on
-        // exactly that event — which calls this generator's `return()` at the
-        // suspended `yield`, so nothing after it ever runs. Losing the receipt
-        // there costs the payer a second real deposit on the next call.
-        if ('status' in event) {
-          // Reconstruct the task from the event so a failure here still hands
-          // the caller the result it paid for on `X402ReconciliationError` —
-          // this runs before the yield, so throwing means the consumer never
-          // sees the terminal event itself.
-          await this._reconcileX402(
-            event.status?.message?.metadata as
+      try {
+        for await (const event of this._sendMessageStreamOnce(
+          currentParams,
+          signal,
+        )) {
+          // Reconcile BEFORE the yield, not after. The receipt rides the final
+          // status event, and the idiomatic consumer breaks out of its loop on
+          // exactly that event — which calls this generator's `return()` at the
+          // suspended `yield`, so nothing after it ever runs. Losing the receipt
+          // there costs the payer a second real deposit on the next call.
+          if ('status' in event) {
+            // Reconstruct the task from the event so a failure here still hands
+            // the caller the result it paid for on `X402ReconciliationError` —
+            // this runs before the yield, so throwing means the consumer never
+            // sees the terminal event itself.
+            const reconciled = await this._reconcileX402(
+              event.status?.message?.metadata as
+                | Record<string, unknown>
+                | undefined,
+              signedBinding,
+              {
+                id: event.taskId,
+                contextId: event.contextId,
+                status: event.status,
+              } as Task,
+            );
+            if (reconciled) signedBinding = undefined;
+          }
+          yield event;
+          if (
+            'status' in event &&
+            event.status?.state === 'input-required' &&
+            (event.status.message?.metadata as
               | Record<string, unknown>
-              | undefined,
-            signedBinding,
-            {
+              | undefined)?.[X402_METADATA_KEYS.STATUS] ===
+              X402_PAYMENT_STATUS.REQUIRED
+          ) {
+            pendingTask = {
               id: event.taskId,
               contextId: event.contextId,
               status: event.status,
-            } as Task,
-          );
+            } as Task;
+            break;
+          }
         }
-        yield event;
-        if (
-          'status' in event &&
-          event.status?.state === 'input-required' &&
-          (event.status.message?.metadata as Record<string, unknown> | undefined)?.[
-            X402_METADATA_KEYS.STATUS
-          ] === X402_PAYMENT_STATUS.REQUIRED
-        ) {
-          pendingTask = {
-            id: event.taskId,
-            contextId: event.contextId,
-            status: event.status,
-          } as Task;
-          break;
-        }
+      } catch (cause) {
+        if (cause instanceof X402ReconciliationError) throw cause;
+        await this._reconcileX402(undefined, signedBinding, undefined, {
+          responseEnded: true,
+          cause,
+        });
+        throw cause;
       }
 
-      if (!pendingTask) return;
+      if (!pendingTask) {
+        await this._reconcileX402(undefined, signedBinding, undefined, {
+          responseEnded: true,
+        });
+        return;
+      }
 
       const required = getX402PaymentRequirements(pendingTask);
       if (!required) return;
+
+      // An explicit retry prompt says this attempt was not accepted. It is the
+      // one non-terminal exit that legitimately closes the old obligation
+      // without a receipt; the next attempt gets its own binding below.
+      signedBinding = undefined;
 
       const decision = await this._x402.onPaymentRequired?.(required);
       if (decision === false) {
@@ -689,7 +729,7 @@ export class A2XClient {
     return signX402Payment(task, {
       signer: x402.signer,
       selectRequirement: select,
-      ...(x402.batchSettlement
+      ...(x402.batchSettlement !== undefined
         ? { batchSettlement: this._cappedBatchSettlement(x402) }
         : {}),
     });
@@ -780,9 +820,10 @@ export class A2XClient {
     metadata: Record<string, unknown> | undefined,
     binding: X402BatchSettlementBinding | undefined,
     task: Task | undefined,
-  ): Promise<void> {
+    options: { responseEnded?: boolean; cause?: unknown } = {},
+  ): Promise<boolean> {
     const batchSettlement = this._x402?.batchSettlement;
-    if (!batchSettlement || !binding) return;
+    if (!batchSettlement || !binding) return true;
 
     // Only a settled payment owes us a receipt. Intermediate events
     // (`payment-verified`, plain `working`) legitimately carry none. Once the
@@ -790,14 +831,15 @@ export class A2XClient {
     // the voucher must be treated as spent even if the remote peer omits the
     // x402 status marker. Otherwise it can suppress both marker and receipt,
     // leave local state stale, and make the next call re-sign or re-deposit.
-    const settled =
+    const receiptRequired =
       metadata?.[X402_METADATA_KEYS.STATUS] === X402_PAYMENT_STATUS.COMPLETED ||
-      task?.status.state === TaskState.COMPLETED;
+      (task !== undefined && TERMINAL_STATES.has(task.status.state)) ||
+      options.responseEnded === true;
     const receipts = metadata?.[X402_METADATA_KEYS.RECEIPTS];
     const list = Array.isArray(receipts)
       ? (receipts as X402SettleResponse[])
       : [];
-    if (!settled && list.length === 0) return;
+    if (!receiptRequired && list.length === 0) return false;
 
     let applied: string[] = [];
     let cause: unknown;
@@ -816,15 +858,23 @@ export class A2XClient {
     // case where the merchant returned no receipt, a foreign channel, or a
     // cumulative above what we authorized — silence there is exactly what the
     // error exists to prevent.
-    if (cause === undefined && (!settled || applied.length > 0)) return;
+    if (cause === undefined && applied.length > 0) return true;
+    if (cause === undefined && !receiptRequired) return false;
+
+    const reason = options.responseEnded
+      ? 'ambiguous-response'
+      : cause === undefined
+        ? 'no-matching-receipt'
+        : 'write-failed';
 
     const error = new X402ReconciliationError(binding.channelId, task, {
-      cause,
-      reason: cause === undefined ? 'no-matching-receipt' : 'write-failed',
+      cause: cause ?? options.cause,
+      reason,
     });
     const handler = this._x402?.onReconcileError;
     if (!handler) throw error;
     await handler(error);
+    return true;
   }
 
   /**

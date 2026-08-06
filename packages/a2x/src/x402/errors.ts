@@ -102,7 +102,7 @@ export class X402PeerMissingError extends X402Error {
 export class X402ReconciliationError extends X402Error {
   /** Channel whose local state is now stale. */
   readonly channelId: string;
-  /** The completed task, so catching this does not lose the paid-for result. */
+  /** The terminal task, when one arrived before reconciliation failed. */
   readonly task?: unknown;
   /**
    * Why the state did not move.
@@ -114,15 +114,25 @@ export class X402ReconciliationError extends X402Error {
    * signed, named a different channel, or reported a cumulative above the
    * ceiling the voucher authorized. Unlike a write failure this can be the
    * merchant misbehaving, not infrastructure.
+   *
+   * `ambiguous-response` — the signed submission was sent, but the transport,
+   * parser, or SSE stream ended before a usable receipt or terminal retry
+   * response arrived. The merchant may still hold a spendable voucher.
    */
-  readonly reason: 'write-failed' | 'no-matching-receipt';
+  readonly reason:
+    | 'write-failed'
+    | 'no-matching-receipt'
+    | 'ambiguous-response';
 
   constructor(
     channelId: string,
     task?: unknown,
     options?: {
       cause?: unknown;
-      reason?: 'write-failed' | 'no-matching-receipt';
+      reason?:
+        | 'write-failed'
+        | 'no-matching-receipt'
+        | 'ambiguous-response';
     },
   ) {
     const reason = options?.reason ?? 'write-failed';
@@ -130,7 +140,10 @@ export class X402ReconciliationError extends X402Error {
       (reason === 'no-matching-receipt'
         ? `Settled a batch-settlement payment on channel ${channelId} but no usable receipt came back for it ` +
           '(none returned, a different channel named, or a cumulative above what the voucher authorized). '
-        : `Settled a batch-settlement payment but failed to record the receipt for channel ${channelId}. `) +
+        : reason === 'ambiguous-response'
+          ? `Submitted a batch-settlement payment on channel ${channelId}, but the response ended before a usable receipt arrived. ` +
+            'The merchant may still hold the spendable voucher. '
+          : `Settled a batch-settlement payment but failed to record the receipt for channel ${channelId}. `) +
         'Local channel state is now stale: the next payment on this channel will be rejected for a ' +
         'cumulative mismatch, or will open a fresh on-chain deposit. Repair the channel record before reusing it.',
     );

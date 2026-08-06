@@ -288,6 +288,22 @@ function _loadRuntime(
   signer: LocalAccount,
   batchSettlement?: X402BatchSettlementOptions,
 ): Promise<X402ClientRuntime> {
+  if (batchSettlement !== undefined) {
+    const storage = (batchSettlement as { storage?: unknown }).storage;
+    if (
+      typeof storage !== 'object' ||
+      storage === null ||
+      typeof (storage as { get?: unknown }).get !== 'function' ||
+      typeof (storage as { set?: unknown }).set !== 'function' ||
+      typeof (storage as { delete?: unknown }).delete !== 'function'
+    ) {
+      throw new X402PaymentRequiredError(
+        'batchSettlement.storage must provide callable get, set, and delete methods; ' +
+          'the SDK does not fall back to in-memory channel storage.',
+      );
+    }
+  }
+
   let entry = _runtimeBySigner.get(signer);
   if (!entry) {
     entry = {};
@@ -662,8 +678,19 @@ export async function reconcileX402BatchSettlement(
     cumulative: bigint;
     deposit: bigint;
   }[] = [];
-  for (const receipt of receipts) {
-    if (!receipt.success) continue;
+  for (const value of receipts) {
+    // The array is remote-controlled despite its public TypeScript type. Keep
+    // malformed entries out of the parsing path so one `null` / primitive
+    // cannot throw before a later valid receipt gets its chance to apply.
+    if (
+      typeof value !== 'object' ||
+      value === null ||
+      Array.isArray(value) ||
+      (value as { success?: unknown }).success !== true
+    ) {
+      continue;
+    }
+    const receipt = value as X402SettleResponse;
     const id = channelIdOf(receipt.extra);
     if (id === undefined) continue;
     const bound = allowed.get(id.toLowerCase());

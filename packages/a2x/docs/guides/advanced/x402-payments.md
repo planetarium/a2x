@@ -598,6 +598,8 @@ const myChannelStorage: X402ClientChannelStorage = {
 };
 ```
 
+The requirement is enforced at runtime as well as by TypeScript. Supplying an empty config, `storage: undefined`, or an object without callable `get`, `set`, and `delete` methods throws `X402PaymentRequiredError` before the upstream scheme is constructed. It never selects `@x402/evm`'s in-memory fallback accidentally across a plain-JavaScript or unchecked configuration boundary.
+
 `@x402/evm` ships `InMemoryClientChannelStorage` and a file-backed one under `@x402/evm/batch-settlement/client/file-storage`; the in-memory one is for tests and short-lived scripts only.
 
 Deposit sizing defaults to 5× the request amount, so one funding covers the next four calls. Tune it with `depositPolicy` (`depositMultiplier`, an integer ≥ 3) or take full control per deposit with `depositStrategy`:
@@ -652,17 +654,19 @@ if (applied.length === 0) {
 }
 ```
 
-Skip reconciliation and the payer's cumulative amount never advances: every subsequent call re-signs an identical voucher against a channel it still believes is unfunded — and therefore signs a **fresh deposit** each time. Receipts from other schemes, malformed ones, any naming a channel outside `bindings`, and any whose cumulative differs from the signed ceiling are ignored; a receipt that fails to apply raises an `AggregateError` after the others have been tried, so one bad entry cannot drop a good one.
+Skip reconciliation and the payer's cumulative amount never advances: every subsequent call re-signs an identical voucher against a channel it still believes is unfunded — and therefore signs a **fresh deposit** each time. Receipts from other schemes, malformed ones (including non-object array entries), any naming a channel outside `bindings`, and any whose cumulative differs from the signed ceiling are ignored; a receipt that fails to apply raises an `AggregateError` after the others have been tried, so one bad entry cannot drop a good one.
 
 **An empty `applied` after a settled payment is a failure, not a no-op.** The voucher is spent either way, so "nothing to record" and "the merchant withheld or falsified the receipt" have identical consequences: local state did not move, and the next call re-signs or re-deposits. `A2XClient` raises `X402ReconciliationError` with `reason: 'no-matching-receipt'` in that case; a caller driving the helper directly should treat it the same way.
 
-The SDK also fails closed when the merchant returns a completed A2A task but omits both `x402.payment.status` and the receipt. Once a task completes after the payer handed over a voucher, the merchant may retain and redeem that voucher; a remote status marker cannot be the only evidence that local channel state now needs to advance.
+The SDK also fails closed when the merchant returns any terminal A2A task (`completed`, `failed`, `canceled`, or `rejected`) but omits a usable receipt. Settlement can succeed before agent execution later fails, and once the payer handed over a voucher the merchant may retain and redeem it; neither a remote status marker nor the task's final state can prove that local channel state is safe to reuse.
+
+The binding becomes outstanding as soon as the signed submission is handed to the transport. If blocking transport/JSON parsing fails, or a follow-up SSE stream errors, is aborted, or reaches EOF before a receipt or explicit retry prompt, `A2XClient` raises the same quarantine error with `reason: 'ambiguous-response'`. In that case `task` is `undefined`, the original failure is available as `cause`, and the merchant must be assumed to hold the voucher until an operator reconciles or retires the channel.
 
 #### A missed receipt does not self-heal
 
 The merchant requires the next voucher's cumulative to equal exactly `charged + amount`, and `@x402/evm`'s corrective-recovery path needs a signer with `readContract`, which a viem `LocalAccount` does not have. A payer that loses a receipt stays desynced until its storage is repaired out of band, and the next call can sign a fresh on-chain deposit.
 
-Because that is a funds-bearing failure, `A2XClient` **throws** `X402ReconciliationError` rather than continuing quietly — an operator who is never told cannot quarantine the channel first. It carries `channelId`, the merchant's completed `task`, and a `reason`: `write-failed` (your storage threw — usually transient) or `no-matching-receipt` (the payment settled but nothing was recorded, which can mean the merchant misbehaved rather than infrastructure). The `task` means catching it still leaves you the result you paid for — including on the streaming path, where reconciliation runs before the final event is yielded and a throw means you never see that event:
+Because that is a funds-bearing failure, `A2XClient` **throws** `X402ReconciliationError` rather than continuing quietly — an operator who is never told cannot quarantine the channel first. It carries `channelId`, the merchant's terminal `task` when available, and a `reason`: `write-failed` (your storage threw — usually transient), `no-matching-receipt` (a terminal task arrived but nothing was recorded), or `ambiguous-response` (the response ended before either safe outcome was known). When present, `task` means catching the error still leaves you the result the merchant produced — including on the streaming path, where reconciliation runs before the terminal event is yielded and a throw means you never see that event:
 
 ```ts
 try {
@@ -670,7 +674,8 @@ try {
 } catch (err) {
   if (err instanceof X402ReconciliationError) {
     await quarantineChannel(err.channelId);
-    return err.task as Task;   // the work was done and paid for
+    if (err.task) return err.task as Task;
+    // No task means the response was ambiguous; quarantine before retrying.
   }
   throw err;
 }
