@@ -501,8 +501,12 @@ export class A2XClient {
       signsRemaining -= 1;
 
       const signed = await this._signX402(pendingTask);
-      signedBinding =
-        getX402BatchSettlementBinding(signed.payload) ?? signedBinding;
+      // Assigned, never merged: under `retryOnFailure` a later attempt can
+      // select a different scheme, and carrying a stale batch binding forward
+      // would test that attempt's `exact` receipt against it and report a
+      // successful payment as unreconciled. A non-batch payload correctly
+      // clears this to `undefined`.
+      signedBinding = getX402BatchSettlementBinding(signed.payload);
       currentParams = this._buildSubmitFollowup(
         params,
         pendingTask,

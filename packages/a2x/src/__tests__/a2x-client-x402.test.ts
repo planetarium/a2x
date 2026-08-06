@@ -1045,6 +1045,80 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     expect((caught!.task as Task).id).toBe('t1');
   });
 
+  it('clears the batch binding when a streaming retry signs another scheme', async () => {
+    // Under `retryOnFailure` a later attempt can select a different scheme.
+    // Carrying the batch binding forward would test that attempt's `exact`
+    // receipt against it and report a successful payment as unreconciled.
+    const { storage } = channelStorage();
+    const encoder = new TextEncoder();
+    const sse = (events: unknown[]) =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            for (const ev of events) {
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({ jsonrpc: '2.0', id: 1, result: ev })}\n\n`,
+                ),
+              );
+            }
+            controller.close();
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      );
+    const statusEvent = (state: string, message: unknown, final: boolean) => ({
+      kind: 'status-update',
+      taskId: 't1',
+      contextId: 'c1',
+      status: { state, timestamp: new Date().toISOString(), message },
+      final,
+    });
+    const batchRequired = batchRequiredTask() as {
+      status: { message: unknown };
+    };
+    // Second prompt offers only `exact`, so the retry switches scheme.
+    const exactRequired = paymentRequiredTask() as {
+      status: { message: unknown };
+    };
+    const exactCompleted = completedTaskWithReceipt() as {
+      status: { message: unknown };
+    };
+
+    let call = 0;
+    const fetch = (async (input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/agent-card.json') || url.endsWith('/agent.json')) {
+        return agentCardResponse();
+      }
+      const streams = [
+        sse([statusEvent('input-required', batchRequired.status.message, false)]),
+        sse([statusEvent('input-required', exactRequired.status.message, false)]),
+        sse([statusEvent('completed', exactCompleted.status.message, true)]),
+      ];
+      return streams[call++]!;
+    }) as unknown as typeof globalThis.fetch;
+
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+        maxRetries: 1,
+      },
+    });
+
+    const states: string[] = [];
+    for await (const event of client.sendMessageStream({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    })) {
+      if ('status' in event) states.push(event.status!.state as string);
+    }
+    // The exact payment succeeded and must not be reported as unreconciled.
+    expect(states.at(-1)).toBe('completed');
+  });
+
   it('raises when a settled payment comes back with no receipt at all', async () => {
     const { storage } = channelStorage();
     const completedNoReceipt = () => {

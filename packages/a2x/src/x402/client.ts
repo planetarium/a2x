@@ -636,41 +636,59 @@ export async function reconcileX402BatchSettlement(
     bindings: X402BatchSettlementBinding | readonly X402BatchSettlementBinding[];
   },
 ): Promise<{ applied: string[] }> {
-  const allowed = new Map<string, bigint>();
+  const allowed = new Map<string, { ceiling: bigint; deposit: bigint }>();
   const bindings = Array.isArray(options.bindings)
     ? options.bindings
     : [options.bindings as X402BatchSettlementBinding];
   for (const binding of bindings) {
     if (!isCanonicalChannelId(binding?.channelId)) continue;
     try {
-      allowed.set(binding.channelId.toLowerCase(), BigInt(binding.maxClaimableAmount));
+      allowed.set(binding.channelId.toLowerCase(), {
+        ceiling: BigInt(binding.maxClaimableAmount),
+        deposit:
+          binding.depositAmount === undefined
+            ? 0n
+            : BigInt(binding.depositAmount),
+      });
     } catch {
-      // A ceiling we cannot parse cannot bound anything — drop the binding
+      // A bound we cannot parse cannot bound anything — drop the binding
       // rather than fall back to an unbounded one.
     }
   }
 
-  const relevant = receipts.filter((r) => {
-    if (!r.success) return false;
-    const id = channelIdOf(r.extra);
-    if (id === undefined) return false;
-    const ceiling = allowed.get(id.toLowerCase());
-    if (ceiling === undefined) return false;
-    return cumulativeWithin(r.extra, ceiling);
-  });
+  const relevant: { receipt: X402SettleResponse; key: string; deposit: bigint }[] =
+    [];
+  for (const receipt of receipts) {
+    if (!receipt.success) continue;
+    const id = channelIdOf(receipt.extra);
+    if (id === undefined) continue;
+    const bound = allowed.get(id.toLowerCase());
+    if (bound === undefined) continue;
+    // A settled payment must advance the signing base. A receipt carrying only
+    // `balance` / `totalClaimed` would let the peer perform a partial write
+    // that leaves `chargedCumulativeAmount` untouched — and counting that as
+    // applied would mask exactly the desync `applied.length === 0` exists to
+    // report.
+    if (!advancesCumulative(receipt.extra, bound.ceiling)) continue;
+    relevant.push({ receipt, key: id.toLowerCase(), deposit: bound.deposit });
+  }
   if (relevant.length === 0) return { applied: [] };
   const mod = (await importX402Peer(
     BATCH_SETTLEMENT_CLIENT_PEER,
   )) as unknown as X402EvmBatchSettlementClientModule;
   const failures: unknown[] = [];
   const applied: string[] = [];
-  for (const receipt of relevant) {
+  for (const { receipt, key, deposit } of relevant) {
     // Per receipt, not one try around the loop: the receipts are
     // remote-controlled, and one malformed entry must not stop a later valid
     // one from being recorded — a dropped receipt leaves the payer desynced,
     // which `@x402/evm` cannot self-heal without a chain-reading signer.
     try {
-      await mod.processSettleResponse(options.storage, receipt);
+      const prior = await options.storage.get(key);
+      await mod.processSettleResponse(
+        options.storage,
+        withTrustedBalance(receipt, prior, deposit),
+      );
       applied.push(channelIdOf(receipt.extra)!);
     } catch (err) {
       failures.push(err);
@@ -712,8 +730,14 @@ function channelIdOf(
 }
 
 /**
- * True when a receipt's reported cumulative is within what the matching
- * voucher authorized.
+ * True when a receipt actually advances the signing base, within what the
+ * matching voucher authorized.
+ *
+ * The cumulative must be **present** and usable. The peer writes only the keys
+ * it finds, so a receipt carrying just `balance` / `totalClaimed` performs a
+ * partial write that leaves `chargedCumulativeAmount` where it was — the payer
+ * then re-signs the same voucher next call. For a settled payment that is a
+ * desync, not a valid no-op, so such a receipt is refused rather than counted.
  *
  * The merchant may charge **at most** the ceiling the payer signed — its own
  * server aborts with `ErrChargeExceedsSignedCumulative` otherwise. A value
@@ -721,11 +745,8 @@ function channelIdOf(
  * merchant's), so this bounds rather than requires equality; a value *above*
  * it is one the merchant could not have charged, and storing it would make
  * the payer's next voucher authorize the difference.
- *
- * A receipt omitting the field updates no cumulative, so it is left to pass —
- * the peer only writes the keys it finds.
  */
-function cumulativeWithin(
+function advancesCumulative(
   extra: Record<string, unknown> | undefined,
   ceiling: bigint,
 ): boolean {
@@ -733,12 +754,63 @@ function cumulativeWithin(
     | { chargedCumulativeAmount?: unknown }
     | undefined;
   const reported = channelState?.chargedCumulativeAmount;
-  if (reported === undefined) return true;
+  if (reported === undefined || reported === null) return false;
+  if (typeof reported !== 'string' && typeof reported !== 'number') return false;
   try {
-    return BigInt(String(reported)) <= ceiling;
+    const value = BigInt(String(reported));
+    return value >= 0n && value <= ceiling;
   } catch {
     return false;
   }
+}
+
+/**
+ * The receipt, with a merchant-reported `balance` dropped when it is below
+ * what this attempt can legitimately establish.
+ *
+ * `balance` steers the payer's funding decision: at `0` the scheme treats the
+ * channel as unfunded and signs a **fresh deposit**. Trusting it is a
+ * funds-moving path, and `maxAmount` does not close it — that caps each
+ * deposit individually, not their aggregate, so a merchant reporting
+ * `balance: "0"` every round induces another capped deposit every round,
+ * unbounded in total.
+ *
+ * Within a payment flow the channel balance only ever goes **up**, by exactly
+ * the deposits this payer signs (claims move `totalClaimed`; only the refund
+ * path — which a2x does not drive — reduces it). So the floor is the stored
+ * balance plus whatever this attempt funded, and anything below it is a figure
+ * the merchant could not have arrived at honestly. Dropping just that key
+ * keeps the rest of the receipt applicable: the cumulative still advances, and
+ * storage keeps the balance the payer already established.
+ *
+ * A value *above* the floor is left alone. It can only make the payer
+ * under-fund a later call, which costs the payer nothing — the merchant simply
+ * cannot claim against funds that were never deposited.
+ */
+function withTrustedBalance(
+  receipt: X402SettleResponse,
+  prior: X402ChannelState | undefined,
+  deposit: bigint,
+): X402SettleResponse {
+  const channelState = receipt.extra?.channelState as
+    | Record<string, unknown>
+    | undefined;
+  if (channelState?.balance === undefined) return receipt;
+
+  let floor: bigint;
+  let reported: bigint;
+  try {
+    floor = BigInt(prior?.balance ?? '0') + deposit;
+    reported = BigInt(String(channelState.balance));
+  } catch {
+    // An unparseable balance is not a figure to trust either.
+    floor = 1n;
+    reported = 0n;
+  }
+  if (reported >= floor) return receipt;
+
+  const { balance: _dropped, ...rest } = channelState;
+  return { ...receipt, extra: { ...receipt.extra, channelState: rest } };
 }
 
 /**
@@ -750,6 +822,14 @@ export interface X402BatchSettlementBinding {
   channelId: string;
   /** Cumulative ceiling the voucher authorized. */
   maxClaimableAmount: string;
+  /**
+   * Amount this payload funds the channel with, when it carries a deposit.
+   * Absent for a voucher-only payload, which funds nothing.
+   *
+   * Establishes the floor the merchant's reported `balance` must clear — see
+   * `withTrustedBalance`.
+   */
+  depositAmount?: string;
 }
 
 /**
@@ -772,5 +852,18 @@ export function getX402BatchSettlementBinding(
   };
   if (!isCanonicalChannelId(channelId)) return undefined;
   if (typeof maxClaimableAmount !== 'string') return undefined;
-  return { channelId, maxClaimableAmount };
+
+  // Present only on the opening / top-up shape; a voucher-only payload funds
+  // nothing and leaves the balance floor at whatever is already stored.
+  const deposit = (inner as { deposit?: unknown }).deposit;
+  const depositAmount =
+    typeof deposit === 'object' && deposit !== null
+      ? (deposit as { amount?: unknown }).amount
+      : undefined;
+
+  return {
+    channelId,
+    maxClaimableAmount,
+    ...(typeof depositAmount === 'string' ? { depositAmount } : {}),
+  };
 }

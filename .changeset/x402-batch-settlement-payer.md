@@ -27,14 +27,19 @@ a cent.
   `onPaymentResponse` hook, which is what normally advances the payer's
   cumulative amount. `A2XClient` calls it automatically on both the blocking
   and streaming paths.
-- `bindings` ties the fold to what that exchange actually signed — the channel
-  **and** the cumulative ceiling its voucher authorized. Both matter. Channel
-  ids derive from public inputs, so without the first a merchant could name a
-  channel belonging to a *different* merchant and overwrite its cumulative.
-  Without the second, the same merchant can inflate its own: reporting 5000
-  after a 1000 voucher makes the payer's next call sign a 6000 cumulative plus
-  a top-up, letting it claim far more than the calls cost. Read the binding
-  off a signed payload with the new `getX402BatchSettlementBinding()`.
+- `bindings` ties the fold to what that exchange actually signed — the channel,
+  the cumulative ceiling its voucher authorized, and the deposit it funded.
+  Each closes a distinct path. Channel ids derive from public inputs, so
+  without the first a merchant could name a channel belonging to a *different*
+  merchant and overwrite its cumulative. Without the second, the same merchant
+  can inflate its own: reporting 5000 after a 1000 voucher makes the payer's
+  next call sign a 6000 cumulative plus a top-up, letting it claim far more
+  than the calls cost. Without the third, a merchant reporting `balance: "0"`
+  every round induces a fresh deposit every round — each within `maxAmount`,
+  which caps deposits individually rather than in aggregate. A receipt with no
+  cumulative at all is refused too, since it would write partially and leave
+  the signing base unmoved. Read the binding off a signed payload with the new
+  `getX402BatchSettlementBinding()`.
 - A receipt that cannot be recorded — a storage failure, or a settled payment
   that came back with no usable receipt at all — raises the new
   `X402ReconciliationError`, carrying the channel id, the merchant's completed
