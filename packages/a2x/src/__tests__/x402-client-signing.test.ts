@@ -655,10 +655,10 @@ describe('reconcileX402BatchSettlement cumulative binding', () => {
   });
 
   it('accepts a cumulative at or below the ceiling', async () => {
-    // Equality is the normal case. Below it is legitimate too — the payer's
-    // local base was ahead of the merchant's — so this bounds rather than
-    // requires an exact match.
-    for (const value of ['3000', '2000', '0']) {
+    // A fresh storage record may accept a cumulative below the signed ceiling;
+    // the reconciliation loop still prevents it from rolling back an existing
+    // local cumulative.
+    for (const value of ['3000', '2000']) {
       captured.reconciled = [];
       const { applied } = await reconcileX402BatchSettlement(
         [receiptWithCumulative(value)],
@@ -872,4 +872,3 @@ describe('getX402BatchSettlementBinding', () => {
     }
   });
 });
-

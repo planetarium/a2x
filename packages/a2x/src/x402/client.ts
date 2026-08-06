@@ -656,8 +656,12 @@ export async function reconcileX402BatchSettlement(
     }
   }
 
-  const relevant: { receipt: X402SettleResponse; key: string; deposit: bigint }[] =
-    [];
+  const relevant: {
+    receipt: X402SettleResponse;
+    key: string;
+    cumulative: bigint;
+    deposit: bigint;
+  }[] = [];
   for (const receipt of receipts) {
     if (!receipt.success) continue;
     const id = channelIdOf(receipt.extra);
@@ -669,8 +673,14 @@ export async function reconcileX402BatchSettlement(
     // that leaves `chargedCumulativeAmount` untouched — and counting that as
     // applied would mask exactly the desync `applied.length === 0` exists to
     // report.
-    if (!advancesCumulative(receipt.extra, bound.ceiling)) continue;
-    relevant.push({ receipt, key: id.toLowerCase(), deposit: bound.deposit });
+    const cumulative = parseCumulative(receipt.extra, bound.ceiling);
+    if (cumulative === undefined) continue;
+    relevant.push({
+      receipt,
+      key: id.toLowerCase(),
+      cumulative,
+      deposit: bound.deposit,
+    });
   }
   if (relevant.length === 0) return { applied: [] };
   const mod = (await importX402Peer(
@@ -678,13 +688,26 @@ export async function reconcileX402BatchSettlement(
   )) as unknown as X402EvmBatchSettlementClientModule;
   const failures: unknown[] = [];
   const applied: string[] = [];
-  for (const { receipt, key, deposit } of relevant) {
+  for (const { receipt, key, cumulative, deposit } of relevant) {
     // Per receipt, not one try around the loop: the receipts are
     // remote-controlled, and one malformed entry must not stop a later valid
     // one from being recorded — a dropped receipt leaves the payer desynced,
     // which `@x402/evm` cannot self-heal without a chain-reading signer.
     try {
       const prior = await options.storage.get(key);
+      const priorCumulative = parseStoredCumulative(prior);
+      if (priorCumulative !== undefined && cumulative < priorCumulative) {
+        // A late/replayed receipt must never roll the payer back to an older
+        // cumulative or re-apply a deposit against the current balance.
+        continue;
+      }
+      if (priorCumulative !== undefined && cumulative === priorCumulative) {
+        // Reconciliation is intentionally idempotent: a retry after an
+        // ambiguous storage write should not add this attempt's deposit again.
+        applied.push(channelIdOf(receipt.extra)!);
+        continue;
+      }
+      if (priorCumulative === undefined && cumulative === 0n) continue;
       await mod.processSettleResponse(
         options.storage,
         withTrustedBalance(receipt, prior, deposit),
@@ -730,8 +753,8 @@ function channelIdOf(
 }
 
 /**
- * True when a receipt actually advances the signing base, within what the
- * matching voucher authorized.
+ * Parse a receipt cumulative when it is usable and within what the matching
+ * voucher authorized.
  *
  * The cumulative must be **present** and usable. The peer writes only the keys
  * it finds, so a receipt carrying just `balance` / `totalClaimed` performs a
@@ -740,27 +763,37 @@ function channelIdOf(
  * desync, not a valid no-op, so such a receipt is refused rather than counted.
  *
  * The merchant may charge **at most** the ceiling the payer signed — its own
- * server aborts with `ErrChargeExceedsSignedCumulative` otherwise. A value
- * below the ceiling is legitimate (the payer's local base was ahead of the
- * merchant's), so this bounds rather than requires equality; a value *above*
- * it is one the merchant could not have charged, and storing it would make
- * the payer's next voucher authorize the difference.
+ * server aborts with `ErrChargeExceedsSignedCumulative` otherwise. Whether a
+ * receipt is newer than the local state is checked immediately before the
+ * storage write, where the current state is available.
  */
-function advancesCumulative(
+function parseCumulative(
   extra: Record<string, unknown> | undefined,
   ceiling: bigint,
-): boolean {
+): bigint | undefined {
   const channelState = extra?.channelState as
     | { chargedCumulativeAmount?: unknown }
     | undefined;
   const reported = channelState?.chargedCumulativeAmount;
-  if (reported === undefined || reported === null) return false;
-  if (typeof reported !== 'string' && typeof reported !== 'number') return false;
+  if (reported === undefined || reported === null) return undefined;
+  if (typeof reported !== 'string' && typeof reported !== 'number') return undefined;
   try {
     const value = BigInt(String(reported));
-    return value >= 0n && value <= ceiling;
+    return value >= 0n && value <= ceiling ? value : undefined;
   } catch {
-    return false;
+    return undefined;
+  }
+}
+
+function parseStoredCumulative(
+  state: X402ChannelState | undefined,
+): bigint | undefined {
+  if (state?.chargedCumulativeAmount === undefined) return undefined;
+  try {
+    const value = BigInt(state.chargedCumulativeAmount);
+    return value >= 0n ? value : undefined;
+  } catch {
+    return undefined;
   }
 }
 

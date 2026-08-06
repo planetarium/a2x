@@ -1766,4 +1766,44 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
       chargedCumulativeAmount: '2000',
     });
   });
+
+  it('does not reapply deposits or roll back on replayed receipts', async () => {
+    const { channels, storage } = store();
+    await storage.set(KEY, { balance: '5000', chargedCumulativeAmount: '2000' });
+    await reconcileX402BatchSettlement(
+      [receipt({ chargedCumulativeAmount: '1000', balance: '5000' })],
+      {
+        storage,
+        bindings: {
+          channelId: CHANNEL,
+          maxClaimableAmount: '1000',
+          depositAmount: '5000',
+        },
+      },
+    );
+    expect(channels.get(KEY)).toEqual({
+      balance: '5000',
+      chargedCumulativeAmount: '2000',
+    });
+
+    const opening = receipt({ chargedCumulativeAmount: '3000', balance: '5000' });
+    const fresh = store();
+    const binding = {
+      channelId: CHANNEL,
+      maxClaimableAmount: '3000',
+      depositAmount: '5000',
+    };
+    await reconcileX402BatchSettlement([opening], {
+      storage: fresh.storage,
+      bindings: binding,
+    });
+    await reconcileX402BatchSettlement([opening], {
+      storage: fresh.storage,
+      bindings: binding,
+    });
+    expect(fresh.channels.get(KEY)).toEqual({
+      balance: '5000',
+      chargedCumulativeAmount: '3000',
+    });
+  });
 });
