@@ -319,6 +319,8 @@ Install the optional peers:
 npm install @x402/core @x402/evm viem
 ```
 
+Use `@x402/core` and `@x402/evm` `>=2.20.0 <3`.
+
 Server (the agent owns the flow; `X402Context` bundles the offering store + facilitator + event builders into one object):
 
 ```typescript

@@ -29,6 +29,11 @@ a cent.
   `onPaymentResponse` hook, which is what normally advances the payer's
   cumulative amount. `A2XClient` calls it automatically on both the blocking
   and streaming paths.
+- Reconciliation rejects duplicate same-channel bindings, serializes each
+  channel for callers sharing one storage object in a process, and ignores
+  late receipts instead of letting a delayed read-check-write roll cumulative
+  state back. Backends shared across processes still require one writer per
+  channel because the upstream storage contract has no atomic compare-and-set.
 - `bindings` ties the fold to what that exchange actually signed — the channel,
   the cumulative ceiling its voucher authorized, and the deposit it funded.
   Each closes a distinct path. Channel ids derive from public inputs, so
@@ -59,6 +64,9 @@ a cent.
   `LocalAccount` is not), so the next call is rejected for a cumulative
   mismatch or opens a fresh on-chain deposit. Set
   `A2XClientX402Options.onReconcileError` to record and continue instead.
+- A matching success receipt suppresses contradictory retry prompts anywhere
+  later in the same response stream, including a separate SSE event, so one
+  call cannot make the payer authorize two cumulative vouchers.
 - Selection stays opt-in behind `allowBatchSettlement`, separate from
   `allowUpto`: `upto` widens how much of an authorization a merchant may draw,
   while funding a channel moves money before any service is rendered. Default
@@ -66,6 +74,15 @@ a cent.
   V2-only and CAIP-2-only, like `upto`.
 - Deposit sizing is tunable via `depositPolicy` (default 5x the request
   amount) or `depositStrategy` for full per-deposit control.
+- The batch signing runtime is constructed only when that scheme wins
+  selection and is rebuilt from the current options for every batch signing.
+  Invalid or mutated batch configuration therefore cannot poison an `exact`
+  payment or leave signing attached to an earlier storage object while
+  reconciliation writes a different one.
+
+On the merchant side, scheme-scoped payer extraction reads
+`batch-settlement` identity from the voucher-bound `channelConfig.payer`.
+Unrelated authorization-shaped keys cannot spoof receipt or audit attribution.
 
 `A2XClient`'s `maxAmount` now bounds the **deposit** for a `batch-settlement`
 offer, not just the request amount — paying one call there authorizes

@@ -476,13 +476,17 @@ export class A2XClient {
 
     while (true) {
       let pendingTask: Task | undefined;
+      // This belongs to the whole response stream, not one event. A merchant
+      // may emit the success receipt and a contradictory retry prompt in two
+      // separate events; once the signed voucher is settled, no later event
+      // in this response may authorize the same work again.
+      let batchAttemptResolved = false;
       try {
         for await (const event of this._sendMessageStreamOnce(
           currentParams,
           signal,
         )) {
           let eventTask: Task | undefined;
-          let batchAttemptResolved = false;
           // Reconcile BEFORE the yield, not after. The receipt rides the final
           // status event, and the idiomatic consumer breaks out of its loop on
           // exactly that event — which calls this generator's `return()` at the
@@ -509,7 +513,7 @@ export class A2XClient {
               );
               if (reconciled) {
                 signedBinding = undefined;
-                batchAttemptResolved = binding !== undefined;
+                if (binding !== undefined) batchAttemptResolved = true;
               }
             } catch (cause) {
               // Reconciliation already surfaced the unsafe channel. Do not

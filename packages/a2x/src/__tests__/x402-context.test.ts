@@ -413,6 +413,41 @@ describe('X402Context.classify', () => {
     },
   );
 
+  it('attributes a batch settlement to channelConfig.payer, ignoring decoy authorization', async () => {
+    const payer = '0x1234567890123456789012345678901234567890';
+    const message = buildBatchSubmittedMessage('voucher');
+    const payload = message.metadata![
+      X402_METADATA_KEYS.PAYLOAD
+    ] as X402PaymentPayload;
+    (payload.payload as Record<string, unknown>).authorization = {
+      from: '0xbad0000000000000000000000000000000000000',
+    };
+    const facilitator: X402Facilitator = {
+      verify: vi.fn(async () => ({ isValid: true } as Awaited<ReturnType<X402Facilitator['verify']>>)),
+      settle: vi.fn(async () => ({
+        success: true,
+        transaction: '',
+        network: 'eip155:84532',
+      } as Awaited<ReturnType<X402Facilitator['settle']>>)),
+    };
+    const ctx = new X402Context({ x402Version: 2, facilitator });
+    await drain(
+      ctx.requestPayment(
+        {
+          taskId: 't1',
+          activatedExtensions: [X402_FOUNDATION_EXTENSION_URI],
+        },
+        { accepts: [BATCH_ACCEPT] },
+      ),
+    );
+    const classified = await ctx.classify({ taskId: 't1', message });
+    if (classified.kind !== 'valid') throw new Error('expected valid');
+    expect(classified.submission.payer).toBe(payer);
+    const receipt = await ctx.settle({ taskId: 't1' }, classified);
+    expect(receipt.payer).toBe(payer);
+    expect((await ctx.store.get('t1'))?.receipt?.payer).toBe(payer);
+  });
+
   it('rejects a malformed batch-settlement payload before verification', async () => {
     const ctx = new X402Context({
       x402Version: 2,
@@ -591,7 +626,12 @@ describe('X402Context.verify and X402Context.settle', () => {
     expect(receipt.transaction).toBe('');
     expect(receipt.extra).toEqual({ channelState, chargedAmount: '3000' });
     // Success with no transaction still records a completed entry.
-    expect((await ctx.store.get('t1'))?.status).toBe('completed');
+    const stored = await ctx.store.get('t1');
+    expect(stored?.status).toBe('completed');
+    expect(stored?.receipt?.extra).toEqual({
+      channelState,
+      chargedAmount: '3000',
+    });
   });
 
   it('settle omits extra when the facilitator sends none, or sends a non-object', async () => {

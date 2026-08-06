@@ -11,9 +11,11 @@ state in `extra.channelState`, and it is the payer's only way to learn its
 voucher was accepted and what the next one must be cumulative over. Without it
 a payer re-signs an identical voucher — and re-deposits — on every call.
 
-The block is forwarded verbatim (plain objects only; a scalar or array from a
-remote facilitator is dropped rather than typed as a record). `exact` and
-`upto` never populate it, so existing receipts are unchanged.
+The block is forwarded verbatim and retained in the durable lifecycle-store
+receipt (plain objects only; a scalar or array from a remote facilitator is
+dropped rather than typed as a record). Retaining it lets a stateful server
+recover after settlement even if it stops before emitting the terminal A2A
+event. `exact` and `upto` never populate it, so existing receipts are unchanged.
 
 Also corrects the documented meaning of `transaction`. It reads "Transaction
 hash on success, empty string on failure", but a successful `batch-settlement`

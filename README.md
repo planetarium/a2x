@@ -26,6 +26,9 @@ npm install @a2x/sdk
 # Download the latest tarball from https://github.com/planetarium/a2x/releases
 ```
 
+The optional x402 integration requires `@x402/core` and `@x402/evm`
+`>=2.20.0 <3`.
+
 ## Key Features
 
 - **Auto-extraction** — `A2XServer` infers AgentCard fields (`name`, `description`, `capabilities.streaming`) from your runtime objects. No manual duplication.

@@ -11,7 +11,10 @@ import {
   signX402Payment,
   type X402ClientChannelStorage,
 } from '../x402/client.js';
-import { X402NoSupportedRequirementError } from '../x402/errors.js';
+import {
+  X402NoSupportedRequirementError,
+  X402PaymentRequiredError,
+} from '../x402/errors.js';
 import type { X402SettleResponse } from '../x402/types.js';
 
 // The docs promise that `signX402Payment` hands the received envelope —
@@ -72,6 +75,12 @@ vi.mock('../x402/peer.js', () => ({
         BatchSettlementEvmScheme: class {
           readonly scheme = 'batch-settlement';
           constructor(_signer: unknown, options: unknown) {
+            const multiplier = (
+              options as { depositPolicy?: { depositMultiplier?: number } }
+            ).depositPolicy?.depositMultiplier;
+            if (multiplier !== undefined && multiplier < 3) {
+              throw new Error('depositMultiplier must be an integer >= 3');
+            }
             captured.batchOptions.push(options as Record<string, unknown>);
           }
         },
@@ -277,9 +286,10 @@ describe('signX402Payment batch-settlement registration', () => {
     captured.registered = [];
     captured.batchOptions = [];
     const storage = memoryChannelStorage();
-    await signX402Payment(v2RequiredTask(), {
+    await signX402Payment(v2RequiredTask([V2_BATCH_ACCEPT]), {
       signer: freshSigner(0x12),
       batchSettlement: { storage },
+      allowBatchSettlement: true,
     });
     expect(captured.registered).toEqual([
       ['eip155:*', 'upto'],
@@ -296,9 +306,10 @@ describe('signX402Payment batch-settlement registration', () => {
     ['a storage with a non-callable method', { storage: { get: true } }],
   ])('rejects %s instead of selecting upstream in-memory storage', async (_label, config) => {
     await expect(
-      signX402Payment(v2RequiredTask(), {
+      signX402Payment(v2RequiredTask([V2_BATCH_ACCEPT]), {
         signer: freshSigner(0x2f),
         batchSettlement: config as never,
+        allowBatchSettlement: true,
       }),
     ).rejects.toThrow(
       'batchSettlement.storage must provide callable get, set, and delete methods',
@@ -307,13 +318,14 @@ describe('signX402Payment batch-settlement registration', () => {
 
   it('forwards only the tuning options the caller actually set', async () => {
     captured.batchOptions = [];
-    await signX402Payment(v2RequiredTask(), {
+    await signX402Payment(v2RequiredTask([V2_BATCH_ACCEPT]), {
       signer: freshSigner(0x13),
       batchSettlement: {
         storage: memoryChannelStorage(),
         depositPolicy: { depositMultiplier: 10 },
         salt: `0x${'ab'.repeat(32)}`,
       },
+      allowBatchSettlement: true,
     });
     const options = captured.batchOptions[0]!;
     expect(options.depositPolicy).toEqual({ depositMultiplier: 10 });
@@ -326,23 +338,44 @@ describe('signX402Payment batch-settlement registration', () => {
     expect('payerAuthorizer' in options).toBe(false);
   });
 
-  it('reuses one runtime per (signer, batchSettlement config) pair', async () => {
+  it('reuses the stateless runtime but rebuilds batch options on every signing', async () => {
     const signer = freshSigner(0x14);
-    const config = { storage: memoryChannelStorage() };
     captured.registered = [];
-    await signX402Payment(v2RequiredTask(), { signer, batchSettlement: config });
-    await signX402Payment(v2RequiredTask(), { signer, batchSettlement: config });
-    expect(captured.registered).toHaveLength(2); // upto + batch, registered once
+    await signX402Payment(v2RequiredTask(), { signer });
+    await signX402Payment(v2RequiredTask(), { signer });
+    expect(captured.registered).toHaveLength(1); // upto, registered once
 
-    // A different config for the same signer is a different runtime: the
-    // scheme closes over the caller's storage, so sharing the cache slot
-    // would point the second caller at the first caller's channels.
-    captured.registered = [];
-    await signX402Payment(v2RequiredTask(), {
+    const firstStorage = memoryChannelStorage();
+    const secondStorage = memoryChannelStorage();
+    const config = { storage: firstStorage };
+    captured.batchOptions = [];
+    await signX402Payment(v2RequiredTask([V2_BATCH_ACCEPT]), {
       signer,
-      batchSettlement: { storage: memoryChannelStorage() },
+      batchSettlement: config,
+      allowBatchSettlement: true,
     });
-    expect(captured.registered).toHaveLength(2);
+    config.storage = secondStorage;
+    await signX402Payment(v2RequiredTask([V2_BATCH_ACCEPT]), {
+      signer,
+      batchSettlement: config,
+      allowBatchSettlement: true,
+    });
+    expect(captured.batchOptions.map((options) => options.storage)).toEqual([
+      firstStorage,
+      secondStorage,
+    ]);
+  });
+
+  it('does not construct an invalid batch scheme when exact was selected', async () => {
+    const signed = await signX402Payment(v2RequiredTask([V2_ACCEPT]), {
+      signer: freshSigner(0x2e),
+      batchSettlement: {
+        storage: memoryChannelStorage(),
+        depositPolicy: { depositMultiplier: 1 },
+      },
+      allowBatchSettlement: true,
+    });
+    expect(signed.requirement).toEqual(V2_ACCEPT);
   });
 });
 
@@ -651,6 +684,22 @@ describe('reconcileX402BatchSettlement', () => {
             .channelState.channelId,
       ),
     ).toEqual([CHANNEL_A, CHANNEL_B]);
+  });
+
+  it('rejects duplicate bindings for the same channel', async () => {
+    await expect(
+      reconcileX402BatchSettlement([channelReceipt], {
+        storage: memoryChannelStorage(),
+        bindings: [
+          {
+            channelId: CHANNEL_A,
+            maxClaimableAmount: '1000',
+            depositAmount: '5000',
+          },
+          { channelId: CHANNEL_A, maxClaimableAmount: '3000' },
+        ],
+      }),
+    ).rejects.toThrow(X402PaymentRequiredError);
   });
 });
 

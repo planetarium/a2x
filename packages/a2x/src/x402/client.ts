@@ -121,6 +121,10 @@ export interface X402ChannelState {
  * payer's *only* record that a channel exists. If it comes back empty against
  * an already-funded channel, the next request signs a **fresh deposit** into
  * it: real funds moved, on top of a balance the payer already has.
+ *
+ * Reconciliation is serialized per channel when callers share this storage
+ * object in one process. The interface has no cross-process compare-and-set,
+ * so replicas sharing a backend must route each channel through one writer.
  */
 export interface X402ClientChannelStorage {
   get(key: string): Promise<X402ChannelState | undefined>;
@@ -216,16 +220,12 @@ export interface X402BatchSettlementOptions {
   voucherSigner?: LocalAccount;
 }
 
-// One runtime per signer, and — when batch-settlement is configured — per
-// options object on top of that. The batch scheme closes over caller-supplied
-// storage, so two configs for the same signer are genuinely different runtimes
-// and must not share a cache slot.
+// Stateless schemes are safe to cache per signer. Batch-settlement is not:
+// its scheme closes over caller-owned storage and policy objects, which can be
+// mutated between calls. Rebuilding that runtime keeps signing and later
+// reconciliation on the same current configuration.
 interface RuntimeCacheEntry {
   base?: Promise<X402ClientRuntime>;
-  byBatchOptions?: WeakMap<
-    X402BatchSettlementOptions,
-    Promise<X402ClientRuntime>
-  >;
 }
 
 const _runtimeBySigner = new WeakMap<LocalAccount, RuntimeCacheEntry>();
@@ -302,6 +302,8 @@ function _loadRuntime(
           'the SDK does not fall back to in-memory channel storage.',
       );
     }
+
+    return _buildRuntime(signer, batchSettlement);
   }
 
   let entry = _runtimeBySigner.get(signer);
@@ -310,9 +312,7 @@ function _loadRuntime(
     _runtimeBySigner.set(signer, entry);
   }
 
-  const cached = batchSettlement
-    ? entry.byBatchOptions?.get(batchSettlement)
-    : entry.base;
+  const cached = entry.base;
   if (cached) return cached;
 
   const created = _buildRuntime(signer, batchSettlement);
@@ -320,21 +320,12 @@ function _loadRuntime(
   // install the peers, and in a long-running server a cached rejection
   // would keep failing after they did.
   created.catch(() => {
-    if (batchSettlement) {
-      if (entry.byBatchOptions?.get(batchSettlement) === created) {
-        entry.byBatchOptions.delete(batchSettlement);
-      }
-    } else if (entry.base === created) {
+    if (entry.base === created) {
       entry.base = undefined;
     }
   });
 
-  if (batchSettlement) {
-    entry.byBatchOptions ??= new WeakMap();
-    entry.byBatchOptions.set(batchSettlement, created);
-  } else {
-    entry.base = created;
-  }
+  entry.base = created;
   return created;
 }
 
@@ -499,7 +490,12 @@ export async function signX402Payment(
     throw new X402NoSupportedRequirementError();
   }
 
-  const runtime = await _loadRuntime(options.signer, options.batchSettlement);
+  const runtime = await _loadRuntime(
+    options.signer,
+    requirement.scheme === BATCH_SETTLEMENT_SCHEME
+      ? options.batchSettlement
+      : undefined,
+  );
 
   // Hand the client the received `payment-required` envelope with `accepts`
   // narrowed to the single selected requirement, so selection stays
@@ -629,6 +625,10 @@ export function defaultSelect(
  * local state did not move, so the next call re-signs it or opens a fresh
  * deposit. `A2XClient` raises `X402ReconciliationError` in that case; a caller
  * driving this directly should treat it the same way.
+ *
+ * Calls sharing one storage object are serialized per channel in-process.
+ * Array bindings must name distinct channels; reconcile successive vouchers
+ * on the same channel in separate calls.
  */
 export async function reconcileX402BatchSettlement(
   receipts: X402SettleResponse[],
@@ -648,6 +648,10 @@ export async function reconcileX402BatchSettlement(
      *
      * Read it off the signed payload with
      * `getX402BatchSettlementBinding(signed.payload)`.
+     *
+     * Array entries must name distinct channels. Reconcile successive
+     * vouchers on one channel separately so each attempt keeps its own
+     * deposit floor and cumulative ceiling.
      */
     bindings: X402BatchSettlementBinding | readonly X402BatchSettlementBinding[];
   },
@@ -659,14 +663,21 @@ export async function reconcileX402BatchSettlement(
   for (const binding of bindings) {
     if (!isCanonicalChannelId(binding?.channelId)) continue;
     try {
-      allowed.set(binding.channelId.toLowerCase(), {
+      const key = binding.channelId.toLowerCase();
+      if (allowed.has(key)) {
+        throw new X402PaymentRequiredError(
+          `bindings must not contain the same batch-settlement channel more than once: ${binding.channelId}`,
+        );
+      }
+      allowed.set(key, {
         ceiling: BigInt(binding.maxClaimableAmount),
         deposit:
           binding.depositAmount === undefined
             ? 0n
             : BigInt(binding.depositAmount),
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof X402PaymentRequiredError) throw error;
       // A bound we cannot parse cannot bound anything — drop the binding
       // rather than fall back to an unbounded one.
     }
@@ -722,25 +733,27 @@ export async function reconcileX402BatchSettlement(
     // one from being recorded — a dropped receipt leaves the payer desynced,
     // which `@x402/evm` cannot self-heal without a chain-reading signer.
     try {
-      const prior = await options.storage.get(key);
-      const priorCumulative = parseStoredCumulative(prior);
-      if (priorCumulative !== undefined && cumulative < priorCumulative) {
-        // A late/replayed receipt must never roll the payer back to an older
-        // cumulative or re-apply a deposit against the current balance.
-        continue;
-      }
-      if (priorCumulative !== undefined && cumulative === priorCumulative) {
-        // Reconciliation is intentionally idempotent: a retry after an
-        // ambiguous storage write should not add this attempt's deposit again.
+      await withChannelReconciliationLock(options.storage, key, async () => {
+        const prior = await options.storage.get(key);
+        const priorCumulative = parseStoredCumulative(prior);
+        if (priorCumulative !== undefined && cumulative < priorCumulative) {
+          // A late/replayed receipt must never roll the payer back to an older
+          // cumulative or re-apply a deposit against the current balance.
+          return;
+        }
+        if (priorCumulative !== undefined && cumulative === priorCumulative) {
+          // Reconciliation is intentionally idempotent: a retry after an
+          // ambiguous storage write should not add this attempt's deposit again.
+          applied.push(channelIdOf(receipt.extra)!);
+          return;
+        }
+        if (priorCumulative === undefined && cumulative === 0n) return;
+        await mod.processSettleResponse(
+          options.storage,
+          withTrustedBalance(receipt, prior, deposit),
+        );
         applied.push(channelIdOf(receipt.extra)!);
-        continue;
-      }
-      if (priorCumulative === undefined && cumulative === 0n) continue;
-      await mod.processSettleResponse(
-        options.storage,
-        withTrustedBalance(receipt, prior, deposit),
-      );
-      applied.push(channelIdOf(receipt.extra)!);
+      });
     } catch (err) {
       failures.push(err);
     }
@@ -752,6 +765,39 @@ export async function reconcileX402BatchSettlement(
     );
   }
   return { applied };
+}
+
+const _reconciliationQueues = new WeakMap<
+  X402ClientChannelStorage,
+  Map<string, Promise<void>>
+>();
+
+/** Serialize read-check-write reconciliation for one in-process channel. */
+async function withChannelReconciliationLock<T>(
+  storage: X402ClientChannelStorage,
+  key: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  let queues = _reconciliationQueues.get(storage);
+  if (!queues) {
+    queues = new Map();
+    _reconciliationQueues.set(storage, queues);
+  }
+
+  const previous = queues.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  queues.set(key, current);
+
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (queues.get(key) === current) queues.delete(key);
+  }
 }
 
 /** A channel id is the EIP-712 hash of the channel config — a bytes32 hex. */

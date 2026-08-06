@@ -18,9 +18,9 @@ on a current peer:
   could not be emitted at all.
 
 The drift guard in `x402-networks-drift.test.ts` compares the table against
-the peer's map; it was passing only because the dev dependency was pinned to
-2.19. That pin is now `~2.21.0`, so CI exercises the same peer version a fresh
-install resolves to.
+the peer's map; it was passing only because workspace consumers were pinned to
+2.19. The SDK, CLI bundle, and x402 samples now use `~2.21.0`, so local and CI
+builds no longer exercise a peer version outside the SDK's declared range.
 
 The peer floor moves to 2.20.0 because the fix makes the table depend on it.
 Under 2.19 a2x would now recognize `celo` as an EVM network the signer can

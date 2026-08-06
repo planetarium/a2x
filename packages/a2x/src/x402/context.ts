@@ -704,6 +704,7 @@ export abstract class BaseX402Context {
           // facilitator omits it the key stays absent rather than recording an
           // inference as fact.
           ...(receipt.amount !== undefined ? { amount: receipt.amount } : {}),
+          ...(receipt.extra !== undefined ? { extra: receipt.extra } : {}),
           settledAt,
         };
         await this.store.update(ctx.taskId, {

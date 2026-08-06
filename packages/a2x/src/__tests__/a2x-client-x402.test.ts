@@ -1023,6 +1023,51 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     });
   });
 
+  it('does not retry when a later stream event contradicts an applied receipt', async () => {
+    const { channels, storage } = channelStorage();
+    const required = batchRequiredTask() as {
+      status: { message: unknown };
+    };
+    const { fetch, rpcRequests } = scriptedFetch([
+      () =>
+        batchSse([
+          batchStatusEvent('input-required', required.status.message),
+        ]),
+      (requests) => {
+        const completed = completedTaskWithChannelReceipt(
+          signedChannelId(requests),
+        ) as { status: { message: unknown } };
+        return batchSse([
+          batchStatusEvent('working', completed.status.message),
+          batchStatusEvent('input-required', required.status.message),
+        ]);
+      },
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+        maxRetries: 1,
+      },
+    });
+
+    const states: string[] = [];
+    for await (const event of client.sendMessageStream({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    })) {
+      if ('status' in event) states.push(event.status!.state as string);
+    }
+
+    expect(states).toEqual(['input-required', 'working', 'input-required']);
+    expect(rpcRequests).toHaveLength(2);
+    expect(channels.get(signedChannelId(rpcRequests).toLowerCase())).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '1000',
+    });
+  });
+
   it('quarantines a streamed batch payment on a marker-only retry response', async () => {
     const { channels, storage } = channelStorage();
     const required = batchRequiredTask() as {
@@ -2339,6 +2384,50 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
       bindings: binding,
     });
     expect(fresh.channels.get(KEY)).toEqual({
+      balance: '5000',
+      chargedCumulativeAmount: '3000',
+    });
+  });
+
+  it('serializes concurrent receipts so a delayed older write cannot roll back', async () => {
+    const channels = new Map<string, Record<string, unknown>>([
+      [KEY, { balance: '5000', chargedCumulativeAmount: '1000' }],
+    ]);
+    let newerWritten!: () => void;
+    const waitForNewer = new Promise<void>((resolve) => {
+      newerWritten = resolve;
+    });
+    const storage = {
+      get: async (key: string) => channels.get(key),
+      set: async (key: string, state: Record<string, unknown>) => {
+        if (state.chargedCumulativeAmount === '2000') {
+          // Without per-channel serialization, let the newer call finish
+          // first and this delayed write deterministically rolls it back.
+          await Promise.race([
+            waitForNewer,
+            new Promise<void>((resolve) => setTimeout(resolve, 25)),
+          ]);
+        }
+        channels.set(key, state);
+        if (state.chargedCumulativeAmount === '3000') newerWritten();
+      },
+      delete: async (key: string) => {
+        channels.delete(key);
+      },
+    };
+
+    await Promise.all([
+      reconcileX402BatchSettlement(
+        [receipt({ chargedCumulativeAmount: '2000', balance: '5000' })],
+        { storage, bindings: { channelId: CHANNEL, maxClaimableAmount: '2000' } },
+      ),
+      reconcileX402BatchSettlement(
+        [receipt({ chargedCumulativeAmount: '3000', balance: '5000' })],
+        { storage, bindings: { channelId: CHANNEL, maxClaimableAmount: '3000' } },
+      ),
+    ]);
+
+    expect(channels.get(KEY)).toMatchObject({
       balance: '5000',
       chargedCumulativeAmount: '3000',
     });

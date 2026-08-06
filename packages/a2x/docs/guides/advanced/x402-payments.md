@@ -440,11 +440,11 @@ An `upto` payload carries `permit2Authorization` + `signature` instead of the `e
 
 `parseX402PaymentSubmission` surfaces both shapes: `submission.authorization` for EIP-3009, `submission.permit2Authorization` for Permit2, and `submission.payer` scheme-agnostically. Receipts backfill `payer` from whichever the payload carries when the facilitator omits it.
 
-Once `classify` has matched a requirement, `payer` is read from the field **that requirement's scheme actually signs** — not sniffed from whichever key is present. A payload is client-controlled and may carry both an `authorization` and a `permit2Authorization`; without scheme-driven extraction a decoy key could name someone else as the payer on the receipt and in your audit store. `extractX402Payer(payload, scheme?)` applies the same dispatch when you drive the pipeline yourself; pass `scheme` whenever you know it.
+Once `classify` has matched a requirement, `payer` is read from the field **that requirement's scheme actually signs** — not sniffed from whichever key is present. `exact` uses its EIP-3009 or Permit2 authorization, `upto` uses its Permit2 authorization, and `batch-settlement` uses `channelConfig.payer`. A payload is client-controlled and may carry decoy authorization objects; without scheme-driven extraction one could name someone else as the payer on the receipt and in your audit store. `extractX402Payer(payload, scheme?)` applies the same dispatch when you drive the pipeline yourself; pass `scheme` whenever you know it.
 
 #### Reconciliation: the settled `amount`
 
-The store entry's receipt now carries `amount` alongside `transaction` / `network` / `payer` / `settledAt`:
+The store entry's receipt carries `amount` and scheme-specific `extra` alongside `transaction` / `network` / `payer` / `settledAt`:
 
 ```ts
 const entry = await x402.store.get(taskId);
@@ -454,6 +454,8 @@ if (entry?.status === 'completed') {
 ```
 
 Under a usage-based scheme this is the key reconciliation datum and it is **not** recoverable from `entry.accepts`, which records the authorized maximum.
+
+For stateful schemes, `extra` is retained in the durable entry as well as the wire receipt. A `batch-settlement` server can therefore recover `extra.channelState` after settling even if the process stops before it emits the terminal A2A event.
 
 It records **only what the facilitator confirmed**. When the facilitator reports no amount (every V1 facilitator, and some V2 ones), the key is absent rather than backfilled from what the SDK asked to settle — a request is not evidence of a settlement, and an audit trail that cannot tell the two apart is worse than one with a gap. Check for the key before relying on it.
 
@@ -656,13 +658,15 @@ if (applied.length === 0) {
 
 Skip reconciliation and the payer's cumulative amount never advances: every subsequent call re-signs an identical voucher against a channel it still believes is unfunded — and therefore signs a **fresh deposit** each time. Receipts from other schemes, malformed ones (including non-object array entries), any naming a channel outside `bindings`, and any whose cumulative differs from the signed ceiling are ignored; a receipt that fails to apply raises an `AggregateError` after the others have been tried, so one bad entry cannot drop a good one.
 
+When `bindings` is an array, every entry must name a distinct channel. Reconcile successive attempts on the same channel separately; collapsing them into one call would lose which deposit floor belongs to which cumulative voucher. Calls through the same storage object are serialized per channel inside the process, so a delayed older receipt cannot overwrite a newer cumulative. The storage interface has no cross-process compare-and-set operation, however: route reconciliation for a channel through one writer when multiple processes or replicas share the backend.
+
 **An empty `applied` after a settled payment is a failure, not a no-op.** The voucher is spent either way, so "nothing to record" and "the merchant withheld or falsified the receipt" have identical consequences: local state did not move, and the next call re-signs or re-deposits. `A2XClient` raises `X402ReconciliationError` with `reason: 'no-matching-receipt'` in that case; a caller driving the helper directly should treat it the same way.
 
 The SDK also fails closed when the merchant returns any terminal A2A task (`completed`, `failed`, `canceled`, or `rejected`) but omits a usable receipt. Settlement can succeed before agent execution later fails, and once the payer handed over a voucher the merchant may retain and redeem it; neither a remote status marker nor the task's final state can prove that local channel state is safe to reuse.
 
 The binding becomes outstanding as soon as the signed submission is handed to the transport. If blocking transport/JSON parsing fails, a non-blocking unary call returns an intermediate task, a follow-up SSE stream errors or is aborted, the caller closes that stream early, or the stream reaches EOF before a receipt or a complete retry prompt, `A2XClient` raises the same quarantine error with `reason: 'ambiguous-response'`. A status marker alone is not a retry prompt: `x402.payment.required` must also be present before the client treats the previous voucher as rejected. A known intermediate unary response is available as `task`; transport failures and streaming exits have no complete task, and the original transport/stream failure is available as `cause` when one occurred. In every case the merchant must be assumed to hold the voucher until an operator reconciles or retires the channel.
 
-A matching success receipt takes precedence over a contradictory retry prompt in the same response. Once that receipt advances durable channel state, `A2XClient` does not sign again for the call; doing so would authorize the same work twice. This batch-only guard does not change `exact` or `upto` retry behavior.
+A matching success receipt takes precedence over a contradictory retry prompt anywhere later in the same response stream, whether it appears in the same event or a separate event. Once that receipt advances durable channel state, `A2XClient` does not sign again for the call; doing so would authorize the same work twice. This batch-only guard does not change `exact` or `upto` retry behavior.
 
 #### A missed receipt does not self-heal
 

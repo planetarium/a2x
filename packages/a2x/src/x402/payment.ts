@@ -220,6 +220,7 @@ export function parseX402PaymentSubmission(
  *  - `'upto'` → `permit2Authorization.from` only;
  *  - `'exact'` → `authorization.from`, or `permit2Authorization.from` when the
  *    requirement selected Permit2 transfers (see `usesPermit2Transfer`);
+ *  - `'batch-settlement'` → `channelConfig.payer` only;
  *  - anything else (or `scheme` omitted) → best-effort shape sniffing.
  *
  * Returns `undefined` when the payload carries no payer for that scheme — the
@@ -238,6 +239,9 @@ export function extractX402Payer(
       nonEmptyString(extractAuthorization(payload)?.from) ??
       nonEmptyString(extractPermit2Authorization(payload)?.from)
     );
+  }
+  if (scheme === 'batch-settlement') {
+    return nonEmptyString(extractBatchChannelConfig(payload)?.payer);
   }
   return extractPayer(payload);
 }
@@ -719,6 +723,16 @@ function extractPermit2Authorization(
   }
   const auth = inner.permit2Authorization;
   return auth && typeof auth === 'object' ? auth : undefined;
+}
+
+function extractBatchChannelConfig(
+  payload: X402PaymentPayload | undefined,
+): Record<string, unknown> | undefined {
+  if (!payload) return undefined;
+  const inner = payload.payload as unknown as { channelConfig?: unknown };
+  if (!inner || typeof inner !== 'object') return undefined;
+  const config = inner.channelConfig;
+  return isRecord(config) ? config : undefined;
 }
 
 function extractPayer(payload: X402PaymentPayload): string | undefined {
