@@ -403,7 +403,7 @@ export class A2XClient {
       // intermediate attempt can settle before a later one re-prompts, and
       // that receipt is state the payer must record either way. Bound to the
       // channel *this attempt* signed — see `_reconcileX402`.
-      await this._reconcileX402(
+      const reconciled = await this._reconcileX402(
         task.status.message?.metadata,
         binding,
         task,
@@ -418,6 +418,16 @@ export class A2XClient {
         getX402PaymentRequirements(task)
       ) {
         continue;
+      }
+      if (!reconciled) {
+        // A non-blocking unary response can legitimately be intermediate, but
+        // returning it ends the only exchange that still owns this binding.
+        // Without a receipt or explicit retry prompt, the merchant may retain
+        // the voucher, so the channel must be quarantined before the binding
+        // falls out of scope.
+        await this._reconcileX402(undefined, binding, task, {
+          responseEnded: true,
+        });
       }
       break;
     }
@@ -472,20 +482,27 @@ export class A2XClient {
             // the caller the result it paid for on `X402ReconciliationError` —
             // this runs before the yield, so throwing means the consumer never
             // sees the terminal event itself.
-            const reconciled = await this._reconcileX402(
-              event.status?.message?.metadata as
-                | Record<string, unknown>
-                | undefined,
-              signedBinding,
-              {
-                id: event.taskId,
-                contextId: event.contextId,
-                status: event.status,
-              } as Task,
-            );
-            if (reconciled) signedBinding = undefined;
+            try {
+              const reconciled = await this._reconcileX402(
+                event.status?.message?.metadata as
+                  | Record<string, unknown>
+                  | undefined,
+                signedBinding,
+                {
+                  id: event.taskId,
+                  contextId: event.contextId,
+                  status: event.status,
+                } as Task,
+              );
+              if (reconciled) signedBinding = undefined;
+            } catch (cause) {
+              // Reconciliation already surfaced the unsafe channel. Do not
+              // let the generator's close path report it a second time.
+              signedBinding = undefined;
+              throw cause;
+            }
           }
-          yield event;
+
           if (
             'status' in event &&
             event.status?.state === 'input-required' &&
@@ -499,32 +516,40 @@ export class A2XClient {
               contextId: event.contextId,
               status: event.status,
             } as Task;
-            break;
+            // A valid retry prompt proves the previous voucher was rejected.
+            // Clear before yielding so consumer-driven iterator close cannot
+            // mistake this safe exit for an ambiguous response.
+            signedBinding = undefined;
           }
+
+          yield event;
+          if (pendingTask) break;
         }
       } catch (cause) {
         if (cause instanceof X402ReconciliationError) throw cause;
-        await this._reconcileX402(undefined, signedBinding, undefined, {
+        const binding = signedBinding;
+        signedBinding = undefined;
+        await this._reconcileX402(undefined, binding, undefined, {
           responseEnded: true,
           cause,
         });
         throw cause;
-      }
-
-      if (!pendingTask) {
-        await this._reconcileX402(undefined, signedBinding, undefined, {
+      } finally {
+        // `AsyncGenerator.return()` skips everything after the suspended
+        // `yield`, but still runs this block. Keep the binding alive until this
+        // point so consumer-driven close is treated like any other ambiguous
+        // end to a response.
+        const binding = signedBinding;
+        signedBinding = undefined;
+        await this._reconcileX402(undefined, binding, undefined, {
           responseEnded: true,
         });
-        return;
       }
+
+      if (!pendingTask) return;
 
       const required = getX402PaymentRequirements(pendingTask);
       if (!required) return;
-
-      // An explicit retry prompt says this attempt was not accepted. It is the
-      // one non-terminal exit that legitimately closes the old obligation
-      // without a receipt; the next attempt gets its own binding below.
-      signedBinding = undefined;
 
       const decision = await this._x402.onPaymentRequired?.(required);
       if (decision === false) {

@@ -893,6 +893,88 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     });
   });
 
+  it('quarantines the channel when the consumer closes a paid stream early', async () => {
+    const { channels, storage } = channelStorage();
+    const encoder = new TextEncoder();
+    const sse = (events: unknown[]) =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            for (const event of events) {
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({ jsonrpc: '2.0', id: 1, result: event })}\n\n`,
+                ),
+              );
+            }
+            controller.close();
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      );
+    const required = batchRequiredTask() as {
+      status: { message: unknown };
+    };
+    const statusEvent = (state: string, message: unknown) => ({
+      kind: 'status-update',
+      taskId: 't1',
+      contextId: 'c1',
+      status: { state, timestamp: new Date().toISOString(), message },
+      final: false,
+    });
+    const verifiedMessage = {
+      messageId: 'x402-batch-2',
+      role: 'agent',
+      parts: [{ kind: 'text', text: 'payment verified' }],
+      metadata: {
+        [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.VERIFIED,
+      },
+    };
+
+    let call = 0;
+    const recorded: Array<{ body: unknown }> = [];
+    const fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/agent-card.json') || url.endsWith('/agent.json')) {
+        return agentCardResponse();
+      }
+      recorded.push({
+        body: init?.body ? JSON.parse(init.body as string) : undefined,
+      });
+      if (call++ === 0) {
+        return sse([statusEvent('input-required', required.status.message)]);
+      }
+      return sse([statusEvent('working', verifiedMessage)]);
+    }) as unknown as typeof globalThis.fetch;
+    const seen: X402ReconciliationError[] = [];
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+        onReconcileError: (error) => {
+          seen.push(error);
+        },
+      },
+    });
+
+    for await (const event of client.sendMessageStream({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    })) {
+      if ('status' in event && event.status?.state === 'working') break;
+    }
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.reason).toBe('ambiguous-response');
+    expect(seen[0]!.channelId).toBe(signedChannelId(recorded));
+    expect(seen[0]!.task).toBeUndefined();
+    expect(channels.size).toBe(0);
+  });
+
   it('ignores receipts from an exchange it did not pay with a voucher', async () => {
     // The storage key is the *merchant-supplied* channelId, and channel ids
     // derive from public inputs — so any agent could name the channel this
@@ -1300,6 +1382,48 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     expect((error as Error & { cause?: unknown }).cause).toEqual(
       new Error('connection reset after submit'),
     );
+  });
+
+  it('quarantines a non-terminal unary response after batch submission', async () => {
+    const { channels, storage } = channelStorage();
+    const working = batchRequiredTask() as {
+      status: {
+        state: string;
+        message: { metadata: Record<string, unknown> };
+      };
+    };
+    working.status.state = 'working';
+    working.status.message.metadata = {
+      [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.VERIFIED,
+    };
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(working),
+    ]);
+    const seen: X402ReconciliationError[] = [];
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+        onReconcileError: (error) => {
+          seen.push(error);
+        },
+      },
+    });
+
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      configuration: { blocking: false },
+    });
+
+    expect(task.status.state).toBe('working');
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.reason).toBe('ambiguous-response');
+    expect(seen[0]!.channelId).toBe(signedChannelId(rpcRequests));
+    expect((seen[0]!.task as Task).status.state).toBe('working');
+    expect(channels.size).toBe(0);
   });
 
   it.each(['error', 'eof'])('quarantines a submitted channel on streaming %s', async (ending) => {

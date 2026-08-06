@@ -49,9 +49,10 @@ a cent.
   value; accepting a lower one would let a stale historical receipt mask the
   current exchange while the merchant retains the higher-value voucher.
 - A receipt that cannot be recorded — a storage failure, a terminal task with
-  no usable receipt, or a transport/parser/SSE exit after submission — raises
+  no usable receipt, a non-terminal unary return, or a transport/parser/SSE
+  exit (including consumer-driven iterator close) after submission — raises
   the new `X402ReconciliationError`, carrying the channel id, the merchant's
-  terminal task when available, and a `reason` (`write-failed` /
+  task when available, and a `reason` (`write-failed` /
   `no-matching-receipt` / `ambiguous-response`). Failing loudly
   is deliberate: a lost receipt leaves the channel desynced with no self-heal
   path (`@x402/evm`'s corrective recovery needs a chain-reading signer, which a
