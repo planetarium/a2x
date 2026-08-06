@@ -57,10 +57,11 @@ import {
   signX402Payment,
   rejectX402Payment,
   reconcileX402BatchSettlement,
-  getX402BatchSettlementChannelId,
+  getX402BatchSettlementBinding,
   getX402PaymentRequirements,
   getX402Receipts,
   type SignedX402Payment,
+  type X402BatchSettlementBinding,
   type X402BatchSettlementOptions,
 } from '../x402/client.js';
 import {
@@ -387,7 +388,7 @@ export class A2XClient {
       // channel *this attempt* signed — see `_reconcileX402`.
       await this._reconcileX402(
         task.status.message?.metadata,
-        getX402BatchSettlementChannelId(signed.payload),
+        getX402BatchSettlementBinding(signed.payload),
         task,
       );
 
@@ -435,7 +436,7 @@ export class A2XClient {
     // The channel this exchange signed a voucher for, or undefined if it never
     // paid with this scheme. Both facts gate reconciliation — see
     // `_reconcileX402` for why an unbound fold is a real attack surface.
-    let signedChannelId: string | undefined;
+    let signedBinding: X402BatchSettlementBinding | undefined;
 
     while (true) {
       let pendingTask: Task | undefined;
@@ -446,12 +447,20 @@ export class A2XClient {
         // suspended `yield`, so nothing after it ever runs. Losing the receipt
         // there costs the payer a second real deposit on the next call.
         if ('status' in event) {
+          // Reconstruct the task from the event so a failure here still hands
+          // the caller the result it paid for on `X402ReconciliationError` —
+          // this runs before the yield, so throwing means the consumer never
+          // sees the terminal event itself.
           await this._reconcileX402(
             event.status?.message?.metadata as
               | Record<string, unknown>
               | undefined,
-            signedChannelId,
-            undefined,
+            signedBinding,
+            {
+              id: event.taskId,
+              contextId: event.contextId,
+              status: event.status,
+            } as Task,
           );
         }
         yield event;
@@ -492,8 +501,8 @@ export class A2XClient {
       signsRemaining -= 1;
 
       const signed = await this._signX402(pendingTask);
-      signedChannelId =
-        getX402BatchSettlementChannelId(signed.payload) ?? signedChannelId;
+      signedBinding =
+        getX402BatchSettlementBinding(signed.payload) ?? signedBinding;
       currentParams = this._buildSubmitFollowup(
         params,
         pendingTask,
@@ -765,24 +774,48 @@ export class A2XClient {
    */
   private async _reconcileX402(
     metadata: Record<string, unknown> | undefined,
-    channelId: string | undefined,
+    binding: X402BatchSettlementBinding | undefined,
     task: Task | undefined,
   ): Promise<void> {
     const batchSettlement = this._x402?.batchSettlement;
-    if (!batchSettlement || !channelId) return;
+    if (!batchSettlement || !binding) return;
+
+    // Only a settled payment owes us a receipt. Intermediate events
+    // (`payment-verified`, plain `working`) legitimately carry none.
+    const settled =
+      metadata?.[X402_METADATA_KEYS.STATUS] === X402_PAYMENT_STATUS.COMPLETED;
     const receipts = metadata?.[X402_METADATA_KEYS.RECEIPTS];
-    if (!Array.isArray(receipts) || receipts.length === 0) return;
+    const list = Array.isArray(receipts)
+      ? (receipts as X402SettleResponse[])
+      : [];
+    if (!settled && list.length === 0) return;
+
+    let applied: string[] = [];
+    let cause: unknown;
     try {
-      await reconcileX402BatchSettlement(receipts as X402SettleResponse[], {
+      ({ applied } = await reconcileX402BatchSettlement(list, {
         storage: batchSettlement.storage,
-        channelIds: channelId,
-      });
-    } catch (cause) {
-      const error = new X402ReconciliationError(channelId, task, { cause });
-      const handler = this._x402?.onReconcileError;
-      if (!handler) throw error;
-      await handler(error);
+        bindings: binding,
+      }));
+    } catch (err) {
+      cause = err;
     }
+
+    // Nothing written on a settled payment is a failure, not a no-op: the
+    // voucher is spent and local state did not move, so the next call either
+    // re-signs the same voucher or opens a fresh on-chain deposit. This is the
+    // case where the merchant returned no receipt, a foreign channel, or a
+    // cumulative above what we authorized — silence there is exactly what the
+    // error exists to prevent.
+    if (cause === undefined && (!settled || applied.length > 0)) return;
+
+    const error = new X402ReconciliationError(binding.channelId, task, {
+      cause,
+      reason: cause === undefined ? 'no-matching-receipt' : 'write-failed',
+    });
+    const handler = this._x402?.onReconcileError;
+    if (!handler) throw error;
+    await handler(error);
   }
 
   /**

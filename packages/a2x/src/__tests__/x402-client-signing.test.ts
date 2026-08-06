@@ -6,7 +6,7 @@ import {
   X402_PAYMENT_STATUS,
 } from '../x402/constants.js';
 import {
-  getX402BatchSettlementChannelId,
+  getX402BatchSettlementBinding,
   reconcileX402BatchSettlement,
   signX402Payment,
   type X402ClientChannelStorage,
@@ -418,6 +418,9 @@ describe('reconcileX402BatchSettlement', () => {
   const CHANNEL_A = `0x${'cd'.repeat(32)}`;
   const CHANNEL_B = `0x${'ef'.repeat(32)}`;
   const FOREIGN = `0x${'ab'.repeat(32)}`;
+  // Ceilings the payer's vouchers authorized on each channel.
+  const BIND_A = { channelId: CHANNEL_A, maxClaimableAmount: '3000' };
+  const BIND_B = { channelId: CHANNEL_B, maxClaimableAmount: '6000' };
 
   const channelReceipt: X402SettleResponse = {
     success: true,
@@ -440,7 +443,7 @@ describe('reconcileX402BatchSettlement', () => {
     const storage = memoryChannelStorage();
     await reconcileX402BatchSettlement([channelReceipt], {
       storage,
-      channelIds: CHANNEL_A,
+      bindings: BIND_A,
     });
     expect(captured.reconciled).toHaveLength(1);
     expect(captured.reconciled[0]!.storage).toBe(storage);
@@ -455,7 +458,7 @@ describe('reconcileX402BatchSettlement', () => {
     captured.reconciled = [];
     await reconcileX402BatchSettlement(
       [{ ...channelReceipt, extra: { channelState: { channelId: FOREIGN } } }],
-      { storage: memoryChannelStorage(), channelIds: CHANNEL_A },
+      { storage: memoryChannelStorage(), bindings: BIND_A },
     );
     expect(captured.reconciled).toEqual([]);
   });
@@ -471,7 +474,7 @@ describe('reconcileX402BatchSettlement', () => {
           extra: { channelState: { channelId: CHANNEL_A.toUpperCase().replace('0X', '0x') } },
         },
       ],
-      { storage: memoryChannelStorage(), channelIds: CHANNEL_A },
+      { storage: memoryChannelStorage(), bindings: BIND_A },
     );
     expect(captured.reconciled).toHaveLength(1);
   });
@@ -483,7 +486,7 @@ describe('reconcileX402BatchSettlement', () => {
     // make every non-batch payer pay for a module it never uses.
     await reconcileX402BatchSettlement(
       [{ success: true, transaction: '0xabc', network: 'eip155:84532' }],
-      { storage: memoryChannelStorage(), channelIds: CHANNEL_A },
+      { storage: memoryChannelStorage(), bindings: BIND_A },
     );
     expect(captured.reconciled).toEqual([]);
   });
@@ -492,7 +495,7 @@ describe('reconcileX402BatchSettlement', () => {
     captured.reconciled = [];
     await reconcileX402BatchSettlement(
       [{ ...channelReceipt, success: false, errorReason: 'CHANNEL_BUSY' }],
-      { storage: memoryChannelStorage(), channelIds: CHANNEL_A },
+      { storage: memoryChannelStorage(), bindings: BIND_A },
     );
     expect(captured.reconciled).toEqual([]);
   });
@@ -514,7 +517,7 @@ describe('reconcileX402BatchSettlement', () => {
         // Truncated.
         { ...channelReceipt, extra: { channelState: { channelId: '0xcd' } } },
       ],
-      { storage: memoryChannelStorage(), channelIds: CHANNEL_A },
+      { storage: memoryChannelStorage(), bindings: BIND_A },
     );
     expect(captured.reconciled).toEqual([]);
   });
@@ -534,7 +537,7 @@ describe('reconcileX402BatchSettlement', () => {
     await expect(
       reconcileX402BatchSettlement([poisoned, channelReceipt], {
         storage,
-        channelIds: [CHANNEL_A, CHANNEL_B],
+        bindings: [BIND_A, BIND_B],
       }),
     ).rejects.toThrow(AggregateError);
     // The valid receipt after the failing one was still processed.
@@ -552,7 +555,7 @@ describe('reconcileX402BatchSettlement', () => {
     };
     await reconcileX402BatchSettlement([channelReceipt, second], {
       storage: memoryChannelStorage(),
-      channelIds: [CHANNEL_A, CHANNEL_B],
+      bindings: [BIND_A, BIND_B],
     });
     expect(captured.reconciled.map((r) => r.settle)).toEqual([
       channelReceipt,
@@ -561,26 +564,108 @@ describe('reconcileX402BatchSettlement', () => {
   });
 });
 
-describe('getX402BatchSettlementChannelId', () => {
-  it('reads the channel id off both payload shapes', () => {
+describe('reconcileX402BatchSettlement cumulative binding', () => {
+  const CHANNEL = `0x${'cd'.repeat(32)}`;
+  const binding = { channelId: CHANNEL, maxClaimableAmount: '3000' };
+
+  function receiptWithCumulative(chargedCumulativeAmount: unknown) {
+    return {
+      success: true,
+      transaction: '',
+      network: 'eip155:84532',
+      extra: { channelState: { channelId: CHANNEL, chargedCumulativeAmount } },
+    } as X402SettleResponse;
+  }
+
+  it('refuses a cumulative above the ceiling the voucher authorized', async () => {
+    // The concrete theft: after a 1000-unit voucher (cumulative ceiling 3000
+    // here) the merchant reports 5000. Stored verbatim, the payer's next call
+    // would sign a cumulative above it plus a top-up to cover the gap, letting
+    // the merchant claim far more than the calls cost.
+    captured.reconciled = [];
+    const { applied } = await reconcileX402BatchSettlement(
+      [receiptWithCumulative('5000')],
+      { storage: memoryChannelStorage(), bindings: binding },
+    );
+    expect(applied).toEqual([]);
+    expect(captured.reconciled).toEqual([]);
+  });
+
+  it('accepts a cumulative at or below the ceiling', async () => {
+    // Equality is the normal case. Below it is legitimate too — the payer's
+    // local base was ahead of the merchant's — so this bounds rather than
+    // requires an exact match.
+    for (const value of ['3000', '2000', '0']) {
+      captured.reconciled = [];
+      const { applied } = await reconcileX402BatchSettlement(
+        [receiptWithCumulative(value)],
+        { storage: memoryChannelStorage(), bindings: binding },
+      );
+      expect(applied, `cumulative ${value}`).toEqual([CHANNEL]);
+    }
+  });
+
+  it('refuses an unparseable cumulative', async () => {
+    captured.reconciled = [];
+    const { applied } = await reconcileX402BatchSettlement(
+      [receiptWithCumulative('not-a-number'), receiptWithCumulative({})],
+      { storage: memoryChannelStorage(), bindings: binding },
+    );
+    expect(applied).toEqual([]);
+  });
+
+  it('drops a binding whose ceiling cannot be parsed rather than unbounding it', async () => {
+    captured.reconciled = [];
+    const { applied } = await reconcileX402BatchSettlement(
+      [receiptWithCumulative('1')],
+      {
+        storage: memoryChannelStorage(),
+        bindings: { channelId: CHANNEL, maxClaimableAmount: 'oops' },
+      },
+    );
+    expect(applied).toEqual([]);
+  });
+});
+
+describe('getX402BatchSettlementBinding', () => {
+  it('reads the binding off both payload shapes', () => {
     const id = `0x${'cd'.repeat(32)}`;
     for (const type of ['deposit', 'voucher']) {
       expect(
-        getX402BatchSettlementChannelId({
+        getX402BatchSettlementBinding({
           x402Version: 2,
-          payload: { type, voucher: { channelId: id } },
-        } as unknown as Parameters<typeof getX402BatchSettlementChannelId>[0]),
-      ).toBe(id);
+          payload: {
+            type,
+            voucher: { channelId: id, maxClaimableAmount: '1000' },
+          },
+        } as unknown as Parameters<typeof getX402BatchSettlementBinding>[0]),
+      ).toEqual({ channelId: id, maxClaimableAmount: '1000' });
     }
   });
 
   it('returns undefined for a payload of another scheme', () => {
     expect(
-      getX402BatchSettlementChannelId({
+      getX402BatchSettlementBinding({
         x402Version: 2,
         payload: { authorization: { from: '0x1' }, signature: '0x2' },
-      } as unknown as Parameters<typeof getX402BatchSettlementChannelId>[0]),
+      } as unknown as Parameters<typeof getX402BatchSettlementBinding>[0]),
     ).toBeUndefined();
+  });
+
+  it('returns undefined when either half is unusable', () => {
+    const id = `0x${'cd'.repeat(32)}`;
+    for (const voucher of [
+      { channelId: '0xshort', maxClaimableAmount: '1000' },
+      { channelId: id },
+      { channelId: id, maxClaimableAmount: 1000 },
+    ]) {
+      expect(
+        getX402BatchSettlementBinding({
+          x402Version: 2,
+          payload: { type: 'voucher', voucher },
+        } as unknown as Parameters<typeof getX402BatchSettlementBinding>[0]),
+      ).toBeUndefined();
+    }
   });
 });
 

@@ -21,22 +21,28 @@ a cent.
   exists — losing it makes the next call sign a **fresh deposit** into an
   already-funded channel. New `X402ClientChannelStorage` / `X402ChannelState`
   types describe the contract without importing the optional peer.
-- `reconcileX402BatchSettlement(receipts, { storage, channelIds })` folds
+- `reconcileX402BatchSettlement(receipts, { storage, bindings })` folds
   settlement receipts back into channel storage. Required because a2x carries
   payments over A2A task metadata and never runs `@x402/evm`'s
   `onPaymentResponse` hook, which is what normally advances the payer's
   cumulative amount. `A2XClient` calls it automatically on both the blocking
-  and streaming paths. `channelIds` binds the fold to the channel that
-  exchange actually signed: channel ids derive from public inputs, so without
-  it a merchant could name a channel belonging to a *different* merchant and
-  overwrite its cumulative. Read it off a signed payload with the new
-  `getX402BatchSettlementChannelId()`.
-- A receipt that cannot be recorded raises the new `X402ReconciliationError`,
-  which carries the channel id and the merchant's completed task. Failing
-  loudly is deliberate — a lost receipt leaves the channel desynced with no
-  self-heal path (`@x402/evm`'s corrective recovery needs a chain-reading
-  signer, which a `LocalAccount` is not), so the next call is rejected for a
-  cumulative mismatch or opens a fresh on-chain deposit. Set
+  and streaming paths.
+- `bindings` ties the fold to what that exchange actually signed — the channel
+  **and** the cumulative ceiling its voucher authorized. Both matter. Channel
+  ids derive from public inputs, so without the first a merchant could name a
+  channel belonging to a *different* merchant and overwrite its cumulative.
+  Without the second, the same merchant can inflate its own: reporting 5000
+  after a 1000 voucher makes the payer's next call sign a 6000 cumulative plus
+  a top-up, letting it claim far more than the calls cost. Read the binding
+  off a signed payload with the new `getX402BatchSettlementBinding()`.
+- A receipt that cannot be recorded — a storage failure, or a settled payment
+  that came back with no usable receipt at all — raises the new
+  `X402ReconciliationError`, carrying the channel id, the merchant's completed
+  task, and a `reason` (`write-failed` / `no-matching-receipt`). Failing loudly
+  is deliberate: a lost receipt leaves the channel desynced with no self-heal
+  path (`@x402/evm`'s corrective recovery needs a chain-reading signer, which a
+  `LocalAccount` is not), so the next call is rejected for a cumulative
+  mismatch or opens a fresh on-chain deposit. Set
   `A2XClientX402Options.onReconcileError` to record and continue instead.
 - Selection stays opt-in behind `allowBatchSettlement`, separate from
   `allowUpto`: `upto` widens how much of an authorization a merchant may draw,

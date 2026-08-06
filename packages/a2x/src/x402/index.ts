@@ -250,7 +250,7 @@ export {
   signX402Payment,
   rejectX402Payment,
   reconcileX402BatchSettlement,
-  getX402BatchSettlementChannelId,
+  getX402BatchSettlementBinding,
   getX402PaymentRequirements,
   getX402PaymentExtensions,
   getX402Receipts,
@@ -263,6 +263,7 @@ export type {
   X402BatchSettlementDepositPolicy,
   X402BatchSettlementDepositStrategy,
   X402BatchSettlementDepositContext,
+  X402BatchSettlementBinding,
   X402ClientChannelStorage,
   X402ChannelState,
 } from './client.js';

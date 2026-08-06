@@ -604,14 +604,17 @@ The second check exists because a `depositStrategy` computes its own figure per 
 
 `@x402/evm` normally advances the payer's channel state from its own HTTP client's `onPaymentResponse` hook, reading the `PAYMENT-RESPONSE` header. **a2x carries payments over A2A task metadata and never runs that hook**, so the step is explicit.
 
-`A2XClient` does it for you on both the blocking and streaming paths, bound to **the channel that exchange actually signed a voucher for**. That binding is a security boundary, not an optimization. Channel ids derive from public inputs, so the id you share with any given merchant is computable by anyone — and a receipt names the channel it updates. Without the binding, a merchant you *did* pay could name a channel belonging to a **different** merchant and overwrite its cumulative, bricking it or forcing an invalid top-up.
+`A2XClient` does it for you on both the blocking and streaming paths, bound to **what that exchange actually signed**: the channel, and the cumulative ceiling its voucher authorized. Both halves are a security boundary, not an optimization.
 
-Two cases `A2XClient` therefore does not cover, where you reconcile yourself — and where you must supply the same binding:
+- **The channel id.** Ids derive from public inputs, so the one you share with any given merchant is computable by anyone — and a receipt names the channel it updates. Without this, a merchant you *did* pay could name a channel belonging to a **different** merchant and overwrite its cumulative, bricking it or forcing an invalid top-up.
+- **The ceiling.** Without it, the same merchant can inflate its *own* channel instead: report 5000 back after a 1000 voucher, and your next 1000 call signs a 6000 cumulative plus a top-up to cover it — letting the merchant claim far more than the calls cost. A receipt reporting more than the voucher authorized is refused. Less is accepted: your local base may legitimately have been ahead of the merchant's.
+
+Two cases `A2XClient` does not cover, where you reconcile yourself — and must supply the same binding:
 
 ```ts
 import {
   reconcileX402BatchSettlement,
-  getX402BatchSettlementChannelId,
+  getX402BatchSettlementBinding,
   getX402Receipts,
 } from '@a2x/sdk/x402';
 
@@ -619,19 +622,24 @@ import {
 // (b) The receipt reached you via `getTask` rather than the send that paid.
 const signed = await signX402Payment(task, { signer, batchSettlement });
 // …resubmit with `signed.metadata`, then on the terminal task:
-await reconcileX402BatchSettlement(getX402Receipts(final), {
+const { applied } = await reconcileX402BatchSettlement(getX402Receipts(final), {
   storage: myChannelStorage,
-  channelIds: getX402BatchSettlementChannelId(signed.payload)!,
+  bindings: getX402BatchSettlementBinding(signed.payload)!,
 });
+if (applied.length === 0) {
+  // The voucher is spent and local state did not move — see below.
+}
 ```
 
-Skip reconciliation and the payer's cumulative amount never advances: every subsequent call re-signs an identical voucher against a channel it still believes is unfunded — and therefore signs a **fresh deposit** each time. Receipts from other schemes, malformed ones, and any naming a channel outside `channelIds` are ignored; a receipt that fails to apply raises an `AggregateError` after the others have been tried, so one bad entry cannot drop a good one.
+Skip reconciliation and the payer's cumulative amount never advances: every subsequent call re-signs an identical voucher against a channel it still believes is unfunded — and therefore signs a **fresh deposit** each time. Receipts from other schemes, malformed ones, any naming a channel outside `bindings`, and any exceeding the signed ceiling are ignored; a receipt that fails to apply raises an `AggregateError` after the others have been tried, so one bad entry cannot drop a good one.
+
+**An empty `applied` after a settled payment is a failure, not a no-op.** The voucher is spent either way, so "nothing to record" and "the merchant withheld or falsified the receipt" have identical consequences: local state did not move, and the next call re-signs or re-deposits. `A2XClient` raises `X402ReconciliationError` with `reason: 'no-matching-receipt'` in that case; a caller driving the helper directly should treat it the same way.
 
 #### A missed receipt does not self-heal
 
 The merchant requires the next voucher's cumulative to equal exactly `charged + amount`, and `@x402/evm`'s corrective-recovery path needs a signer with `readContract`, which a viem `LocalAccount` does not have. A payer that loses a receipt stays desynced until its storage is repaired out of band, and the next call can sign a fresh on-chain deposit.
 
-Because that is a funds-bearing failure, `A2XClient` **throws** `X402ReconciliationError` rather than continuing quietly — an operator who is never told cannot quarantine the channel first. The error carries `channelId` and the merchant's completed `task`, so catching it still leaves you the result you paid for:
+Because that is a funds-bearing failure, `A2XClient` **throws** `X402ReconciliationError` rather than continuing quietly — an operator who is never told cannot quarantine the channel first. It carries `channelId`, the merchant's completed `task`, and a `reason`: `write-failed` (your storage threw — usually transient) or `no-matching-receipt` (the payment settled but nothing was recorded, which can mean the merchant misbehaved rather than infrastructure). The `task` means catching it still leaves you the result you paid for — including on the streaming path, where reconciliation runs before the final event is yielded and a throw means you never see that event:
 
 ```ts
 try {

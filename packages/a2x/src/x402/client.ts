@@ -595,61 +595,75 @@ export function defaultSelect(
  * identical voucher against a channel a2x still believes is unfunded — and so
  * signs a **fresh deposit** each time.
  *
- * Receipts from other schemes, malformed ones, and any naming a channel
- * outside `channelIds` are ignored, so passing a whole task's receipts is
- * safe:
+ * Receipts from other schemes, malformed ones, any naming a channel outside
+ * `bindings`, and any reporting a cumulative above what the matching voucher
+ * authorized are all ignored, so passing a whole task's receipts is safe:
  *
  * ```ts
  * const signed = await signX402Payment(task, { signer, batchSettlement });
  * // …resubmit, then, on the terminal task:
- * await reconcileX402BatchSettlement(getX402Receipts(final), {
+ * const { applied } = await reconcileX402BatchSettlement(getX402Receipts(final), {
  *   storage,
- *   channelIds: getX402BatchSettlementChannelId(signed.payload)!,
+ *   bindings: getX402BatchSettlementBinding(signed.payload)!,
  * });
  * ```
  *
- * `A2XClient` calls this automatically when configured with
- * `x402.batchSettlement`.
+ * Returns the channel ids actually written. **An empty `applied` after a
+ * settled payment is a failure, not a no-op** — the voucher is spent and
+ * local state did not move, so the next call re-signs it or opens a fresh
+ * deposit. `A2XClient` raises `X402ReconciliationError` in that case; a caller
+ * driving this directly should treat it the same way.
  */
 export async function reconcileX402BatchSettlement(
   receipts: X402SettleResponse[],
   options: {
     storage: X402ClientChannelStorage;
     /**
-     * The channel(s) this caller actually signed a voucher for. **Required.**
+     * What this caller actually signed: the channel, and the cumulative
+     * ceiling its voucher authorized. **Required.**
      *
-     * A receipt names the channel it updates, and channel ids are derived from
-     * public inputs — so a merchant this payer *did* pay can return an id
-     * belonging to a **different** merchant and overwrite that channel's
-     * cumulative, bricking it or forcing an invalid top-up. Restricting the
-     * fold to the channels this exchange signed keeps a merchant able to
-     * update only its own.
+     * Both halves are load-bearing. The channel id stops a merchant from
+     * naming a channel belonging to a *different* merchant — ids derive from
+     * public inputs, so any of them is computable. The ceiling stops the same
+     * merchant inflating its *own* channel's cumulative: reporting 5000 back
+     * after a 1000 voucher would make the payer's next 1000 call sign a 6000
+     * cumulative and a top-up to cover it, letting the merchant claim far
+     * more than the calls cost.
      *
      * Read it off the signed payload with
-     * `getX402BatchSettlementChannelId(signed.payload)`.
+     * `getX402BatchSettlementBinding(signed.payload)`.
      */
-    channelIds: string | readonly string[];
+    bindings: X402BatchSettlementBinding | readonly X402BatchSettlementBinding[];
   },
-): Promise<void> {
-  const allowed = new Set(
-    (typeof options.channelIds === 'string'
-      ? [options.channelIds]
-      : options.channelIds
-    )
-      .filter(isCanonicalChannelId)
-      .map((id) => id.toLowerCase()),
-  );
-  const relevant = receipts.filter(
-    (r) =>
-      r.success &&
-      hasChannelStateKey(r.extra) &&
-      allowed.has(channelIdOf(r.extra)!.toLowerCase()),
-  );
-  if (relevant.length === 0) return;
+): Promise<{ applied: string[] }> {
+  const allowed = new Map<string, bigint>();
+  const bindings = Array.isArray(options.bindings)
+    ? options.bindings
+    : [options.bindings as X402BatchSettlementBinding];
+  for (const binding of bindings) {
+    if (!isCanonicalChannelId(binding?.channelId)) continue;
+    try {
+      allowed.set(binding.channelId.toLowerCase(), BigInt(binding.maxClaimableAmount));
+    } catch {
+      // A ceiling we cannot parse cannot bound anything — drop the binding
+      // rather than fall back to an unbounded one.
+    }
+  }
+
+  const relevant = receipts.filter((r) => {
+    if (!r.success) return false;
+    const id = channelIdOf(r.extra);
+    if (id === undefined) return false;
+    const ceiling = allowed.get(id.toLowerCase());
+    if (ceiling === undefined) return false;
+    return cumulativeWithin(r.extra, ceiling);
+  });
+  if (relevant.length === 0) return { applied: [] };
   const mod = (await importX402Peer(
     BATCH_SETTLEMENT_CLIENT_PEER,
   )) as unknown as X402EvmBatchSettlementClientModule;
   const failures: unknown[] = [];
+  const applied: string[] = [];
   for (const receipt of relevant) {
     // Per receipt, not one try around the loop: the receipts are
     // remote-controlled, and one malformed entry must not stop a later valid
@@ -657,6 +671,7 @@ export async function reconcileX402BatchSettlement(
     // which `@x402/evm` cannot self-heal without a chain-reading signer.
     try {
       await mod.processSettleResponse(options.storage, receipt);
+      applied.push(channelIdOf(receipt.extra)!);
     } catch (err) {
       failures.push(err);
     }
@@ -667,6 +682,7 @@ export async function reconcileX402BatchSettlement(
       `Failed to reconcile ${failures.length} of ${relevant.length} batch-settlement receipt(s).`,
     );
   }
+  return { applied };
 }
 
 /** A channel id is the EIP-712 hash of the channel config — a bytes32 hex. */
@@ -677,7 +693,15 @@ function isCanonicalChannelId(id: unknown): id is string {
   return typeof id === 'string' && CANONICAL_CHANNEL_ID.test(id);
 }
 
-/** The `channelState.channelId` on a receipt, when it is a canonical one. */
+/**
+ * The `channelState.channelId` on a receipt, when it is a canonical one.
+ *
+ * The peer keys storage on `channelState.channelId.toLowerCase()` with no
+ * guard of its own, so a merchant sending `channelState: {}` (or a numeric id)
+ * would throw a bare `TypeError` from inside it. Requiring the canonical
+ * `bytes32` form also stops a near-miss id — differing only by padding or a
+ * stray prefix — from being written as a second, orphaned storage key.
+ */
 function channelIdOf(
   extra: Record<string, unknown> | undefined,
 ): string | undefined {
@@ -688,34 +712,65 @@ function channelIdOf(
 }
 
 /**
- * True when `extra` carries a `channelState` this SDK can hand to
- * `@x402/evm` — i.e. with a canonical `channelId`.
+ * True when a receipt's reported cumulative is within what the matching
+ * voucher authorized.
  *
- * The peer keys storage on `channelState.channelId.toLowerCase()` with no
- * guard of its own, so a merchant sending `channelState: {}` (or a numeric id)
- * would throw a bare `TypeError` from inside the peer. Requiring the canonical
- * `bytes32` form also stops a near-miss id — differing only by padding or a
- * stray prefix — from being written as a second, orphaned storage key.
+ * The merchant may charge **at most** the ceiling the payer signed — its own
+ * server aborts with `ErrChargeExceedsSignedCumulative` otherwise. A value
+ * below the ceiling is legitimate (the payer's local base was ahead of the
+ * merchant's), so this bounds rather than requires equality; a value *above*
+ * it is one the merchant could not have charged, and storing it would make
+ * the payer's next voucher authorize the difference.
+ *
+ * A receipt omitting the field updates no cumulative, so it is left to pass —
+ * the peer only writes the keys it finds.
  */
-function hasChannelStateKey(extra: Record<string, unknown> | undefined): boolean {
-  return channelIdOf(extra) !== undefined;
+function cumulativeWithin(
+  extra: Record<string, unknown> | undefined,
+  ceiling: bigint,
+): boolean {
+  const channelState = extra?.channelState as
+    | { chargedCumulativeAmount?: unknown }
+    | undefined;
+  const reported = channelState?.chargedCumulativeAmount;
+  if (reported === undefined) return true;
+  try {
+    return BigInt(String(reported)) <= ceiling;
+  } catch {
+    return false;
+  }
 }
 
 /**
- * Read the channel id out of a signed `batch-settlement` payload, for
- * `reconcileX402BatchSettlement`'s `channelIds`. Returns `undefined` for a
- * payload of any other scheme.
+ * What a signed `batch-settlement` payment authorized, and what a receipt for
+ * it must stay within. See `reconcileX402BatchSettlement`'s `bindings`.
+ */
+export interface X402BatchSettlementBinding {
+  /** Channel the voucher was signed against. */
+  channelId: string;
+  /** Cumulative ceiling the voucher authorized. */
+  maxClaimableAmount: string;
+}
+
+/**
+ * Read the reconciliation binding out of a signed `batch-settlement` payload.
+ * Returns `undefined` for a payload of any other scheme.
  *
  * Both payload shapes the scheme produces — the opening `deposit` and the
- * subsequent voucher-only one — carry it at `payload.voucher.channelId`.
+ * subsequent voucher-only one — carry it under `payload.voucher`.
  */
-export function getX402BatchSettlementChannelId(
+export function getX402BatchSettlementBinding(
   payload: X402PaymentPayload,
-): string | undefined {
+): X402BatchSettlementBinding | undefined {
   const inner = (payload as { payload?: unknown }).payload;
   if (typeof inner !== 'object' || inner === null) return undefined;
   const voucher = (inner as { voucher?: unknown }).voucher;
   if (typeof voucher !== 'object' || voucher === null) return undefined;
-  const id = (voucher as { channelId?: unknown }).channelId;
-  return isCanonicalChannelId(id) ? id : undefined;
+  const { channelId, maxClaimableAmount } = voucher as {
+    channelId?: unknown;
+    maxClaimableAmount?: unknown;
+  };
+  if (!isCanonicalChannelId(channelId)) return undefined;
+  if (typeof maxClaimableAmount !== 'string') return undefined;
+  return { channelId, maxClaimableAmount };
 }

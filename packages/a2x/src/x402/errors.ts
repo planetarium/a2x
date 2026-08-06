@@ -104,16 +104,40 @@ export class X402ReconciliationError extends X402Error {
   readonly channelId: string;
   /** The completed task, so catching this does not lose the paid-for result. */
   readonly task?: unknown;
+  /**
+   * Why the state did not move.
+   *
+   * `write-failed` — the storage backend threw. Usually transient.
+   *
+   * `no-matching-receipt` — the payment settled but nothing was written,
+   * because the merchant returned no receipt for the channel this payment
+   * signed, named a different channel, or reported a cumulative above the
+   * ceiling the voucher authorized. Unlike a write failure this can be the
+   * merchant misbehaving, not infrastructure.
+   */
+  readonly reason: 'write-failed' | 'no-matching-receipt';
 
-  constructor(channelId: string, task?: unknown, options?: { cause?: unknown }) {
+  constructor(
+    channelId: string,
+    task?: unknown,
+    options?: {
+      cause?: unknown;
+      reason?: 'write-failed' | 'no-matching-receipt';
+    },
+  ) {
+    const reason = options?.reason ?? 'write-failed';
     super(
-      `Settled a batch-settlement payment but failed to record the receipt for channel ${channelId}. ` +
+      (reason === 'no-matching-receipt'
+        ? `Settled a batch-settlement payment on channel ${channelId} but no usable receipt came back for it ` +
+          '(none returned, a different channel named, or a cumulative above what the voucher authorized). '
+        : `Settled a batch-settlement payment but failed to record the receipt for channel ${channelId}. `) +
         'Local channel state is now stale: the next payment on this channel will be rejected for a ' +
         'cumulative mismatch, or will open a fresh on-chain deposit. Repair the channel record before reusing it.',
     );
     this.name = 'X402ReconciliationError';
     this.channelId = channelId;
     this.task = task;
+    this.reason = reason;
     if (options && 'cause' in options) {
       (this as { cause?: unknown }).cause = options.cause;
     }
