@@ -42,6 +42,10 @@ a cent.
   cumulative at all is refused too, since it would write partially and leave
   the signing base unmoved. Read the binding off a signed payload with the new
   `getX402BatchSettlementBinding()`.
+- Successful reconciliation requires the receipt cumulative to equal the
+  voucher's signed ceiling. Upstream verify and settle establish that exact
+  value; accepting a lower one would let a stale historical receipt mask the
+  current exchange while the merchant retains the higher-value voucher.
 - A receipt that cannot be recorded — a storage failure, or a settled payment
   that came back with no usable receipt at all — raises the new
   `X402ReconciliationError`, carrying the channel id, the merchant's completed
@@ -67,7 +71,9 @@ twice: offers whose policy deposit exceeds the cap are filtered out before
 selection, and the amount actually sized at signing — including one a
 `depositStrategy` returned — is checked again before it is signed.
 
-Merchant-side wiring is documented rather than shipped: voucher accounting
-needs `@x402/core`'s server lifecycle, and redemption must be a singleton
-across replicas, so the guide shows injecting an `x402ResourceServer` as
-`X402Context`'s facilitator instead.
+Merchant-side wiring is documented rather than shipped: `X402Context` now
+recognizes the ordinary deposit and voucher payload shapes, while voucher
+accounting needs `@x402/core`'s server lifecycle, and redemption must be a
+singleton across replicas, so the guide shows injecting an `x402ResourceServer` as
+`X402Context`'s facilitator instead. V1 offering encoding rejects the V2-only
+scheme before persisting an unusable payment challenge.

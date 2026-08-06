@@ -9,6 +9,7 @@ import type { Message } from '../types/common.js';
 import {
   X402_ERROR_CODES,
   X402_EXTENSION_URI,
+  X402_FOUNDATION_EXTENSION_URI,
   X402_METADATA_KEYS,
   X402_PAYMENT_STATUS,
 } from '../x402/constants.js';
@@ -33,6 +34,16 @@ const ACCEPT: X402Accept = {
   payTo: '0x2222222222222222222222222222222222222222',
   resource: 'https://api.example.com/premium',
   description: 'Premium agent access',
+};
+
+const BATCH_ACCEPT: X402Accept = {
+  ...ACCEPT,
+  scheme: 'batch-settlement',
+  extra: {
+    name: 'USDC',
+    version: '2',
+    receiverAuthorizer: '0x3333333333333333333333333333333333333333',
+  },
 };
 
 function buildSubmittedMessage(overrides: {
@@ -72,6 +83,70 @@ function buildSubmittedMessage(overrides: {
 
 function buildPlainMessage(): Message {
   return { messageId: 'm0', role: 'user', parts: [{ text: 'hi' }] };
+}
+
+function buildBatchSubmittedMessage(
+  type: 'voucher' | 'deposit',
+  overrides: { omitVoucher?: boolean } = {},
+): Message {
+  const inner: Record<string, unknown> = {
+    type,
+    channelConfig: {
+      payer: '0x1234567890123456789012345678901234567890',
+      payerAuthorizer: '0x1234567890123456789012345678901234567890',
+      receiver: BATCH_ACCEPT.payTo,
+      receiverAuthorizer: BATCH_ACCEPT.extra!.receiverAuthorizer,
+      token: BATCH_ACCEPT.asset,
+      withdrawDelay: 3600,
+      salt: `0x${'00'.repeat(32)}`,
+    },
+    ...(!overrides.omitVoucher
+      ? {
+          voucher: {
+            channelId: `0x${'cd'.repeat(32)}`,
+            maxClaimableAmount: BATCH_ACCEPT.amount,
+            signature: '0xabc',
+          },
+        }
+      : {}),
+    ...(type === 'deposit'
+      ? {
+          deposit: {
+            amount: '50000',
+            authorization: {
+              erc3009Authorization: {
+                validAfter: '0',
+                validBefore: '9999999999',
+                salt: `0x${'11'.repeat(32)}`,
+                signature: '0xdef',
+              },
+            },
+          },
+        }
+      : {}),
+  };
+  const payload: X402PaymentPayload = {
+    x402Version: 2,
+    accepted: {
+      scheme: 'batch-settlement',
+      network: 'eip155:84532',
+      asset: BATCH_ACCEPT.asset,
+      amount: BATCH_ACCEPT.amount,
+      payTo: BATCH_ACCEPT.payTo,
+      maxTimeoutSeconds: 300,
+      extra: BATCH_ACCEPT.extra,
+    },
+    payload: inner,
+  };
+  return {
+    messageId: 'm-batch',
+    role: 'user',
+    parts: [],
+    metadata: {
+      [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.SUBMITTED,
+      [X402_METADATA_KEYS.PAYLOAD]: payload,
+    },
+  };
 }
 
 function makeMockFacilitator(): X402Facilitator {
@@ -312,6 +387,65 @@ describe('X402Context.classify', () => {
     if (result.kind === 'valid') {
       expect(result.requirement.payTo).toBe(ACCEPT.payTo);
     }
+  });
+
+  it.each(['voucher', 'deposit'] as const)(
+    'accepts a well-formed batch-settlement %s before resource-server verification',
+    async (type) => {
+      const ctx = new X402Context({
+        x402Version: 2,
+        facilitator: makeMockFacilitator(),
+      });
+      await drain(
+        ctx.requestPayment(
+          {
+            taskId: 't1',
+            activatedExtensions: [X402_FOUNDATION_EXTENSION_URI],
+          },
+          { accepts: [BATCH_ACCEPT] },
+        ),
+      );
+      const result = await ctx.classify({
+        taskId: 't1',
+        message: buildBatchSubmittedMessage(type),
+      });
+      expect(result.kind).toBe('valid');
+    },
+  );
+
+  it('rejects a malformed batch-settlement payload before verification', async () => {
+    const ctx = new X402Context({
+      x402Version: 2,
+      facilitator: makeMockFacilitator(),
+    });
+    await drain(
+      ctx.requestPayment(
+        {
+          taskId: 't1',
+          activatedExtensions: [X402_FOUNDATION_EXTENSION_URI],
+        },
+        { accepts: [BATCH_ACCEPT] },
+      ),
+    );
+    const result = await ctx.classify({
+      taskId: 't1',
+      message: buildBatchSubmittedMessage('voucher', { omitVoucher: true }),
+    });
+    expect(result.kind).toBe('invalid-shape');
+  });
+
+  it('rejects a batch-settlement offering under V1 before storing it', async () => {
+    const ctx = new X402Context({ facilitator: makeMockFacilitator() });
+    const request = async () => {
+      await drain(
+        ctx.requestPayment(
+          { taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] },
+          { accepts: [BATCH_ACCEPT] },
+        ),
+      );
+    };
+    await expect(request()).rejects.toThrow(/x402 V2 only/);
+    expect(await ctx.store.get('t1')).toBeUndefined();
   });
 
   it('throws when ctx.taskId is missing on a submitted message', async () => {

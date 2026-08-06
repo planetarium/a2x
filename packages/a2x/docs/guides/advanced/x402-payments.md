@@ -482,10 +482,11 @@ That matters when settlement latency sits in the response critical path, and whe
 
 **The SDK does not own the batch lifecycle**, deliberately. Voucher accounting is not bookkeeping that fits behind `X402Context.settle()`: it needs cap enforcement against the payer's signed ceiling, a compare-and-set on the cumulative amount, and a request reservation established during *verify* — all of which live in `@x402/evm`'s **server-side** scheme as `@x402/core` lifecycle hooks. Redemption is a separate background concern that must be a singleton across horizontally-scaled deployments, which is not something a library should start on your behalf.
 
-The seam is `facilitator`. `X402Context` accepts any `{ verify, settle }` pair, and `@x402/core`'s `x402ResourceServer` — which knows how to drive those hooks — exposes a signature-compatible one:
+The seam is `facilitator`. `X402Context` accepts any `{ verify, settle }` pair, and `@x402/core`'s `x402ResourceServer` knows how to drive those hooks. Because the resource server is V2-only while the SDK facilitator type covers both x402 versions, narrow the already-V2 context at the adapter boundary:
 
 ```ts
 import { x402ResourceServer, HTTPFacilitatorClient } from '@x402/core/server';
+import type { PaymentPayload, PaymentRequirements } from '@x402/core/types';
 import { BatchSettlementEvmScheme } from '@x402/evm/batch-settlement/server';
 import { RedisChannelStorage } from '@x402/evm/batch-settlement/server/redis-storage';
 import { X402Context } from '@a2x/sdk/x402';
@@ -504,13 +505,29 @@ await resourceServer.initialize();
 const x402 = new X402Context({
   x402Version: 2,
   facilitator: {
-    verify: (payload, requirement) => resourceServer.verifyPayment(payload, requirement),
-    settle: (payload, requirement) => resourceServer.settlePayment(payload, requirement),
+    verify: (payload, requirement) => {
+      if (payload.x402Version !== 2 || !('amount' in requirement)) {
+        throw new Error('batch-settlement requires x402 V2');
+      }
+      return resourceServer.verifyPayment(
+        payload as unknown as PaymentPayload,
+        requirement as unknown as PaymentRequirements,
+      );
+    },
+    settle: (payload, requirement) => {
+      if (payload.x402Version !== 2 || !('amount' in requirement)) {
+        throw new Error('batch-settlement requires x402 V2');
+      }
+      return resourceServer.settlePayment(
+        payload as unknown as PaymentPayload,
+        requirement as unknown as PaymentRequirements,
+      );
+    },
   },
 });
 ```
 
-Your agent's `run()` is then the ordinary pipeline — `classify` → `verify` → `settle` → `completedEvent` — with no batch-specific code. `settle` returns as soon as the voucher is recorded; nothing waits on a block.
+Your agent's `run()` is then the ordinary pipeline — `classify` → `verify` → `settle` → `completedEvent` — with no batch-specific code. `X402Context` recognizes both the opening deposit and subsequent voucher-only payload shapes; `settle` returns as soon as the voucher is recorded, so nothing waits on a block.
 
 Redemption stays yours, on whatever cadence suits your economics:
 
@@ -537,6 +554,9 @@ const ACCEPTS = [{
   },
 }];
 ```
+
+`batch-settlement` is V2-only. Configuring this offering on an
+`x402Version: 1` context throws before the offering is stored or emitted.
 
 #### Receipts have no transaction hash
 
@@ -607,7 +627,7 @@ The second check exists because a `depositStrategy` computes its own figure per 
 `A2XClient` does it for you on both the blocking and streaming paths, bound to **what that exchange actually signed**: the channel, and the cumulative ceiling its voucher authorized. Both halves are a security boundary, not an optimization.
 
 - **The channel id.** Ids derive from public inputs, so the one you share with any given merchant is computable by anyone — and a receipt names the channel it updates. Without this, a merchant you *did* pay could name a channel belonging to a **different** merchant and overwrite its cumulative, bricking it or forcing an invalid top-up.
-- **The ceiling.** Without it, the same merchant can inflate its *own* channel instead: report 5000 back after a 1000 voucher, and your next 1000 call signs a 6000 cumulative plus a top-up to cover it — letting the merchant claim far more than the calls cost. A receipt reporting more than the voucher authorized is refused. Less is accepted: your local base may legitimately have been ahead of the merchant's. A receipt with **no** cumulative at all is also refused — it would perform a partial write that leaves the signing base where it was, which for a spent voucher is a desync rather than a no-op.
+- **The ceiling.** Without it, the same merchant can inflate its *own* channel instead: report 5000 back after a 1000 voucher, and your next 1000 call signs a 6000 cumulative plus a top-up to cover it — letting the merchant claim far more than the calls cost. The receipt must report exactly what the voucher authorized: upstream verify requires that ceiling to equal the prior cumulative plus the request amount, and settle advances by the same amount. A smaller value is stale and could let an old receipt mask this exchange while the merchant retains the higher-value voucher; a larger value was never authorized. A receipt with **no** cumulative at all is also refused — it would perform a partial write that leaves the signing base where it was, which for a spent voucher is a desync rather than a no-op.
 - **The deposit.** A merchant reporting `balance: "0"` every round makes the scheme treat the channel as unfunded and sign a fresh deposit every round. `maxAmount` does not stop that — it caps each deposit individually, not their aggregate. Within a payment flow the channel balance only ever goes up, by exactly the deposits you sign, so a reported balance below `stored + this deposit` is one the merchant could not have reached honestly, and it is **replaced** by that floor. (Replaced, not dropped: `@x402/evm` merges onto the stored record and writes `balance` only when the receipt still carries it, so removing the key would leave the deposit you just signed unrecorded — the same repeat-funding loop. The substituted value is not merchant input; it is your durable prior state plus the deposit you signed.) A balance *above* the floor is kept: overstating can only make you under-fund a later call, which costs you nothing.
 
 Two cases `A2XClient` does not cover, where you reconcile yourself — and must supply the same binding:
@@ -632,7 +652,7 @@ if (applied.length === 0) {
 }
 ```
 
-Skip reconciliation and the payer's cumulative amount never advances: every subsequent call re-signs an identical voucher against a channel it still believes is unfunded — and therefore signs a **fresh deposit** each time. Receipts from other schemes, malformed ones, any naming a channel outside `bindings`, and any exceeding the signed ceiling are ignored; a receipt that fails to apply raises an `AggregateError` after the others have been tried, so one bad entry cannot drop a good one.
+Skip reconciliation and the payer's cumulative amount never advances: every subsequent call re-signs an identical voucher against a channel it still believes is unfunded — and therefore signs a **fresh deposit** each time. Receipts from other schemes, malformed ones, any naming a channel outside `bindings`, and any whose cumulative differs from the signed ceiling are ignored; a receipt that fails to apply raises an `AggregateError` after the others have been tried, so one bad entry cannot drop a good one.
 
 **An empty `applied` after a settled payment is a failure, not a no-op.** The voucher is spent either way, so "nothing to record" and "the merchant withheld or falsified the receipt" have identical consequences: local state did not move, and the next call re-signs or re-deposits. `A2XClient` raises `X402ReconciliationError` with `reason: 'no-matching-receipt'` in that case; a caller driving the helper directly should treat it the same way.
 

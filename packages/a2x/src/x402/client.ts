@@ -596,7 +596,7 @@ export function defaultSelect(
  * signs a **fresh deposit** each time.
  *
  * Receipts from other schemes, malformed ones, any naming a channel outside
- * `bindings`, and any reporting a cumulative above what the matching voucher
+ * `bindings`, and any whose cumulative differs from what the matching voucher
  * authorized are all ignored, so passing a whole task's receipts is safe:
  *
  * ```ts
@@ -668,7 +668,8 @@ export async function reconcileX402BatchSettlement(
     if (id === undefined) continue;
     const bound = allowed.get(id.toLowerCase());
     if (bound === undefined) continue;
-    // A settled payment must advance the signing base. A receipt carrying only
+    // A settled payment must advance the signing base to exactly what this
+    // voucher authorized. A receipt carrying only
     // `balance` / `totalClaimed` would let the peer perform a partial write
     // that leaves `chargedCumulativeAmount` untouched — and counting that as
     // applied would mask exactly the desync `applied.length === 0` exists to
@@ -762,10 +763,13 @@ function channelIdOf(
  * then re-signs the same voucher next call. For a settled payment that is a
  * desync, not a valid no-op, so such a receipt is refused rather than counted.
  *
- * The merchant may charge **at most** the ceiling the payer signed — its own
- * server aborts with `ErrChargeExceedsSignedCumulative` otherwise. Whether a
- * receipt is newer than the local state is checked immediately before the
- * storage write, where the current state is available.
+ * A successful upstream settlement reports exactly the ceiling the payer
+ * signed: verify requires `maxClaimableAmount === current + request amount`,
+ * and settle advances the cumulative by that same request amount. Accepting a
+ * smaller figure would let an old receipt satisfy a new exchange, or let a
+ * merchant retain a higher-value voucher while keeping the payer's signing
+ * base stale. Whether an equal receipt is an idempotent retry is checked
+ * immediately before the storage write, where the current state is available.
  */
 function parseCumulative(
   extra: Record<string, unknown> | undefined,
@@ -779,7 +783,7 @@ function parseCumulative(
   if (typeof reported !== 'string' && typeof reported !== 'number') return undefined;
   try {
     const value = BigInt(String(reported));
-    return value >= 0n && value <= ceiling ? value : undefined;
+    return value >= 0n && value === ceiling ? value : undefined;
   } catch {
     return undefined;
   }

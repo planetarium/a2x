@@ -654,18 +654,35 @@ describe('reconcileX402BatchSettlement cumulative binding', () => {
     expect(captured.reconciled).toEqual([]);
   });
 
-  it('accepts a cumulative at or below the ceiling', async () => {
-    // A fresh storage record may accept a cumulative below the signed ceiling;
-    // the reconciliation loop still prevents it from rolling back an existing
-    // local cumulative.
-    for (const value of ['3000', '2000']) {
-      captured.reconciled = [];
-      const { applied } = await reconcileX402BatchSettlement(
-        [receiptWithCumulative(value)],
-        { storage: memoryChannelStorage(), bindings: binding },
-      );
-      expect(applied, `cumulative ${value}`).toEqual([CHANNEL]);
-    }
+  it('accepts a cumulative equal to the signed ceiling', async () => {
+    captured.reconciled = [];
+    const { applied } = await reconcileX402BatchSettlement(
+      [receiptWithCumulative('3000')],
+      { storage: memoryChannelStorage(), bindings: binding },
+    );
+    expect(applied).toEqual([CHANNEL]);
+  });
+
+  it('refuses a cumulative below the signed ceiling, including a stale local value', async () => {
+    // Upstream verify requires signedMax === current + request amount and
+    // settle advances by that same amount, so success reports the ceiling
+    // exactly. Accepting an older value would let a historical receipt mask
+    // this exchange while the merchant retains the higher-value voucher.
+    const storage = memoryChannelStorage();
+    await storage.set(CHANNEL.toLowerCase(), {
+      chargedCumulativeAmount: '1000',
+      balance: '5000',
+    });
+    captured.reconciled = [];
+    const { applied } = await reconcileX402BatchSettlement(
+      [receiptWithCumulative('1000')],
+      { storage, bindings: binding },
+    );
+    expect(applied).toEqual([]);
+    expect(captured.reconciled).toEqual([]);
+    expect(await storage.get(CHANNEL.toLowerCase())).toMatchObject({
+      chargedCumulativeAmount: '1000',
+    });
   });
 
   it('refuses an unparseable cumulative', async () => {
