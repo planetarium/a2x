@@ -6,6 +6,7 @@ import {
   X402_PAYMENT_STATUS,
 } from '../x402/constants.js';
 import {
+  getX402BatchSettlementChannelId,
   reconcileX402BatchSettlement,
   signX402Payment,
   type X402ClientChannelStorage,
@@ -414,6 +415,10 @@ describe('signX402Payment batch-settlement selection policy', () => {
 });
 
 describe('reconcileX402BatchSettlement', () => {
+  const CHANNEL_A = `0x${'cd'.repeat(32)}`;
+  const CHANNEL_B = `0x${'ef'.repeat(32)}`;
+  const FOREIGN = `0x${'ab'.repeat(32)}`;
+
   const channelReceipt: X402SettleResponse = {
     success: true,
     // A successful voucher settlement carries no transaction hash — the
@@ -422,7 +427,7 @@ describe('reconcileX402BatchSettlement', () => {
     network: 'eip155:84532',
     extra: {
       channelState: {
-        channelId: `0x${'cd'.repeat(32)}`,
+        channelId: CHANNEL_A,
         balance: '15000',
         totalClaimed: '0',
         chargedCumulativeAmount: '3000',
@@ -433,10 +438,42 @@ describe('reconcileX402BatchSettlement', () => {
   it('folds a voucher receipt into the caller storage', async () => {
     captured.reconciled = [];
     const storage = memoryChannelStorage();
-    await reconcileX402BatchSettlement([channelReceipt], { storage });
+    await reconcileX402BatchSettlement([channelReceipt], {
+      storage,
+      channelIds: CHANNEL_A,
+    });
     expect(captured.reconciled).toHaveLength(1);
     expect(captured.reconciled[0]!.storage).toBe(storage);
     expect(captured.reconciled[0]!.settle).toBe(channelReceipt);
+  });
+
+  it('ignores a receipt naming a channel outside channelIds', async () => {
+    // Channel ids are computable from public inputs, so a merchant this payer
+    // *did* pay could otherwise name a channel belonging to a different
+    // merchant and overwrite its cumulative — bricking it, or forcing an
+    // invalid top-up.
+    captured.reconciled = [];
+    await reconcileX402BatchSettlement(
+      [{ ...channelReceipt, extra: { channelState: { channelId: FOREIGN } } }],
+      { storage: memoryChannelStorage(), channelIds: CHANNEL_A },
+    );
+    expect(captured.reconciled).toEqual([]);
+  });
+
+  it('matches the allowlist case-insensitively', async () => {
+    // The peer lowercases the storage key, so a checksummed id from the
+    // merchant must still match a lowercase one the payer signed.
+    captured.reconciled = [];
+    await reconcileX402BatchSettlement(
+      [
+        {
+          ...channelReceipt,
+          extra: { channelState: { channelId: CHANNEL_A.toUpperCase().replace('0X', '0x') } },
+        },
+      ],
+      { storage: memoryChannelStorage(), channelIds: CHANNEL_A },
+    );
+    expect(captured.reconciled).toHaveLength(1);
   });
 
   it('ignores receipts from other schemes without loading the peer', async () => {
@@ -446,7 +483,7 @@ describe('reconcileX402BatchSettlement', () => {
     // make every non-batch payer pay for a module it never uses.
     await reconcileX402BatchSettlement(
       [{ success: true, transaction: '0xabc', network: 'eip155:84532' }],
-      { storage: memoryChannelStorage() },
+      { storage: memoryChannelStorage(), channelIds: CHANNEL_A },
     );
     expect(captured.reconciled).toEqual([]);
   });
@@ -455,15 +492,16 @@ describe('reconcileX402BatchSettlement', () => {
     captured.reconciled = [];
     await reconcileX402BatchSettlement(
       [{ ...channelReceipt, success: false, errorReason: 'CHANNEL_BUSY' }],
-      { storage: memoryChannelStorage() },
+      { storage: memoryChannelStorage(), channelIds: CHANNEL_A },
     );
     expect(captured.reconciled).toEqual([]);
   });
 
-  it('screens out a channelState with no usable channelId', async () => {
+  it('screens out a channelState with no canonical channelId', async () => {
     // The peer keys storage on `channelState.channelId.toLowerCase()` with no
     // guard of its own, so an unusable id would surface as a bare TypeError
-    // thrown from inside `@x402/evm`.
+    // thrown from inside `@x402/evm`. Requiring the canonical bytes32 form
+    // also stops a near-miss id becoming a second, orphaned storage key.
     captured.reconciled = [];
     await reconcileX402BatchSettlement(
       [
@@ -471,8 +509,12 @@ describe('reconcileX402BatchSettlement', () => {
         { ...channelReceipt, extra: { channelState: { channelId: 123 } } },
         { ...channelReceipt, extra: { channelState: { channelId: '' } } },
         { ...channelReceipt, extra: { channelState: null } },
+        // Right length, missing 0x prefix.
+        { ...channelReceipt, extra: { channelState: { channelId: 'cd'.repeat(32) } } },
+        // Truncated.
+        { ...channelReceipt, extra: { channelState: { channelId: '0xcd' } } },
       ],
-      { storage: memoryChannelStorage() },
+      { storage: memoryChannelStorage(), channelIds: CHANNEL_A },
     );
     expect(captured.reconciled).toEqual([]);
   });
@@ -483,38 +525,62 @@ describe('reconcileX402BatchSettlement', () => {
     // leaves it desynced, and `@x402/evm` cannot self-heal that without a
     // chain-reading signer.
     captured.reconciled = [];
-    captured.failOnChannelId = `0x${'99'.repeat(32)}`;
+    captured.failOnChannelId = CHANNEL_B;
     const poisoned: X402SettleResponse = {
       ...channelReceipt,
-      extra: { channelState: { channelId: captured.failOnChannelId } },
+      extra: { channelState: { channelId: CHANNEL_B } },
     };
     const storage = memoryChannelStorage();
     await expect(
-      reconcileX402BatchSettlement([poisoned, channelReceipt], { storage }),
+      reconcileX402BatchSettlement([poisoned, channelReceipt], {
+        storage,
+        channelIds: [CHANNEL_A, CHANNEL_B],
+      }),
     ).rejects.toThrow(AggregateError);
     // The valid receipt after the failing one was still processed.
     expect(captured.reconciled.map((r) => r.settle)).toEqual([channelReceipt]);
     captured.failOnChannelId = undefined;
   });
 
-  it('processes every channel receipt on a task, in order', async () => {
+  it('processes every allowed channel receipt on a task, in order', async () => {
     captured.reconciled = [];
     const second: X402SettleResponse = {
       ...channelReceipt,
       extra: {
-        channelState: {
-          channelId: `0x${'ef'.repeat(32)}`,
-          chargedCumulativeAmount: '6000',
-        },
+        channelState: { channelId: CHANNEL_B, chargedCumulativeAmount: '6000' },
       },
     };
     await reconcileX402BatchSettlement([channelReceipt, second], {
       storage: memoryChannelStorage(),
+      channelIds: [CHANNEL_A, CHANNEL_B],
     });
     expect(captured.reconciled.map((r) => r.settle)).toEqual([
       channelReceipt,
       second,
     ]);
+  });
+});
+
+describe('getX402BatchSettlementChannelId', () => {
+  it('reads the channel id off both payload shapes', () => {
+    const id = `0x${'cd'.repeat(32)}`;
+    for (const type of ['deposit', 'voucher']) {
+      expect(
+        getX402BatchSettlementChannelId({
+          x402Version: 2,
+          payload: { type, voucher: { channelId: id } },
+        } as unknown as Parameters<typeof getX402BatchSettlementChannelId>[0]),
+      ).toBe(id);
+    }
+  });
+
+  it('returns undefined for a payload of another scheme', () => {
+    expect(
+      getX402BatchSettlementChannelId({
+        x402Version: 2,
+        payload: { authorization: { from: '0x1' }, signature: '0x2' },
+      } as unknown as Parameters<typeof getX402BatchSettlementChannelId>[0]),
+    ).toBeUndefined();
   });
 });
 

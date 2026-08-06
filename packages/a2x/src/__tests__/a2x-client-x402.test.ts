@@ -23,9 +23,11 @@ import {
   X402_METADATA_KEYS,
   X402_PAYMENT_STATUS,
 } from '../x402/constants.js';
+import type { Task } from '../types/task.js';
 import {
   X402NoSupportedRequirementError,
   X402PaymentFailedError,
+  X402ReconciliationError,
 } from '../x402/errors.js';
 
 const TEST_ACCOUNT = privateKeyToAccount(
@@ -619,7 +621,25 @@ describe('A2XClient.sendMessage — native x402 dance', () => {
 });
 
 describe('A2XClient.sendMessage — batch-settlement', () => {
-  const CHANNEL_ID = `0x${'cd'.repeat(32)}`;
+  /** A channel id the payer never signed, used to test the binding. */
+  const FOREIGN_CHANNEL_ID = `0x${'cd'.repeat(32)}`;
+
+  /**
+   * Channel id out of the payload the client submitted, as a real merchant
+   * would echo it. Reconciliation is bound to the channel the payer actually
+   * signed, so the fixture cannot invent one.
+   */
+  function signedChannelId(
+    rpcRequests: Array<{ body: unknown }>,
+  ): string {
+    const submission = rpcRequests.at(-1)!.body as {
+      params: { message: { metadata: Record<string, unknown> } };
+    };
+    const payload = submission.params.message.metadata[
+      X402_METADATA_KEYS.PAYLOAD
+    ] as { payload: { voucher: { channelId: string } } };
+    return payload.payload.voucher.channelId;
+  }
 
   /** A V2 `payment-required` whose only option is a `batch-settlement` offer. */
   function batchRequiredTask(): unknown {
@@ -665,7 +685,7 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
   }
 
   /** Terminal task carrying the merchant's post-voucher channel snapshot. */
-  function completedTaskWithChannelReceipt(): unknown {
+  function completedTaskWithChannelReceipt(channelId: string): unknown {
     return {
       kind: 'task',
       id: 't1',
@@ -687,7 +707,7 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
                 network: 'eip155:84532',
                 extra: {
                   channelState: {
-                    channelId: CHANNEL_ID,
+                    channelId,
                     balance: '5000',
                     totalClaimed: '0',
                     chargedCumulativeAmount: '1000',
@@ -721,10 +741,15 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
 
   it('signs a batch-settlement offer and folds the receipt back into channel storage', async () => {
     const { channels, storage } = channelStorage();
+    // The reply thunk runs after the submission is recorded, so it can echo
+    // the channel the client actually signed — `recorded` is bound to the
+    // live array below before any request is made.
+    let recorded: Array<{ body: unknown }> = [];
     const { fetch, rpcRequests } = scriptedFetch([
       () => jsonRpcOk(batchRequiredTask()),
-      () => jsonRpcOk(completedTaskWithChannelReceipt()),
+      () => jsonRpcOk(completedTaskWithChannelReceipt(signedChannelId(recorded))),
     ]);
+    recorded = rpcRequests;
     const client = new A2XClient(AGENT_URL, {
       fetch,
       x402: {
@@ -760,7 +785,7 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     // The reconcile step is what makes the *next* call a cheap voucher instead
     // of a second deposit — without it the payer re-funds the same channel
     // forever, since a LocalAccount cannot read the channel back off-chain.
-    expect(channels.get(CHANNEL_ID.toLowerCase())).toEqual({
+    expect(channels.get(signedChannelId(rpcRequests).toLowerCase())).toEqual({
       balance: '5000',
       totalClaimed: '0',
       chargedCumulativeAmount: '1000',
@@ -809,44 +834,39 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     const required = batchRequiredTask() as {
       status: { message: { metadata: Record<string, unknown> } };
     };
-    const completed = completedTaskWithChannelReceipt() as {
-      status: { message: { metadata: Record<string, unknown> } };
-    };
-    const streams = [
-      sse([
-        {
-          kind: 'status-update',
-          taskId: 't1',
-          contextId: 'c1',
-          status: {
-            state: 'input-required',
-            timestamp: new Date().toISOString(),
-            message: required.status.message,
-          },
-          final: false,
-        },
-      ]),
-      sse([
-        {
-          kind: 'status-update',
-          taskId: 't1',
-          contextId: 'c1',
-          status: {
-            state: 'completed',
-            timestamp: new Date().toISOString(),
-            message: completed.status.message,
-          },
-          final: true,
-        },
-      ]),
-    ];
+    const statusEvent = (
+      state: string,
+      message: unknown,
+      final: boolean,
+    ) => ({
+      kind: 'status-update',
+      taskId: 't1',
+      contextId: 'c1',
+      status: { state, timestamp: new Date().toISOString(), message },
+      final,
+    });
+
     let call = 0;
-    const fetch = (async (input: RequestInfo | URL): Promise<Response> => {
+    const recorded: Array<{ body: unknown }> = [];
+    const fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
       const url = typeof input === 'string' ? input : input.toString();
       if (url.endsWith('/agent-card.json') || url.endsWith('/agent.json')) {
         return agentCardResponse();
       }
-      return streams[call++]!;
+      recorded.push({ body: init?.body ? JSON.parse(init.body as string) : undefined });
+      if (call++ === 0) {
+        return sse([
+          statusEvent('input-required', required.status.message, false),
+        ]);
+      }
+      // Echo the channel the client actually signed, as a merchant would.
+      const completed = completedTaskWithChannelReceipt(
+        signedChannelId(recorded),
+      ) as { status: { message: unknown } };
+      return sse([statusEvent('completed', completed.status.message, true)]);
     }) as unknown as typeof globalThis.fetch;
 
     const client = new A2XClient(AGENT_URL, {
@@ -865,7 +885,7 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
       if ('status' in event && event.status?.state === 'completed') break;
     }
 
-    expect(channels.get(CHANNEL_ID.toLowerCase())).toEqual({
+    expect(channels.get(signedChannelId(recorded).toLowerCase())).toEqual({
       balance: '5000',
       totalClaimed: '0',
       chargedCumulativeAmount: '1000',
@@ -879,7 +899,7 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     // never paid would let it plant a bogus cumulative and brick that channel.
     const { channels, storage } = channelStorage();
     const { fetch } = scriptedFetch([
-      () => jsonRpcOk(completedTaskWithChannelReceipt()),
+      () => jsonRpcOk(completedTaskWithChannelReceipt(FOREIGN_CHANNEL_ID)),
     ]);
     const client = new A2XClient(AGENT_URL, {
       fetch,
@@ -894,6 +914,107 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     });
     expect(task.status.state).toBe('completed');
     expect(channels.size).toBe(0);
+  });
+
+  it('ignores a receipt naming a channel this exchange did not sign', async () => {
+    // The gate above stops agents we never paid. This is the other half: a
+    // merchant we *did* pay must not be able to name someone else's channel —
+    // ids are computable from public inputs, so it could brick a channel this
+    // payer shares with a different merchant, or force an invalid top-up.
+    const { channels, storage } = channelStorage();
+    const { fetch } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(completedTaskWithChannelReceipt(FOREIGN_CHANNEL_ID)),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    // The payment itself went through — only the foreign write is refused.
+    expect(task.status.state).toBe('completed');
+    expect(channels.size).toBe(0);
+  });
+
+  it('throws X402ReconciliationError carrying the task when storage fails', async () => {
+    // A lost receipt is a funds-bearing failure with no self-heal path, so it
+    // must not pass silently — but the caller still keeps the result it paid
+    // for, on the error.
+    const { storage } = channelStorage();
+    let recorded: Array<{ body: unknown }> = [];
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(completedTaskWithChannelReceipt(signedChannelId(recorded))),
+    ]);
+    recorded = rpcRequests;
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: {
+          storage: {
+            ...storage,
+            set: async () => {
+              throw new Error('durable store unavailable');
+            },
+          },
+        },
+        allowBatchSettlement: true,
+      },
+    });
+
+    const error = await client
+      .sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      })
+      .then(
+        () => undefined,
+        (e: unknown) => e as X402ReconciliationError,
+      );
+    expect(error).toBeInstanceOf(X402ReconciliationError);
+    expect(error!.channelId).toBe(signedChannelId(rpcRequests));
+    expect((error!.task as Task).status.state).toBe('completed');
+  });
+
+  it('routes a reconciliation failure to onReconcileError instead of throwing', async () => {
+    const { storage } = channelStorage();
+    let recorded: Array<{ body: unknown }> = [];
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(completedTaskWithChannelReceipt(signedChannelId(recorded))),
+    ]);
+    recorded = rpcRequests;
+    const seen: X402ReconciliationError[] = [];
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: {
+          storage: {
+            ...storage,
+            set: async () => {
+              throw new Error('durable store unavailable');
+            },
+          },
+        },
+        allowBatchSettlement: true,
+        onReconcileError: (error) => {
+          seen.push(error);
+        },
+      },
+    });
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    expect(task.status.state).toBe('completed');
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.channelId).toBe(signedChannelId(rpcRequests));
   });
 
   it('filters out an offer whose deposit would exceed maxAmount', async () => {
@@ -924,7 +1045,10 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     // an x402 one — and a cap that cannot compute the deposit must not report
     // it affordable. `@x402/evm` rejects any multiplier below 3 anyway, so
     // excluding the offer loses nothing that could have been signed.
-    for (const depositMultiplier of [5.5, 0, -1, NaN]) {
+    // 1 and 2 are integers but below `@x402/evm`'s floor of 3 — accepting
+    // them would pass the affordability filter only to fail during scheme
+    // construction with a generic error.
+    for (const depositMultiplier of [5.5, 0, -1, NaN, 1, 2]) {
       const { storage } = channelStorage();
       const { fetch } = scriptedFetch([() => jsonRpcOk(batchRequiredTask())]);
       const client = new A2XClient(AGENT_URL, {
@@ -965,14 +1089,16 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     ).rejects.toThrow(X402NoSupportedRequirementError);
   });
 
-  it('leaves the cap to a caller-supplied depositStrategy', async () => {
-    // The strategy sizes each deposit itself and may return any amount, so
-    // the SDK cannot predict it and does not pretend to.
+  it('admits a depositStrategy result that fits maxAmount', async () => {
+    // The offer filter cannot predict a strategy's figure, so the cap is
+    // enforced where the deposit is actually sized. 1000 fits a 1000 cap.
     const { storage } = channelStorage();
-    const { fetch } = scriptedFetch([
+    let recorded: Array<{ body: unknown }> = [];
+    const { fetch, rpcRequests } = scriptedFetch([
       () => jsonRpcOk(batchRequiredTask()),
-      () => jsonRpcOk(completedTaskWithChannelReceipt()),
+      () => jsonRpcOk(completedTaskWithChannelReceipt(signedChannelId(recorded))),
     ]);
+    recorded = rpcRequests;
     const client = new A2XClient(AGENT_URL, {
       fetch,
       x402: {
@@ -991,12 +1117,60 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     expect(task.status.state).toBe('completed');
   });
 
+  it('refuses a depositStrategy result that exceeds maxAmount', async () => {
+    // Without this the strategy would slip past a cap the option documents as
+    // always enforced, signing an authorization larger than the wallet agreed
+    // to. The offer filter cannot catch it — only the sizing site can.
+    const { storage } = channelStorage();
+    const { fetch } = scriptedFetch([() => jsonRpcOk(batchRequiredTask())]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: {
+          storage,
+          depositStrategy: () => '999999',
+        },
+        allowBatchSettlement: true,
+        maxAmount: 1000n,
+      },
+    });
+    await expect(
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      }),
+    ).rejects.toThrow(/exceeds maxAmount/);
+  });
+
+  it('caps the policy-computed deposit a strategy defers to with undefined', async () => {
+    // `undefined` means "use the policy amount" — that is the value that
+    // would be signed, so it is checked too. 5 x 1000 over a 2000 cap.
+    const { storage } = channelStorage();
+    const { fetch } = scriptedFetch([() => jsonRpcOk(batchRequiredTask())]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage, depositStrategy: () => undefined },
+        allowBatchSettlement: true,
+        maxAmount: 2000n,
+      },
+    });
+    await expect(
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      }),
+    ).rejects.toThrow(/exceeds maxAmount/);
+  });
+
   it('admits the same offer once maxAmount covers the whole deposit', async () => {
     const { storage } = channelStorage();
-    const { fetch } = scriptedFetch([
+    let recorded: Array<{ body: unknown }> = [];
+    const { fetch, rpcRequests } = scriptedFetch([
       () => jsonRpcOk(batchRequiredTask()),
-      () => jsonRpcOk(completedTaskWithChannelReceipt()),
+      () => jsonRpcOk(completedTaskWithChannelReceipt(signedChannelId(recorded))),
     ]);
+    recorded = rpcRequests;
     const client = new A2XClient(AGENT_URL, {
       fetch,
       x402: {

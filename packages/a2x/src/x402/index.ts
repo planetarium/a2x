@@ -250,6 +250,7 @@ export {
   signX402Payment,
   rejectX402Payment,
   reconcileX402BatchSettlement,
+  getX402BatchSettlementChannelId,
   getX402PaymentRequirements,
   getX402PaymentExtensions,
   getX402Receipts,
@@ -273,4 +274,5 @@ export {
   X402NoSupportedRequirementError,
   X402InvalidVersionError,
   X402PeerMissingError,
+  X402ReconciliationError,
 } from './errors.js';

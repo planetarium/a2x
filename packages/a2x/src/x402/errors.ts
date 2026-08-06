@@ -83,6 +83,44 @@ export class X402PeerMissingError extends X402Error {
 }
 
 /**
+ * Thrown when a `batch-settlement` payment settled but its receipt could not
+ * be folded back into channel storage.
+ *
+ * This is a funds-bearing failure, not a bookkeeping one. The merchant
+ * requires the next voucher's cumulative to equal exactly `charged + amount`,
+ * and `@x402/evm`'s corrective-recovery path needs a signer with
+ * `readContract` — which a viem `LocalAccount` does not have. So a channel
+ * whose receipt was lost stays desynced until its storage is repaired out of
+ * band, and the next call can sign a **fresh on-chain deposit**. Continuing
+ * silently would deny the operator the one chance to quarantine the channel
+ * before that happens.
+ *
+ * `task` carries the merchant's completed task, so a caller that catches this
+ * still has the result it paid for. Configure `A2XClientX402Options`'
+ * `onReconcileError` to record and continue instead of throwing.
+ */
+export class X402ReconciliationError extends X402Error {
+  /** Channel whose local state is now stale. */
+  readonly channelId: string;
+  /** The completed task, so catching this does not lose the paid-for result. */
+  readonly task?: unknown;
+
+  constructor(channelId: string, task?: unknown, options?: { cause?: unknown }) {
+    super(
+      `Settled a batch-settlement payment but failed to record the receipt for channel ${channelId}. ` +
+        'Local channel state is now stale: the next payment on this channel will be rejected for a ' +
+        'cumulative mismatch, or will open a fresh on-chain deposit. Repair the channel record before reusing it.',
+    );
+    this.name = 'X402ReconciliationError';
+    this.channelId = channelId;
+    this.task = task;
+    if (options && 'cause' in options) {
+      (this as { cause?: unknown }).cause = options.cause;
+    }
+  }
+}
+
+/**
  * Thrown when the merchant claims an `x402Version` the SDK can't speak.
  * a2x supports x402Version 1 and 2. The wire `code` matches the spec's
  * `invalid_x402_version` token verbatim — a2a-x402 v0.2 §9.1 doesn't

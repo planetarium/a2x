@@ -593,27 +593,71 @@ batchSettlement: {
 },
 ```
 
-`maxAmount` bounds the deposit too, not just the per-request amount — an offer whose `depositMultiplier x amount` exceeds the cap is filtered out before selection, surfacing `X402NoSupportedRequirementError`. Since the multiplier floor is 3, a `maxAmount` under 3x the per-call price can never admit a `batch-settlement` offer through `depositPolicy` alone; use `depositStrategy` if you need to size below that, which also takes the deposit out of the SDK's reach for capping.
+`maxAmount` bounds the **deposit**, not just the per-request amount, and it is enforced in both places the deposit can be decided:
+
+1. **Before selection** — an offer whose `depositMultiplier x amount` exceeds the cap is filtered out, surfacing `X402NoSupportedRequirementError`. A multiplier outside `@x402/evm`'s accepted range (integers ≥ 3) fails closed here rather than being trusted.
+2. **At signing** — the amount actually sized for this deposit is checked again before it is signed, including one a `depositStrategy` returned and the policy amount a strategy defers to with `undefined`. Exceeding the cap throws rather than silently authorizing.
+
+The second check exists because a `depositStrategy` computes its own figure per deposit, which no static filter can predict; without it the strategy would slip past a cap the option documents as always enforced. Note the multiplier floor of 3 means a `maxAmount` below 3x the per-call price can never admit a `batch-settlement` offer via `depositPolicy` alone — use `depositStrategy` to size under that.
 
 #### Reconciliation is mandatory
 
 `@x402/evm` normally advances the payer's channel state from its own HTTP client's `onPaymentResponse` hook, reading the `PAYMENT-RESPONSE` header. **a2x carries payments over A2A task metadata and never runs that hook**, so the step is explicit.
 
-`A2XClient` does it for you on both the blocking and streaming paths — but only for an exchange it actually paid with a `batch-settlement` voucher. That gate is a security boundary, not an optimization: the storage key is the *merchant-supplied* `channelState.channelId`, and channel ids derive from public inputs, so any agent could compute the one you share with a different merchant. Folding receipts from every response would let an agent you merely messaged plant a bogus cumulative for someone else's channel.
+`A2XClient` does it for you on both the blocking and streaming paths, bound to **the channel that exchange actually signed a voucher for**. That binding is a security boundary, not an optimization. Channel ids derive from public inputs, so the id you share with any given merchant is computable by anyone — and a receipt names the channel it updates. Without the binding, a merchant you *did* pay could name a channel belonging to a **different** merchant and overwrite its cumulative, bricking it or forcing an invalid top-up.
 
-Two cases it therefore does not cover, where you must reconcile yourself:
+Two cases `A2XClient` therefore does not cover, where you reconcile yourself — and where you must supply the same binding:
 
 ```ts
-import { reconcileX402BatchSettlement, getX402Receipts } from '@a2x/sdk/x402';
+import {
+  reconcileX402BatchSettlement,
+  getX402BatchSettlementChannelId,
+  getX402Receipts,
+} from '@a2x/sdk/x402';
 
 // (a) You drove the dance manually with `signX402Payment`.
 // (b) The receipt reached you via `getTask` rather than the send that paid.
-await reconcileX402BatchSettlement(getX402Receipts(task), { storage: myChannelStorage });
+const signed = await signX402Payment(task, { signer, batchSettlement });
+// …resubmit with `signed.metadata`, then on the terminal task:
+await reconcileX402BatchSettlement(getX402Receipts(final), {
+  storage: myChannelStorage,
+  channelIds: getX402BatchSettlementChannelId(signed.payload)!,
+});
 ```
 
-Skip it and the payer's cumulative amount never advances: every subsequent call re-signs an identical voucher against a channel it still believes is unfunded — and therefore signs a **fresh deposit** each time. Receipts from other schemes, and malformed ones, are ignored; a receipt that fails to apply raises an `AggregateError` after the others have been tried, so one bad entry cannot drop a good one.
+Skip reconciliation and the payer's cumulative amount never advances: every subsequent call re-signs an identical voucher against a channel it still believes is unfunded — and therefore signs a **fresh deposit** each time. Receipts from other schemes, malformed ones, and any naming a channel outside `channelIds` are ignored; a receipt that fails to apply raises an `AggregateError` after the others have been tried, so one bad entry cannot drop a good one.
 
-**A missed receipt does not self-heal.** The merchant requires the next voucher's cumulative to equal exactly `charged + amount`, and `@x402/evm`'s corrective-recovery path needs a signer with `readContract`, which a viem `LocalAccount` does not have. A payer that loses a receipt stays desynced until its storage is repaired out of band. `A2XClient` deliberately does not fail the task over a reconcile error — the work is done and the voucher is spent either way — so treat durable storage as the requirement it is.
+#### A missed receipt does not self-heal
+
+The merchant requires the next voucher's cumulative to equal exactly `charged + amount`, and `@x402/evm`'s corrective-recovery path needs a signer with `readContract`, which a viem `LocalAccount` does not have. A payer that loses a receipt stays desynced until its storage is repaired out of band, and the next call can sign a fresh on-chain deposit.
+
+Because that is a funds-bearing failure, `A2XClient` **throws** `X402ReconciliationError` rather than continuing quietly — an operator who is never told cannot quarantine the channel first. The error carries `channelId` and the merchant's completed `task`, so catching it still leaves you the result you paid for:
+
+```ts
+try {
+  const task = await client.sendMessage({ message });
+} catch (err) {
+  if (err instanceof X402ReconciliationError) {
+    await quarantineChannel(err.channelId);
+    return err.task as Task;   // the work was done and paid for
+  }
+  throw err;
+}
+```
+
+Prefer to record and continue? Supply a handler and nothing is thrown:
+
+```ts
+x402: {
+  signer,
+  batchSettlement: { storage },
+  allowBatchSettlement: true,
+  onReconcileError: async (err) => {
+    await pageOperator(err);
+    await quarantineChannel(err.channelId);
+  },
+}
+```
 
 #### Selection is opt-in, and separate from `allowUpto`
 

@@ -595,12 +595,17 @@ export function defaultSelect(
  * identical voucher against a channel a2x still believes is unfunded — and so
  * signs a **fresh deposit** each time.
  *
- * Receipts from other schemes (and any receipt without the scheme's
- * `extra.channelState`) are ignored, so passing a whole task's receipts is
+ * Receipts from other schemes, malformed ones, and any naming a channel
+ * outside `channelIds` are ignored, so passing a whole task's receipts is
  * safe:
  *
  * ```ts
- * await reconcileX402BatchSettlement(getX402Receipts(task), { storage });
+ * const signed = await signX402Payment(task, { signer, batchSettlement });
+ * // …resubmit, then, on the terminal task:
+ * await reconcileX402BatchSettlement(getX402Receipts(final), {
+ *   storage,
+ *   channelIds: getX402BatchSettlementChannelId(signed.payload)!,
+ * });
  * ```
  *
  * `A2XClient` calls this automatically when configured with
@@ -608,10 +613,37 @@ export function defaultSelect(
  */
 export async function reconcileX402BatchSettlement(
   receipts: X402SettleResponse[],
-  options: { storage: X402ClientChannelStorage },
+  options: {
+    storage: X402ClientChannelStorage;
+    /**
+     * The channel(s) this caller actually signed a voucher for. **Required.**
+     *
+     * A receipt names the channel it updates, and channel ids are derived from
+     * public inputs — so a merchant this payer *did* pay can return an id
+     * belonging to a **different** merchant and overwrite that channel's
+     * cumulative, bricking it or forcing an invalid top-up. Restricting the
+     * fold to the channels this exchange signed keeps a merchant able to
+     * update only its own.
+     *
+     * Read it off the signed payload with
+     * `getX402BatchSettlementChannelId(signed.payload)`.
+     */
+    channelIds: string | readonly string[];
+  },
 ): Promise<void> {
+  const allowed = new Set(
+    (typeof options.channelIds === 'string'
+      ? [options.channelIds]
+      : options.channelIds
+    )
+      .filter(isCanonicalChannelId)
+      .map((id) => id.toLowerCase()),
+  );
   const relevant = receipts.filter(
-    (r) => r.success && hasChannelStateKey(r.extra),
+    (r) =>
+      r.success &&
+      hasChannelStateKey(r.extra) &&
+      allowed.has(channelIdOf(r.extra)!.toLowerCase()),
   );
   if (relevant.length === 0) return;
   const mod = (await importX402Peer(
@@ -637,18 +669,53 @@ export async function reconcileX402BatchSettlement(
   }
 }
 
+/** A channel id is the EIP-712 hash of the channel config — a bytes32 hex. */
+const CANONICAL_CHANNEL_ID = /^0x[0-9a-fA-F]{64}$/;
+
+/** True for a well-formed `bytes32` channel id. */
+function isCanonicalChannelId(id: unknown): id is string {
+  return typeof id === 'string' && CANONICAL_CHANNEL_ID.test(id);
+}
+
+/** The `channelState.channelId` on a receipt, when it is a canonical one. */
+function channelIdOf(
+  extra: Record<string, unknown> | undefined,
+): string | undefined {
+  const channelState = extra?.channelState;
+  if (typeof channelState !== 'object' || channelState === null) return undefined;
+  const id = (channelState as { channelId?: unknown }).channelId;
+  return isCanonicalChannelId(id) ? id : undefined;
+}
+
 /**
  * True when `extra` carries a `channelState` this SDK can hand to
- * `@x402/evm` — i.e. with a usable string `channelId`.
+ * `@x402/evm` — i.e. with a canonical `channelId`.
  *
  * The peer keys storage on `channelState.channelId.toLowerCase()` with no
  * guard of its own, so a merchant sending `channelState: {}` (or a numeric id)
- * would throw a bare `TypeError` from inside the peer. Screening here keeps a
- * malformed receipt an ignored receipt.
+ * would throw a bare `TypeError` from inside the peer. Requiring the canonical
+ * `bytes32` form also stops a near-miss id — differing only by padding or a
+ * stray prefix — from being written as a second, orphaned storage key.
  */
 function hasChannelStateKey(extra: Record<string, unknown> | undefined): boolean {
-  const channelState = extra?.channelState;
-  if (typeof channelState !== 'object' || channelState === null) return false;
-  const id = (channelState as { channelId?: unknown }).channelId;
-  return typeof id === 'string' && id.length > 0;
+  return channelIdOf(extra) !== undefined;
+}
+
+/**
+ * Read the channel id out of a signed `batch-settlement` payload, for
+ * `reconcileX402BatchSettlement`'s `channelIds`. Returns `undefined` for a
+ * payload of any other scheme.
+ *
+ * Both payload shapes the scheme produces — the opening `deposit` and the
+ * subsequent voucher-only one — carry it at `payload.voucher.channelId`.
+ */
+export function getX402BatchSettlementChannelId(
+  payload: X402PaymentPayload,
+): string | undefined {
+  const inner = (payload as { payload?: unknown }).payload;
+  if (typeof inner !== 'object' || inner === null) return undefined;
+  const voucher = (inner as { voucher?: unknown }).voucher;
+  if (typeof voucher !== 'object' || voucher === null) return undefined;
+  const id = (voucher as { channelId?: unknown }).channelId;
+  return isCanonicalChannelId(id) ? id : undefined;
 }

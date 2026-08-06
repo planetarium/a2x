@@ -21,11 +21,23 @@ a cent.
   exists — losing it makes the next call sign a **fresh deposit** into an
   already-funded channel. New `X402ClientChannelStorage` / `X402ChannelState`
   types describe the contract without importing the optional peer.
-- `reconcileX402BatchSettlement(receipts, { storage })` folds settlement
-  receipts back into channel storage. Required because a2x carries payments
-  over A2A task metadata and never runs `@x402/evm`'s `onPaymentResponse`
-  hook, which is what normally advances the payer's cumulative amount.
-  `A2XClient` calls it automatically on both the blocking and streaming paths.
+- `reconcileX402BatchSettlement(receipts, { storage, channelIds })` folds
+  settlement receipts back into channel storage. Required because a2x carries
+  payments over A2A task metadata and never runs `@x402/evm`'s
+  `onPaymentResponse` hook, which is what normally advances the payer's
+  cumulative amount. `A2XClient` calls it automatically on both the blocking
+  and streaming paths. `channelIds` binds the fold to the channel that
+  exchange actually signed: channel ids derive from public inputs, so without
+  it a merchant could name a channel belonging to a *different* merchant and
+  overwrite its cumulative. Read it off a signed payload with the new
+  `getX402BatchSettlementChannelId()`.
+- A receipt that cannot be recorded raises the new `X402ReconciliationError`,
+  which carries the channel id and the merchant's completed task. Failing
+  loudly is deliberate — a lost receipt leaves the channel desynced with no
+  self-heal path (`@x402/evm`'s corrective recovery needs a chain-reading
+  signer, which a `LocalAccount` is not), so the next call is rejected for a
+  cumulative mismatch or opens a fresh on-chain deposit. Set
+  `A2XClientX402Options.onReconcileError` to record and continue instead.
 - Selection stays opt-in behind `allowBatchSettlement`, separate from
   `allowUpto`: `upto` widens how much of an authorization a merchant may draw,
   while funding a channel moves money before any service is rendered. Default
@@ -37,9 +49,10 @@ a cent.
 `A2XClient`'s `maxAmount` now bounds the **deposit** for a `batch-settlement`
 offer, not just the request amount — paying one call there authorizes
 `depositMultiplier x` the price (5x by default), so a cap that only bounded
-the per-call amount would let a wallet capped at 1 USDC authorize 5. Offers
-whose deposit exceeds the cap are filtered out. A caller-supplied
-`depositStrategy` sizes deposits itself and is left alone.
+the per-call amount would let a wallet capped at 1 USDC authorize 5. Enforced
+twice: offers whose policy deposit exceeds the cap are filtered out before
+selection, and the amount actually sized at signing — including one a
+`depositStrategy` returned — is checked again before it is signed.
 
 Merchant-side wiring is documented rather than shipped: voucher accounting
 needs `@x402/core`'s server lifecycle, and redemption must be a singleton
