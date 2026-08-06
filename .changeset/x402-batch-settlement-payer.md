@@ -66,10 +66,17 @@ a cent.
 `A2XClient`'s `maxAmount` now bounds the **deposit** for a `batch-settlement`
 offer, not just the request amount — paying one call there authorizes
 `depositMultiplier x` the price (5x by default), so a cap that only bounded
-the per-call amount would let a wallet capped at 1 USDC authorize 5. Enforced
-twice: offers whose policy deposit exceeds the cap are filtered out before
-selection, and the amount actually sized at signing — including one a
-`depositStrategy` returned — is checked again before it is signed.
+the per-call amount would let a wallet capped at 1 USDC authorize 5. The
+request amount is filtered before selection, then any deposit actually needed
+after reading channel storage — including one a `depositStrategy` returned —
+is checked before signing. A funded channel can therefore keep paying with
+voucher-only payloads under the cap without being rejected by its original
+deposit estimate.
+
+A completed A2A task after a batch voucher was submitted also requires a
+matching receipt even when the merchant omits `x402.payment.status`; otherwise
+the remote peer could suppress both marker and receipt and silently leave the
+payer's channel state stale.
 
 Merchant-side wiring is documented rather than shipped: `X402Context` now
 recognizes the ordinary deposit and voucher payload shapes, while voucher

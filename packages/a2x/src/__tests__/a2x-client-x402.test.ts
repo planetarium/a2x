@@ -1190,6 +1190,43 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     ).rejects.toBeInstanceOf(X402ReconciliationError);
   });
 
+  it('raises when a completed task omits both the x402 status and receipt', async () => {
+    // Once the merchant completes a task after receiving our voucher, the
+    // voucher may be spent. Trusting the remote status marker as the only
+    // settlement signal lets it suppress both keys and leave local state stale.
+    const { storage } = channelStorage();
+    const completedWithoutX402Metadata = () => {
+      const task = completedTaskWithChannelReceipt(FOREIGN_CHANNEL_ID) as {
+        status: { message: { metadata: Record<string, unknown> } };
+      };
+      delete task.status.message.metadata[X402_METADATA_KEYS.STATUS];
+      delete task.status.message.metadata[X402_METADATA_KEYS.RECEIPTS];
+      return task;
+    };
+    const { fetch } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(completedWithoutX402Metadata()),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+    const error = await client
+      .sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      })
+      .then(
+        () => undefined,
+        (reason: unknown) => reason as X402ReconciliationError,
+      );
+    expect(error).toBeInstanceOf(X402ReconciliationError);
+    expect(error!.reason).toBe('no-matching-receipt');
+  });
+
   it('raises when the merchant inflates the cumulative beyond the signed ceiling', async () => {
     // Reporting 9999 after a 1000 voucher would make the payer's next call
     // sign a cumulative above what it ever authorized, plus a top-up to cover
@@ -1303,10 +1340,10 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     expect(seen[0]!.channelId).toBe(signedChannelId(rpcRequests));
   });
 
-  it('filters out an offer whose deposit would exceed maxAmount', async () => {
-    // The offer costs 1000 and passes a 1000 cap on its own, but paying it
-    // signs a 5x deposit authorization. A cap that only bounded the request
-    // amount would let a wallet capped at 1000 authorize 5000.
+  it('refuses an unfunded channel whose actual deposit exceeds maxAmount', async () => {
+    // The offer costs 1000 and passes a 1000 request cap, but opening its
+    // channel signs a 5x deposit authorization. The signing-time hook sees the
+    // actual 5000 deposit after storage reports the channel is unfunded.
     const { storage } = channelStorage();
     const { fetch } = scriptedFetch([() => jsonRpcOk(batchRequiredTask())]);
     const client = new A2XClient(AGENT_URL, {
@@ -1322,7 +1359,51 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
       client.sendMessage({
         message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
       }),
-    ).rejects.toThrow(X402NoSupportedRequirementError);
+    ).rejects.toThrow(/deposit of 5000 exceeds maxAmount 1000/);
+  });
+
+  it('allows a funded channel to pay voucher-only below maxAmount', async () => {
+    // A static 5x pre-filter rejected this even though the peer reads storage,
+    // sees enough balance, and never invokes the deposit-sizing hook.
+    const { channels, storage } = channelStorage();
+    const fundedStorage = {
+      ...storage,
+      get: async (key: string) =>
+        channels.get(key) ?? {
+          balance: '5000',
+          chargedCumulativeAmount: '0',
+          totalClaimed: '0',
+        },
+    };
+    let recorded: Array<{ body: unknown }> = [];
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(completedTaskWithChannelReceipt(signedChannelId(recorded))),
+    ]);
+    recorded = rpcRequests;
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage: fundedStorage },
+        allowBatchSettlement: true,
+        maxAmount: 1000n,
+      },
+    });
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    expect(task.status.state).toBe('completed');
+
+    const followup = (
+      rpcRequests[1]!.body as {
+        params: { message: { metadata: Record<string, unknown> } };
+      }
+    ).params.message.metadata;
+    const payload = followup[X402_METADATA_KEYS.PAYLOAD] as {
+      payload: { type: string };
+    };
+    expect(payload.payload.type).toBe('voucher');
   });
 
   it('fails closed on an unusable depositMultiplier instead of throwing', async () => {
@@ -1372,7 +1453,7 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
       client.sendMessage({
         message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
       }),
-    ).rejects.toThrow(X402NoSupportedRequirementError);
+    ).rejects.toThrow(/deposit of 20000 exceeds maxAmount 10000/);
   });
 
   it('admits a depositStrategy result that fits maxAmount', async () => {

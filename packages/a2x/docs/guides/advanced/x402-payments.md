@@ -613,12 +613,12 @@ batchSettlement: {
 },
 ```
 
-`maxAmount` bounds the **deposit**, not just the per-request amount, and it is enforced in both places the deposit can be decided:
+`maxAmount` bounds the **deposit**, not just the per-request amount:
 
-1. **Before selection** — an offer whose `depositMultiplier x amount` exceeds the cap is filtered out, surfacing `X402NoSupportedRequirementError`. A multiplier outside `@x402/evm`'s accepted range (integers ≥ 3) fails closed here rather than being trusted.
-2. **At signing** — the amount actually sized for this deposit is checked again before it is signed, including one a `depositStrategy` returned and the policy amount a strategy defers to with `undefined`. Exceeding the cap throws rather than silently authorizing.
+1. **Before selection** — the per-request amount is filtered against the cap like every other scheme. A multiplier outside `@x402/evm`'s accepted range (integers ≥ 3) also fails closed here rather than leaking a generic scheme-construction error.
+2. **At signing** — after the scheme derives the channel id and reads storage, any deposit it actually sizes is checked before it is signed, including one a `depositStrategy` returned and the policy amount a strategy defers to with `undefined`. Exceeding the cap throws rather than silently authorizing.
 
-The second check exists because a `depositStrategy` computes its own figure per deposit, which no static filter can predict; without it the strategy would slip past a cap the option documents as always enforced. Note the multiplier floor of 3 means a `maxAmount` below 3x the per-call price can never admit a `batch-settlement` offer via `depositPolicy` alone — use `depositStrategy` to size under that.
+The second check cannot be replaced with a static `depositMultiplier x amount` filter. A channel may already have enough balance, in which case the same request emits a voucher-only payload and authorizes no new deposit; rejecting it by the opening-deposit estimate would make `maxAmount` disable the channel after it was funded. Conversely, when initial funding or a top-up is required, the signing hook sees the exact amount the peer is about to authorize and keeps the cap authoritative.
 
 #### Reconciliation is mandatory
 
@@ -655,6 +655,8 @@ if (applied.length === 0) {
 Skip reconciliation and the payer's cumulative amount never advances: every subsequent call re-signs an identical voucher against a channel it still believes is unfunded — and therefore signs a **fresh deposit** each time. Receipts from other schemes, malformed ones, any naming a channel outside `bindings`, and any whose cumulative differs from the signed ceiling are ignored; a receipt that fails to apply raises an `AggregateError` after the others have been tried, so one bad entry cannot drop a good one.
 
 **An empty `applied` after a settled payment is a failure, not a no-op.** The voucher is spent either way, so "nothing to record" and "the merchant withheld or falsified the receipt" have identical consequences: local state did not move, and the next call re-signs or re-deposits. `A2XClient` raises `X402ReconciliationError` with `reason: 'no-matching-receipt'` in that case; a caller driving the helper directly should treat it the same way.
+
+The SDK also fails closed when the merchant returns a completed A2A task but omits both `x402.payment.status` and the receipt. Once a task completes after the payer handed over a voucher, the merchant may retain and redeem that voucher; a remote status marker cannot be the only evidence that local channel state now needs to advance.
 
 #### A missed receipt does not self-heal
 

@@ -102,11 +102,12 @@ export interface A2XClientX402Options {
    * For `batch-settlement` the cap applies to the **deposit**, not just the
    * request amount: paying one call there authorizes `depositMultiplier x`
    * the price (5x by default), and a cap that only bounded the per-call
-   * amount would let a wallet capped at 1 USDC authorize 5. Enforced twice —
-   * offers whose policy deposit exceeds the cap are filtered out before
-   * selection, and the deposit actually sized at signing time (including one
-   * a `depositStrategy` returned) is checked again before it is signed.
-   * Exceeding the cap there throws rather than silently authorizing.
+   * amount would let a wallet capped at 1 USDC authorize 5. The request amount
+   * is filtered before selection like every other scheme; after the scheme
+   * reads channel storage, any deposit it actually sizes (including one a
+   * `depositStrategy` returned) is checked again before signing. A funded
+   * channel that needs only a voucher therefore remains payable, while a new
+   * deposit above the cap throws rather than silently authorizing.
    */
   maxAmount?: bigint;
   /**
@@ -669,12 +670,11 @@ export class A2XClient {
     ): X402PaymentRequirements | undefined => {
       // maxAmount is enforced first regardless of caller predicate, so a
       // user-provided selectRequirement only sees the affordable subset.
+      const usable = reqs.filter((r) => hasUsableBatchDepositPolicy(r, x402));
       const affordable =
         x402.maxAmount === undefined
-          ? reqs
-          : reqs
-              .filter((r) => isWithinBudget(r, x402.maxAmount!))
-              .filter((r) => isDepositWithinBudget(r, x402));
+          ? usable
+          : usable.filter((r) => isWithinBudget(r, x402.maxAmount!));
       if (userSelect) return userSelect(affordable);
       // Only auto-pick an option the EVM signer can fulfil, exact-first and
       // never `upto` / `batch-settlement` unless opted in — see defaultSelect
@@ -699,11 +699,11 @@ export class A2XClient {
    * `batchSettlement` with `maxAmount` enforced at the point the deposit is
    * actually sized.
    *
-   * The offer filter can only bound the *policy* deposit, which is
-   * `depositMultiplier x amount`. A `depositStrategy` computes its own figure
-   * per deposit and the SDK cannot predict it — so without this the strategy's
-   * result would slip past a cap the option documents as always enforced, and
-   * sign an ERC-3009/Permit2 authorization larger than the wallet agreed to.
+   * Only the scheme knows whether this request needs a deposit: it must derive
+   * the channel id and read storage first. A static `depositMultiplier x
+   * amount` filter would reject a funded channel even though the scheme emits
+   * only a voucher there. The cap therefore lives at this sizing hook, which
+   * runs only when the channel needs initial funding or a top-up.
    *
    * The guard wraps whatever strategy the caller supplied (or stands in for
    * one when they supplied none, which is where the peer's own
@@ -785,9 +785,14 @@ export class A2XClient {
     if (!batchSettlement || !binding) return;
 
     // Only a settled payment owes us a receipt. Intermediate events
-    // (`payment-verified`, plain `working`) legitimately carry none.
+    // (`payment-verified`, plain `working`) legitimately carry none. Once the
+    // merchant completes the A2A task after receiving our voucher, however,
+    // the voucher must be treated as spent even if the remote peer omits the
+    // x402 status marker. Otherwise it can suppress both marker and receipt,
+    // leave local state stale, and make the next call re-sign or re-deposit.
     const settled =
-      metadata?.[X402_METADATA_KEYS.STATUS] === X402_PAYMENT_STATUS.COMPLETED;
+      metadata?.[X402_METADATA_KEYS.STATUS] === X402_PAYMENT_STATUS.COMPLETED ||
+      task?.status.state === TaskState.COMPLETED;
     const receipts = metadata?.[X402_METADATA_KEYS.RECEIPTS];
     const list = Array.isArray(receipts)
       ? (receipts as X402SettleResponse[])
@@ -1092,67 +1097,33 @@ export class A2XClient {
   }
 }
 
-/** `@x402/evm`'s default `depositMultiplier` when no policy overrides it. */
-const DEFAULT_DEPOSIT_MULTIPLIER = 5n;
-
 /** Lowest multiplier `@x402/evm`'s `validateDepositPolicy` accepts. */
 const MIN_DEPOSIT_MULTIPLIER = 3;
 
 /**
- * True when a `batch-settlement` requirement's **deposit** also fits the
- * caller's `maxAmount`. Every other scheme passes through.
+ * True when a `batch-settlement` requirement can be constructed with the
+ * configured deposit policy. Every other scheme passes through.
  *
- * `maxAmount` promises a cap on what the client will authorize, and for the
- * other schemes the authorization *is* the request amount. Batch settlement
- * breaks that identity: paying 0.2 USDC signs an ERC-3009 authorization for
- * `depositMultiplier x` that (5x by default), so a wallet capped at 1 USDC
- * would otherwise silently authorize 5. Filtering the offer out instead
- * surfaces `X402NoSupportedRequirementError`, which is the honest outcome —
- * the payer's cap genuinely cannot cover this offer.
- *
- * A caller-supplied `depositStrategy` owns sizing outright and can return any
- * amount, so the SDK cannot predict the deposit and does not pretend to —
- * that case is left to the strategy.
+ * The peer validates this during scheme construction regardless of whether
+ * the current channel needs a deposit. Filtering the unusable option here
+ * preserves the clean `X402NoSupportedRequirementError` instead of leaking a
+ * generic constructor error. Deposit affordability is deliberately not
+ * predicted here: only the scheme can know, after reading storage, whether it
+ * will fund the channel or emit a voucher-only payload.
  */
-function isDepositWithinBudget(
+function hasUsableBatchDepositPolicy(
   requirement: X402PaymentRequirements,
   x402: A2XClientX402Options,
 ): boolean {
   if (requirement.scheme !== 'batch-settlement') return true;
-  if (x402.maxAmount === undefined) return true;
   const batchSettlement = x402.batchSettlement;
-  if (!batchSettlement || batchSettlement.depositStrategy) return true;
+  if (!batchSettlement) return true;
 
   const configured = batchSettlement.depositPolicy?.depositMultiplier;
-  let multiplier: bigint;
-  if (configured === undefined) {
-    multiplier = DEFAULT_DEPOSIT_MULTIPLIER;
-  } else if (
-    Number.isInteger(configured) &&
-    configured >= MIN_DEPOSIT_MULTIPLIER
-  ) {
-    multiplier = BigInt(configured);
-  } else {
-    // Fail closed on a multiplier we cannot use. Two reasons: `BigInt(5.5)`
-    // throws, and this runs inside offer filtering where an exception would
-    // surface as an opaque RangeError out of `sendMessage`; and a cap that
-    // cannot compute the deposit must never report it as affordable.
-    //
-    // The floor mirrors `@x402/evm`'s own `validateDepositPolicy`, which
-    // rejects every integer below 3. Accepting 1 or 2 here would let the offer
-    // through the affordability filter only to fail during scheme
-    // construction with a generic error, instead of the
-    // `X402NoSupportedRequirementError` the selector is supposed to raise.
-    return false;
-  }
-
-  try {
-    return BigInt(requirementAmount(requirement)) * multiplier <= x402.maxAmount;
-  } catch {
-    // Unparseable amount — `isWithinBudget` already defers to the signer here,
-    // and diverging would silently drop a requirement it let through.
-    return true;
-  }
+  return (
+    configured === undefined ||
+    (Number.isInteger(configured) && configured >= MIN_DEPOSIT_MULTIPLIER)
+  );
 }
 
 function isWithinBudget(
