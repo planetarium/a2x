@@ -213,6 +213,10 @@ export interface A2XClientX402Options {
    * is the right knob for failures the wallet can recover from on its
    * own (network blip, transient nonce reuse) — anything that needs
    * user interaction (top-up, wallet switch) should still surface.
+   * A `batch-settlement` attempt is never retried after its matching success
+   * receipt has been applied, even if that response also asks for payment
+   * again. A status marker without a complete payment-required envelope is
+   * ambiguous and quarantines the outstanding channel instead of clearing it.
    */
   maxRetries?: number;
 }
@@ -408,12 +412,17 @@ export class A2XClient {
         binding,
         task,
       );
+      const batchAttemptResolved = binding !== undefined && reconciled;
 
       // Server may re-issue payment-required when running with
       // retryOnFailure (a2a-x402 v0.2 §9). Loop within the budget; once
       // exhausted (or on any non-payment-required terminal), fall through
-      // to the receipt-scan decision.
+      // to the receipt-scan decision. A matching batch receipt wins over a
+      // contradictory retry prompt: that voucher was accepted and signing
+      // again would authorize the same call twice. Non-batch retries retain
+      // their existing behavior because they have no binding.
       if (
+        !batchAttemptResolved &&
         task.status.state === 'input-required' &&
         getX402PaymentRequirements(task)
       ) {
@@ -472,6 +481,8 @@ export class A2XClient {
           currentParams,
           signal,
         )) {
+          let eventTask: Task | undefined;
+          let batchAttemptResolved = false;
           // Reconcile BEFORE the yield, not after. The receipt rides the final
           // status event, and the idiomatic consumer breaks out of its loop on
           // exactly that event — which calls this generator's `return()` at the
@@ -483,18 +494,23 @@ export class A2XClient {
             // this runs before the yield, so throwing means the consumer never
             // sees the terminal event itself.
             try {
+              eventTask = {
+                id: event.taskId,
+                contextId: event.contextId,
+                status: event.status,
+              } as Task;
+              const binding = signedBinding;
               const reconciled = await this._reconcileX402(
                 event.status?.message?.metadata as
                   | Record<string, unknown>
                   | undefined,
-                signedBinding,
-                {
-                  id: event.taskId,
-                  contextId: event.contextId,
-                  status: event.status,
-                } as Task,
+                binding,
+                eventTask,
               );
-              if (reconciled) signedBinding = undefined;
+              if (reconciled) {
+                signedBinding = undefined;
+                batchAttemptResolved = binding !== undefined;
+              }
             } catch (cause) {
               // Reconciliation already surfaced the unsafe channel. Do not
               // let the generator's close path report it a second time.
@@ -504,18 +520,11 @@ export class A2XClient {
           }
 
           if (
-            'status' in event &&
-            event.status?.state === 'input-required' &&
-            (event.status.message?.metadata as
-              | Record<string, unknown>
-              | undefined)?.[X402_METADATA_KEYS.STATUS] ===
-              X402_PAYMENT_STATUS.REQUIRED
+            !batchAttemptResolved &&
+            eventTask?.status.state === 'input-required' &&
+            getX402PaymentRequirements(eventTask)
           ) {
-            pendingTask = {
-              id: event.taskId,
-              contextId: event.contextId,
-              status: event.status,
-            } as Task;
+            pendingTask = eventTask;
             // A valid retry prompt proves the previous voucher was rejected.
             // Clear before yielding so consumer-driven iterator close cannot
             // mistake this safe exit for an ambiguous response.

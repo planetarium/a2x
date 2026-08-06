@@ -660,7 +660,9 @@ Skip reconciliation and the payer's cumulative amount never advances: every subs
 
 The SDK also fails closed when the merchant returns any terminal A2A task (`completed`, `failed`, `canceled`, or `rejected`) but omits a usable receipt. Settlement can succeed before agent execution later fails, and once the payer handed over a voucher the merchant may retain and redeem it; neither a remote status marker nor the task's final state can prove that local channel state is safe to reuse.
 
-The binding becomes outstanding as soon as the signed submission is handed to the transport. If blocking transport/JSON parsing fails, a non-blocking unary call returns an intermediate task, a follow-up SSE stream errors or is aborted, the caller closes that stream early, or the stream reaches EOF before a receipt or explicit retry prompt, `A2XClient` raises the same quarantine error with `reason: 'ambiguous-response'`. A known intermediate unary response is available as `task`; transport failures and streaming exits have no complete task, and the original transport/stream failure is available as `cause` when one occurred. In every case the merchant must be assumed to hold the voucher until an operator reconciles or retires the channel.
+The binding becomes outstanding as soon as the signed submission is handed to the transport. If blocking transport/JSON parsing fails, a non-blocking unary call returns an intermediate task, a follow-up SSE stream errors or is aborted, the caller closes that stream early, or the stream reaches EOF before a receipt or a complete retry prompt, `A2XClient` raises the same quarantine error with `reason: 'ambiguous-response'`. A status marker alone is not a retry prompt: `x402.payment.required` must also be present before the client treats the previous voucher as rejected. A known intermediate unary response is available as `task`; transport failures and streaming exits have no complete task, and the original transport/stream failure is available as `cause` when one occurred. In every case the merchant must be assumed to hold the voucher until an operator reconciles or retires the channel.
+
+A matching success receipt takes precedence over a contradictory retry prompt in the same response. Once that receipt advances durable channel state, `A2XClient` does not sign again for the call; doing so would authorize the same work twice. This batch-only guard does not change `exact` or `upto` retry behavior.
 
 #### A missed receipt does not self-heal
 
@@ -909,7 +911,7 @@ If the merchant's terminal task records a payment failure (the latest receipt is
 | `selectRequirement` | first EVM `scheme === 'exact'` | Predicate over the (already filtered) requirements. Return `undefined` to abort. |
 | `allowUpto` | `false` | Let the default selector fall back to an EVM `upto` offer when no `exact` one fits. See [Paying an `upto` offer](#paying-an-upto-offer). |
 | `onPaymentRequired` | none | Hook between `payment-required` and signing. Return `false` to send `payment-rejected` cleanly; throw to abort *locally* without telling the merchant. |
-| `maxRetries` | `0` | Additional sign+resubmit attempts when the merchant re-issues `payment-required` on the same task. |
+| `maxRetries` | `0` | Additional sign+resubmit attempts when the merchant re-issues a complete `payment-required` envelope on the same task. A reconciled batch attempt is never paid again. |
 
 ### Extension activation header
 

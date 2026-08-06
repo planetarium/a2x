@@ -209,7 +209,16 @@ function jsonRpcOk(result: unknown): Response {
  * Build a fake fetch that serves a sequence of responses for /a2a calls,
  * always returning the AgentCard for /.well-known/* probes.
  */
-function scriptedFetch(replies: Array<() => Response>): {
+function scriptedFetch(
+  replies: Array<
+    (
+      rpcRequests: Array<{
+        body: unknown;
+        headers: Record<string, string>;
+      }>,
+    ) => Response
+  >,
+): {
   fetch: typeof globalThis.fetch;
   rpcRequests: Array<{ body: unknown; headers: Record<string, string> }>;
 } {
@@ -237,7 +246,7 @@ function scriptedFetch(replies: Array<() => Response>): {
       throw new Error(`No scripted reply for RPC call #${cursor + 1}`);
     }
     cursor += 1;
-    return make();
+    return make(rpcRequests);
   }) as unknown as typeof globalThis.fetch;
   return { fetch, rpcRequests };
 }
@@ -724,6 +733,54 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     };
   }
 
+  /** Contradictory response: the voucher succeeded, but payment is requested again. */
+  function retryTaskWithChannelReceipt(channelId: string): unknown {
+    const task = completedTaskWithChannelReceipt(channelId) as {
+      status: {
+        state: string;
+        message: { metadata: Record<string, unknown> };
+      };
+    };
+    const required = batchRequiredTask() as {
+      status: { message: { metadata: Record<string, unknown> } };
+    };
+    task.status.state = 'input-required';
+    task.status.message.metadata[X402_METADATA_KEYS.STATUS] =
+      X402_PAYMENT_STATUS.REQUIRED;
+    task.status.message.metadata[X402_METADATA_KEYS.REQUIRED] =
+      required.status.message.metadata[X402_METADATA_KEYS.REQUIRED];
+    return task;
+  }
+
+  function batchSse(events: unknown[]): Response {
+    const encoder = new TextEncoder();
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          for (const event of events) {
+            controller.enqueue(
+              encoder.encode(
+                `data: ${JSON.stringify({ jsonrpc: '2.0', id: 1, result: event })}\n\n`,
+              ),
+            );
+          }
+          controller.close();
+        },
+      }),
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    );
+  }
+
+  function batchStatusEvent(state: string, message: unknown) {
+    return {
+      kind: 'status-update',
+      taskId: 't1',
+      contextId: 'c1',
+      status: { state, timestamp: new Date().toISOString(), message },
+      final: false,
+    };
+  }
+
   function channelStorage() {
     const channels = new Map<string, Record<string, unknown>>();
     return {
@@ -789,6 +846,35 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     expect(channels.get(signedChannelId(rpcRequests).toLowerCase())).toEqual({
       balance: '5000',
       totalClaimed: '0',
+      chargedCumulativeAmount: '1000',
+    });
+  });
+
+  it('does not retry a batch payment after applying its success receipt', async () => {
+    const { channels, storage } = channelStorage();
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      (requests) =>
+        jsonRpcOk(retryTaskWithChannelReceipt(signedChannelId(requests))),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+        maxRetries: 1,
+      },
+    });
+
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+
+    expect(task.status.state).toBe('input-required');
+    expect(rpcRequests).toHaveLength(2);
+    expect(channels.get(signedChannelId(rpcRequests).toLowerCase())).toMatchObject({
+      balance: '5000',
       chargedCumulativeAmount: '1000',
     });
   });
@@ -891,6 +977,102 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
       totalClaimed: '0',
       chargedCumulativeAmount: '1000',
     });
+  });
+
+  it('does not retry a streamed batch payment after applying its success receipt', async () => {
+    const { channels, storage } = channelStorage();
+    const required = batchRequiredTask() as {
+      status: { message: unknown };
+    };
+    const { fetch, rpcRequests } = scriptedFetch([
+      () =>
+        batchSse([
+          batchStatusEvent('input-required', required.status.message),
+        ]),
+      (requests) => {
+        const retry = retryTaskWithChannelReceipt(signedChannelId(requests)) as {
+          status: { message: unknown };
+        };
+        return batchSse([
+          batchStatusEvent('input-required', retry.status.message),
+        ]);
+      },
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+        maxRetries: 1,
+      },
+    });
+
+    const states: string[] = [];
+    for await (const event of client.sendMessageStream({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    })) {
+      if ('status' in event) states.push(event.status!.state as string);
+    }
+
+    expect(states).toEqual(['input-required', 'input-required']);
+    expect(rpcRequests).toHaveLength(2);
+    expect(channels.get(signedChannelId(rpcRequests).toLowerCase())).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '1000',
+    });
+  });
+
+  it('quarantines a streamed batch payment on a marker-only retry response', async () => {
+    const { channels, storage } = channelStorage();
+    const required = batchRequiredTask() as {
+      status: { message: unknown };
+    };
+    const markerOnlyMessage = {
+      messageId: 'x402-batch-retry',
+      role: 'agent',
+      parts: [{ kind: 'text', text: 'try again' }],
+      metadata: {
+        [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REQUIRED,
+      },
+    };
+
+    const { fetch, rpcRequests } = scriptedFetch([
+      () =>
+        batchSse([
+          batchStatusEvent('input-required', required.status.message),
+        ]),
+      () =>
+        batchSse([
+          batchStatusEvent('input-required', markerOnlyMessage),
+        ]),
+    ]);
+    const seen: X402ReconciliationError[] = [];
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+        onReconcileError: (error) => {
+          seen.push(error);
+        },
+      },
+    });
+
+    const states: string[] = [];
+    for await (const event of client.sendMessageStream({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    })) {
+      if ('status' in event) states.push(event.status!.state as string);
+    }
+
+    expect(states).toEqual(['input-required', 'input-required']);
+    expect(rpcRequests).toHaveLength(2);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.reason).toBe('ambiguous-response');
+    expect(seen[0]!.channelId).toBe(signedChannelId(rpcRequests));
+    expect(channels.size).toBe(0);
   });
 
   it('quarantines the channel when the consumer closes a paid stream early', async () => {

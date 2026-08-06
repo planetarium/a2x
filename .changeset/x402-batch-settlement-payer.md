@@ -81,9 +81,12 @@ Every terminal A2A task after a batch voucher was submitted also requires a
 matching receipt even when the merchant omits `x402.payment.status`. The same
 channel is surfaced for quarantine if the blocking response fails or a
 follow-up SSE stream errors, is aborted, or reaches EOF before a receipt or
-retry prompt;
-otherwise the remote peer could retain the voucher while silently leaving the
-payer's channel state stale.
+complete retry prompt. A status marker without `x402.payment.required` is
+ambiguous and cannot clear the outstanding binding. Conversely, when a
+response carries both a matching success receipt and a retry prompt, the
+receipt wins and the client does not sign the same call again. Together these
+rules prevent the remote peer from retaining a voucher while silently leaving
+the payer's channel state stale or inducing a duplicate payment.
 
 Merchant-side wiring is documented rather than shipped: `X402Context` now
 recognizes the ordinary deposit and voucher payload shapes, while voucher
