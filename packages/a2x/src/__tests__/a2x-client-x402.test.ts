@@ -24,6 +24,7 @@ import {
   X402_PAYMENT_STATUS,
 } from '../x402/constants.js';
 import type { Task } from '../types/task.js';
+import { reconcileX402BatchSettlement } from '../x402/client.js';
 import {
   X402NoSupportedRequirementError,
   X402PaymentFailedError,
@@ -1045,6 +1046,48 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     expect((caught!.task as Task).id).toBe('t1');
   });
 
+  it('records the deposit even when the merchant reports it away', async () => {
+    // End-to-end against the real `@x402/evm`. The merchant settles the
+    // voucher but reports `balance: "0"`; if that survives, the next call sees
+    // an unfunded channel and signs another real deposit — and `maxAmount`
+    // would not stop it, since it caps deposits individually.
+    const { channels, storage } = channelStorage();
+    let recorded: Array<{ body: unknown }> = [];
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => {
+        const task = completedTaskWithChannelReceipt(
+          signedChannelId(recorded),
+        ) as { status: { message: { metadata: Record<string, unknown> } } };
+        const receipts = task.status.message.metadata[
+          X402_METADATA_KEYS.RECEIPTS
+        ] as Array<{ extra: { channelState: { balance: string } } }>;
+        receipts[0]!.extra.channelState.balance = '0';
+        return jsonRpcOk(task);
+      },
+    ]);
+    recorded = rpcRequests;
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+    await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+
+    // Asserts the state after upstream's merge, not the input we handed it —
+    // the peer assigns `balance` only when the receipt still carries the key,
+    // so a guard that merely deleted it would leave this undefined.
+    expect(channels.get(signedChannelId(rpcRequests).toLowerCase())).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '1000',
+    });
+  });
+
   it('clears the batch binding when a streaming retry signs another scheme', async () => {
     // Under `retryOnFailure` a later attempt can select a different scheme.
     // Carrying the batch binding forward would test that attempt's `exact`
@@ -1603,5 +1646,124 @@ describe('A2XClient.sendMessageStream — native x402 dance', () => {
       events.push(ev);
     }
     expect(events).toHaveLength(1);
+  });
+});
+
+/**
+ * Storage semantics of `reconcileX402BatchSettlement` against the **real**
+ * `@x402/evm`, which merges onto the stored record and assigns each field only
+ * when the receipt still carries it. Asserting on the receipt handed to the
+ * peer cannot observe that, which is how a guard that merely deleted a
+ * distrusted `balance` looked correct while leaving storage unfunded.
+ */
+describe('reconcileX402BatchSettlement — storage after upstream merge', () => {
+  const CHANNEL = `0x${'cd'.repeat(32)}`;
+  const KEY = CHANNEL.toLowerCase();
+
+  function store() {
+    const channels = new Map<string, Record<string, unknown>>();
+    return {
+      channels,
+      storage: {
+        get: async (key: string) => channels.get(key),
+        set: async (key: string, state: Record<string, unknown>) => {
+          channels.set(key, state);
+        },
+        delete: async (key: string) => {
+          channels.delete(key);
+        },
+      },
+    };
+  }
+
+  function receipt(channelState: Record<string, unknown>) {
+    return {
+      success: true,
+      transaction: '',
+      network: 'eip155:84532',
+      extra: { channelState: { channelId: CHANNEL, ...channelState } },
+    };
+  }
+
+  const openingDeposit = {
+    channelId: CHANNEL,
+    maxClaimableAmount: '1000',
+    depositAmount: '5000',
+  };
+
+  it('establishes the signed deposit when the merchant reports zero', async () => {
+    const { channels, storage } = store();
+    await reconcileX402BatchSettlement(
+      [
+        receipt({
+          chargedCumulativeAmount: '1000',
+          balance: '0',
+          totalClaimed: '0',
+        }),
+      ],
+      { storage, bindings: openingDeposit },
+    );
+    expect(channels.get(KEY)).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '1000',
+    });
+  });
+
+  it('establishes it when the merchant omits balance entirely', async () => {
+    // Deleting the key would leave the peer's merge with no balance at all —
+    // indistinguishable from an unfunded channel on the next call.
+    const { channels, storage } = store();
+    await reconcileX402BatchSettlement(
+      [receipt({ chargedCumulativeAmount: '1000', totalClaimed: '0' })],
+      { storage, bindings: openingDeposit },
+    );
+    expect(channels.get(KEY)).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '1000',
+    });
+  });
+
+  it('adds a top-up to the stored balance rather than keeping the stale figure', async () => {
+    const { channels, storage } = store();
+    await storage.set(KEY, { balance: '5000', chargedCumulativeAmount: '5000' });
+    await reconcileX402BatchSettlement(
+      [receipt({ chargedCumulativeAmount: '6000', balance: '5000' })],
+      {
+        storage,
+        bindings: {
+          channelId: CHANNEL,
+          maxClaimableAmount: '6000',
+          depositAmount: '5000',
+        },
+      },
+    );
+    expect(channels.get(KEY)).toMatchObject({
+      balance: '10000',
+      chargedCumulativeAmount: '6000',
+    });
+  });
+
+  it('keeps an honest balance at or above the floor', async () => {
+    const { channels, storage } = store();
+    await reconcileX402BatchSettlement(
+      [receipt({ chargedCumulativeAmount: '1000', balance: '5000' })],
+      { storage, bindings: openingDeposit },
+    );
+    expect(channels.get(KEY)).toMatchObject({ balance: '5000' });
+  });
+
+  it('holds a voucher-only payment at the stored balance', async () => {
+    // No deposit signed, so the floor is whatever is already stored — the
+    // merchant cannot talk it down, and nothing new is established either.
+    const { channels, storage } = store();
+    await storage.set(KEY, { balance: '5000', chargedCumulativeAmount: '1000' });
+    await reconcileX402BatchSettlement(
+      [receipt({ chargedCumulativeAmount: '2000', balance: '0' })],
+      { storage, bindings: { channelId: CHANNEL, maxClaimableAmount: '2000' } },
+    );
+    expect(channels.get(KEY)).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '2000',
+    });
   });
 });

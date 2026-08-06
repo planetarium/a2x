@@ -765,13 +765,14 @@ function advancesCumulative(
 }
 
 /**
- * The receipt, with a merchant-reported `balance` dropped when it is below
- * what this attempt can legitimately establish.
+ * The receipt, with a merchant-reported `balance` **replaced** by the floor
+ * this attempt establishes whenever the reported value is missing,
+ * unparseable, or below it.
  *
- * `balance` steers the payer's funding decision: at `0` the scheme treats the
- * channel as unfunded and signs a **fresh deposit**. Trusting it is a
- * funds-moving path, and `maxAmount` does not close it — that caps each
- * deposit individually, not their aggregate, so a merchant reporting
+ * `balance` steers the payer's funding decision: at `0` — or absent — the
+ * scheme treats the channel as unfunded and signs a **fresh deposit**.
+ * Trusting it is a funds-moving path, and `maxAmount` does not close it: that
+ * caps each deposit individually, not their aggregate, so a merchant reporting
  * `balance: "0"` every round induces another capped deposit every round,
  * unbounded in total.
  *
@@ -779,9 +780,16 @@ function advancesCumulative(
  * the deposits this payer signs (claims move `totalClaimed`; only the refund
  * path — which a2x does not drive — reduces it). So the floor is the stored
  * balance plus whatever this attempt funded, and anything below it is a figure
- * the merchant could not have arrived at honestly. Dropping just that key
- * keeps the rest of the receipt applicable: the cumulative still advances, and
- * storage keeps the balance the payer already established.
+ * the merchant could not have arrived at honestly.
+ *
+ * Substituting rather than deleting is the whole point. `processSettleResponse`
+ * merges onto the stored record and assigns `balance` **only when the receipt
+ * still carries it**, so dropping the key leaves storage holding the *prior*
+ * balance — `undefined` on an opening deposit, the pre-top-up figure on a
+ * top-up. Either way the deposit this payer just signed goes unrecorded and
+ * the next call funds the channel again, which is exactly the loop this guard
+ * exists to break. The substituted value is not merchant trust: it is durable
+ * prior state plus the deposit this payer signed.
  *
  * A value *above* the floor is left alone. It can only make the payer
  * under-fund a later call, which costs the payer nothing — the merchant simply
@@ -792,25 +800,35 @@ function withTrustedBalance(
   prior: X402ChannelState | undefined,
   deposit: bigint,
 ): X402SettleResponse {
-  const channelState = receipt.extra?.channelState as
-    | Record<string, unknown>
-    | undefined;
-  if (channelState?.balance === undefined) return receipt;
+  const channelState = receipt.extra?.channelState as Record<string, unknown>;
 
   let floor: bigint;
-  let reported: bigint;
   try {
     floor = BigInt(prior?.balance ?? '0') + deposit;
-    reported = BigInt(String(channelState.balance));
   } catch {
-    // An unparseable balance is not a figure to trust either.
-    floor = 1n;
-    reported = 0n;
+    // Prior state we cannot read bounds nothing; fall back to what this
+    // attempt alone establishes.
+    floor = deposit;
   }
-  if (reported >= floor) return receipt;
 
-  const { balance: _dropped, ...rest } = channelState;
-  return { ...receipt, extra: { ...receipt.extra, channelState: rest } };
+  let reported: bigint | undefined;
+  const raw = channelState.balance;
+  if (raw !== undefined && raw !== null) {
+    try {
+      reported = BigInt(String(raw));
+    } catch {
+      reported = undefined;
+    }
+  }
+  if (reported !== undefined && reported >= floor) return receipt;
+
+  return {
+    ...receipt,
+    extra: {
+      ...receipt.extra,
+      channelState: { ...channelState, balance: floor.toString() },
+    },
+  };
 }
 
 /**

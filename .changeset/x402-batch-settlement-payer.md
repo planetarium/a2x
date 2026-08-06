@@ -36,7 +36,9 @@ a cent.
   next call sign a 6000 cumulative plus a top-up, letting it claim far more
   than the calls cost. Without the third, a merchant reporting `balance: "0"`
   every round induces a fresh deposit every round — each within `maxAmount`,
-  which caps deposits individually rather than in aggregate. A receipt with no
+  which caps deposits individually rather than in aggregate; a balance below
+  `stored + this deposit` is replaced by that floor, which is derived from the
+  payer's own durable state rather than from the merchant. A receipt with no
   cumulative at all is refused too, since it would write partially and leave
   the signing base unmoved. Read the binding off a signed payload with the new
   `getX402BatchSettlementBinding()`.

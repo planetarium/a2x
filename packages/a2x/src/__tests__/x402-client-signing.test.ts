@@ -610,14 +610,20 @@ describe('reconcileX402BatchSettlement', () => {
         channelState: { channelId: CHANNEL_B, chargedCumulativeAmount: '6000' },
       },
     };
-    await reconcileX402BatchSettlement([channelReceipt, second], {
-      storage: memoryChannelStorage(),
-      bindings: [BIND_A, BIND_B],
-    });
-    expect(captured.reconciled.map((r) => r.settle)).toEqual([
-      channelReceipt,
-      second,
-    ]);
+    const { applied } = await reconcileX402BatchSettlement(
+      [channelReceipt, second],
+      { storage: memoryChannelStorage(), bindings: [BIND_A, BIND_B] },
+    );
+    // Compared by channel rather than object identity: a receipt whose
+    // balance is below the floor is handed to the peer as a corrected copy.
+    expect(applied).toEqual([CHANNEL_A, CHANNEL_B]);
+    expect(
+      captured.reconciled.map(
+        (r) =>
+          (r.settle as { extra: { channelState: { channelId: string } } }).extra
+            .channelState.channelId,
+      ),
+    ).toEqual([CHANNEL_A, CHANNEL_B]);
   });
 });
 
@@ -710,7 +716,10 @@ describe('reconcileX402BatchSettlement balance floor', () => {
     return settle.extra.channelState.balance;
   }
 
-  it('drops a balance below what this attempt funded', async () => {
+  // These assert what is handed to the peer. The state that actually lands in
+  // storage — which depends on upstream's merge semantics — is covered in
+  // `a2x-client-x402.test.ts` against the real `@x402/evm`.
+  it('substitutes the floor for a balance below what this attempt funded', async () => {
     // The aggregate attack: `maxAmount` caps each deposit individually, so a
     // merchant reporting `balance: "0"` every round induces another
     // individually-capped deposit every round, unbounded in total. Within a
@@ -725,15 +734,45 @@ describe('reconcileX402BatchSettlement balance floor', () => {
         depositAmount: '5000',
       },
     });
-    // The cumulative still advanced — only the balance key was refused.
+    // Substituted, not deleted: the peer assigns `balance` only when the
+    // receipt still carries the key, so dropping it would leave storage
+    // holding the prior (here: absent) value.
     expect(captured.reconciled).toHaveLength(1);
-    expect(reportedBalance()).toBeUndefined();
+    expect(reportedBalance()).toBe('5000');
     const state = (
       captured.reconciled[0]!.settle as {
         extra: { channelState: { chargedCumulativeAmount?: string } };
       }
     ).extra.channelState;
     expect(state.chargedCumulativeAmount).toBe('1000');
+  });
+
+  it('substitutes the floor when the merchant omits balance', async () => {
+    captured.reconciled = [];
+    await reconcileX402BatchSettlement(
+      [
+        {
+          success: true,
+          transaction: '',
+          network: 'eip155:84532',
+          extra: {
+            channelState: {
+              channelId: CHANNEL,
+              chargedCumulativeAmount: '1000',
+            },
+          },
+        } as X402SettleResponse,
+      ],
+      {
+        storage: memoryChannelStorage(),
+        bindings: {
+          channelId: CHANNEL,
+          maxClaimableAmount: '1000',
+          depositAmount: '5000',
+        },
+      },
+    );
+    expect(reportedBalance()).toBe('5000');
   });
 
   it('keeps a balance at or above the floor', async () => {
@@ -763,7 +802,7 @@ describe('reconcileX402BatchSettlement balance floor', () => {
         depositAmount: '5000',
       },
     });
-    expect(reportedBalance()).toBeUndefined();
+    expect(reportedBalance()).toBe('10000');
   });
 
   it('keeps a balance above the floor untouched', async () => {
