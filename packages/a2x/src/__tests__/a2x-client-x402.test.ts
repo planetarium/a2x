@@ -17,7 +17,10 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import { privateKeyToAccount } from 'viem/accounts';
-import { A2XClient } from '../client/a2x-client.js';
+import {
+  A2XClient,
+  type A2XClientX402Options,
+} from '../client/a2x-client.js';
 import {
   X402_EXTENSION_URI,
   X402_METADATA_KEYS,
@@ -695,7 +698,10 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
   }
 
   /** Terminal task carrying the merchant's post-voucher channel snapshot. */
-  function completedTaskWithChannelReceipt(channelId: string): unknown {
+  function completedTaskWithChannelReceipt(
+    channelId: string,
+    chargedCumulativeAmount = '1000',
+  ): unknown {
     return {
       kind: 'task',
       id: 't1',
@@ -720,7 +726,7 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
                     channelId,
                     balance: '5000',
                     totalClaimed: '0',
-                    chargedCumulativeAmount: '1000',
+                    chargedCumulativeAmount,
                   },
                 },
               },
@@ -848,6 +854,159 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
       totalClaimed: '0',
       chargedCumulativeAmount: '1000',
     });
+  });
+
+  it('serializes concurrent batch attempts until the first receipt is reconciled', async () => {
+    const { channels, storage } = channelStorage();
+    const submitted: Array<{
+      payload: {
+        type: string;
+        voucher: { channelId: string; maxClaimableAmount: string };
+      };
+    }> = [];
+    let submissionCount = 0;
+    let initialCount = 0;
+    let resolveBothInitial!: () => void;
+    const bothInitial = new Promise<void>((resolve) => {
+      resolveBothInitial = resolve;
+    });
+    let resolveFirstSubmission!: () => void;
+    const firstSubmission = new Promise<void>((resolve) => {
+      resolveFirstSubmission = resolve;
+    });
+    let resolveSecondSubmission!: () => void;
+    const secondSubmission = new Promise<void>((resolve) => {
+      resolveSecondSubmission = resolve;
+    });
+    let releaseFirstResponse!: () => void;
+    const firstResponseGate = new Promise<void>((resolve) => {
+      releaseFirstResponse = resolve;
+    });
+
+    const fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/agent-card.json') || url.endsWith('/agent.json')) {
+        return agentCardResponse();
+      }
+      const body = init?.body
+        ? (JSON.parse(init.body as string) as {
+            params?: { message?: { metadata?: Record<string, unknown> } };
+          })
+        : undefined;
+      const payment = body?.params?.message?.metadata?.[
+        X402_METADATA_KEYS.PAYLOAD
+      ] as (typeof submitted)[number] | undefined;
+      if (!payment) {
+        initialCount += 1;
+        if (initialCount === 2) resolveBothInitial();
+        return jsonRpcOk(batchRequiredTask());
+      }
+
+      submitted.push(payment);
+      submissionCount += 1;
+      if (submissionCount === 1) {
+        resolveFirstSubmission();
+        await firstResponseGate;
+      } else {
+        resolveSecondSubmission();
+      }
+      return jsonRpcOk(
+        completedTaskWithChannelReceipt(
+          payment.payload.voucher.channelId,
+          payment.payload.voucher.maxClaimableAmount,
+        ),
+      );
+    }) as unknown as typeof globalThis.fetch;
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+
+    const calls = Promise.all([
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'one' }] },
+      }),
+      client.sendMessage({
+        message: { messageId: 'm2', role: 'user', parts: [{ text: 'two' }] },
+      }),
+    ]);
+    await Promise.all([bothInitial, firstSubmission]);
+    const overlapped = await Promise.race([
+      secondSubmission.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 100)),
+    ]);
+    releaseFirstResponse();
+    await calls;
+
+    expect(overlapped).toBe(false);
+    expect(submitted).toHaveLength(2);
+    expect(submitted[0]!.payload.type).toBe('deposit');
+    expect(submitted[0]!.payload.voucher.maxClaimableAmount).toBe('1000');
+    expect(submitted[1]!.payload.type).toBe('voucher');
+    expect(submitted[1]!.payload.voucher.maxClaimableAmount).toBe('2000');
+    expect(
+      channels.get(submitted[0]!.payload.voucher.channelId.toLowerCase()),
+    ).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '2000',
+    });
+  });
+
+  it('reconciles through the storage snapshot used to sign the attempt', async () => {
+    const storageAState = channelStorage();
+    const storageBState = channelStorage();
+    const storageA = {
+      ...storageAState.storage,
+      get: async (key: string) =>
+        storageAState.channels.get(key) ?? {
+          balance: '5000',
+          chargedCumulativeAmount: '1000',
+          totalClaimed: '0',
+        },
+    };
+    let x402!: A2XClientX402Options;
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      (requests) => {
+        const task = completedTaskWithChannelReceipt(
+          signedChannelId(requests),
+          '2000',
+        ) as {
+          status: { message: { metadata: Record<string, unknown> } };
+        };
+        const receipts = task.status.message.metadata[
+          X402_METADATA_KEYS.RECEIPTS
+        ] as Array<{ extra: { channelState: { balance?: string } } }>;
+        delete receipts[0]!.extra.channelState.balance;
+        x402.batchSettlement = { storage: storageBState.storage };
+        return jsonRpcOk(task);
+      },
+    ]);
+    x402 = {
+      signer: TEST_ACCOUNT,
+      batchSettlement: { storage: storageA },
+      allowBatchSettlement: true,
+    };
+    const client = new A2XClient(AGENT_URL, { fetch, x402 });
+
+    await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+
+    expect(
+      storageAState.channels.get(signedChannelId(rpcRequests).toLowerCase()),
+    ).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '2000',
+    });
+    expect(storageBState.channels.size).toBe(0);
   });
 
   it('does not retry a batch payment after applying its success receipt', async () => {

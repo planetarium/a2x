@@ -122,9 +122,12 @@ export interface X402ChannelState {
  * an already-funded channel, the next request signs a **fresh deposit** into
  * it: real funds moved, on top of a balance the payer already has.
  *
- * Reconciliation is serialized per channel when callers share this storage
- * object in one process. The interface has no cross-process compare-and-set,
- * so replicas sharing a backend must route each channel through one writer.
+ * `A2XClient` serializes the complete sign → submit → reconcile/quarantine
+ * lifetime for batch attempts sharing this storage object in one process.
+ * Low-level callers using `signX402Payment` must provide the equivalent
+ * per-channel exclusion themselves. The interface has no cross-process
+ * compare-and-set, so replicas sharing a backend must route each channel
+ * through one writer.
  */
 export interface X402ClientChannelStorage {
   get(key: string): Promise<X402ChannelState | undefined>;
@@ -457,6 +460,13 @@ export function getX402Status(task: Task): X402PaymentStatus | undefined {
  * typically use this when they want fine-grained control of the
  * subsequent `message/send` call. For a one-call API that handles the
  * full dance, configure `A2XClient` with `{ x402: { signer } }`.
+ *
+ * When selecting `batch-settlement`, do not overlap this channel's complete
+ * sign → submit → reconcile/quarantine sequence with another attempt. Signing
+ * only reads storage; it does not reserve the next cumulative or deposit, so
+ * concurrent manual attempts can each authorize a fresh deposit. `A2XClient`
+ * provides this in-process exclusion automatically. Multiple processes need
+ * a single channel owner or an application-level durable reservation.
  */
 export async function signX402Payment(
   task: Task,
@@ -626,7 +636,9 @@ export function defaultSelect(
  * deposit. `A2XClient` raises `X402ReconciliationError` in that case; a caller
  * driving this directly should treat it the same way.
  *
- * Calls sharing one storage object are serialized per channel in-process.
+ * Reconciliation calls sharing one storage object are serialized per channel
+ * in-process. This protects the receipt read-check-write only; manual callers
+ * must also prevent overlapping signing/submission attempts for that channel.
  * Array bindings must name distinct channels; reconcile successive vouchers
  * on the same channel in separate calls.
  */

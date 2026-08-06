@@ -51,7 +51,7 @@ import {
   X402_METADATA_KEYS,
   X402_PAYMENT_STATUS,
 } from '../x402/constants.js';
-import { requirementAmount } from '../x402/versions.js';
+import { detectX402Version, requirementAmount } from '../x402/versions.js';
 import {
   defaultSelect,
   signX402Payment,
@@ -63,6 +63,7 @@ import {
   type SignedX402Payment,
   type X402BatchSettlementBinding,
   type X402BatchSettlementOptions,
+  type X402ClientChannelStorage,
 } from '../x402/client.js';
 import {
   X402PaymentFailedError,
@@ -138,6 +139,8 @@ export interface A2XClientX402Options {
    * call. Supplying it registers the scheme (it cannot be constructed from a
    * signer alone) and makes the client reconcile each task's receipts back
    * into `storage` — the step that advances the payer's cumulative voucher.
+   * Complete batch attempts sharing one storage object are serialized in this
+   * process so concurrent calls cannot sign from the same pre-payment state.
    *
    * See `X402BatchSettlementOptions`: `storage` must be durable.
    */
@@ -263,6 +266,63 @@ const ERROR_CODE_MAP: Record<number, new (message?: string, data?: unknown) => A
   [A2A_ERROR_CODES.VERSION_NOT_SUPPORTED]: VersionNotSupportedError,
 };
 
+interface ActiveX402BatchAttempt {
+  binding: X402BatchSettlementBinding;
+  storage: X402ClientChannelStorage;
+  release(): void;
+}
+
+interface SignedX402Attempt {
+  payment: SignedX402Payment;
+  batch?: ActiveX402BatchAttempt;
+}
+
+// The peer does not persist provisional state while it signs, so two payloads
+// produced from the same storage snapshot can each carry a fresh deposit. The
+// channel id is only available after that unsafe signing step; serialize by
+// storage identity instead, from before signing until receipt reconciliation
+// or quarantine completes. Module scope makes the guard span A2XClient
+// instances that share the same storage object.
+const _batchAttemptQueues = new WeakMap<
+  X402ClientChannelStorage,
+  Promise<void>
+>();
+
+async function acquireBatchAttemptLock(
+  storage: X402ClientChannelStorage,
+): Promise<() => void> {
+  if (
+    typeof storage !== 'object' ||
+    storage === null ||
+    typeof (storage as { get?: unknown }).get !== 'function' ||
+    typeof (storage as { set?: unknown }).set !== 'function' ||
+    typeof (storage as { delete?: unknown }).delete !== 'function'
+  ) {
+    throw new X402PaymentRequiredError(
+      'batchSettlement.storage must provide callable get, set, and delete methods; ' +
+        'the SDK does not fall back to in-memory channel storage.',
+    );
+  }
+
+  const previous = _batchAttemptQueues.get(storage) ?? Promise.resolve();
+  let unlock!: () => void;
+  const current = new Promise<void>((resolve) => {
+    unlock = resolve;
+  });
+  _batchAttemptQueues.set(storage, current);
+
+  await previous;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    unlock();
+    if (_batchAttemptQueues.get(storage) === current) {
+      _batchAttemptQueues.delete(storage);
+    }
+  };
+}
+
 // ─── v0.3 Request Formatting ───
 
 /**
@@ -385,60 +445,67 @@ export class A2XClient {
         return this._sendMessageOnce(this._buildRejectFollowup(params, task));
       }
 
-      const signed = await this._signX402(task);
-      const binding = getX402BatchSettlementBinding(signed.payload);
+      const signedAttempt = await this._signX402(task);
+      const { payment: signed, batch } = signedAttempt;
       try {
-        task = await this._sendMessageOnce(
-          this._buildSubmitFollowup(params, task, signed.metadata),
+        try {
+          task = await this._sendMessageOnce(
+            this._buildSubmitFollowup(params, task, signed.metadata),
+          );
+        } catch (cause) {
+          // Submission may already have reached the merchant before transport,
+          // JSON parsing, or response validation failed. The signed voucher is
+          // therefore potentially spendable even though no task came back.
+          await this._reconcileX402(undefined, batch, undefined, {
+            responseEnded: true,
+            cause,
+          });
+          // A handler may deliberately absorb the quarantine error. Preserve
+          // the original request failure in that case.
+          throw cause;
+        }
+        // Per attempt, not once after the loop: under `retryOnFailure` an
+        // intermediate attempt can settle before a later one re-prompts, and
+        // that receipt is state the payer must record either way. Bound to the
+        // channel and storage *this attempt* signed against.
+        const reconciled = await this._reconcileX402(
+          task.status.message?.metadata,
+          batch,
+          task,
         );
-      } catch (cause) {
-        // Submission may already have reached the merchant before transport,
-        // JSON parsing, or response validation failed. The signed voucher is
-        // therefore potentially spendable even though no task came back.
-        await this._reconcileX402(undefined, binding, undefined, {
-          responseEnded: true,
-          cause,
-        });
-        // A handler may deliberately absorb the quarantine error. Preserve
-        // the original request failure in that case.
-        throw cause;
-      }
-      // Per attempt, not once after the loop: under `retryOnFailure` an
-      // intermediate attempt can settle before a later one re-prompts, and
-      // that receipt is state the payer must record either way. Bound to the
-      // channel *this attempt* signed — see `_reconcileX402`.
-      const reconciled = await this._reconcileX402(
-        task.status.message?.metadata,
-        binding,
-        task,
-      );
-      const batchAttemptResolved = binding !== undefined && reconciled;
+        const batchAttemptResolved = batch !== undefined && reconciled;
 
-      // Server may re-issue payment-required when running with
-      // retryOnFailure (a2a-x402 v0.2 §9). Loop within the budget; once
-      // exhausted (or on any non-payment-required terminal), fall through
-      // to the receipt-scan decision. A matching batch receipt wins over a
-      // contradictory retry prompt: that voucher was accepted and signing
-      // again would authorize the same call twice. Non-batch retries retain
-      // their existing behavior because they have no binding.
-      if (
-        !batchAttemptResolved &&
-        task.status.state === 'input-required' &&
-        getX402PaymentRequirements(task)
-      ) {
-        continue;
+        // Server may re-issue payment-required when running with
+        // retryOnFailure (a2a-x402 v0.2 §9). Loop within the budget; once
+        // exhausted (or on any non-payment-required terminal), fall through
+        // to the receipt-scan decision. A matching batch receipt wins over a
+        // contradictory retry prompt: that voucher was accepted and signing
+        // again would authorize the same call twice. Non-batch retries retain
+        // their existing behavior because they have no binding.
+        if (
+          !batchAttemptResolved &&
+          task.status.state === 'input-required' &&
+          getX402PaymentRequirements(task)
+        ) {
+          continue;
+        }
+        if (!reconciled) {
+          // A non-blocking unary response can legitimately be intermediate, but
+          // returning it ends the only exchange that still owns this binding.
+          // Without a receipt or explicit retry prompt, the merchant may retain
+          // the voucher, so the channel must be quarantined before the binding
+          // falls out of scope.
+          await this._reconcileX402(undefined, batch, task, {
+            responseEnded: true,
+          });
+        }
+        break;
+      } finally {
+        // The lease starts before signing and spans submission plus every
+        // reconcile/quarantine exit, so another call cannot sign from the same
+        // pre-payment storage snapshot.
+        batch?.release();
       }
-      if (!reconciled) {
-        // A non-blocking unary response can legitimately be intermediate, but
-        // returning it ends the only exchange that still owns this binding.
-        // Without a receipt or explicit retry prompt, the merchant may retain
-        // the voucher, so the channel must be quarantined before the binding
-        // falls out of scope.
-        await this._reconcileX402(undefined, binding, task, {
-          responseEnded: true,
-        });
-      }
-      break;
     }
 
     this._throwIfX402Failure(task);
@@ -472,7 +539,7 @@ export class A2XClient {
     // The channel this exchange signed a voucher for, or undefined if it never
     // paid with this scheme. Both facts gate reconciliation — see
     // `_reconcileX402` for why an unbound fold is a real attack surface.
-    let signedBinding: X402BatchSettlementBinding | undefined;
+    let signedBatchAttempt: ActiveX402BatchAttempt | undefined;
 
     while (true) {
       let pendingTask: Task | undefined;
@@ -503,22 +570,25 @@ export class A2XClient {
                 contextId: event.contextId,
                 status: event.status,
               } as Task;
-              const binding = signedBinding;
+              const attempt = signedBatchAttempt;
               const reconciled = await this._reconcileX402(
                 event.status?.message?.metadata as
                   | Record<string, unknown>
                   | undefined,
-                binding,
+                attempt,
                 eventTask,
               );
               if (reconciled) {
-                signedBinding = undefined;
-                if (binding !== undefined) batchAttemptResolved = true;
+                signedBatchAttempt = undefined;
+                attempt?.release();
+                if (attempt !== undefined) batchAttemptResolved = true;
               }
             } catch (cause) {
               // Reconciliation already surfaced the unsafe channel. Do not
               // let the generator's close path report it a second time.
-              signedBinding = undefined;
+              const attempt = signedBatchAttempt;
+              signedBatchAttempt = undefined;
+              attempt?.release();
               throw cause;
             }
           }
@@ -532,7 +602,9 @@ export class A2XClient {
             // A valid retry prompt proves the previous voucher was rejected.
             // Clear before yielding so consumer-driven iterator close cannot
             // mistake this safe exit for an ambiguous response.
-            signedBinding = undefined;
+            const attempt = signedBatchAttempt;
+            signedBatchAttempt = undefined;
+            attempt?.release();
           }
 
           yield event;
@@ -540,23 +612,31 @@ export class A2XClient {
         }
       } catch (cause) {
         if (cause instanceof X402ReconciliationError) throw cause;
-        const binding = signedBinding;
-        signedBinding = undefined;
-        await this._reconcileX402(undefined, binding, undefined, {
-          responseEnded: true,
-          cause,
-        });
+        const attempt = signedBatchAttempt;
+        signedBatchAttempt = undefined;
+        try {
+          await this._reconcileX402(undefined, attempt, undefined, {
+            responseEnded: true,
+            cause,
+          });
+        } finally {
+          attempt?.release();
+        }
         throw cause;
       } finally {
         // `AsyncGenerator.return()` skips everything after the suspended
         // `yield`, but still runs this block. Keep the binding alive until this
         // point so consumer-driven close is treated like any other ambiguous
         // end to a response.
-        const binding = signedBinding;
-        signedBinding = undefined;
-        await this._reconcileX402(undefined, binding, undefined, {
-          responseEnded: true,
-        });
+        const attempt = signedBatchAttempt;
+        signedBatchAttempt = undefined;
+        try {
+          await this._reconcileX402(undefined, attempt, undefined, {
+            responseEnded: true,
+          });
+        } finally {
+          attempt?.release();
+        }
       }
 
       if (!pendingTask) return;
@@ -579,18 +659,25 @@ export class A2XClient {
       if (signsRemaining <= 0) return;
       signsRemaining -= 1;
 
-      const signed = await this._signX402(pendingTask);
+      const signedAttempt = await this._signX402(pendingTask);
+      const { payment: signed, batch } = signedAttempt;
       // Assigned, never merged: under `retryOnFailure` a later attempt can
       // select a different scheme, and carrying a stale batch binding forward
       // would test that attempt's `exact` receipt against it and report a
       // successful payment as unreconciled. A non-batch payload correctly
       // clears this to `undefined`.
-      signedBinding = getX402BatchSettlementBinding(signed.payload);
-      currentParams = this._buildSubmitFollowup(
-        params,
-        pendingTask,
-        signed.metadata,
-      );
+      signedBatchAttempt = batch;
+      try {
+        currentParams = this._buildSubmitFollowup(
+          params,
+          pendingTask,
+          signed.metadata,
+        );
+      } catch (cause) {
+        signedBatchAttempt = undefined;
+        batch?.release();
+        throw cause;
+      }
     }
   }
 
@@ -740,8 +827,18 @@ export class A2XClient {
     );
   }
 
-  private async _signX402(task: Task): Promise<SignedX402Payment> {
-    const x402 = this._x402!;
+  private async _signX402(task: Task): Promise<SignedX402Attempt> {
+    // Snapshot the mutable caller-owned configuration once for this attempt.
+    // In particular, the storage that signing reads must be the same object
+    // reconciliation later writes even if the caller swaps options while the
+    // network request is in flight.
+    const configured = this._x402!;
+    const x402: A2XClientX402Options = {
+      ...configured,
+      ...(configured.batchSettlement !== undefined
+        ? { batchSettlement: { ...configured.batchSettlement } }
+        : {}),
+    };
     const userSelect = x402.selectRequirement;
     const select = (
       reqs: X402PaymentRequirements[],
@@ -764,13 +861,47 @@ export class A2XClient {
           x402.allowBatchSettlement && x402.batchSettlement !== undefined,
       });
     };
-    return signX402Payment(task, {
-      signer: x402.signer,
-      selectRequirement: select,
-      ...(x402.batchSettlement !== undefined
-        ? { batchSettlement: this._cappedBatchSettlement(x402) }
-        : {}),
-    });
+    const required = getX402PaymentRequirements(task);
+    const selected =
+      required && detectX402Version(required)
+        ? select(required.accepts as X402PaymentRequirements[])
+        : undefined;
+    const batchSettlement = x402.batchSettlement;
+    const release =
+      selected?.scheme === 'batch-settlement' && batchSettlement !== undefined
+        ? await acquireBatchAttemptLock(batchSettlement.storage)
+        : undefined;
+
+    try {
+      const payment = await signX402Payment(task, {
+        signer: x402.signer,
+        // Selection already ran before the batch lease was acquired. Reusing
+        // that exact result avoids invoking a stateful caller predicate twice.
+        selectRequirement: () => selected,
+        ...(batchSettlement !== undefined
+          ? { batchSettlement: this._cappedBatchSettlement(x402) }
+          : {}),
+      });
+      if (!release || !batchSettlement) return { payment };
+
+      const binding = getX402BatchSettlementBinding(payment.payload);
+      if (!binding) {
+        throw new X402PaymentRequiredError(
+          'The selected batch-settlement signer returned a payload without a usable channel binding.',
+        );
+      }
+      return {
+        payment,
+        batch: {
+          binding,
+          storage: batchSettlement.storage,
+          release,
+        },
+      };
+    } catch (cause) {
+      release?.();
+      throw cause;
+    }
   }
 
   /**
@@ -856,12 +987,12 @@ export class A2XClient {
    */
   private async _reconcileX402(
     metadata: Record<string, unknown> | undefined,
-    binding: X402BatchSettlementBinding | undefined,
+    attempt: ActiveX402BatchAttempt | undefined,
     task: Task | undefined,
     options: { responseEnded?: boolean; cause?: unknown } = {},
   ): Promise<boolean> {
-    const batchSettlement = this._x402?.batchSettlement;
-    if (!batchSettlement || !binding) return true;
+    if (!attempt) return true;
+    const { binding, storage } = attempt;
 
     // Only a settled payment owes us a receipt. Intermediate events
     // (`payment-verified`, plain `working`) legitimately carry none. Once the
@@ -883,7 +1014,7 @@ export class A2XClient {
     let cause: unknown;
     try {
       ({ applied } = await reconcileX402BatchSettlement(list, {
-        storage: batchSettlement.storage,
+        storage,
         bindings: binding,
       }));
     } catch (err) {

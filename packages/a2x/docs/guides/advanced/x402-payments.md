@@ -645,7 +645,11 @@ import {
 
 // (a) You drove the dance manually with `signX402Payment`.
 // (b) The receipt reached you via `getTask` rather than the send that paid.
-const signed = await signX402Payment(task, { signer, batchSettlement });
+const signed = await signX402Payment(task, {
+  signer,
+  batchSettlement,
+  allowBatchSettlement: true,
+});
 // …resubmit with `signed.metadata`, then on the terminal task:
 const { applied } = await reconcileX402BatchSettlement(getX402Receipts(final), {
   storage: myChannelStorage,
@@ -658,7 +662,9 @@ if (applied.length === 0) {
 
 Skip reconciliation and the payer's cumulative amount never advances: every subsequent call re-signs an identical voucher against a channel it still believes is unfunded — and therefore signs a **fresh deposit** each time. Receipts from other schemes, malformed ones (including non-object array entries), any naming a channel outside `bindings`, and any whose cumulative differs from the signed ceiling are ignored; a receipt that fails to apply raises an `AggregateError` after the others have been tried, so one bad entry cannot drop a good one.
 
-When `bindings` is an array, every entry must name a distinct channel. Reconcile successive attempts on the same channel separately; collapsing them into one call would lose which deposit floor belongs to which cumulative voucher. Calls through the same storage object are serialized per channel inside the process, so a delayed older receipt cannot overwrite a newer cumulative. The storage interface has no cross-process compare-and-set operation, however: route reconciliation for a channel through one writer when multiple processes or replicas share the backend.
+When `bindings` is an array, every entry must name a distinct channel. Reconcile successive attempts on the same channel separately; collapsing them into one call would lose which deposit floor belongs to which cumulative voucher. Reconciliation calls through the same storage object are serialized per channel inside the process, so a delayed older receipt cannot overwrite a newer cumulative.
+
+That receipt lock alone cannot make concurrent signing safe: `@x402/evm` only reads storage while it creates a payload and does not reserve the next cumulative or deposit. Two overlapping attempts can therefore read the same empty state and each authorize a fresh deposit before either receipt exists. `A2XClient` prevents this in-process by holding one lease per storage object across the complete sign → submit → reconcile/quarantine lifetime (conservatively serializing different channels that share that object because the channel id is not available until after signing). The low-level helpers cannot retain a lock across your network call, so manual flows must serialize that entire lifetime per channel themselves. The storage interface has no cross-process compare-and-set operation; when multiple processes or replicas share a backend, route each channel through one owner or add an application-level durable reservation before signing.
 
 **An empty `applied` after a settled payment is a failure, not a no-op.** The voucher is spent either way, so "nothing to record" and "the merchant withheld or falsified the receipt" have identical consequences: local state did not move, and the next call re-signs or re-deposits. `A2XClient` raises `X402ReconciliationError` with `reason: 'no-matching-receipt'` in that case; a caller driving the helper directly should treat it the same way.
 

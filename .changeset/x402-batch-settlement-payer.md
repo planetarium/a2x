@@ -34,6 +34,12 @@ a cent.
   late receipts instead of letting a delayed read-check-write roll cumulative
   state back. Backends shared across processes still require one writer per
   channel because the upstream storage contract has no atomic compare-and-set.
+- `A2XClient` also serializes the complete sign, submit, and
+  reconcile/quarantine lifetime for batch attempts sharing one storage object.
+  The peer does not reserve state while signing, so without that lease two
+  concurrent calls can read the same empty channel and each authorize a fresh
+  deposit. Manual and cross-process flows must provide equivalent per-channel
+  exclusion or a durable reservation themselves.
 - `bindings` ties the fold to what that exchange actually signed — the channel,
   the cumulative ceiling its voucher authorized, and the deposit it funded.
   Each closes a distinct path. Channel ids derive from public inputs, so
@@ -75,10 +81,10 @@ a cent.
 - Deposit sizing is tunable via `depositPolicy` (default 5x the request
   amount) or `depositStrategy` for full per-deposit control.
 - The batch signing runtime is constructed only when that scheme wins
-  selection and is rebuilt from the current options for every batch signing.
-  Invalid or mutated batch configuration therefore cannot poison an `exact`
-  payment or leave signing attached to an earlier storage object while
-  reconciliation writes a different one.
+  selection and is rebuilt from a per-attempt options snapshot. That same
+  snapshot's storage is carried through reconciliation, so invalid or mutated
+  batch configuration cannot poison an `exact` payment or make an in-flight
+  attempt sign against one storage object and write its receipt to another.
 
 On the merchant side, scheme-scoped payer extraction reads
 `batch-settlement` identity from the voucher-bound `channelConfig.payer`.
