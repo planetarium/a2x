@@ -696,7 +696,11 @@ async function captureBatchSettlementBinding(
     );
   }
 
-  return { ...partial, preAttemptState };
+  // `null`, not `undefined`, for a fresh channel: the binding gets persisted
+  // (quarantine marker, caller attempt stores), and JSON.stringify would
+  // drop an `undefined`-valued key — erasing the proof that no record
+  // existed and failing the required-key check after the round trip.
+  return { ...partial, preAttemptState: preAttemptState ?? null };
 }
 
 /**
@@ -871,13 +875,14 @@ export async function reconcileX402BatchSettlement(
     // TypeScript already requires the key, but plain-JavaScript and
     // deserialized callers can omit it — and treating omission as "fresh
     // channel" would silently drop the trusted existing balance from the
-    // fold's floor. An explicit `preAttemptState: undefined` states the
-    // channel had no record; an absent key states nothing, so it fails.
+    // fold's floor. An explicit `preAttemptState: null` (the JSON-safe
+    // spelling the SDK emits) or `undefined` states the channel had no
+    // record; an absent key states nothing, so it fails.
     if (!('preAttemptState' in (binding as object))) {
       throw new X402PaymentRequiredError(
         `bindings entry for channel ${binding.channelId} omits preAttemptState. ` +
           'Pass the channel snapshot captured when the payload was signed ' +
-          '(SignedX402Payment.batch carries it), or explicitly undefined for a ' +
+          '(SignedX402Payment.batch carries it), or explicitly null for a ' +
           'channel that had no record.',
       );
     }
@@ -894,8 +899,9 @@ export async function reconcileX402BatchSettlement(
     }
     // Unlike the remote-controlled receipt, the snapshot is caller-trusted
     // input: silently coercing garbage here would corrupt the floor and base
-    // the whole fold rests on, so fail loudly instead.
-    const pre = binding.preAttemptState;
+    // the whole fold rests on, so fail loudly instead. `null` is the
+    // JSON-safe fresh-channel sentinel and normalizes to "no record".
+    const pre = binding.preAttemptState ?? undefined;
     let preBalance = 0n;
     if (pre?.balance !== undefined) {
       try {
@@ -1295,7 +1301,7 @@ export interface X402BatchSettlementBinding
   extends X402BatchSettlementPayloadBinding {
   /**
    * Channel state as stored immediately before this attempt signed —
-   * explicitly `undefined` when no record existed (a fresh channel).
+   * `null` when no record existed (a fresh channel).
    *
    * This is the fold's only trusted balance source. Basing the write on the
    * snapshot rather than on whatever storage holds at reconcile time is what
@@ -1303,8 +1309,15 @@ export interface X402BatchSettlementBinding
    * the thing that cannot be trusted. The key is required (not optional) so
    * a caller cannot forget the snapshot and silently degrade the floor to
    * the deposit alone.
+   *
+   * The SDK emits `null` — never `undefined` — for a fresh channel because
+   * bindings get persisted (the quarantine marker's recovery record, a
+   * caller's own attempt store) and `JSON.stringify` drops
+   * `undefined`-valued properties, which would erase exactly the proof that
+   * no record existed. An explicit `undefined` from hand-written callers is
+   * still accepted; an absent key throws.
    */
-  preAttemptState: X402ChannelState | undefined;
+  preAttemptState: X402ChannelState | null | undefined;
 }
 
 /**

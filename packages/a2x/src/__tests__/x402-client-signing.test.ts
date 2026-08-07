@@ -421,6 +421,9 @@ describe('signX402Payment batch-settlement selection policy', () => {
       allowBatchSettlement: true,
     });
     expect(signed.requirement).toEqual(V2_BATCH_ACCEPT);
+    // Fresh channel: the sentinel is the JSON-safe `null`, never an
+    // `undefined` that JSON.stringify would drop from a persisted binding.
+    expect(signed.batch?.preAttemptState).toBeNull();
   });
 
   it('prefers exact, then upto, and takes batch-settlement last', async () => {

@@ -1866,6 +1866,86 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     });
   });
 
+  it('repairs a fresh-channel quarantine through a JSON round-tripping storage', async () => {
+    // Durable storages persist records with JSON.stringify (the peer's
+    // file-backed one does exactly that), which drops undefined-valued keys.
+    // The fresh-channel sentinel on the persisted recovery record must be
+    // the JSON-safe `null`, or the restart repair fails its required-key
+    // check for precisely the most important case: a quarantined opening
+    // deposit into a channel with no prior record.
+    const records = new Map<string, string>();
+    const storage = {
+      get: async (key: string) => {
+        const raw = records.get(key);
+        return raw === undefined
+          ? undefined
+          : (JSON.parse(raw) as Record<string, unknown>);
+      },
+      set: async (key: string, state: Record<string, unknown>) => {
+        records.set(key, JSON.stringify(state));
+      },
+      delete: async (key: string) => {
+        records.delete(key);
+      },
+    };
+    const completedNoReceipt = (requests: Array<{ body: unknown }>) => {
+      const task = completedTaskWithChannelReceipt(
+        signedChannelId(requests),
+      ) as { status: { message: { metadata: Record<string, unknown> } } };
+      delete task.status.message.metadata[X402_METADATA_KEYS.RECEIPTS];
+      return task;
+    };
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      (requests) => jsonRpcOk(completedNoReceipt(requests)),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+    await expect(
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      }),
+    ).rejects.toBeInstanceOf(X402ReconciliationError);
+
+    // "Restart": everything in memory is gone; the round-tripped marker is
+    // the only surviving recovery record.
+    const key = signedChannelId(rpcRequests).toLowerCase();
+    const marker = (await storage.get(key)) as {
+      quarantineTaskId?: string;
+      quarantineBinding?: Record<string, unknown>;
+    };
+    expect(marker.quarantineTaskId).toBe('t1');
+    expect(
+      Object.hasOwn(marker.quarantineBinding!, 'preAttemptState'),
+    ).toBe(true);
+    expect(marker.quarantineBinding!.preAttemptState).toBeNull();
+
+    const recovered = completedTaskWithChannelReceipt(
+      signedChannelId(rpcRequests),
+    ) as Task;
+    const { applied } = await reconcileX402BatchSettlement(
+      recovered.status.message!.metadata![
+        X402_METADATA_KEYS.RECEIPTS
+      ] as never[],
+      {
+        storage,
+        bindings: marker.quarantineBinding as never,
+      },
+    );
+    expect(applied).toEqual([signedChannelId(rpcRequests)]);
+    expect(await storage.get(key)).toEqual({
+      balance: '5000',
+      totalClaimed: '0',
+      chargedCumulativeAmount: '1000',
+    });
+  });
+
   it.each(['failed', 'canceled', 'rejected'])(
     'raises when a terminal %s task omits x402 metadata',
     async (state) => {
@@ -1945,7 +2025,9 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
       maxClaimableAmount: '1000',
       depositAmount: '5000',
     });
-    expect(error!.binding!.preAttemptState).toBeUndefined();
+    // `null`, not `undefined`: the fresh-channel sentinel must survive the
+    // JSON round trip durable storages and attempt stores perform.
+    expect(error!.binding!.preAttemptState).toBeNull();
     expect((error as Error & { cause?: unknown }).cause).toEqual(
       new Error('connection reset after submit'),
     );

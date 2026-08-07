@@ -52,7 +52,9 @@ a cent.
   durable reservation themselves.
 - `bindings` ties the fold to what that exchange actually signed — the channel,
   the cumulative ceiling its voucher authorized, the deposit it funded, and
-  the pre-attempt snapshot (`preAttemptState`, a required key). Each closes a
+  the pre-attempt snapshot (`preAttemptState`, a required key whose
+  fresh-channel value is the JSON-safe `null`, so persisted bindings survive
+  a `JSON.stringify` round trip). Each closes a
   distinct path. Channel ids derive from public inputs, so without the first a
   merchant could name a channel belonging to a *different* merchant and
   overwrite its cumulative. Without the second, the same merchant can inflate
