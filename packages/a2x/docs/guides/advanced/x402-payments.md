@@ -665,7 +665,7 @@ if (applied.length === 0) {
 
 Persist `signed.batch` alongside the payload if reconciliation may happen in a later process: the snapshot cannot be reconstructed afterwards. The binding is JSON-safe by construction — a fresh channel's `preAttemptState` is `null`, never an `undefined` that `JSON.stringify` would silently drop (an absent key is rejected at reconcile time, so a lossy round trip would otherwise break the repair for exactly the opening-deposit case). A caller resuming from a persisted *payload* alone can rebuild the payload-provable half with `getX402BatchSettlementBinding(payload)`, but must combine it with the snapshot it captured at signing time to form the `bindings` entry.
 
-Skip reconciliation and the payer's cumulative amount never advances: every subsequent call re-signs an identical voucher against a channel it still believes is unfunded — and therefore signs a **fresh deposit** each time. Receipts from other schemes, malformed ones (including non-object array entries), any naming a channel outside `bindings`, and any whose cumulative the binding cannot vouch for are ignored. A cumulative is vouched for when it stays at or below the signed ceiling **and** either equals `preAttemptState cumulative + extra.chargedAmount` (a metered settlement — see the ceiling bullet above) or, absent a usable `chargedAmount`, equals the ceiling exactly (the unmetered lifecycle). A receipt that fails to apply raises an `AggregateError` after the others have been tried, so one bad entry cannot drop a good one.
+Skip reconciliation and the payer's cumulative amount never advances: every subsequent call re-signs an identical voucher against a channel it still believes is unfunded — and therefore signs a **fresh deposit** each time. Receipts from other schemes, malformed ones (including non-object array entries), any naming a channel outside `bindings`, and any whose cumulative the binding cannot vouch for are ignored. A cumulative is vouched for when it stays at or below the signed ceiling **and** either equals `preAttemptState cumulative + extra.chargedAmount` (a metered settlement — see the ceiling bullet above) or, absent a usable `chargedAmount`, equals the ceiling exactly (the unmetered lifecycle). Ignored receipts do not throw — they simply leave `applied` empty, which is why an empty `applied` after a settled payment must be treated as a failure (below). `AggregateError` is reserved for storage operations that throw, raised after the other receipts have been tried so one failing write cannot drop a good receipt.
 
 When `bindings` is an array, every entry must name a distinct channel. Reconcile successive attempts on the same channel separately; collapsing them into one call would lose which deposit floor belongs to which cumulative voucher. Reconciliation calls through the same storage object are serialized per channel inside the process, so a delayed older receipt cannot overwrite a newer cumulative.
 
@@ -698,11 +698,15 @@ try {
     const final = (err.task as Task | undefined) ??
       (err.taskId ? await client.getTask(err.taskId) : undefined);
     if (final && err.binding) {
-      await reconcileX402BatchSettlement(getX402Receipts(final), {
-        storage,
-        bindings: err.binding,
-      });
-      return final;
+      const { applied } = await reconcileX402BatchSettlement(
+        getX402Receipts(final),
+        { storage, bindings: err.binding },
+      );
+      // Check `applied`: ignored receipts do not throw, so an empty result
+      // means the fetched task still lacks a usable receipt and the channel
+      // is still quarantined — returning here would report a repair that
+      // never happened.
+      if (applied.length > 0) return final;
     }
     // Nothing to repair from yet — leave the channel quarantined.
   }

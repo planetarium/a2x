@@ -2033,6 +2033,112 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     );
   });
 
+  it('releases cleanly when follow-up serialization fails before the transport', async () => {
+    // `_formatParams` deep-clones via JSON.stringify before fetch ever runs,
+    // so a follow-up that cannot be encoded fails with the voucher still
+    // inside this process. That is the signed-but-not-submitted exit: no
+    // quarantine marker, no reconciliation error, and the lease must release
+    // clean so the very next call can pay through the same storage.
+    const { channels, storage } = channelStorage();
+    let toJsonCalls = 0;
+    const trap = {
+      // Serializes fine for the initial request (and for every call after
+      // the failure), but the *first follow-up* yields a BigInt, which
+      // JSON.stringify rejects before the request reaches the transport.
+      toJSON: () => (++toJsonCalls === 2 ? { boom: 1n } : { ok: true }),
+    };
+    let recorded: Array<{ body: unknown }> = [];
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(completedTaskWithChannelReceipt(signedChannelId(recorded))),
+    ]);
+    recorded = rpcRequests;
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+
+    const error = await client
+      .sendMessage({
+        message: {
+          messageId: 'm1',
+          role: 'user',
+          parts: [{ text: 'hi' }],
+          metadata: { trap },
+        },
+      })
+      .then(
+        () => undefined,
+        (reason: unknown) => reason,
+      );
+    expect(error).toBeInstanceOf(TypeError);
+    expect(error).not.toBeInstanceOf(X402ReconciliationError);
+    // Only the initial request reached the wire; nothing was quarantined.
+    expect(rpcRequests).toHaveLength(1);
+    expect(channels.size).toBe(0);
+
+    // The lease released clean: the next payment on the same storage signs,
+    // submits, and reconciles without any operator intervention.
+    const task = await client.sendMessage({
+      message: {
+        messageId: 'm2',
+        role: 'user',
+        parts: [{ text: 'hi again' }],
+        metadata: { trap },
+      },
+    });
+    expect(task.status.state).toBe('completed');
+    expect(
+      channels.get(signedChannelId(rpcRequests).toLowerCase()),
+    ).toMatchObject({ chargedCumulativeAmount: '1000' });
+  });
+
+  it('releases a stream cleanly when follow-up serialization fails before the transport', async () => {
+    const { channels, storage } = channelStorage();
+    let toJsonCalls = 0;
+    const trap = {
+      toJSON: () => (++toJsonCalls === 2 ? { boom: 1n } : { ok: true }),
+    };
+    const required = batchRequiredTask() as { status: { message: unknown } };
+    const { fetch, rpcRequests } = scriptedFetch([
+      () =>
+        batchSse([batchStatusEvent('input-required', required.status.message)]),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+
+    let error: unknown;
+    try {
+      for await (const _event of client.sendMessageStream({
+        message: {
+          messageId: 'm1',
+          role: 'user',
+          parts: [{ text: 'hi' }],
+          metadata: { trap },
+        },
+      })) {
+        // consume
+      }
+    } catch (reason) {
+      error = reason;
+    }
+    expect(error).toBeInstanceOf(TypeError);
+    expect(error).not.toBeInstanceOf(X402ReconciliationError);
+    expect(rpcRequests).toHaveLength(1);
+    expect(channels.size).toBe(0);
+  });
+
   it('quarantines a non-terminal unary response after batch submission', async () => {
     const { channels, storage } = channelStorage();
     const working = batchRequiredTask() as {

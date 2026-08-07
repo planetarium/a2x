@@ -402,15 +402,29 @@ export class A2XClient {
       const signedAttempt = await this._signX402(task);
       const { payment: signed, batch } = signedAttempt;
       try {
+        // False until the request body is handed to the transport. Building
+        // and serializing the follow-up (`_formatParams` deep-clones via
+        // JSON.stringify before fetch ever runs) can fail with the voucher
+        // still inside this process — that is a clean release, not a
+        // quarantine, or a healthy channel gets blocked over a local bug.
+        let submitted = false;
         try {
           task = await this._sendMessageOnce(
             this._buildSubmitFollowup(params, task, signed.metadata),
+            () => {
+              submitted = true;
+            },
           );
         } catch (cause) {
-          // Submission may already have reached the merchant before transport,
-          // JSON parsing, or response validation failed. The signed voucher is
-          // therefore potentially spendable even though no task came back.
-          await batch?.close({ cause });
+          if (submitted) {
+            // Submission may already have reached the merchant before
+            // transport, JSON parsing, or response validation failed. The
+            // signed voucher is therefore potentially spendable even though
+            // no task came back.
+            await batch?.close({ cause });
+          } else {
+            batch?.dispose();
+          }
           // A handler may deliberately absorb the quarantine error. Preserve
           // the original request failure in that case.
           throw cause;
@@ -497,10 +511,18 @@ export class A2XClient {
       // separate events; once the signed voucher is settled, no later event
       // in this response may authorize the same work again.
       let batchAttemptResolved = false;
+      // False until this response's request body is handed to the transport.
+      // Formatting/serializing it happens before fetch, so a failure there
+      // leaves the voucher inside this process — a clean release, not a
+      // quarantine.
+      let submitted = false;
       try {
         for await (const event of this._sendMessageStreamOnce(
           currentParams,
           signal,
+          () => {
+            submitted = true;
+          },
         )) {
           let eventTask: Task | undefined;
           // Reconcile BEFORE the yield, not after. The receipt rides the final
@@ -559,7 +581,11 @@ export class A2XClient {
         }
         const attempt = batch;
         batch = undefined;
-        await attempt?.close({ cause });
+        if (submitted) {
+          await attempt?.close({ cause });
+        } else {
+          attempt?.dispose();
+        }
         throw cause;
       } finally {
         // `AsyncGenerator.return()` skips everything after the suspended
@@ -568,7 +594,13 @@ export class A2XClient {
         // ambiguous end to a response.
         const attempt = batch;
         batch = undefined;
-        await attempt?.close({});
+        if (attempt) {
+          if (submitted) {
+            await attempt.close({});
+          } else {
+            attempt.dispose();
+          }
+        }
       }
 
       if (!pendingTask) return;
@@ -614,12 +646,15 @@ export class A2XClient {
     }
   }
 
-  private async _sendMessageOnce(params: SendMessageParams): Promise<Task> {
+  private async _sendMessageOnce(
+    params: SendMessageParams,
+    onTransport?: () => void,
+  ): Promise<Task> {
     await this._ensureResolved();
     await this._ensureAuthenticated();
     const formatted = this._formatParams(params);
     const request = this._buildJsonRpcRequest(A2A_METHODS.SEND_MESSAGE, formatted);
-    const result = await this._postJsonRpc(request);
+    const result = await this._postJsonRpc(request, onTransport);
     const task = this._parser!.parseTask(result);
     // Spec a2a-v0.3 §TaskState / a2a-v1.0 §TASK_STATE_AUTH_REQUIRED:
     // an auth failure surfaces as a Task in `auth-required` state.
@@ -628,23 +663,25 @@ export class A2XClient {
     if (task.status.state !== TaskState.AUTH_REQUIRED) return task;
     if (!(await this._refreshAuth())) return task;
     const retryRequest = this._buildJsonRpcRequest(A2A_METHODS.SEND_MESSAGE, formatted);
-    const retryResult = await this._postJsonRpc(retryRequest);
+    const retryResult = await this._postJsonRpc(retryRequest, onTransport);
     return this._parser!.parseTask(retryResult);
   }
 
   private async *_sendMessageStreamOnce(
     params: SendMessageParams,
     signal?: AbortSignal,
+    onTransport?: () => void,
   ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
     await this._ensureResolved();
     await this._ensureAuthenticated();
-    yield* this._streamWithAuthRetry(params, signal, false);
+    yield* this._streamWithAuthRetry(params, signal, false, onTransport);
   }
 
   private async *_streamWithAuthRetry(
     params: SendMessageParams,
     signal: AbortSignal | undefined,
     isRetry: boolean,
+    onTransport?: () => void,
   ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
     const formatted = this._formatParams(params);
     const request = this._buildJsonRpcRequest(
@@ -659,10 +696,15 @@ export class A2XClient {
 
     this._applyAuth({ headers, url });
 
+    // Everything above ran locally; serialize the body before declaring the
+    // request submitted, so a payload that cannot even be encoded never
+    // counts as having possibly reached the merchant.
+    const body = JSON.stringify(request);
+    onTransport?.();
     const response = await this._fetchImpl(url.toString(), {
       method: 'POST',
       headers,
-      body: JSON.stringify(request),
+      body,
       signal,
     });
 
@@ -697,7 +739,7 @@ export class A2XClient {
       firstEvent.status?.state === TaskState.AUTH_REQUIRED &&
       (await this._refreshAuth())
     ) {
-      yield* this._streamWithAuthRetry(params, signal, true);
+      yield* this._streamWithAuthRetry(params, signal, true, onTransport);
       return;
     }
     yield firstEvent;
@@ -1117,16 +1159,24 @@ export class A2XClient {
     };
   }
 
-  private async _postJsonRpc(request: JSONRPCRequest): Promise<unknown> {
+  private async _postJsonRpc(
+    request: JSONRPCRequest,
+    onTransport?: () => void,
+  ): Promise<unknown> {
     const headers = this._buildHeaders();
     const url = new URL(this._endpointUrl!);
 
     this._applyAuth({ headers, url });
 
+    // Everything above ran locally; serialize the body before declaring the
+    // request submitted, so a payload that cannot even be encoded never
+    // counts as having possibly reached the merchant.
+    const body = JSON.stringify(request);
+    onTransport?.();
     const response = await this._fetchImpl(url.toString(), {
       method: 'POST',
       headers,
-      body: JSON.stringify(request),
+      body,
     });
 
     if (!response.ok) {
