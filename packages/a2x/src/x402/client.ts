@@ -187,9 +187,22 @@ export interface X402ChannelState {
  * opened, and a stale receipt from before the deletion can resurrect it.
  * a2x never deletes records, but `@x402/evm`'s cooperative refund path does
  * when a channel drains. Do not share this storage with flows that perform
- * an unversioned delete: when retiring a refunded channel, either keep a
- * record in place of deleting, or rotate `salt` so future payments derive a
- * fresh channel id and the old receipts have nothing to match.
+ * an unversioned delete.
+ *
+ * The supported way to retire a refunded channel is to rotate
+ * `batchSettlement.salt` — future payments derive a fresh channel id — and
+ * never reuse the old channel. Retaining an arbitrary record instead is
+ * **not** safe: keeping the old `lastAppliedAttemptId` leaves the old
+ * receipt as the record's owner, so replaying it rewrites the record
+ * (including its pre-refund balance), and keeping a positive balance makes
+ * the signer treat the refunded channel as still funded. A manually
+ * retained record is safe only when it simultaneously (a) carries a
+ * generation no payment attempt owns and (b) refuses signing — i.e. replace
+ * the record with exactly
+ * `{ lastAppliedAttemptId: 'retired:<unique>', quarantinedAt: <ISO 8601>,
+ * quarantineReason: 'retired' }` and nothing else. A first-class
+ * retirement/tombstone operation is planned with the transactional storage
+ * extension.
  */
 export interface X402ClientChannelStorage {
   get(key: string): Promise<X402ChannelState | undefined>;

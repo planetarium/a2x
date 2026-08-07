@@ -3232,6 +3232,47 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
     });
   });
 
+  it('a retirement record blocks replays of the retired channel', async () => {
+    // The documented refund retirement: replace the record with a generation
+    // no payment attempt owns plus a quarantine marker. Merely keeping the
+    // old record (old stamp, zeroed balance) would NOT do — the old receipt
+    // still owns that stamp and its replay would rewrite the record,
+    // pre-refund balance included.
+    const { channels, storage } = store();
+    const openingBinding = {
+      channelId: CHANNEL,
+      maxClaimableAmount: '500',
+      depositAmount: '5000',
+      attemptId: 'attempt-old',
+      preAttemptState: undefined,
+    };
+    const openingReceipt = receipt({
+      chargedCumulativeAmount: '500',
+      balance: '5000',
+    });
+    await reconcileX402BatchSettlement([openingReceipt], {
+      storage,
+      bindings: openingBinding,
+    });
+
+    // Channel refunded and retired per the documented shape.
+    const retirement = {
+      lastAppliedAttemptId: 'retired:00000000-0000-4000-8000-000000000000',
+      quarantinedAt: '2026-01-01T00:00:00.000Z',
+      quarantineReason: 'retired',
+    };
+    await storage.set(KEY, retirement);
+
+    // The old attempt neither owns the retirement generation nor descends
+    // from it, so its replayed receipt cannot resurrect the channel.
+    const { applied } = await reconcileX402BatchSettlement([openingReceipt], {
+      storage,
+      bindings: openingBinding,
+    });
+    expect(applied).toEqual([]);
+    expect(channels.get(KEY)).toEqual(retirement);
+  });
+
   it('repairs an opening deposit when a failed write persisted only the cumulative', async () => {
     const channels = new Map<string, Record<string, unknown>>();
     let writes = 0;

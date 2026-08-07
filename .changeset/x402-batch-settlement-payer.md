@@ -110,9 +110,12 @@ a cent.
   record, so an unversioned `delete` (the peer's cooperative refund does
   this when a channel drains) makes absence indistinguishable from a
   never-opened channel, and a stale receipt can resurrect it. Documented on
-  the storage contract: retire refunded channels by keeping a record or
-  rotating `salt`; a tombstone helper is planned with the transactional
-  storage extension.
+  the storage contract: the supported retirement is rotating `salt` and
+  never reusing the old channel; a retained record is safe only in the
+  documented retirement shape (a `retired:` generation no attempt owns plus
+  a quarantine marker), since keeping the old attempt stamp leaves the old
+  receipt able to rewrite the record. A first-class tombstone helper is
+  planned with the transactional storage extension.
 - Quarantine survives a restart, and carries its repair inputs.
   `X402ReconciliationError` retains the attempt's complete binding
   (pre-attempt snapshot included) and the paid task's id — on a transport or

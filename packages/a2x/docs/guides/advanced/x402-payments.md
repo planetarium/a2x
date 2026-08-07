@@ -742,7 +742,19 @@ After a crash, recovery is the same shape as quarantine repair: read `pendingAtt
 
 #### Deletion erases the generation
 
-Replay protection lives in the stored record (`lastAppliedAttemptId`), so a **deleted** record is indistinguishable from a channel that never opened — a stale receipt from before the deletion can resurrect it, balance and all. a2x never deletes channel records, but `@x402/evm`'s cooperative refund path does when a channel drains. If you share this storage with that flow, do not let it perform an unversioned delete: retire the channel by keeping a record in place (any record preserves the generation), or rotate `batchSettlement.salt` so future payments derive a fresh channel id and old receipts have nothing to match. A first-class tombstone/retirement helper is planned alongside the transactional storage extension.
+Replay protection lives in the stored record (`lastAppliedAttemptId`), so a **deleted** record is indistinguishable from a channel that never opened — a stale receipt from before the deletion can resurrect it, balance and all. a2x never deletes channel records, but `@x402/evm`'s cooperative refund path does when a channel drains. If you share this storage with that flow, do not let it perform an unversioned delete.
+
+The supported retirement is **salt rotation**: change `batchSettlement.salt` so future payments derive a fresh channel id, and never reuse the old channel. Retaining an arbitrary record instead does **not** preserve a new generation — keeping the old `lastAppliedAttemptId` leaves the old receipt as the record's owner, so replaying that receipt rewrites the record, pre-refund balance included; and keeping a positive balance makes the signer treat the refunded channel as still funded. A manually retained record is safe only when it simultaneously carries a generation no payment attempt owns **and** refuses signing. With the current primitives that means replacing the record with exactly:
+
+```ts
+await storage.set(channelId.toLowerCase(), {
+  lastAppliedAttemptId: `retired:${crypto.randomUUID()}`, // owned by no attempt → every replay fails provenance
+  quarantinedAt: new Date().toISOString(),                // signing refuses while present
+  quarantineReason: 'retired',
+});
+```
+
+A first-class retirement/tombstone operation is planned alongside the transactional storage extension.
 
 #### Quarantine survives a restart
 
