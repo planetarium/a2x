@@ -1038,7 +1038,15 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     const outcomes = await calls;
 
     expect(submitted).toHaveLength(1);
-    expect(channels.size).toBe(0);
+    // The quarantine is persisted as a marker on the signed channel, so the
+    // block survives a restart; no payment state is invented alongside it.
+    const quarantinedKey =
+      submitted[0]!.payload.voucher.channelId.toLowerCase();
+    expect([...channels.keys()]).toEqual([quarantinedKey]);
+    expect(channels.get(quarantinedKey)).toMatchObject({
+      quarantineReason: 'no-matching-receipt',
+      quarantinedAt: expect.any(String) as unknown,
+    });
     expect(outcomes).toHaveLength(2);
     for (const outcome of outcomes) {
       expect(outcome.status).toBe('rejected');
@@ -1368,7 +1376,9 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     expect(seen).toHaveLength(1);
     expect(seen[0]!.reason).toBe('ambiguous-response');
     expect(seen[0]!.channelId).toBe(signedChannelId(rpcRequests));
-    expect(channels.size).toBe(0);
+    expect(
+      channels.get(signedChannelId(rpcRequests).toLowerCase()),
+    ).toMatchObject({ quarantineReason: 'ambiguous-response' });
   });
 
   it('quarantines the channel when the consumer closes a paid stream early', async () => {
@@ -1450,7 +1460,9 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     expect(seen[0]!.reason).toBe('ambiguous-response');
     expect(seen[0]!.channelId).toBe(signedChannelId(recorded));
     expect(seen[0]!.task).toBeUndefined();
-    expect(channels.size).toBe(0);
+    expect(
+      channels.get(signedChannelId(recorded).toLowerCase()),
+    ).toMatchObject({ quarantineReason: 'ambiguous-response' });
   });
 
   it('ignores receipts from an exchange it did not pay with a voucher', async () => {
@@ -1488,7 +1500,7 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     // see no funded channel and sign a fresh real deposit. Swallowing that as
     // a completed task is the unsafe half.
     const { channels, storage } = channelStorage();
-    const { fetch } = scriptedFetch([
+    const { fetch, rpcRequests } = scriptedFetch([
       () => jsonRpcOk(batchRequiredTask()),
       () => jsonRpcOk(completedTaskWithChannelReceipt(FOREIGN_CHANNEL_ID)),
     ]);
@@ -1510,8 +1522,15 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
       );
     expect(error).toBeInstanceOf(X402ReconciliationError);
     expect(error!.reason).toBe('no-matching-receipt');
-    // Nothing foreign was written, and the caller still has its result.
-    expect(channels.size).toBe(0);
+    // Nothing foreign was written — only the signed channel's quarantine
+    // marker — and the caller still has its result.
+    expect(channels.has(FOREIGN_CHANNEL_ID.toLowerCase())).toBe(false);
+    expect([...channels.keys()]).toEqual([
+      signedChannelId(rpcRequests).toLowerCase(),
+    ]);
+    expect(
+      channels.get(signedChannelId(rpcRequests).toLowerCase()),
+    ).toMatchObject({ quarantineReason: 'no-matching-receipt' });
     expect((error!.task as Task).status.state).toBe('completed');
   });
 
@@ -1901,7 +1920,9 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     expect(seen[0]!.reason).toBe('ambiguous-response');
     expect(seen[0]!.channelId).toBe(signedChannelId(rpcRequests));
     expect((seen[0]!.task as Task).status.state).toBe('working');
-    expect(channels.size).toBe(0);
+    expect(
+      channels.get(signedChannelId(rpcRequests).toLowerCase()),
+    ).toMatchObject({ quarantineReason: 'ambiguous-response' });
   });
 
   it.each(['error', 'eof'])('quarantines a submitted channel on streaming %s', async (ending) => {
@@ -2014,7 +2035,10 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
         message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
       }),
     ).rejects.toBeInstanceOf(X402ReconciliationError);
-    expect(channels.size).toBe(0);
+    // The inflated receipt is refused; only the quarantine marker lands.
+    expect(
+      channels.get(signedChannelId(rpcRequests).toLowerCase()),
+    ).toMatchObject({ quarantineReason: 'no-matching-receipt' });
   });
 
   it('throws X402ReconciliationError carrying the task when storage fails', async () => {
@@ -2522,6 +2546,8 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
     channelId: CHANNEL,
     maxClaimableAmount: '1000',
     depositAmount: '5000',
+    // Fresh channel: nothing was stored when the attempt signed.
+    preAttemptState: undefined,
   };
 
   it('establishes the signed deposit when the merchant reports zero', async () => {
@@ -2556,7 +2582,7 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
     });
   });
 
-  it('adds a top-up to the stored balance rather than keeping the stale figure', async () => {
+  it('adds a top-up to the snapshot balance rather than keeping the stale figure', async () => {
     const { channels, storage } = store();
     await storage.set(KEY, { balance: '5000', chargedCumulativeAmount: '5000' });
     await reconcileX402BatchSettlement(
@@ -2567,6 +2593,7 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
           channelId: CHANNEL,
           maxClaimableAmount: '6000',
           depositAmount: '5000',
+          preAttemptState: { balance: '5000', chargedCumulativeAmount: '5000' },
         },
       },
     );
@@ -2585,14 +2612,21 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
     expect(channels.get(KEY)).toMatchObject({ balance: '5000' });
   });
 
-  it('holds a voucher-only payment at the stored balance', async () => {
-    // No deposit signed, so the floor is whatever is already stored — the
+  it('holds a voucher-only payment at the snapshot balance', async () => {
+    // No deposit signed, so the floor is the pre-attempt snapshot — the
     // merchant cannot talk it down, and nothing new is established either.
     const { channels, storage } = store();
     await storage.set(KEY, { balance: '5000', chargedCumulativeAmount: '1000' });
     await reconcileX402BatchSettlement(
       [receipt({ chargedCumulativeAmount: '2000', balance: '0' })],
-      { storage, bindings: { channelId: CHANNEL, maxClaimableAmount: '2000' } },
+      {
+        storage,
+        bindings: {
+          channelId: CHANNEL,
+          maxClaimableAmount: '2000',
+          preAttemptState: { balance: '5000', chargedCumulativeAmount: '1000' },
+        },
+      },
     );
     expect(channels.get(KEY)).toMatchObject({
       balance: '5000',
@@ -2611,6 +2645,7 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
           channelId: CHANNEL,
           maxClaimableAmount: '1000',
           depositAmount: '5000',
+          preAttemptState: undefined,
         },
       },
     );
@@ -2625,6 +2660,7 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
       channelId: CHANNEL,
       maxClaimableAmount: '3000',
       depositAmount: '5000',
+      preAttemptState: undefined,
     };
     await reconcileX402BatchSettlement([opening], {
       storage: fresh.storage,
@@ -2715,6 +2751,7 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
       channelId: CHANNEL,
       maxClaimableAmount: '6000',
       depositAmount: '5000',
+      preAttemptState: { balance: '5000', chargedCumulativeAmount: '5000' },
     };
 
     await expect(
@@ -2725,6 +2762,9 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
       chargedCumulativeAmount: '6000',
     });
 
+    // The half-written record holds the stale balance; only the snapshot in
+    // the binding can restore `previous balance + deposit` rather than the
+    // deposit alone.
     await expect(
       reconcileX402BatchSettlement([topUp], { storage, bindings: binding }),
     ).resolves.toEqual({ applied: [CHANNEL] });
@@ -2733,6 +2773,157 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
       chargedCumulativeAmount: '6000',
     });
     expect(writes).toBe(2);
+  });
+
+  it('repairs a top-up when a failed write persisted only the balance', async () => {
+    // The reverse torn write: balance committed, cumulative lost. The floor
+    // comes from the snapshot, so the retry must not re-add the deposit to
+    // the already-bumped stored balance.
+    const channels = new Map<string, Record<string, unknown>>([
+      [KEY, { balance: '5000', chargedCumulativeAmount: '5000' }],
+    ]);
+    let writes = 0;
+    const storage = {
+      get: async (key: string) => channels.get(key),
+      set: async (key: string, state: Record<string, unknown>) => {
+        writes += 1;
+        if (writes === 1) {
+          channels.set(key, {
+            balance: state.balance,
+            chargedCumulativeAmount: '5000',
+          });
+          throw new Error('partial write');
+        }
+        channels.set(key, state);
+      },
+      delete: async (key: string) => {
+        channels.delete(key);
+      },
+    };
+    const topUp = receipt({
+      chargedCumulativeAmount: '6000',
+      balance: '5000',
+    });
+    const binding = {
+      channelId: CHANNEL,
+      maxClaimableAmount: '6000',
+      depositAmount: '5000',
+      preAttemptState: { balance: '5000', chargedCumulativeAmount: '5000' },
+    };
+
+    await expect(
+      reconcileX402BatchSettlement([topUp], { storage, bindings: binding }),
+    ).rejects.toThrow(AggregateError);
+    expect(channels.get(KEY)).toEqual({
+      balance: '10000',
+      chargedCumulativeAmount: '5000',
+    });
+
+    await expect(
+      reconcileX402BatchSettlement([topUp], { storage, bindings: binding }),
+    ).resolves.toEqual({ applied: [CHANNEL] });
+    expect(channels.get(KEY)).toEqual({
+      balance: '10000', // snapshot 5000 + deposit 5000 — not 15000
+      chargedCumulativeAmount: '6000',
+    });
+    expect(writes).toBe(2);
+  });
+
+  it('repairs a voucher-only payment when a failed write dropped the balance', async () => {
+    // With no deposit in the binding, the old repair heuristic had nothing to
+    // detect an incomplete write with — a retry would report applied while
+    // the balance stayed lost, and the next call would open a fresh deposit.
+    // The snapshot makes the retry exact instead.
+    const channels = new Map<string, Record<string, unknown>>([
+      [KEY, { balance: '5000', chargedCumulativeAmount: '1000' }],
+    ]);
+    let writes = 0;
+    const storage = {
+      get: async (key: string) => channels.get(key),
+      set: async (key: string, state: Record<string, unknown>) => {
+        writes += 1;
+        if (writes === 1) {
+          channels.set(key, {
+            chargedCumulativeAmount: state.chargedCumulativeAmount,
+          });
+          throw new Error('partial write');
+        }
+        channels.set(key, state);
+      },
+      delete: async (key: string) => {
+        channels.delete(key);
+      },
+    };
+    const voucher = receipt({
+      chargedCumulativeAmount: '2000',
+      balance: '5000',
+    });
+    const binding = {
+      channelId: CHANNEL,
+      maxClaimableAmount: '2000',
+      preAttemptState: { balance: '5000', chargedCumulativeAmount: '1000' },
+    };
+
+    await expect(
+      reconcileX402BatchSettlement([voucher], { storage, bindings: binding }),
+    ).rejects.toThrow(AggregateError);
+    expect(channels.get(KEY)).toEqual({ chargedCumulativeAmount: '2000' });
+
+    await expect(
+      reconcileX402BatchSettlement([voucher], { storage, bindings: binding }),
+    ).resolves.toEqual({ applied: [CHANNEL] });
+    expect(channels.get(KEY)).toEqual({
+      balance: '5000',
+      chargedCumulativeAmount: '2000',
+    });
+    expect(writes).toBe(2);
+  });
+
+  it('clears a quarantine marker on a successful fold', async () => {
+    // Re-running the attempt's binding + receipt is the documented repair
+    // path for a quarantined channel: an exact fold proves the state again,
+    // so the marker must not survive it.
+    const { channels, storage } = store();
+    await storage.set(KEY, {
+      balance: '5000',
+      chargedCumulativeAmount: '1000',
+      quarantinedAt: '2026-01-01T00:00:00.000Z',
+      quarantineReason: 'ambiguous-response',
+    });
+    await reconcileX402BatchSettlement(
+      [receipt({ chargedCumulativeAmount: '2000', balance: '5000' })],
+      {
+        storage,
+        bindings: {
+          channelId: CHANNEL,
+          maxClaimableAmount: '2000',
+          preAttemptState: { balance: '5000', chargedCumulativeAmount: '1000' },
+        },
+      },
+    );
+    expect(channels.get(KEY)).toEqual({
+      balance: '5000',
+      chargedCumulativeAmount: '2000',
+    });
+  });
+
+  it('rejects a binding whose snapshot balance is unparseable', async () => {
+    // The snapshot is caller-trusted input; garbage there would silently
+    // corrupt the floor, so it fails loudly instead of degrading.
+    const { storage } = store();
+    await expect(
+      reconcileX402BatchSettlement(
+        [receipt({ chargedCumulativeAmount: '2000', balance: '5000' })],
+        {
+          storage,
+          bindings: {
+            channelId: CHANNEL,
+            maxClaimableAmount: '2000',
+            preAttemptState: { balance: 'not-a-number' },
+          },
+        },
+      ),
+    ).rejects.toThrow(/preAttemptState\.balance/);
   });
 
   it('serializes concurrent receipts so a delayed older write cannot roll back', async () => {
@@ -2765,11 +2956,25 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
     await Promise.all([
       reconcileX402BatchSettlement(
         [receipt({ chargedCumulativeAmount: '2000', balance: '5000' })],
-        { storage, bindings: { channelId: CHANNEL, maxClaimableAmount: '2000' } },
+        {
+          storage,
+          bindings: {
+            channelId: CHANNEL,
+            maxClaimableAmount: '2000',
+            preAttemptState: { balance: '5000', chargedCumulativeAmount: '1000' },
+          },
+        },
       ),
       reconcileX402BatchSettlement(
         [receipt({ chargedCumulativeAmount: '3000', balance: '5000' })],
-        { storage, bindings: { channelId: CHANNEL, maxClaimableAmount: '3000' } },
+        {
+          storage,
+          bindings: {
+            channelId: CHANNEL,
+            maxClaimableAmount: '3000',
+            preAttemptState: { balance: '5000', chargedCumulativeAmount: '2000' },
+          },
+        },
       ),
     ]);
 

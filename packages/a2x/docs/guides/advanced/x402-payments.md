@@ -632,14 +632,13 @@ The second check cannot be replaced with a static `depositMultiplier x amount` f
 
 - **The channel id.** Ids derive from public inputs, so the one you share with any given merchant is computable by anyone — and a receipt names the channel it updates. Without this, a merchant you *did* pay could name a channel belonging to a **different** merchant and overwrite its cumulative, bricking it or forcing an invalid top-up.
 - **The ceiling.** Without it, the same merchant can inflate its *own* channel instead: report 5000 back after a 1000 voucher, and your next 1000 call signs a 6000 cumulative plus a top-up to cover it — letting the merchant claim far more than the calls cost. The receipt must report exactly what the voucher authorized: upstream verify requires that ceiling to equal the prior cumulative plus the request amount, and settle advances by the same amount. A smaller value is stale and could let an old receipt mask this exchange while the merchant retains the higher-value voucher; a larger value was never authorized. A receipt with **no** cumulative at all is also refused — it would perform a partial write that leaves the signing base where it was, which for a spent voucher is a desync rather than a no-op.
-- **The deposit.** A merchant reporting `balance: "0"` every round makes the scheme treat the channel as unfunded and sign a fresh deposit every round. `maxAmount` does not stop that — it caps each deposit individually, not their aggregate. Within a payment flow the channel balance only ever goes up, by exactly the deposits you sign, so a reported balance below `stored + this deposit` is one the merchant could not have reached honestly, and it is **replaced** by that floor. (Replaced, not dropped: `@x402/evm` merges onto the stored record and writes `balance` only when the receipt still carries it, so removing the key would leave the deposit you just signed unrecorded — the same repeat-funding loop. The substituted value is not merchant input; it is your durable prior state plus the deposit you signed.) A balance *above* the floor is kept: overstating can only make you under-fund a later call, which costs you nothing.
+- **The deposit and the snapshot.** A merchant reporting `balance: "0"` every round makes the scheme treat the channel as unfunded and sign a fresh deposit every round. `maxAmount` does not stop that — it caps each deposit individually, not their aggregate. Within a payment flow the channel balance only ever goes up, by exactly the deposits you sign, so a reported balance below `pre-attempt balance + this deposit` is one the merchant could not have reached honestly, and it is **replaced** by that floor. The floor's base is the **pre-attempt snapshot** captured when the payload was signed, not whatever storage holds when the receipt is folded: after a torn or failed write, the stored record is precisely the thing that cannot be trusted. A balance *above* the floor is kept: overstating can only make you under-fund a later call, which costs you nothing.
 
 Two cases `A2XClient` does not cover, where you reconcile yourself — and must supply the same binding:
 
 ```ts
 import {
   reconcileX402BatchSettlement,
-  getX402BatchSettlementBinding,
   getX402Receipts,
 } from '@a2x/sdk/x402';
 
@@ -650,19 +649,25 @@ const signed = await signX402Payment(task, {
   batchSettlement,
   allowBatchSettlement: true,
 });
+// `signed.batch` is the complete binding: channel, voucher ceiling, deposit,
+// and the trusted pre-attempt snapshot read right after signing.
 // …resubmit with `signed.metadata`, then on the terminal task:
 const { applied } = await reconcileX402BatchSettlement(getX402Receipts(final), {
   storage: myChannelStorage,
-  bindings: getX402BatchSettlementBinding(signed.payload)!,
+  bindings: signed.batch!,
 });
 if (applied.length === 0) {
   // The voucher is spent and local state did not move — see below.
 }
 ```
 
+Persist `signed.batch` alongside the payload if reconciliation may happen in a later process: the snapshot cannot be reconstructed afterwards. A caller resuming from a persisted *payload* alone can rebuild the payload-provable half with `getX402BatchSettlementBinding(payload)`, but must combine it with the snapshot it captured at signing time to form the `bindings` entry.
+
 Skip reconciliation and the payer's cumulative amount never advances: every subsequent call re-signs an identical voucher against a channel it still believes is unfunded — and therefore signs a **fresh deposit** each time. Receipts from other schemes, malformed ones (including non-object array entries), any naming a channel outside `bindings`, and any whose cumulative differs from the signed ceiling are ignored; a receipt that fails to apply raises an `AggregateError` after the others have been tried, so one bad entry cannot drop a good one.
 
-When `bindings` is an array, every entry must name a distinct channel. Reconcile successive attempts on the same channel separately; collapsing them into one call would lose which deposit floor belongs to which cumulative voucher. Reconciliation calls through the same storage object are serialized per channel inside the process, so a delayed older receipt cannot overwrite a newer cumulative. Retrying after a storage error is idempotent when the first write completed; if it committed only the cumulative while leaving an opening deposit or top-up balance stale, the retry detects that the stored balance cannot cover the cumulative and repairs the trusted deposit floor before reporting the receipt as applied.
+When `bindings` is an array, every entry must name a distinct channel. Reconcile successive attempts on the same channel separately; collapsing them into one call would lose which deposit floor belongs to which cumulative voucher. Reconciliation calls through the same storage object are serialized per channel inside the process, so a delayed older receipt cannot overwrite a newer cumulative.
+
+The write itself is a **deterministic fold**: `trusted snapshot + binding + receipt → next state`, computed without reading the record being replaced. That makes retries exact rather than best-effort — re-running the same binding and receipt rewrites the same state, so a torn write (cumulative committed without the balance, or the reverse) is repaired by simply reconciling again, for deposits and voucher-only payments alike. A successful fold also clears any quarantine marker on the record, which is the documented repair path for a quarantined channel.
 
 That receipt lock alone cannot make concurrent signing safe: `@x402/evm` only reads storage while it creates a payload and does not reserve the next cumulative or deposit. Two overlapping attempts can therefore read the same empty state and each authorize a fresh deposit before either receipt exists. `A2XClient` prevents this in-process by holding one lease per storage object across the complete sign → submit → reconcile/quarantine lifetime (conservatively serializing different channels that share that object because the channel id is not available until after signing). If the lease holder is quarantined, attempts already queued behind it are rejected with the same `X402ReconciliationError` before they can sign from stale storage; repair or retire the channel before retrying. The low-level helpers cannot retain a lock across your network call, so manual flows must serialize that entire lifetime per channel themselves. The storage interface has no cross-process compare-and-set operation; when multiple processes or replicas share a backend, route each channel through one owner or add an application-level durable reservation before signing.
 
@@ -708,6 +713,17 @@ x402: {
 ```
 
 The handler does not release already-queued calls to sign from stale storage. Those callers are rejected with the same reconciliation error before payload creation, so repair or retire the channel before retrying them.
+
+#### Quarantine survives a restart
+
+The in-process rejection above dies with the process. To stop a restarted payer from signing a fresh deposit out of the same desynced storage, the SDK also **persists** the quarantine: alongside raising `X402ReconciliationError` it best-effort writes `quarantinedAt` / `quarantineReason` onto the channel's stored record. While that marker is present, signing against the channel throws `X402ChannelQuarantinedError` — before the payload ever reaches the merchant.
+
+Two ways to lift it:
+
+- **Repair**: re-run `reconcileX402BatchSettlement` with the attempt's binding and the receipt (fetched via `getTask` if the original response was lost). A successful fold rewrites the exact post-attempt state and clears the marker.
+- **Manual**: after verifying the stored state out of band, remove the `quarantinedAt` / `quarantineReason` keys yourself.
+
+The marker write is advisory — when storage itself is what failed, it fails too, and the raised error plus the in-process abort remain the guarantee.
 
 #### Selection is opt-in, and separate from `allowUpto`
 

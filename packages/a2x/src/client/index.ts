@@ -17,6 +17,7 @@ export type {
   X402BatchSettlementDepositStrategy,
   X402BatchSettlementDepositContext,
   X402BatchSettlementBinding,
+  X402BatchSettlementPayloadBinding,
   X402ClientChannelStorage,
   X402ChannelState,
 } from '../x402/client.js';

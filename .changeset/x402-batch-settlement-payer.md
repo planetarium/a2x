@@ -29,14 +29,19 @@ a cent.
   `onPaymentResponse` hook, which is what normally advances the payer's
   cumulative amount. `A2XClient` calls it automatically on both the blocking
   and streaming paths.
-- Reconciliation rejects duplicate same-channel bindings, serializes each
-  channel for callers sharing one storage object in a process, and ignores
-  late receipts instead of letting a delayed read-check-write roll cumulative
-  state back. If a failed storage write committed the cumulative but not the
-  deposit balance, retrying the receipt repairs the trusted balance floor
-  before counting it as applied. Backends shared across processes still
-  require one writer per channel because the upstream storage contract has no
-  atomic compare-and-set.
+- The reconciliation write is a deterministic fold —
+  `trusted pre-attempt snapshot + binding + receipt → next state` — computed
+  from the channel snapshot captured when the payload was signed, never from
+  whatever the storage holds when the fold runs. Retries are therefore exact:
+  re-running the same binding and receipt rewrites the same state, which
+  repairs a torn write (cumulative committed without the balance, or the
+  reverse) for deposits and voucher-only payments alike, instead of guessing
+  from the half-committed record. Reconciliation also rejects duplicate
+  same-channel bindings, serializes each channel for callers sharing one
+  storage object in a process, and ignores late receipts instead of letting a
+  delayed read-check-write roll cumulative state back. Backends shared across
+  processes still require one writer per channel because the upstream storage
+  contract has no atomic compare-and-set.
 - `A2XClient` also serializes the complete sign, submit, and
   reconcile/quarantine lifetime for batch attempts sharing one storage object.
   The peer does not reserve state while signing, so without that lease two
@@ -46,20 +51,23 @@ a cent.
   cross-process flows must provide equivalent per-channel exclusion or a
   durable reservation themselves.
 - `bindings` ties the fold to what that exchange actually signed — the channel,
-  the cumulative ceiling its voucher authorized, and the deposit it funded.
-  Each closes a distinct path. Channel ids derive from public inputs, so
-  without the first a merchant could name a channel belonging to a *different*
-  merchant and overwrite its cumulative. Without the second, the same merchant
-  can inflate its own: reporting 5000 after a 1000 voucher makes the payer's
-  next call sign a 6000 cumulative plus a top-up, letting it claim far more
-  than the calls cost. Without the third, a merchant reporting `balance: "0"`
-  every round induces a fresh deposit every round — each within `maxAmount`,
-  which caps deposits individually rather than in aggregate; a balance below
-  `stored + this deposit` is replaced by that floor, which is derived from the
-  payer's own durable state rather than from the merchant. A receipt with no
-  cumulative at all is refused too, since it would write partially and leave
-  the signing base unmoved. Read the binding off a signed payload with the new
-  `getX402BatchSettlementBinding()`.
+  the cumulative ceiling its voucher authorized, the deposit it funded, and
+  the pre-attempt snapshot (`preAttemptState`, a required key). Each closes a
+  distinct path. Channel ids derive from public inputs, so without the first a
+  merchant could name a channel belonging to a *different* merchant and
+  overwrite its cumulative. Without the second, the same merchant can inflate
+  its own: reporting 5000 after a 1000 voucher makes the payer's next call
+  sign a 6000 cumulative plus a top-up, letting it claim far more than the
+  calls cost. Without the third and fourth, a merchant reporting
+  `balance: "0"` every round induces a fresh deposit every round — each within
+  `maxAmount`, which caps deposits individually rather than in aggregate; a
+  balance below `snapshot balance + this deposit` is replaced by that floor,
+  which is derived from the payer's own trusted state rather than from the
+  merchant. A receipt with no cumulative at all is refused too, since it would
+  write partially and leave the signing base unmoved. `signX402Payment`
+  assembles the complete binding as `SignedX402Payment.batch`; the new
+  `getX402BatchSettlementBinding()` reads the payload-provable half off a
+  persisted payload for resumption.
 - Successful reconciliation requires the receipt cumulative to equal the
   voucher's signed ceiling. Upstream verify and settle establish that exact
   value; accepting a lower one would let a stale historical receipt mask the
@@ -75,6 +83,12 @@ a cent.
   `LocalAccount` is not), so the next call is rejected for a cumulative
   mismatch or opens a fresh on-chain deposit. Set
   `A2XClientX402Options.onReconcileError` to record and continue instead.
+- Quarantine survives a restart. Alongside the raised error, the SDK
+  best-effort persists `quarantinedAt` / `quarantineReason` onto the
+  channel's stored record; while the marker is present, signing against the
+  channel throws the new `X402ChannelQuarantinedError` before the payload
+  reaches the merchant. A successful reconciliation fold — the repair path —
+  clears the marker, or remove it manually after verifying the stored state.
 - A matching success receipt suppresses contradictory retry prompts anywhere
   later in the same response stream, including a separate SSE event, so one
   call cannot make the payer authorize two cumulative vouchers.

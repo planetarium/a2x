@@ -22,6 +22,7 @@ import {
   type X402PaymentStatus,
 } from './constants.js';
 import {
+  X402ChannelQuarantinedError,
   X402InvalidVersionError,
   X402NoSupportedRequirementError,
   X402PaymentRequiredError,
@@ -72,7 +73,6 @@ type X402EvmBatchSettlementClientModule = {
     signer: LocalAccount,
     options: unknown,
   ) => unknown;
-  processSettleResponse: (storage: unknown, settle: unknown) => Promise<void>;
 };
 
 /** CAIP-2 wildcard `@x402/evm` registers its V2 schemes under. */
@@ -109,6 +109,20 @@ export interface X402ChannelState {
   signedMaxClaimable?: string;
   /** Payer's voucher signature for `signedMaxClaimable`. */
   signature?: `0x${string}`;
+  /**
+   * Set (ISO 8601) when an attempt on this channel ended without a
+   * trustworthy reconciliation — the voucher may be spent with no receipt
+   * recorded. While present, `signX402Payment` refuses to sign against the
+   * channel (`X402ChannelQuarantinedError`), so the block survives a process
+   * restart rather than living only in the in-process attempt queue. The
+   * `@x402/evm` peer ignores the extra keys.
+   *
+   * Cleared by a successful `reconcileX402BatchSettlement` fold — the repair
+   * path — or manually once the operator has verified the stored state.
+   */
+  quarantinedAt?: string;
+  /** `X402ReconciliationError.reason` recorded alongside `quarantinedAt`. */
+  quarantineReason?: string;
 }
 
 /**
@@ -395,6 +409,18 @@ export interface SignedX402Payment {
    * `x402.payment.payload: <signed>`.
    */
   metadata: Record<string, unknown>;
+  /**
+   * The complete reconciliation binding for a `batch-settlement` payload:
+   * what the voucher authorized plus the trusted pre-attempt channel
+   * snapshot, read from `batchSettlement.storage` immediately after signing
+   * (signing never writes storage, so under the caller's per-channel
+   * exclusion the two observe the same state).
+   *
+   * Pass it to `reconcileX402BatchSettlement` as the `bindings` entry once
+   * the merchant's terminal response arrives. Absent for every other scheme,
+   * and for a batch payload the runtime produced without a usable voucher.
+   */
+  batch?: X402BatchSettlementBinding;
 }
 
 /**
@@ -467,6 +493,12 @@ export function getX402Status(task: Task): X402PaymentStatus | undefined {
  * concurrent manual attempts can each authorize a fresh deposit. `A2XClient`
  * provides this in-process exclusion automatically. Multiple processes need
  * a single channel owner or an application-level durable reservation.
+ *
+ * A `batch-settlement` result carries `batch` — the binding (including the
+ * trusted pre-attempt snapshot) that `reconcileX402BatchSettlement` needs
+ * once the merchant's terminal response arrives. Signing refuses a channel
+ * whose stored state carries a quarantine marker
+ * (`X402ChannelQuarantinedError`) — repair the record first.
  */
 export async function signX402Payment(
   task: Task,
@@ -515,6 +547,15 @@ export async function signX402Payment(
   const narrowed = { ...required, accepts: [requirement] };
   const payload = await runtime.createPaymentPayload(narrowed);
 
+  const batch =
+    requirement.scheme === BATCH_SETTLEMENT_SCHEME &&
+    options.batchSettlement !== undefined
+      ? await captureBatchSettlementBinding(
+          payload,
+          options.batchSettlement.storage,
+        )
+      : undefined;
+
   return {
     requirement,
     payload,
@@ -522,7 +563,54 @@ export async function signX402Payment(
       [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.SUBMITTED,
       [X402_METADATA_KEYS.PAYLOAD]: payload,
     },
+    ...(batch !== undefined ? { batch } : {}),
   };
+}
+
+/**
+ * Complete a signed `batch-settlement` payload's binding with the trusted
+ * pre-attempt snapshot, and refuse a quarantined channel.
+ *
+ * The snapshot is the reconciliation's only trusted balance/cumulative
+ * source: a fold computed from it is deterministic, so a retry after a torn
+ * storage write rewrites the exact same state instead of guessing from
+ * whatever half-committed record the failure left behind. It is read *after*
+ * signing because the channel id is only derivable then — safe, since
+ * signing never writes storage.
+ *
+ * Both failure modes here throw before the payload is returned, i.e. before
+ * anything reaches the merchant: a voucher that never leaves the process
+ * moves no funds.
+ */
+async function captureBatchSettlementBinding(
+  payload: X402PaymentPayload,
+  storage: X402ClientChannelStorage,
+): Promise<X402BatchSettlementBinding | undefined> {
+  const partial = getX402BatchSettlementBinding(payload);
+  if (!partial) return undefined;
+
+  let preAttemptState: X402ChannelState | undefined;
+  try {
+    preAttemptState = await storage.get(partial.channelId.toLowerCase());
+  } catch (cause) {
+    const error = new X402PaymentRequiredError(
+      `Signed a batch-settlement payload for channel ${partial.channelId} but could not ` +
+        'snapshot the pre-attempt channel state; refusing to hand back a payload whose ' +
+        'reconciliation basis is unknown.',
+    );
+    (error as { cause?: unknown }).cause = cause;
+    throw error;
+  }
+
+  if (preAttemptState?.quarantinedAt !== undefined) {
+    throw new X402ChannelQuarantinedError(
+      partial.channelId,
+      preAttemptState.quarantinedAt,
+      preAttemptState.quarantineReason,
+    );
+  }
+
+  return { ...partial, preAttemptState };
 }
 
 /**
@@ -617,6 +705,13 @@ export function defaultSelect(
  * identical voucher against a channel a2x still believes is unfunded — and so
  * signs a **fresh deposit** each time.
  *
+ * The write is a **deterministic fold**: the next channel state is computed
+ * from the binding's trusted pre-attempt snapshot, the voucher's bounds, and
+ * the receipt — never from whatever the storage happens to hold when the
+ * fold runs. That makes it idempotent: re-running the same binding + receipt
+ * rewrites the same state, which is also the repair path after a torn or
+ * failed storage write (and it clears any quarantine marker on the record).
+ *
  * Receipts from other schemes, malformed ones, any naming a channel outside
  * `bindings`, and any whose cumulative differs from what the matching voucher
  * authorized are all ignored, so passing a whole task's receipts is safe:
@@ -626,7 +721,7 @@ export function defaultSelect(
  * // …resubmit, then, on the terminal task:
  * const { applied } = await reconcileX402BatchSettlement(getX402Receipts(final), {
  *   storage,
- *   bindings: getX402BatchSettlementBinding(signed.payload)!,
+ *   bindings: signed.batch!,
  * });
  * ```
  *
@@ -637,7 +732,7 @@ export function defaultSelect(
  * driving this directly should treat it the same way.
  *
  * Reconciliation calls sharing one storage object are serialized per channel
- * in-process. This protects the receipt read-check-write only; manual callers
+ * in-process. This protects the stale-replay check only; manual callers
  * must also prevent overlapping signing/submission attempts for that channel.
  * Array bindings must name distinct channels; reconcile successive vouchers
  * on the same channel in separate calls.
@@ -647,19 +742,21 @@ export async function reconcileX402BatchSettlement(
   options: {
     storage: X402ClientChannelStorage;
     /**
-     * What this caller actually signed: the channel, and the cumulative
-     * ceiling its voucher authorized. **Required.**
+     * What this caller actually signed — channel, voucher ceiling, deposit —
+     * plus the trusted pre-attempt snapshot. **Required.** `A2XClient` and
+     * `signX402Payment` assemble it as `SignedX402Payment.batch`; a caller
+     * resuming from a persisted payload combines
+     * `getX402BatchSettlementBinding(payload)` with the snapshot it captured
+     * when it signed.
      *
-     * Both halves are load-bearing. The channel id stops a merchant from
+     * Every field is load-bearing. The channel id stops a merchant from
      * naming a channel belonging to a *different* merchant — ids derive from
      * public inputs, so any of them is computable. The ceiling stops the same
      * merchant inflating its *own* channel's cumulative: reporting 5000 back
      * after a 1000 voucher would make the payer's next 1000 call sign a 6000
      * cumulative and a top-up to cover it, letting the merchant claim far
-     * more than the calls cost.
-     *
-     * Read it off the signed payload with
-     * `getX402BatchSettlementBinding(signed.payload)`.
+     * more than the calls cost. The snapshot plus the deposit establish the
+     * floor the reported balance must clear (see `foldChannelState`).
      *
      * Array entries must name distinct channels. Reconcile successive
      * vouchers on one channel separately so each attempt keeps its own
@@ -668,38 +765,55 @@ export async function reconcileX402BatchSettlement(
     bindings: X402BatchSettlementBinding | readonly X402BatchSettlementBinding[];
   },
 ): Promise<{ applied: string[] }> {
-  const allowed = new Map<string, { ceiling: bigint; deposit: bigint }>();
+  const allowed = new Map<string, TrustedAttemptBounds>();
   const bindings = Array.isArray(options.bindings)
     ? options.bindings
     : [options.bindings as X402BatchSettlementBinding];
   for (const binding of bindings) {
     if (!isCanonicalChannelId(binding?.channelId)) continue;
+    const key = binding.channelId.toLowerCase();
+    if (allowed.has(key)) {
+      throw new X402PaymentRequiredError(
+        `bindings must not contain the same batch-settlement channel more than once: ${binding.channelId}`,
+      );
+    }
+    let ceiling: bigint;
+    let deposit: bigint;
     try {
-      const key = binding.channelId.toLowerCase();
-      if (allowed.has(key)) {
-        throw new X402PaymentRequiredError(
-          `bindings must not contain the same batch-settlement channel more than once: ${binding.channelId}`,
-        );
-      }
-      allowed.set(key, {
-        ceiling: BigInt(binding.maxClaimableAmount),
-        deposit:
-          binding.depositAmount === undefined
-            ? 0n
-            : BigInt(binding.depositAmount),
-      });
-    } catch (error) {
-      if (error instanceof X402PaymentRequiredError) throw error;
+      ceiling = BigInt(binding.maxClaimableAmount);
+      deposit =
+        binding.depositAmount === undefined ? 0n : BigInt(binding.depositAmount);
+    } catch {
       // A bound we cannot parse cannot bound anything — drop the binding
       // rather than fall back to an unbounded one.
+      continue;
     }
+    // Unlike the remote-controlled receipt, the snapshot is caller-trusted
+    // input: silently coercing garbage here would corrupt the floor the whole
+    // fold rests on, so fail loudly instead.
+    const pre = binding.preAttemptState;
+    let preBalance = 0n;
+    if (pre?.balance !== undefined) {
+      try {
+        preBalance = BigInt(pre.balance);
+      } catch {
+        preBalance = -1n;
+      }
+      if (preBalance < 0n) {
+        throw new X402PaymentRequiredError(
+          `preAttemptState.balance for channel ${binding.channelId} is not a ` +
+            'non-negative integer; the trusted balance floor cannot be computed from it.',
+        );
+      }
+    }
+    allowed.set(key, { ceiling, deposit, pre, floor: preBalance + deposit });
   }
 
   const relevant: {
     receipt: X402SettleResponse;
     key: string;
     cumulative: bigint;
-    deposit: bigint;
+    bounds: TrustedAttemptBounds;
   }[] = [];
   for (const value of receipts) {
     // The array is remote-controlled despite its public TypeScript type. Keep
@@ -716,65 +830,48 @@ export async function reconcileX402BatchSettlement(
     const receipt = value as X402SettleResponse;
     const id = channelIdOf(receipt.extra);
     if (id === undefined) continue;
-    const bound = allowed.get(id.toLowerCase());
-    if (bound === undefined) continue;
+    const bounds = allowed.get(id.toLowerCase());
+    if (bounds === undefined) continue;
     // A settled payment must advance the signing base to exactly what this
     // voucher authorized. A receipt carrying only
-    // `balance` / `totalClaimed` would let the peer perform a partial write
-    // that leaves `chargedCumulativeAmount` untouched — and counting that as
-    // applied would mask exactly the desync `applied.length === 0` exists to
-    // report.
-    const cumulative = parseCumulative(receipt.extra, bound.ceiling);
+    // `balance` / `totalClaimed` performs a partial update that leaves
+    // `chargedCumulativeAmount` untouched — and counting that as applied
+    // would mask exactly the desync `applied.length === 0` exists to report.
+    const cumulative = parseCumulative(receipt.extra, bounds.ceiling);
     if (cumulative === undefined) continue;
     relevant.push({
       receipt,
       key: id.toLowerCase(),
       cumulative,
-      deposit: bound.deposit,
+      bounds,
     });
   }
   if (relevant.length === 0) return { applied: [] };
-  const mod = (await importX402Peer(
-    BATCH_SETTLEMENT_CLIENT_PEER,
-  )) as unknown as X402EvmBatchSettlementClientModule;
   const failures: unknown[] = [];
   const applied: string[] = [];
-  for (const { receipt, key, cumulative, deposit } of relevant) {
+  for (const { receipt, key, cumulative, bounds } of relevant) {
     // Per receipt, not one try around the loop: the receipts are
     // remote-controlled, and one malformed entry must not stop a later valid
     // one from being recorded — a dropped receipt leaves the payer desynced,
     // which `@x402/evm` cannot self-heal without a chain-reading signer.
     try {
       await withChannelReconciliationLock(options.storage, key, async () => {
-        const prior = await options.storage.get(key);
-        const priorCumulative = parseStoredCumulative(prior);
-        if (priorCumulative !== undefined && cumulative < priorCumulative) {
-          // A late/replayed receipt must never roll the payer back to an older
-          // cumulative or re-apply a deposit against the current balance.
+        const stored = await options.storage.get(key);
+        const storedCumulative = parseStoredCumulative(stored);
+        if (storedCumulative !== undefined && storedCumulative > cumulative) {
+          // A late/replayed receipt for an older voucher must never roll the
+          // payer back below a newer attempt's committed state.
           return;
         }
-        if (priorCumulative !== undefined && cumulative === priorCumulative) {
-          // Equality normally means this receipt was already applied. A
-          // rejected storage write can still have committed only the
-          // cumulative, however, leaving the deposit balance absent/stale.
-          // Upstream creates a deposit only when the new cumulative exceeds
-          // the pre-attempt balance, so a stored balance below that cumulative
-          // proves the write is incomplete and the trusted floor must be
-          // repaired before this retry can count as applied.
-          const priorBalance = parseStoredBalance(prior);
-          const depositWriteIncomplete =
-            deposit > 0n &&
-            (priorBalance === undefined || priorBalance < cumulative);
-          if (!depositWriteIncomplete) {
-            applied.push(channelIdOf(receipt.extra)!);
-            return;
-          }
-        }
-        if (priorCumulative === undefined && cumulative === 0n) return;
-        await mod.processSettleResponse(
-          options.storage,
-          withTrustedBalance(receipt, prior, deposit),
-        );
+        // Zero authorized and nothing recorded: there is no channel to
+        // create from this receipt.
+        if (storedCumulative === undefined && cumulative === 0n) return;
+        // Equality means the receipt was (at least partially) applied
+        // already. Rewriting the fold's output is deliberate: the write is
+        // deterministic, so a retry repairs a torn write — cumulative
+        // committed without the balance, or vice versa — instead of having
+        // to guess from the half-committed record which halves survived.
+        await options.storage.set(key, foldChannelState(bounds, receipt));
         applied.push(channelIdOf(receipt.extra)!);
       });
     } catch (err) {
@@ -788,6 +885,89 @@ export async function reconcileX402BatchSettlement(
     );
   }
   return { applied };
+}
+
+/** What one attempt's binding proves, parsed once for the fold. */
+interface TrustedAttemptBounds {
+  /** Cumulative ceiling the voucher authorized — the fold's next cumulative. */
+  ceiling: bigint;
+  /** Deposit this attempt funded (0 for a voucher-only payload). */
+  deposit: bigint;
+  /** Trusted pre-attempt snapshot, `undefined` when no record existed. */
+  pre: X402ChannelState | undefined;
+  /** `preAttemptState.balance + deposit` — the trusted balance floor. */
+  floor: bigint;
+}
+
+/**
+ * Compute the channel state one settled attempt commits:
+ * `trusted pre-attempt snapshot + binding + receipt → next state`, a pure
+ * function of its inputs.
+ *
+ * The merchant-reported `balance` steers the payer's funding decision: at
+ * `0` — or absent — the scheme treats the channel as unfunded and signs a
+ * **fresh deposit**, so it is a funds-moving field and cannot be trusted
+ * below the floor this attempt establishes. Within a payment flow the
+ * balance only ever goes **up**, by exactly the deposits this payer signs
+ * (claims move `totalClaimed`; only the refund path — which a2x does not
+ * drive — reduces it), so the floor is the snapshot balance plus this
+ * attempt's deposit, and anything below it is a figure the merchant could
+ * not have arrived at honestly. A value *above* the floor is kept: it can
+ * only make the payer under-fund a later call, which costs the payer
+ * nothing — the merchant simply cannot claim against funds that were never
+ * deposited.
+ *
+ * Mirrors the write set of `@x402/evm`'s own `processSettleResponse`
+ * (`chargedCumulativeAmount`, `balance`, `totalClaimed`), except that the
+ * base is the trusted snapshot rather than the record currently in storage,
+ * and the cumulative/balance come from the binding's bounds rather than the
+ * merchant's figures. Quarantine markers never survive a successful fold.
+ */
+function foldChannelState(
+  bounds: TrustedAttemptBounds,
+  receipt: X402SettleResponse,
+): X402ChannelState {
+  const channelState = (receipt.extra?.channelState ?? {}) as Record<
+    string,
+    unknown
+  >;
+  const {
+    quarantinedAt: _quarantinedAt,
+    quarantineReason: _quarantineReason,
+    ...pre
+  } = bounds.pre ?? {};
+
+  let reported: bigint | undefined;
+  const raw = channelState.balance;
+  if (typeof raw === 'string' || typeof raw === 'number') {
+    try {
+      reported = BigInt(String(raw));
+    } catch {
+      reported = undefined;
+    }
+  }
+  const balance =
+    reported !== undefined && reported > bounds.floor ? reported : bounds.floor;
+
+  const next: X402ChannelState = {
+    ...pre,
+    chargedCumulativeAmount: bounds.ceiling.toString(),
+    balance: balance.toString(),
+  };
+  // `totalClaimed` only mirrors the merchant's on-chain claims for
+  // observability; the scheme funds and signs off `balance` and the
+  // cumulative alone, so the reported figure is carried when parseable and
+  // the snapshot's retained otherwise.
+  const totalClaimed = channelState.totalClaimed;
+  if (typeof totalClaimed === 'string' || typeof totalClaimed === 'number') {
+    try {
+      const value = BigInt(String(totalClaimed));
+      if (value >= 0n) next.totalClaimed = value.toString();
+    } catch {
+      // Keep the snapshot's figure.
+    }
+  }
+  return next;
 }
 
 const _reconciliationQueues = new WeakMap<
@@ -897,90 +1077,16 @@ function parseStoredCumulative(
   }
 }
 
-function parseStoredBalance(
-  state: X402ChannelState | undefined,
-): bigint | undefined {
-  if (state?.balance === undefined) return undefined;
-  try {
-    const value = BigInt(state.balance);
-    return value >= 0n ? value : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 /**
- * The receipt, with a merchant-reported `balance` **replaced** by the floor
- * this attempt establishes whenever the reported value is missing,
- * unparseable, or below it.
+ * What a signed `batch-settlement` payload proves on its own: the channel,
+ * the cumulative ceiling its voucher authorized, and the deposit it funds
+ * (when it carries one). Read it off a payload with
+ * `getX402BatchSettlementBinding`.
  *
- * `balance` steers the payer's funding decision: at `0` — or absent — the
- * scheme treats the channel as unfunded and signs a **fresh deposit**.
- * Trusting it is a funds-moving path, and `maxAmount` does not close it: that
- * caps each deposit individually, not their aggregate, so a merchant reporting
- * `balance: "0"` every round induces another capped deposit every round,
- * unbounded in total.
- *
- * Within a payment flow the channel balance only ever goes **up**, by exactly
- * the deposits this payer signs (claims move `totalClaimed`; only the refund
- * path — which a2x does not drive — reduces it). So the floor is the stored
- * balance plus whatever this attempt funded, and anything below it is a figure
- * the merchant could not have arrived at honestly.
- *
- * Substituting rather than deleting is the whole point. `processSettleResponse`
- * merges onto the stored record and assigns `balance` **only when the receipt
- * still carries it**, so dropping the key leaves storage holding the *prior*
- * balance — `undefined` on an opening deposit, the pre-top-up figure on a
- * top-up. Either way the deposit this payer just signed goes unrecorded and
- * the next call funds the channel again, which is exactly the loop this guard
- * exists to break. The substituted value is not merchant trust: it is durable
- * prior state plus the deposit this payer signed.
- *
- * A value *above* the floor is left alone. It can only make the payer
- * under-fund a later call, which costs the payer nothing — the merchant simply
- * cannot claim against funds that were never deposited.
+ * Reconciliation needs the full `X402BatchSettlementBinding`, which adds the
+ * trusted pre-attempt snapshot — information the payload cannot carry.
  */
-function withTrustedBalance(
-  receipt: X402SettleResponse,
-  prior: X402ChannelState | undefined,
-  deposit: bigint,
-): X402SettleResponse {
-  const channelState = receipt.extra?.channelState as Record<string, unknown>;
-
-  let floor: bigint;
-  try {
-    floor = BigInt(prior?.balance ?? '0') + deposit;
-  } catch {
-    // Prior state we cannot read bounds nothing; fall back to what this
-    // attempt alone establishes.
-    floor = deposit;
-  }
-
-  let reported: bigint | undefined;
-  const raw = channelState.balance;
-  if (raw !== undefined && raw !== null) {
-    try {
-      reported = BigInt(String(raw));
-    } catch {
-      reported = undefined;
-    }
-  }
-  if (reported !== undefined && reported >= floor) return receipt;
-
-  return {
-    ...receipt,
-    extra: {
-      ...receipt.extra,
-      channelState: { ...channelState, balance: floor.toString() },
-    },
-  };
-}
-
-/**
- * What a signed `batch-settlement` payment authorized, and what a receipt for
- * it must stay within. See `reconcileX402BatchSettlement`'s `bindings`.
- */
-export interface X402BatchSettlementBinding {
+export interface X402BatchSettlementPayloadBinding {
   /** Channel the voucher was signed against. */
   channelId: string;
   /** Cumulative ceiling the voucher authorized. */
@@ -989,22 +1095,47 @@ export interface X402BatchSettlementBinding {
    * Amount this payload funds the channel with, when it carries a deposit.
    * Absent for a voucher-only payload, which funds nothing.
    *
-   * Establishes the floor the merchant's reported `balance` must clear — see
-   * `withTrustedBalance`.
+   * Together with `preAttemptState.balance` it establishes the floor the
+   * merchant's reported `balance` must clear — see `foldChannelState`.
    */
   depositAmount?: string;
 }
 
 /**
- * Read the reconciliation binding out of a signed `batch-settlement` payload.
- * Returns `undefined` for a payload of any other scheme.
+ * Everything `reconcileX402BatchSettlement` needs to commit one attempt:
+ * what the payload authorized plus the trusted channel snapshot taken when
+ * it was signed. `signX402Payment` assembles it as `SignedX402Payment.batch`.
+ */
+export interface X402BatchSettlementBinding
+  extends X402BatchSettlementPayloadBinding {
+  /**
+   * Channel state as stored immediately before this attempt signed —
+   * explicitly `undefined` when no record existed (a fresh channel).
+   *
+   * This is the fold's only trusted balance source. Basing the write on the
+   * snapshot rather than on whatever storage holds at reconcile time is what
+   * makes retries exact: after a torn write the stored record is precisely
+   * the thing that cannot be trusted. The key is required (not optional) so
+   * a caller cannot forget the snapshot and silently degrade the floor to
+   * the deposit alone.
+   */
+  preAttemptState: X402ChannelState | undefined;
+}
+
+/**
+ * Read the payload-provable half of a `batch-settlement` binding out of a
+ * signed payload. Returns `undefined` for a payload of any other scheme.
  *
  * Both payload shapes the scheme produces — the opening `deposit` and the
- * subsequent voucher-only one — carry it under `payload.voucher`.
+ * subsequent voucher-only one — carry it under `payload.voucher`. Callers
+ * resuming a persisted attempt combine this with the pre-attempt snapshot
+ * they captured at signing time to rebuild the full
+ * `X402BatchSettlementBinding`; live callers get that assembled on
+ * `SignedX402Payment.batch` already.
  */
 export function getX402BatchSettlementBinding(
   payload: X402PaymentPayload,
-): X402BatchSettlementBinding | undefined {
+): X402BatchSettlementPayloadBinding | undefined {
   const inner = (payload as { payload?: unknown }).payload;
   if (typeof inner !== 'object' || inner === null) return undefined;
   const voucher = (inner as { voucher?: unknown }).voucher;
@@ -1017,7 +1148,7 @@ export function getX402BatchSettlementBinding(
   if (typeof maxClaimableAmount !== 'string') return undefined;
 
   // Present only on the opening / top-up shape; a voucher-only payload funds
-  // nothing and leaves the balance floor at whatever is already stored.
+  // nothing and leaves the balance floor at the pre-attempt snapshot.
   const deposit = (inner as { deposit?: unknown }).deposit;
   const depositAmount =
     typeof deposit === 'object' && deposit !== null

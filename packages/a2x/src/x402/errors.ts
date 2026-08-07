@@ -158,6 +158,48 @@ export class X402ReconciliationError extends X402Error {
 }
 
 /**
+ * Thrown when signing selected a `batch-settlement` channel whose stored
+ * state carries a quarantine marker (`X402ChannelState.quarantinedAt`).
+ *
+ * The SDK writes that marker when an attempt on the channel ended without a
+ * trustworthy reconciliation — the voucher may be spent, or a receipt may
+ * have been lost — so the next signature could authorize a duplicate
+ * deposit. Unlike the in-process abort that `X402ReconciliationError`
+ * propagates to queued attempts, the marker survives a process restart.
+ *
+ * Recovery: repair the channel record (for example by re-running
+ * `reconcileX402BatchSettlement` with the original attempt's binding and the
+ * receipt fetched via `tasks/get`), which clears the marker on a successful
+ * fold — or remove the marker manually once the state is verified.
+ */
+export class X402ChannelQuarantinedError extends X402Error {
+  /** Channel whose stored state is marked quarantined. */
+  readonly channelId: string;
+  /** When the marker was written (ISO 8601). */
+  readonly quarantinedAt: string;
+  /** The `X402ReconciliationError` reason recorded with the marker, if any. */
+  readonly quarantineReason?: string;
+
+  constructor(
+    channelId: string,
+    quarantinedAt: string,
+    quarantineReason?: string,
+  ) {
+    super(
+      `batch-settlement channel ${channelId} was quarantined at ${quarantinedAt}` +
+        (quarantineReason ? ` (${quarantineReason})` : '') +
+        '. A previous attempt ended without a trustworthy reconciliation, so signing ' +
+        'again could authorize a duplicate deposit. Repair the channel record ' +
+        '(or clear the quarantine marker after verifying it) before reusing the channel.',
+    );
+    this.name = 'X402ChannelQuarantinedError';
+    this.channelId = channelId;
+    this.quarantinedAt = quarantinedAt;
+    this.quarantineReason = quarantineReason;
+  }
+}
+
+/**
  * Thrown when the merchant claims an `x402Version` the SDK can't speak.
  * a2x supports x402Version 1 and 2. The wire `code` matches the spec's
  * `invalid_x402_version` token verbatim — a2a-x402 v0.2 §9.1 doesn't

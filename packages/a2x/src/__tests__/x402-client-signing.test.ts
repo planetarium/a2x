@@ -12,6 +12,7 @@ import {
   type X402ClientChannelStorage,
 } from '../x402/client.js';
 import {
+  X402ChannelQuarantinedError,
   X402NoSupportedRequirementError,
   X402PaymentRequiredError,
 } from '../x402/errors.js';
@@ -28,14 +29,13 @@ const captured: {
   envelope?: unknown;
   registered: [string, string][];
   batchOptions: Record<string, unknown>[];
-  reconciled: { storage: unknown; settle: unknown }[];
-  /** Makes the mocked peer throw for one channel id, as the real one would. */
-  failOnChannelId?: string;
 } = {
   registered: [],
   batchOptions: [],
-  reconciled: [],
 };
+
+/** Channel id the mocked batch-settlement runtime signs vouchers against. */
+const MOCK_BATCH_CHANNEL = `0x${'aa'.repeat(32)}`;
 
 vi.mock('../x402/peer.js', () => ({
   importX402Peer: vi.fn(async (specifier: string) => {
@@ -54,7 +54,19 @@ vi.mock('../x402/peer.js', () => ({
               x402Version: 2,
               scheme: selected.scheme,
               network: 'eip155:84532',
-              payload: {},
+              // A batch payload carries the voucher the binding is read from;
+              // every other scheme's payload shape is irrelevant to these
+              // tests.
+              payload:
+                selected.scheme === 'batch-settlement'
+                  ? {
+                      type: 'voucher',
+                      voucher: {
+                        channelId: MOCK_BATCH_CHANNEL,
+                        maxClaimableAmount: '3000',
+                      },
+                    }
+                  : {},
             };
           }
         },
@@ -83,16 +95,6 @@ vi.mock('../x402/peer.js', () => ({
             }
             captured.batchOptions.push(options as Record<string, unknown>);
           }
-        },
-        processSettleResponse: async (storage: unknown, settle: unknown) => {
-          const id = (
-            (settle as { extra?: { channelState?: { channelId?: string } } })
-              .extra?.channelState ?? {}
-          ).channelId;
-          if (captured.failOnChannelId && id === captured.failOnChannelId) {
-            throw new Error('channel storage write failed');
-          }
-          captured.reconciled.push({ storage, settle });
         },
       };
     }
@@ -460,15 +462,94 @@ describe('signX402Payment batch-settlement selection policy', () => {
     );
     expect(signed.requirement).toEqual(V2_BATCH_ACCEPT);
   });
+
+  it('captures the pre-attempt snapshot on the signed batch binding', async () => {
+    // The snapshot is the trusted base the later reconciliation fold rests
+    // on; it is read right after signing, which never writes storage.
+    const storage = memoryChannelStorage();
+    await storage.set(MOCK_BATCH_CHANNEL.toLowerCase(), {
+      balance: '5000',
+      chargedCumulativeAmount: '1000',
+    });
+    const signed = await signX402Payment(v2RequiredTask([V2_BATCH_ACCEPT]), {
+      signer: freshSigner(0x1c),
+      batchSettlement: { storage },
+      allowBatchSettlement: true,
+    });
+    expect(signed.batch).toEqual({
+      channelId: MOCK_BATCH_CHANNEL,
+      maxClaimableAmount: '3000',
+      preAttemptState: { balance: '5000', chargedCumulativeAmount: '1000' },
+    });
+  });
+
+  it('leaves batch undefined for a non-batch scheme', async () => {
+    const signed = await signX402Payment(v2RequiredTask(), {
+      signer: freshSigner(0x1d),
+      batchSettlement: { storage: memoryChannelStorage() },
+      allowBatchSettlement: true,
+    });
+    expect(signed.requirement).toEqual(V2_ACCEPT);
+    expect(signed.batch).toBeUndefined();
+  });
+
+  it('refuses to sign against a quarantined channel', async () => {
+    // The marker outlives the process that wrote it; a channel that ended an
+    // attempt without a trustworthy reconciliation must not fund or spend
+    // again until its record is repaired.
+    const storage = memoryChannelStorage();
+    await storage.set(MOCK_BATCH_CHANNEL.toLowerCase(), {
+      balance: '5000',
+      chargedCumulativeAmount: '1000',
+      quarantinedAt: '2026-01-01T00:00:00.000Z',
+      quarantineReason: 'ambiguous-response',
+    });
+    await expect(
+      signX402Payment(v2RequiredTask([V2_BATCH_ACCEPT]), {
+        signer: freshSigner(0x1e),
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      }),
+    ).rejects.toThrow(X402ChannelQuarantinedError);
+  });
+
+  it('fails closed when the snapshot read fails after signing', async () => {
+    // Without the snapshot the attempt's reconciliation basis is unknown;
+    // the payload must not reach the merchant. Nothing was submitted yet, so
+    // refusing here moves no funds.
+    const storage: X402ClientChannelStorage = {
+      get: async () => {
+        throw new Error('storage down');
+      },
+      set: async () => {},
+      delete: async () => {},
+    };
+    await expect(
+      signX402Payment(v2RequiredTask([V2_BATCH_ACCEPT]), {
+        signer: freshSigner(0x1f),
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      }),
+    ).rejects.toThrow(/snapshot the pre-attempt channel state/);
+  });
 });
 
 describe('reconcileX402BatchSettlement', () => {
   const CHANNEL_A = `0x${'cd'.repeat(32)}`;
   const CHANNEL_B = `0x${'ef'.repeat(32)}`;
   const FOREIGN = `0x${'ab'.repeat(32)}`;
-  // Ceilings the payer's vouchers authorized on each channel.
-  const BIND_A = { channelId: CHANNEL_A, maxClaimableAmount: '3000' };
-  const BIND_B = { channelId: CHANNEL_B, maxClaimableAmount: '6000' };
+  // Ceilings the payer's vouchers authorized on each channel. Both attempts
+  // signed against fresh channels, so the trusted snapshot is undefined.
+  const BIND_A = {
+    channelId: CHANNEL_A,
+    maxClaimableAmount: '3000',
+    preAttemptState: undefined,
+  };
+  const BIND_B = {
+    channelId: CHANNEL_B,
+    maxClaimableAmount: '6000',
+    preAttemptState: undefined,
+  };
 
   const channelReceipt: X402SettleResponse = {
     success: true,
@@ -487,15 +568,17 @@ describe('reconcileX402BatchSettlement', () => {
   };
 
   it('folds a voucher receipt into the caller storage', async () => {
-    captured.reconciled = [];
     const storage = memoryChannelStorage();
-    await reconcileX402BatchSettlement([channelReceipt], {
+    const { applied } = await reconcileX402BatchSettlement([channelReceipt], {
       storage,
       bindings: BIND_A,
     });
-    expect(captured.reconciled).toHaveLength(1);
-    expect(captured.reconciled[0]!.storage).toBe(storage);
-    expect(captured.reconciled[0]!.settle).toBe(channelReceipt);
+    expect(applied).toEqual([CHANNEL_A]);
+    expect(await storage.get(CHANNEL_A.toLowerCase())).toEqual({
+      chargedCumulativeAmount: '3000',
+      balance: '15000',
+      totalClaimed: '0',
+    });
   });
 
   it('ignores a receipt naming a channel outside channelIds', async () => {
@@ -503,19 +586,20 @@ describe('reconcileX402BatchSettlement', () => {
     // *did* pay could otherwise name a channel belonging to a different
     // merchant and overwrite its cumulative — bricking it, or forcing an
     // invalid top-up.
-    captured.reconciled = [];
-    await reconcileX402BatchSettlement(
+    const storage = memoryChannelStorage();
+    const { applied } = await reconcileX402BatchSettlement(
       [{ ...channelReceipt, extra: { channelState: { channelId: FOREIGN } } }],
-      { storage: memoryChannelStorage(), bindings: BIND_A },
+      { storage, bindings: BIND_A },
     );
-    expect(captured.reconciled).toEqual([]);
+    expect(applied).toEqual([]);
+    expect(await storage.get(FOREIGN.toLowerCase())).toBeUndefined();
   });
 
   it('matches the allowlist case-insensitively', async () => {
-    // The peer lowercases the storage key, so a checksummed id from the
+    // Storage is keyed on the lowercased id, so a checksummed id from the
     // merchant must still match a lowercase one the payer signed.
-    captured.reconciled = [];
-    await reconcileX402BatchSettlement(
+    const storage = memoryChannelStorage();
+    const { applied } = await reconcileX402BatchSettlement(
       [
         {
           ...channelReceipt,
@@ -527,17 +611,19 @@ describe('reconcileX402BatchSettlement', () => {
           },
         },
       ],
-      { storage: memoryChannelStorage(), bindings: BIND_A },
+      { storage, bindings: BIND_A },
     );
-    expect(captured.reconciled).toHaveLength(1);
+    expect(applied).toHaveLength(1);
+    expect(await storage.get(CHANNEL_A.toLowerCase())).toMatchObject({
+      chargedCumulativeAmount: '3000',
+    });
   });
 
   it('refuses a receipt that carries no cumulative to advance', async () => {
-    // The peer writes only the keys it finds, so a receipt with just
-    // `balance` / `totalClaimed` performs a partial write that leaves the
-    // signing base where it was. Counting that as applied would mask the very
-    // desync an empty `applied` exists to report.
-    captured.reconciled = [];
+    // A receipt with just `balance` / `totalClaimed` cannot advance the
+    // signing base. Counting that as applied would mask the very desync an
+    // empty `applied` exists to report.
+    const storage = memoryChannelStorage();
     const { applied } = await reconcileX402BatchSettlement(
       [
         {
@@ -552,14 +638,13 @@ describe('reconcileX402BatchSettlement', () => {
         },
         { ...channelReceipt, extra: { channelState: { channelId: CHANNEL_A } } },
       ],
-      { storage: memoryChannelStorage(), bindings: BIND_A },
+      { storage, bindings: BIND_A },
     );
     expect(applied).toEqual([]);
-    expect(captured.reconciled).toEqual([]);
+    expect(await storage.get(CHANNEL_A.toLowerCase())).toBeUndefined();
   });
 
   it('refuses a negative cumulative', async () => {
-    captured.reconciled = [];
     const { applied } = await reconcileX402BatchSettlement(
       [
         {
@@ -574,46 +659,46 @@ describe('reconcileX402BatchSettlement', () => {
     expect(applied).toEqual([]);
   });
 
-  it('ignores receipts from other schemes without loading the peer', async () => {
-    captured.reconciled = [];
-    // An `exact` receipt has no channelState. Reconciling it would be a
-    // no-op upstream anyway, but importing the peer to discover that would
-    // make every non-batch payer pay for a module it never uses.
-    await reconcileX402BatchSettlement(
+  it('ignores receipts from other schemes', async () => {
+    // An `exact` receipt has no channelState, so there is nothing to fold —
+    // and nothing may be written for it either.
+    const storage = memoryChannelStorage();
+    const { applied } = await reconcileX402BatchSettlement(
       [{ success: true, transaction: '0xabc', network: 'eip155:84532' }],
-      { storage: memoryChannelStorage(), bindings: BIND_A },
+      { storage, bindings: BIND_A },
     );
-    expect(captured.reconciled).toEqual([]);
+    expect(applied).toEqual([]);
+    expect(await storage.get(CHANNEL_A.toLowerCase())).toBeUndefined();
   });
 
   it('skips failed receipts', async () => {
-    captured.reconciled = [];
-    await reconcileX402BatchSettlement(
+    const storage = memoryChannelStorage();
+    const { applied } = await reconcileX402BatchSettlement(
       [{ ...channelReceipt, success: false, errorReason: 'CHANNEL_BUSY' }],
-      { storage: memoryChannelStorage(), bindings: BIND_A },
+      { storage, bindings: BIND_A },
     );
-    expect(captured.reconciled).toEqual([]);
+    expect(applied).toEqual([]);
+    expect(await storage.get(CHANNEL_A.toLowerCase())).toBeUndefined();
   });
 
   it('skips malformed entries without dropping a later valid receipt', async () => {
-    captured.reconciled = [];
+    const storage = memoryChannelStorage();
     const { applied } = await reconcileX402BatchSettlement(
       [null, 'not-a-receipt', 42, [], channelReceipt] as never,
-      { storage: memoryChannelStorage(), bindings: BIND_A },
+      { storage, bindings: BIND_A },
     );
     expect(applied).toEqual([CHANNEL_A]);
-    expect(captured.reconciled.map((entry) => entry.settle)).toEqual([
-      channelReceipt,
-    ]);
+    expect(await storage.get(CHANNEL_A.toLowerCase())).toMatchObject({
+      chargedCumulativeAmount: '3000',
+    });
   });
 
   it('screens out a channelState with no canonical channelId', async () => {
-    // The peer keys storage on `channelState.channelId.toLowerCase()` with no
-    // guard of its own, so an unusable id would surface as a bare TypeError
-    // thrown from inside `@x402/evm`. Requiring the canonical bytes32 form
-    // also stops a near-miss id becoming a second, orphaned storage key.
-    captured.reconciled = [];
-    await reconcileX402BatchSettlement(
+    // Storage is keyed on `channelState.channelId.toLowerCase()`, so an
+    // unusable id would surface as a bare TypeError. Requiring the canonical
+    // bytes32 form also stops a near-miss id becoming a second, orphaned
+    // storage key.
+    const { applied } = await reconcileX402BatchSettlement(
       [
         { ...channelReceipt, extra: { channelState: {} } },
         { ...channelReceipt, extra: { channelState: { channelId: 123 } } },
@@ -626,16 +711,27 @@ describe('reconcileX402BatchSettlement', () => {
       ],
       { storage: memoryChannelStorage(), bindings: BIND_A },
     );
-    expect(captured.reconciled).toEqual([]);
+    expect(applied).toEqual([]);
   });
 
   it('still applies the good receipts when one fails, then reports', async () => {
-    // Receipts are remote-controlled. One entry blowing up inside the peer
-    // must not drop a later valid one — a receipt the payer never records
-    // leaves it desynced, and `@x402/evm` cannot self-heal that without a
+    // Receipts are remote-controlled. One entry failing its write must not
+    // drop a later valid one — a receipt the payer never records leaves it
+    // desynced, and `@x402/evm` cannot self-heal that without a
     // chain-reading signer.
-    captured.reconciled = [];
-    captured.failOnChannelId = CHANNEL_B;
+    const channels = new Map<string, Record<string, unknown>>();
+    const storage = {
+      get: async (key: string) => channels.get(key),
+      set: async (key: string, state: Record<string, unknown>) => {
+        if (key === CHANNEL_B.toLowerCase()) {
+          throw new Error('channel storage write failed');
+        }
+        channels.set(key, state);
+      },
+      delete: async (key: string) => {
+        channels.delete(key);
+      },
+    };
     const poisoned: X402SettleResponse = {
       ...channelReceipt,
       extra: {
@@ -645,25 +741,20 @@ describe('reconcileX402BatchSettlement', () => {
         },
       },
     };
-    const storage = memoryChannelStorage();
-    try {
-      await expect(
-        reconcileX402BatchSettlement([poisoned, channelReceipt], {
-          storage,
-          bindings: [BIND_A, BIND_B],
-        }),
-      ).rejects.toThrow(AggregateError);
-      // The valid receipt after the failing one was still processed.
-      expect(captured.reconciled.map((r) => r.settle)).toEqual([channelReceipt]);
-    } finally {
-      // Reset even on failure — a leaked value would break later tests in a
-      // way that points at the wrong code.
-      captured.failOnChannelId = undefined;
-    }
+    await expect(
+      reconcileX402BatchSettlement([poisoned, channelReceipt], {
+        storage,
+        bindings: [BIND_A, BIND_B],
+      }),
+    ).rejects.toThrow(AggregateError);
+    // The valid receipt after the failing one was still recorded.
+    expect(channels.get(CHANNEL_A.toLowerCase())).toMatchObject({
+      chargedCumulativeAmount: '3000',
+    });
   });
 
   it('processes every allowed channel receipt on a task, in order', async () => {
-    captured.reconciled = [];
+    const storage = memoryChannelStorage();
     const second: X402SettleResponse = {
       ...channelReceipt,
       extra: {
@@ -672,18 +763,15 @@ describe('reconcileX402BatchSettlement', () => {
     };
     const { applied } = await reconcileX402BatchSettlement(
       [channelReceipt, second],
-      { storage: memoryChannelStorage(), bindings: [BIND_A, BIND_B] },
+      { storage, bindings: [BIND_A, BIND_B] },
     );
-    // Compared by channel rather than object identity: a receipt whose
-    // balance is below the floor is handed to the peer as a corrected copy.
     expect(applied).toEqual([CHANNEL_A, CHANNEL_B]);
-    expect(
-      captured.reconciled.map(
-        (r) =>
-          (r.settle as { extra: { channelState: { channelId: string } } }).extra
-            .channelState.channelId,
-      ),
-    ).toEqual([CHANNEL_A, CHANNEL_B]);
+    expect(await storage.get(CHANNEL_A.toLowerCase())).toMatchObject({
+      chargedCumulativeAmount: '3000',
+    });
+    expect(await storage.get(CHANNEL_B.toLowerCase())).toMatchObject({
+      chargedCumulativeAmount: '6000',
+    });
   });
 
   it('rejects duplicate bindings for the same channel', async () => {
@@ -695,8 +783,13 @@ describe('reconcileX402BatchSettlement', () => {
             channelId: CHANNEL_A,
             maxClaimableAmount: '1000',
             depositAmount: '5000',
+            preAttemptState: undefined,
           },
-          { channelId: CHANNEL_A, maxClaimableAmount: '3000' },
+          {
+            channelId: CHANNEL_A,
+            maxClaimableAmount: '3000',
+            preAttemptState: undefined,
+          },
         ],
       }),
     ).rejects.toThrow(X402PaymentRequiredError);
@@ -705,7 +798,11 @@ describe('reconcileX402BatchSettlement', () => {
 
 describe('reconcileX402BatchSettlement cumulative binding', () => {
   const CHANNEL = `0x${'cd'.repeat(32)}`;
-  const binding = { channelId: CHANNEL, maxClaimableAmount: '3000' };
+  const binding = {
+    channelId: CHANNEL,
+    maxClaimableAmount: '3000',
+    preAttemptState: undefined,
+  };
 
   function receiptWithCumulative(chargedCumulativeAmount: unknown) {
     return {
@@ -721,17 +818,16 @@ describe('reconcileX402BatchSettlement cumulative binding', () => {
     // here) the merchant reports 5000. Stored verbatim, the payer's next call
     // would sign a cumulative above it plus a top-up to cover the gap, letting
     // the merchant claim far more than the calls cost.
-    captured.reconciled = [];
+    const storage = memoryChannelStorage();
     const { applied } = await reconcileX402BatchSettlement(
       [receiptWithCumulative('5000')],
-      { storage: memoryChannelStorage(), bindings: binding },
+      { storage, bindings: binding },
     );
     expect(applied).toEqual([]);
-    expect(captured.reconciled).toEqual([]);
+    expect(await storage.get(CHANNEL.toLowerCase())).toBeUndefined();
   });
 
   it('accepts a cumulative equal to the signed ceiling', async () => {
-    captured.reconciled = [];
     const { applied } = await reconcileX402BatchSettlement(
       [receiptWithCumulative('3000')],
       { storage: memoryChannelStorage(), bindings: binding },
@@ -749,20 +845,23 @@ describe('reconcileX402BatchSettlement cumulative binding', () => {
       chargedCumulativeAmount: '1000',
       balance: '5000',
     });
-    captured.reconciled = [];
     const { applied } = await reconcileX402BatchSettlement(
       [receiptWithCumulative('1000')],
-      { storage, bindings: binding },
+      {
+        storage,
+        bindings: {
+          ...binding,
+          preAttemptState: { chargedCumulativeAmount: '1000', balance: '5000' },
+        },
+      },
     );
     expect(applied).toEqual([]);
-    expect(captured.reconciled).toEqual([]);
     expect(await storage.get(CHANNEL.toLowerCase())).toMatchObject({
       chargedCumulativeAmount: '1000',
     });
   });
 
   it('refuses an unparseable cumulative', async () => {
-    captured.reconciled = [];
     const { applied } = await reconcileX402BatchSettlement(
       [receiptWithCumulative('not-a-number'), receiptWithCumulative({})],
       { storage: memoryChannelStorage(), bindings: binding },
@@ -771,12 +870,15 @@ describe('reconcileX402BatchSettlement cumulative binding', () => {
   });
 
   it('drops a binding whose ceiling cannot be parsed rather than unbounding it', async () => {
-    captured.reconciled = [];
     const { applied } = await reconcileX402BatchSettlement(
       [receiptWithCumulative('1')],
       {
         storage: memoryChannelStorage(),
-        bindings: { channelId: CHANNEL, maxClaimableAmount: 'oops' },
+        bindings: {
+          channelId: CHANNEL,
+          maxClaimableAmount: 'oops',
+          preAttemptState: undefined,
+        },
       },
     );
     expect(applied).toEqual([]);
@@ -802,46 +904,36 @@ describe('reconcileX402BatchSettlement balance floor', () => {
     } as X402SettleResponse;
   }
 
-  function reportedBalance(): unknown {
-    const settle = captured.reconciled.at(-1)!.settle as {
-      extra: { channelState: Record<string, unknown> };
-    };
-    return settle.extra.channelState.balance;
+  async function storedBalance(
+    storage: X402ClientChannelStorage,
+  ): Promise<unknown> {
+    return (await storage.get(CHANNEL.toLowerCase()))?.balance;
   }
 
-  // These assert what is handed to the peer. The state that actually lands in
-  // storage — which depends on upstream's merge semantics — is covered in
-  // `a2x-client-x402.test.ts` against the real `@x402/evm`.
   it('substitutes the floor for a balance below what this attempt funded', async () => {
     // The aggregate attack: `maxAmount` caps each deposit individually, so a
     // merchant reporting `balance: "0"` every round induces another
     // individually-capped deposit every round, unbounded in total. Within a
     // payment flow the balance only ever goes up, so anything below the floor
     // is a figure the merchant could not have reached honestly.
-    captured.reconciled = [];
+    const storage = memoryChannelStorage();
     await reconcileX402BatchSettlement([receipt('0')], {
-      storage: memoryChannelStorage(),
+      storage,
       bindings: {
         channelId: CHANNEL,
         maxClaimableAmount: '1000',
         depositAmount: '5000',
+        preAttemptState: undefined,
       },
     });
-    // Substituted, not deleted: the peer assigns `balance` only when the
-    // receipt still carries the key, so dropping it would leave storage
-    // holding the prior (here: absent) value.
-    expect(captured.reconciled).toHaveLength(1);
-    expect(reportedBalance()).toBe('5000');
-    const state = (
-      captured.reconciled[0]!.settle as {
-        extra: { channelState: { chargedCumulativeAmount?: string } };
-      }
-    ).extra.channelState;
-    expect(state.chargedCumulativeAmount).toBe('1000');
+    expect(await storage.get(CHANNEL.toLowerCase())).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '1000',
+    });
   });
 
   it('substitutes the floor when the merchant omits balance', async () => {
-    captured.reconciled = [];
+    const storage = memoryChannelStorage();
     await reconcileX402BatchSettlement(
       [
         {
@@ -857,56 +949,62 @@ describe('reconcileX402BatchSettlement balance floor', () => {
         } as X402SettleResponse,
       ],
       {
-        storage: memoryChannelStorage(),
+        storage,
         bindings: {
           channelId: CHANNEL,
           maxClaimableAmount: '1000',
           depositAmount: '5000',
+          preAttemptState: undefined,
         },
       },
     );
-    expect(reportedBalance()).toBe('5000');
+    expect(await storedBalance(storage)).toBe('5000');
   });
 
   it('keeps a balance at or above the floor', async () => {
-    captured.reconciled = [];
-    await reconcileX402BatchSettlement([receipt('5000')], {
-      storage: memoryChannelStorage(),
-      bindings: {
-        channelId: CHANNEL,
-        maxClaimableAmount: '1000',
-        depositAmount: '5000',
-      },
-    });
-    expect(reportedBalance()).toBe('5000');
-  });
-
-  it('adds the stored balance to the floor for a top-up', async () => {
-    // Prior balance 5000 + this deposit 5000 = 10000. Reporting 5000 back
-    // would hide the top-up and invite yet another one.
     const storage = memoryChannelStorage();
-    await storage.set(CHANNEL.toLowerCase(), { balance: '5000' });
-    captured.reconciled = [];
     await reconcileX402BatchSettlement([receipt('5000')], {
       storage,
       bindings: {
         channelId: CHANNEL,
         maxClaimableAmount: '1000',
         depositAmount: '5000',
+        preAttemptState: undefined,
       },
     });
-    expect(reportedBalance()).toBe('10000');
+    expect(await storedBalance(storage)).toBe('5000');
+  });
+
+  it('adds the snapshot balance to the floor for a top-up', async () => {
+    // Snapshot balance 5000 + this deposit 5000 = 10000. Reporting 5000 back
+    // would hide the top-up and invite yet another one.
+    const storage = memoryChannelStorage();
+    await storage.set(CHANNEL.toLowerCase(), { balance: '5000' });
+    await reconcileX402BatchSettlement([receipt('5000')], {
+      storage,
+      bindings: {
+        channelId: CHANNEL,
+        maxClaimableAmount: '1000',
+        depositAmount: '5000',
+        preAttemptState: { balance: '5000' },
+      },
+    });
+    expect(await storedBalance(storage)).toBe('10000');
   });
 
   it('keeps a balance above the floor untouched', async () => {
     // Overstating costs the payer nothing — it can only make the payer
     // under-fund later, and the merchant cannot claim funds never deposited.
-    captured.reconciled = [];
+    const storage = memoryChannelStorage();
     await reconcileX402BatchSettlement([receipt('999999')], {
-      storage: memoryChannelStorage(),
-      bindings: { channelId: CHANNEL, maxClaimableAmount: '1000' },
+      storage,
+      bindings: {
+        channelId: CHANNEL,
+        maxClaimableAmount: '1000',
+        preAttemptState: undefined,
+      },
     });
-    expect(reportedBalance()).toBe('999999');
+    expect(await storedBalance(storage)).toBe('999999');
   });
 });
 
