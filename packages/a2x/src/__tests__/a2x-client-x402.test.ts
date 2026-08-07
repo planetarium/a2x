@@ -853,6 +853,7 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
       balance: '5000',
       totalClaimed: '0',
       chargedCumulativeAmount: '1000',
+      lastAppliedAttemptId: expect.any(String) as unknown as string,
     });
   });
 
@@ -1235,6 +1236,7 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
       balance: '5000',
       totalClaimed: '0',
       chargedCumulativeAmount: '1000',
+      lastAppliedAttemptId: expect.any(String) as unknown as string,
     });
   });
 
@@ -1863,6 +1865,7 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
       balance: '5000',
       totalClaimed: '0',
       chargedCumulativeAmount: '1000',
+      lastAppliedAttemptId: expect.any(String) as unknown as string,
     });
   });
 
@@ -1943,6 +1946,7 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
       balance: '5000',
       totalClaimed: '0',
       chargedCumulativeAmount: '1000',
+      lastAppliedAttemptId: expect.any(String) as unknown as string,
     });
   });
 
@@ -2823,6 +2827,7 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
     maxClaimableAmount: '1000',
     depositAmount: '5000',
     // Fresh channel: nothing was stored when the attempt signed.
+    attemptId: 'attempt-101',
     preAttemptState: undefined,
   };
 
@@ -2869,6 +2874,7 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
           channelId: CHANNEL,
           maxClaimableAmount: '6000',
           depositAmount: '5000',
+          attemptId: 'attempt-102',
           preAttemptState: { balance: '5000', chargedCumulativeAmount: '5000' },
         },
       },
@@ -2900,6 +2906,7 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
         bindings: {
           channelId: CHANNEL,
           maxClaimableAmount: '2000',
+          attemptId: 'attempt-103',
           preAttemptState: { balance: '5000', chargedCumulativeAmount: '1000' },
         },
       },
@@ -2921,6 +2928,7 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
           channelId: CHANNEL,
           maxClaimableAmount: '1000',
           depositAmount: '5000',
+          attemptId: 'attempt-104',
           preAttemptState: undefined,
         },
       },
@@ -2936,6 +2944,7 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
       channelId: CHANNEL,
       maxClaimableAmount: '3000',
       depositAmount: '5000',
+      attemptId: 'attempt-105',
       preAttemptState: undefined,
     };
     await reconcileX402BatchSettlement([opening], {
@@ -2949,6 +2958,149 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
     expect(fresh.channels.get(KEY)).toEqual({
       balance: '5000',
       chargedCumulativeAmount: '3000',
+      lastAppliedAttemptId: 'attempt-105',
+    });
+  });
+
+  it('does not roll back a newer zero-charge top-up on an equal-cumulative replay', async () => {
+    // The cumulative cannot order attempts: a metered call may charge zero,
+    // so a later top-up can leave it unchanged while moving real funds. The
+    // attempt stamp — not the cumulative — must reject the older replay, or
+    // the fold rewrites the balance to the old figure and the next payment
+    // authorizes another deposit on top of 30000 already funded.
+    const { channels, storage } = store();
+    const openingBinding = {
+      channelId: CHANNEL,
+      maxClaimableAmount: '500',
+      depositAmount: '5000',
+      attemptId: 'attempt-open',
+      preAttemptState: undefined,
+    };
+    const openingReceipt = receipt({
+      chargedCumulativeAmount: '500',
+      balance: '5000',
+    });
+    await expect(
+      reconcileX402BatchSettlement([openingReceipt], {
+        storage,
+        bindings: openingBinding,
+      }),
+    ).resolves.toEqual({ applied: [CHANNEL] });
+
+    // Zero-charge metered top-up: same cumulative, 25000 more funded.
+    const topUpReceipt = receipt({
+      chargedCumulativeAmount: '500',
+      balance: '30000',
+    });
+    topUpReceipt.extra!.chargedAmount = '0';
+    await expect(
+      reconcileX402BatchSettlement([topUpReceipt], {
+        storage,
+        bindings: {
+          channelId: CHANNEL,
+          maxClaimableAmount: '1500',
+          depositAmount: '25000',
+          attemptId: 'attempt-topup',
+          preAttemptState: {
+            balance: '5000',
+            chargedCumulativeAmount: '500',
+            lastAppliedAttemptId: 'attempt-open',
+          },
+        },
+      }),
+    ).resolves.toEqual({ applied: [CHANNEL] });
+    expect(channels.get(KEY)).toMatchObject({ balance: '30000' });
+
+    // Replaying the opening attempt passes the cumulative comparison (500 is
+    // not greater than 500) but fails the provenance check.
+    const { applied } = await reconcileX402BatchSettlement([openingReceipt], {
+      storage,
+      bindings: openingBinding,
+    });
+    expect(applied).toEqual([]);
+    expect(channels.get(KEY)).toEqual({
+      balance: '30000',
+      chargedCumulativeAmount: '500',
+      lastAppliedAttemptId: 'attempt-topup',
+    });
+  });
+
+  it('preserves another attempt\'s quarantine across an already-applied replay', async () => {
+    // A quarantined attempt leaves storage at its pre-attempt state, so the
+    // preceding attempt's receipt still folds (its own idempotent rewrite).
+    // That rewrite must not strip the newer attempt's marker: the merchant
+    // may hold that attempt's spendable voucher, and clearing its block
+    // would reopen the channel underneath it.
+    const { channels, storage } = store();
+    const bindingA = {
+      channelId: CHANNEL,
+      maxClaimableAmount: '500',
+      depositAmount: '5000',
+      attemptId: 'attempt-a',
+      preAttemptState: undefined,
+    };
+    const receiptA = receipt({
+      chargedCumulativeAmount: '500',
+      balance: '5000',
+    });
+    await reconcileX402BatchSettlement([receiptA], {
+      storage,
+      bindings: bindingA,
+    });
+
+    // Attempt B submitted and went ambiguous: the state machine persists its
+    // marker onto A's post-attempt record.
+    const bindingB = {
+      channelId: CHANNEL,
+      maxClaimableAmount: '1500',
+      depositAmount: '25000',
+      attemptId: 'attempt-b',
+      preAttemptState: {
+        balance: '5000',
+        chargedCumulativeAmount: '500',
+        lastAppliedAttemptId: 'attempt-a',
+      },
+    };
+    await storage.set(KEY, {
+      ...channels.get(KEY)!,
+      quarantinedAt: '2026-01-01T00:00:00.000Z',
+      quarantineReason: 'ambiguous-response',
+      quarantineBinding: bindingB,
+      quarantineTaskId: 't-b',
+    });
+
+    // Replaying A's already-applied receipt rewrites A's own state but must
+    // leave B's marker in place.
+    await expect(
+      reconcileX402BatchSettlement([receiptA], {
+        storage,
+        bindings: bindingA,
+      }),
+    ).resolves.toEqual({ applied: [CHANNEL] });
+    expect(channels.get(KEY)).toMatchObject({
+      balance: '5000',
+      quarantinedAt: '2026-01-01T00:00:00.000Z',
+      quarantineReason: 'ambiguous-response',
+      quarantineTaskId: 't-b',
+      quarantineBinding: { attemptId: 'attempt-b' },
+    });
+
+    // Only B's own repair clears B's marker.
+    const receiptB = receipt({
+      chargedCumulativeAmount: '500',
+      balance: '30000',
+    });
+    receiptB.extra!.chargedAmount = '0';
+    await expect(
+      reconcileX402BatchSettlement([receiptB], {
+        storage,
+        bindings: bindingB,
+      }),
+    ).resolves.toEqual({ applied: [CHANNEL] });
+    expect(channels.get(KEY)).toEqual({
+      balance: '30000',
+      chargedCumulativeAmount: '500',
+      lastAppliedAttemptId: 'attempt-b',
     });
   });
 
@@ -3027,6 +3179,7 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
       channelId: CHANNEL,
       maxClaimableAmount: '6000',
       depositAmount: '5000',
+      attemptId: 'attempt-106',
       preAttemptState: { balance: '5000', chargedCumulativeAmount: '5000' },
     };
 
@@ -3047,6 +3200,7 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
     expect(channels.get(KEY)).toEqual({
       balance: '10000',
       chargedCumulativeAmount: '6000',
+      lastAppliedAttemptId: 'attempt-106',
     });
     expect(writes).toBe(2);
   });
@@ -3084,6 +3238,7 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
       channelId: CHANNEL,
       maxClaimableAmount: '6000',
       depositAmount: '5000',
+      attemptId: 'attempt-107',
       preAttemptState: { balance: '5000', chargedCumulativeAmount: '5000' },
     };
 
@@ -3101,6 +3256,7 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
     expect(channels.get(KEY)).toEqual({
       balance: '10000', // snapshot 5000 + deposit 5000 — not 15000
       chargedCumulativeAmount: '6000',
+      lastAppliedAttemptId: 'attempt-107',
     });
     expect(writes).toBe(2);
   });
@@ -3137,6 +3293,7 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
     const binding = {
       channelId: CHANNEL,
       maxClaimableAmount: '2000',
+      attemptId: 'attempt-108',
       preAttemptState: { balance: '5000', chargedCumulativeAmount: '1000' },
     };
 
@@ -3151,6 +3308,7 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
     expect(channels.get(KEY)).toEqual({
       balance: '5000',
       chargedCumulativeAmount: '2000',
+      lastAppliedAttemptId: 'attempt-108',
     });
     expect(writes).toBe(2);
   });
@@ -3173,6 +3331,7 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
         bindings: {
           channelId: CHANNEL,
           maxClaimableAmount: '2000',
+          attemptId: 'attempt-109',
           preAttemptState: { balance: '5000', chargedCumulativeAmount: '1000' },
         },
       },
@@ -3180,6 +3339,7 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
     expect(channels.get(KEY)).toEqual({
       balance: '5000',
       chargedCumulativeAmount: '2000',
+      lastAppliedAttemptId: 'attempt-109',
     });
   });
 
@@ -3195,6 +3355,7 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
           bindings: {
             channelId: CHANNEL,
             maxClaimableAmount: '2000',
+            attemptId: 'attempt-110',
             preAttemptState: { balance: 'not-a-number' },
           },
         },
@@ -3237,6 +3398,7 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
           bindings: {
             channelId: CHANNEL,
             maxClaimableAmount: '2000',
+            attemptId: 'attempt-111',
             preAttemptState: { balance: '5000', chargedCumulativeAmount: '1000' },
           },
         },
@@ -3248,7 +3410,12 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
           bindings: {
             channelId: CHANNEL,
             maxClaimableAmount: '3000',
-            preAttemptState: { balance: '5000', chargedCumulativeAmount: '2000' },
+            attemptId: 'attempt-112',
+            preAttemptState: {
+              balance: '5000',
+              chargedCumulativeAmount: '2000',
+              lastAppliedAttemptId: 'attempt-111',
+            },
           },
         },
       ),

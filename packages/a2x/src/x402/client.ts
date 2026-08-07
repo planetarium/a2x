@@ -133,6 +133,16 @@ export interface X402ChannelState {
   quarantineBinding?: X402BatchSettlementBinding;
   /** Id of the A2A task the quarantined attempt paid. */
   quarantineTaskId?: string;
+  /**
+   * `attemptId` of the attempt whose fold last wrote this record — the
+   * ordering token reconciliation uses instead of the cumulative, which is
+   * **not** strictly increasing (a metered call may charge zero). Two rules
+   * rest on it: a fold rewrites a record it already owns (idempotent
+   * torn-write repair), and it refuses a record another attempt has advanced
+   * past its snapshot — even at an equal cumulative — so a replayed older
+   * receipt cannot roll back a newer attempt's balance or metadata.
+   */
+  lastAppliedAttemptId?: string;
 }
 
 /**
@@ -700,7 +710,11 @@ async function captureBatchSettlementBinding(
   // (quarantine marker, caller attempt stores), and JSON.stringify would
   // drop an `undefined`-valued key — erasing the proof that no record
   // existed and failing the required-key check after the round trip.
-  return { ...partial, preAttemptState: preAttemptState ?? null };
+  return {
+    ...partial,
+    attemptId: globalThis.crypto.randomUUID(),
+    preAttemptState: preAttemptState ?? null,
+  };
 }
 
 /**
@@ -886,6 +900,16 @@ export async function reconcileX402BatchSettlement(
           'channel that had no record.',
       );
     }
+    // Same policy for the attempt identity: without it the fold cannot tell
+    // its own idempotent rewrite from a replayed older attempt at an equal
+    // cumulative, and cannot scope quarantine clearing to its own marker.
+    if (typeof binding.attemptId !== 'string' || binding.attemptId === '') {
+      throw new X402PaymentRequiredError(
+        `bindings entry for channel ${binding.channelId} needs a non-empty attemptId. ` +
+          'Reuse the id from the persisted binding (SignedX402Payment.batch carries ' +
+          'it); hand-built bindings may use any unique string.',
+      );
+    }
     let ceiling: bigint;
     let deposit: bigint;
     try {
@@ -936,6 +960,7 @@ export async function reconcileX402BatchSettlement(
       pre,
       floor: preBalance + deposit,
       preCumulative,
+      attemptId: binding.attemptId,
     });
   }
 
@@ -988,32 +1013,54 @@ export async function reconcileX402BatchSettlement(
     try {
       await withChannelReconciliationLock(options.storage, key, async () => {
         const stored = await options.storage.get(key);
-        const storedCumulative = parseStoredCumulative(stored);
-        if (storedCumulative !== undefined && storedCumulative > cumulative) {
-          // A late/replayed receipt for an older voucher must never roll the
-          // payer back below a newer attempt's committed state.
-          return;
+        // The cumulative cannot order attempts — a metered call may charge
+        // zero, leaving two distinct attempts at the same figure — so the
+        // ordering token is the attempt id the last successful fold stamped.
+        const ownsStored =
+          stored?.lastAppliedAttemptId === bounds.attemptId &&
+          stored?.lastAppliedAttemptId !== undefined;
+        if (!ownsStored) {
+          const storedCumulative = parseStoredCumulative(stored);
+          if (storedCumulative !== undefined && storedCumulative > cumulative) {
+            // A late/replayed receipt for an older voucher must never roll
+            // the payer back below a newer attempt's committed state.
+            return;
+          }
+          // ABA guard: the record must still descend from this attempt's
+          // snapshot. A different attempt having applied since — even at an
+          // equal cumulative, e.g. a zero-charge top-up — means this receipt
+          // is a replay, and folding it would roll back the newer balance
+          // and metadata. A record with no stamp is accepted: it is either
+          // the pre-attempt state itself, or this attempt's own torn write
+          // that dropped the stamp — and repair must stay possible there.
+          const storedStamp = stored?.lastAppliedAttemptId;
+          if (
+            storedStamp !== undefined &&
+            storedStamp !== bounds.pre?.lastAppliedAttemptId
+          ) {
+            return;
+          }
+          // Zero authorized, nothing funded, nothing recorded: there is no
+          // channel to create from this receipt. A zero-cumulative receipt
+          // for an attempt that DID fund a deposit must still be written —
+          // zero usage does not undo the on-chain deposit, and dropping it
+          // would make the next call fund the channel again.
+          if (
+            storedCumulative === undefined &&
+            cumulative === 0n &&
+            bounds.deposit === 0n
+          ) {
+            return;
+          }
         }
-        // Zero authorized, nothing funded, nothing recorded: there is no
-        // channel to create from this receipt. A zero-cumulative receipt for
-        // an attempt that DID fund a deposit must still be written — zero
-        // usage does not undo the on-chain deposit, and dropping it would
-        // make the next call fund the channel again.
-        if (
-          storedCumulative === undefined &&
-          cumulative === 0n &&
-          bounds.deposit === 0n
-        ) {
-          return;
-        }
-        // Equality means the receipt was (at least partially) applied
-        // already. Rewriting the fold's output is deliberate: the write is
-        // deterministic, so a retry repairs a torn write — cumulative
-        // committed without the balance, or vice versa — instead of having
-        // to guess from the half-committed record which halves survived.
+        // Owning the record means this is an idempotent retry. Rewriting the
+        // fold's output is deliberate: the write is deterministic, so a
+        // retry repairs a torn write — cumulative committed without the
+        // balance, or vice versa — instead of having to guess from the
+        // half-committed record which halves survived.
         await options.storage.set(
           key,
-          foldChannelState(bounds, cumulative, receipt),
+          foldChannelState(bounds, cumulative, receipt, stored),
         );
         applied.push(channelIdOf(receipt.extra)!);
       });
@@ -1042,6 +1089,8 @@ interface TrustedAttemptBounds {
   floor: bigint;
   /** `preAttemptState.chargedCumulativeAmount` — the metered charge's base. */
   preCumulative: bigint;
+  /** The attempt's identity — the fold's ordering and ownership token. */
+  attemptId: string;
 }
 
 /**
@@ -1067,12 +1116,21 @@ interface TrustedAttemptBounds {
  * base is the trusted snapshot rather than the record currently in storage,
  * the cumulative is the accepted figure `parseAcceptedCumulative` already
  * bounded, and the balance floor comes from the binding rather than the
- * merchant. Quarantine markers never survive a successful fold.
+ * merchant. The output is stamped with the attempt's id — the ordering
+ * token replay and ownership checks rest on.
+ *
+ * A quarantine marker is cleared only when this attempt **owns** it (or it
+ * names no owner, e.g. an operator's manual marker). A marker some *other*
+ * attempt wrote — say a later attempt whose response went ambiguous while
+ * this one replays its already-applied receipt — must survive the fold: the
+ * merchant may still hold that attempt's spendable voucher, and clearing
+ * its block would reopen the channel underneath it.
  */
 function foldChannelState(
   bounds: TrustedAttemptBounds,
   cumulative: bigint,
   receipt: X402SettleResponse,
+  stored: X402ChannelState | undefined,
 ): X402ChannelState {
   const channelState = (receipt.extra?.channelState ?? {}) as Record<
     string,
@@ -1083,6 +1141,7 @@ function foldChannelState(
     quarantineReason: _quarantineReason,
     quarantineBinding: _quarantineBinding,
     quarantineTaskId: _quarantineTaskId,
+    lastAppliedAttemptId: _lastAppliedAttemptId,
     ...pre
   } = bounds.pre ?? {};
 
@@ -1102,6 +1161,7 @@ function foldChannelState(
     ...pre,
     chargedCumulativeAmount: cumulative.toString(),
     balance: balance.toString(),
+    lastAppliedAttemptId: bounds.attemptId,
   };
   // `totalClaimed` only mirrors the merchant's on-chain claims for
   // observability; the scheme funds and signs off `balance` and the
@@ -1114,6 +1174,23 @@ function foldChannelState(
       if (value >= 0n) next.totalClaimed = value.toString();
     } catch {
       // Keep the snapshot's figure.
+    }
+  }
+  // Preserve a quarantine marker owned by a different attempt; clear one
+  // owned by this attempt (its repair) or naming no owner (manual marker).
+  const markerOwner = stored?.quarantineBinding?.attemptId;
+  if (
+    stored?.quarantinedAt !== undefined &&
+    markerOwner !== undefined &&
+    markerOwner !== bounds.attemptId
+  ) {
+    next.quarantinedAt = stored.quarantinedAt;
+    if (stored.quarantineReason !== undefined) {
+      next.quarantineReason = stored.quarantineReason;
+    }
+    next.quarantineBinding = stored.quarantineBinding;
+    if (stored.quarantineTaskId !== undefined) {
+      next.quarantineTaskId = stored.quarantineTaskId;
     }
   }
   return next;
@@ -1299,6 +1376,20 @@ export interface X402BatchSettlementPayloadBinding {
  */
 export interface X402BatchSettlementBinding
   extends X402BatchSettlementPayloadBinding {
+  /**
+   * Unique id of this signing attempt, generated by `signX402Payment`. This
+   * — not the cumulative, which a zero-charge metered call leaves unchanged —
+   * is what orders reconciliation: it lets a retry rewrite its own record
+   * (torn-write repair), stops a replayed older receipt from rolling back a
+   * newer attempt's state at an equal cumulative, and scopes quarantine
+   * clearing to the attempt that owns the marker.
+   *
+   * A caller resuming a persisted attempt must reuse the persisted id —
+   * minting a new one severs the attempt from its own storage writes and
+   * quarantine marker. Hand-built bindings may use any unique string (e.g.
+   * `crypto.randomUUID()`).
+   */
+  attemptId: string;
   /**
    * Channel state as stored immediately before this attempt signed —
    * `null` when no record existed (a fresh channel).

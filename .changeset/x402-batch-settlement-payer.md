@@ -36,12 +36,18 @@ a cent.
   re-running the same binding and receipt rewrites the same state, which
   repairs a torn write (cumulative committed without the balance, or the
   reverse) for deposits and voucher-only payments alike, instead of guessing
-  from the half-committed record. Reconciliation also rejects duplicate
-  same-channel bindings, serializes each channel for callers sharing one
-  storage object in a process, and ignores late receipts instead of letting a
-  delayed read-check-write roll cumulative state back. Backends shared across
-  processes still require one writer per channel because the upstream storage
-  contract has no atomic compare-and-set.
+  from the half-committed record. Attempts are ordered by identity, not by
+  the cumulative — a metered call may charge zero, so two attempts can share
+  a cumulative while the newer one moved real funds. Each binding carries an
+  `attemptId` and each fold stamps it as `lastAppliedAttemptId` on the
+  record: a fold rewrites only a record it stamped or one still descending
+  from its own snapshot, so a replayed older receipt cannot roll back a
+  newer attempt's balance at an equal cumulative. Reconciliation also
+  rejects duplicate same-channel bindings, serializes each channel for
+  callers sharing one storage object in a process, and ignores late receipts
+  instead of letting a delayed read-check-write roll cumulative state back.
+  Backends shared across processes still require one writer per channel
+  because the upstream storage contract has no atomic compare-and-set.
 - `A2XClient` also serializes the complete sign, submit, and
   reconcile/quarantine lifetime for batch attempts sharing one storage object.
   The peer does not reserve state while signing, so without that lease two
@@ -100,8 +106,10 @@ a cent.
   (`quarantineBinding` / `quarantineTaskId`) onto the channel's stored
   record; while the marker is present, signing against the channel throws
   the new `X402ChannelQuarantinedError` before the payload reaches the
-  merchant. A successful reconciliation fold — the repair path — clears the
-  marker, or remove it manually after verifying the stored state.
+  merchant. The owning attempt's successful reconciliation fold — the repair
+  path — clears the marker; a fold by any other attempt preserves it, since
+  the merchant may still hold the quarantined attempt's spendable voucher.
+  Remove it manually only after verifying the stored state.
 - A matching success receipt suppresses contradictory retry prompts anywhere
   later in the same response stream, including a separate SSE event, so one
   call cannot make the payer authorize two cumulative vouchers.

@@ -494,6 +494,7 @@ describe('signX402Payment batch-settlement selection policy', () => {
     expect(signed.batch).toEqual({
       channelId: MOCK_BATCH_CHANNEL,
       maxClaimableAmount: '3000',
+      attemptId: expect.any(String) as unknown as string,
       preAttemptState: { balance: '5000', chargedCumulativeAmount: '1000' },
     });
   });
@@ -558,11 +559,13 @@ describe('reconcileX402BatchSettlement', () => {
   const BIND_A = {
     channelId: CHANNEL_A,
     maxClaimableAmount: '3000',
+    attemptId: 'attempt-2',
     preAttemptState: undefined,
   };
   const BIND_B = {
     channelId: CHANNEL_B,
     maxClaimableAmount: '6000',
+    attemptId: 'attempt-3',
     preAttemptState: undefined,
   };
 
@@ -593,6 +596,7 @@ describe('reconcileX402BatchSettlement', () => {
       chargedCumulativeAmount: '3000',
       balance: '15000',
       totalClaimed: '0',
+      lastAppliedAttemptId: BIND_A.attemptId,
     });
   });
 
@@ -798,11 +802,13 @@ describe('reconcileX402BatchSettlement', () => {
             channelId: CHANNEL_A,
             maxClaimableAmount: '1000',
             depositAmount: '5000',
+            attemptId: 'attempt-4',
             preAttemptState: undefined,
           },
           {
             channelId: CHANNEL_A,
             maxClaimableAmount: '3000',
+            attemptId: 'attempt-5',
             preAttemptState: undefined,
           },
         ],
@@ -816,6 +822,7 @@ describe('reconcileX402BatchSettlement cumulative binding', () => {
   const binding = {
     channelId: CHANNEL,
     maxClaimableAmount: '3000',
+    attemptId: 'attempt-6',
     preAttemptState: undefined,
   };
 
@@ -872,6 +879,7 @@ describe('reconcileX402BatchSettlement cumulative binding', () => {
       bindings: {
         channelId: CHANNEL,
         maxClaimableAmount: '6000',
+        attemptId: 'attempt-7',
         preAttemptState: {
           balance: '10000',
           chargedCumulativeAmount: '5000',
@@ -903,6 +911,7 @@ describe('reconcileX402BatchSettlement cumulative binding', () => {
       bindings: {
         channelId: CHANNEL,
         maxClaimableAmount: '6000',
+        attemptId: 'attempt-8',
         preAttemptState: {
           balance: '10000',
           chargedCumulativeAmount: '5000',
@@ -930,6 +939,7 @@ describe('reconcileX402BatchSettlement cumulative binding', () => {
         channelId: CHANNEL,
         maxClaimableAmount: '1000',
         depositAmount: '5000',
+        attemptId: 'attempt-9',
         preAttemptState: undefined,
       },
     });
@@ -954,6 +964,7 @@ describe('reconcileX402BatchSettlement cumulative binding', () => {
         channelId: CHANNEL,
         maxClaimableAmount: '0',
         depositAmount: '5000',
+        attemptId: 'attempt-10',
         preAttemptState: undefined,
       },
     });
@@ -981,6 +992,7 @@ describe('reconcileX402BatchSettlement cumulative binding', () => {
         storage,
         bindings: {
           ...binding,
+          attemptId: 'attempt-11',
           preAttemptState: { chargedCumulativeAmount: '1000', balance: '5000' },
         },
       },
@@ -1007,6 +1019,7 @@ describe('reconcileX402BatchSettlement cumulative binding', () => {
         bindings: {
           channelId: CHANNEL,
           maxClaimableAmount: 'oops',
+          attemptId: 'attempt-12',
           preAttemptState: undefined,
         },
       },
@@ -1089,6 +1102,7 @@ describe('reconcileX402BatchSettlement balance floor', () => {
         channelId: CHANNEL,
         maxClaimableAmount: '1000',
         depositAmount: '5000',
+        attemptId: 'attempt-13',
         preAttemptState: undefined,
       },
     });
@@ -1120,6 +1134,7 @@ describe('reconcileX402BatchSettlement balance floor', () => {
           channelId: CHANNEL,
           maxClaimableAmount: '1000',
           depositAmount: '5000',
+          attemptId: 'attempt-14',
           preAttemptState: undefined,
         },
       },
@@ -1135,6 +1150,7 @@ describe('reconcileX402BatchSettlement balance floor', () => {
         channelId: CHANNEL,
         maxClaimableAmount: '1000',
         depositAmount: '5000',
+        attemptId: 'attempt-15',
         preAttemptState: undefined,
       },
     });
@@ -1152,6 +1168,7 @@ describe('reconcileX402BatchSettlement balance floor', () => {
         channelId: CHANNEL,
         maxClaimableAmount: '1000',
         depositAmount: '5000',
+        attemptId: 'attempt-16',
         preAttemptState: { balance: '5000' },
       },
     });
@@ -1167,6 +1184,7 @@ describe('reconcileX402BatchSettlement balance floor', () => {
       bindings: {
         channelId: CHANNEL,
         maxClaimableAmount: '1000',
+        attemptId: 'attempt-17',
         preAttemptState: undefined,
       },
     });
