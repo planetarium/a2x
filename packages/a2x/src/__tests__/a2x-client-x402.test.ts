@@ -959,6 +959,98 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     });
   });
 
+  it('aborts queued batch attempts when the predecessor is quarantined', async () => {
+    const { channels, storage } = channelStorage();
+    const submitted: Array<{
+      payload: {
+        type: string;
+        voucher: { channelId: string; maxClaimableAmount: string };
+      };
+    }> = [];
+    let selectedCount = 0;
+    let resolveBothSelected!: () => void;
+    const bothSelected = new Promise<void>((resolve) => {
+      resolveBothSelected = resolve;
+    });
+    let resolveFirstSubmission!: () => void;
+    const firstSubmission = new Promise<void>((resolve) => {
+      resolveFirstSubmission = resolve;
+    });
+    let releaseFirstResponse!: () => void;
+    const firstResponseGate = new Promise<void>((resolve) => {
+      releaseFirstResponse = resolve;
+    });
+
+    const fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/agent-card.json') || url.endsWith('/agent.json')) {
+        return agentCardResponse();
+      }
+      const body = init?.body
+        ? (JSON.parse(init.body as string) as {
+            params?: { message?: { metadata?: Record<string, unknown> } };
+          })
+        : undefined;
+      const payment = body?.params?.message?.metadata?.[
+        X402_METADATA_KEYS.PAYLOAD
+      ] as (typeof submitted)[number] | undefined;
+      if (!payment) return jsonRpcOk(batchRequiredTask());
+
+      submitted.push(payment);
+      resolveFirstSubmission();
+      await firstResponseGate;
+      const task = completedTaskWithChannelReceipt(
+        payment.payload.voucher.channelId,
+        payment.payload.voucher.maxClaimableAmount,
+      ) as {
+        status: { message: { metadata: Record<string, unknown> } };
+      };
+      delete task.status.message.metadata[X402_METADATA_KEYS.RECEIPTS];
+      return jsonRpcOk(task);
+    }) as unknown as typeof globalThis.fetch;
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        selectRequirement: (requirements) => {
+          selectedCount += 1;
+          if (selectedCount === 2) resolveBothSelected();
+          return requirements[0];
+        },
+      },
+    });
+
+    const calls = Promise.allSettled([
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'one' }] },
+      }),
+      client.sendMessage({
+        message: { messageId: 'm2', role: 'user', parts: [{ text: 'two' }] },
+      }),
+    ]);
+    await Promise.all([bothSelected, firstSubmission]);
+    expect(submitted).toHaveLength(1);
+    releaseFirstResponse();
+    const outcomes = await calls;
+
+    expect(submitted).toHaveLength(1);
+    expect(channels.size).toBe(0);
+    expect(outcomes).toHaveLength(2);
+    for (const outcome of outcomes) {
+      expect(outcome.status).toBe('rejected');
+      if (outcome.status === 'rejected') {
+        expect(outcome.reason).toBeInstanceOf(X402ReconciliationError);
+        expect((outcome.reason as X402ReconciliationError).reason).toBe(
+          'no-matching-receipt',
+        );
+      }
+    }
+  });
+
   it('reconciles through the storage snapshot used to sign the attempt', async () => {
     const storageAState = channelStorage();
     const storageBState = channelStorage();

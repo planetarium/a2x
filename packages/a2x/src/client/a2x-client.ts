@@ -160,8 +160,11 @@ export interface A2XClientX402Options {
    */
   allowBatchSettlement?: boolean;
   /**
-   * Called instead of throwing when a settled `batch-settlement` payment's
-   * receipt could not be folded back into channel storage.
+   * Called instead of throwing from the attempt whose settled
+   * `batch-settlement` receipt could not be folded back into channel storage.
+   * Concurrent attempts already queued on the same storage object are still
+   * rejected with that error before signing; absorbing the originating error
+   * cannot make their stale storage snapshot safe to use.
    *
    * Without a handler the SDK throws `X402ReconciliationError`, which carries
    * the merchant's terminal task when one arrived. A transport, parsing, or
@@ -269,6 +272,7 @@ const ERROR_CODE_MAP: Record<number, new (message?: string, data?: unknown) => A
 interface ActiveX402BatchAttempt {
   binding: X402BatchSettlementBinding;
   storage: X402ClientChannelStorage;
+  quarantineError?: X402ReconciliationError;
   release(): void;
 }
 
@@ -285,12 +289,12 @@ interface SignedX402Attempt {
 // instances that share the same storage object.
 const _batchAttemptQueues = new WeakMap<
   X402ClientChannelStorage,
-  Promise<void>
+  Promise<X402ReconciliationError | undefined>
 >();
 
 async function acquireBatchAttemptLock(
   storage: X402ClientChannelStorage,
-): Promise<() => void> {
+): Promise<(error?: X402ReconciliationError) => void> {
   if (
     typeof storage !== 'object' ||
     storage === null ||
@@ -304,19 +308,32 @@ async function acquireBatchAttemptLock(
     );
   }
 
-  const previous = _batchAttemptQueues.get(storage) ?? Promise.resolve();
-  let unlock!: () => void;
-  const current = new Promise<void>((resolve) => {
+  const previous =
+    _batchAttemptQueues.get(storage) ?? Promise.resolve(undefined);
+  let unlock!: (error?: X402ReconciliationError) => void;
+  const current = new Promise<X402ReconciliationError | undefined>((resolve) => {
     unlock = resolve;
   });
   _batchAttemptQueues.set(storage, current);
 
-  await previous;
+  const previousError = await previous;
+  if (previousError) {
+    // Every waiter registered before the unsafe outcome must observe it
+    // instead of signing from the same stale storage snapshot. Passing the
+    // error through this queue node also aborts waiters already chained behind
+    // this one; a later explicit retry can start after the queue drains and the
+    // operator has repaired or retired the channel.
+    unlock(previousError);
+    if (_batchAttemptQueues.get(storage) === current) {
+      _batchAttemptQueues.delete(storage);
+    }
+    throw previousError;
+  }
   let released = false;
-  return () => {
+  return (error?: X402ReconciliationError) => {
     if (released) return;
     released = true;
-    unlock();
+    unlock(error);
     if (_batchAttemptQueues.get(storage) === current) {
       _batchAttemptQueues.delete(storage);
     }
@@ -890,13 +907,14 @@ export class A2XClient {
           'The selected batch-settlement signer returned a payload without a usable channel binding.',
         );
       }
+      const batch: ActiveX402BatchAttempt = {
+        binding,
+        storage: batchSettlement.storage,
+        release: () => release(batch.quarantineError),
+      };
       return {
         payment,
-        batch: {
-          binding,
-          storage: batchSettlement.storage,
-          release,
-        },
+        batch,
       };
     } catch (cause) {
       release?.();
@@ -1040,6 +1058,11 @@ export class A2XClient {
       cause: cause ?? options.cause,
       reason,
     });
+    // Releasing the full-attempt lease must carry this unsafe outcome to calls
+    // that are already queued on the same storage object. Otherwise the next
+    // waiter signs from the unchanged snapshot and can authorize a duplicate
+    // deposit before the operator has a chance to quarantine the channel.
+    attempt.quarantineError = error;
     const handler = this._x402?.onReconcileError;
     if (!handler) throw error;
     await handler(error);

@@ -38,8 +38,10 @@ a cent.
   reconcile/quarantine lifetime for batch attempts sharing one storage object.
   The peer does not reserve state while signing, so without that lease two
   concurrent calls can read the same empty channel and each authorize a fresh
-  deposit. Manual and cross-process flows must provide equivalent per-channel
-  exclusion or a durable reservation themselves.
+  deposit. If the active attempt is quarantined, callers already queued behind
+  it are rejected before signing from the stale snapshot. Manual and
+  cross-process flows must provide equivalent per-channel exclusion or a
+  durable reservation themselves.
 - `bindings` ties the fold to what that exchange actually signed — the channel,
   the cumulative ceiling its voucher authorized, and the deposit it funded.
   Each closes a distinct path. Channel ids derive from public inputs, so

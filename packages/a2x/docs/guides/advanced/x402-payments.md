@@ -664,7 +664,7 @@ Skip reconciliation and the payer's cumulative amount never advances: every subs
 
 When `bindings` is an array, every entry must name a distinct channel. Reconcile successive attempts on the same channel separately; collapsing them into one call would lose which deposit floor belongs to which cumulative voucher. Reconciliation calls through the same storage object are serialized per channel inside the process, so a delayed older receipt cannot overwrite a newer cumulative.
 
-That receipt lock alone cannot make concurrent signing safe: `@x402/evm` only reads storage while it creates a payload and does not reserve the next cumulative or deposit. Two overlapping attempts can therefore read the same empty state and each authorize a fresh deposit before either receipt exists. `A2XClient` prevents this in-process by holding one lease per storage object across the complete sign → submit → reconcile/quarantine lifetime (conservatively serializing different channels that share that object because the channel id is not available until after signing). The low-level helpers cannot retain a lock across your network call, so manual flows must serialize that entire lifetime per channel themselves. The storage interface has no cross-process compare-and-set operation; when multiple processes or replicas share a backend, route each channel through one owner or add an application-level durable reservation before signing.
+That receipt lock alone cannot make concurrent signing safe: `@x402/evm` only reads storage while it creates a payload and does not reserve the next cumulative or deposit. Two overlapping attempts can therefore read the same empty state and each authorize a fresh deposit before either receipt exists. `A2XClient` prevents this in-process by holding one lease per storage object across the complete sign → submit → reconcile/quarantine lifetime (conservatively serializing different channels that share that object because the channel id is not available until after signing). If the lease holder is quarantined, attempts already queued behind it are rejected with the same `X402ReconciliationError` before they can sign from stale storage; repair or retire the channel before retrying. The low-level helpers cannot retain a lock across your network call, so manual flows must serialize that entire lifetime per channel themselves. The storage interface has no cross-process compare-and-set operation; when multiple processes or replicas share a backend, route each channel through one owner or add an application-level durable reservation before signing.
 
 **An empty `applied` after a settled payment is a failure, not a no-op.** The voucher is spent either way, so "nothing to record" and "the merchant withheld or falsified the receipt" have identical consequences: local state did not move, and the next call re-signs or re-deposits. `A2XClient` raises `X402ReconciliationError` with `reason: 'no-matching-receipt'` in that case; a caller driving the helper directly should treat it the same way.
 
@@ -693,7 +693,7 @@ try {
 }
 ```
 
-Prefer to record and continue? Supply a handler and nothing is thrown:
+Prefer the originating call to record and continue? Supply a handler:
 
 ```ts
 x402: {
@@ -706,6 +706,8 @@ x402: {
   },
 }
 ```
+
+The handler does not release already-queued calls to sign from stale storage. Those callers are rejected with the same reconciliation error before payload creation, so repair or retire the channel before retrying them.
 
 #### Selection is opt-in, and separate from `allowUpto`
 
