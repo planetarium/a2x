@@ -68,9 +68,14 @@ a cent.
   assembles the complete binding as `SignedX402Payment.batch`; the new
   `getX402BatchSettlementBinding()` reads the payload-provable half off a
   persisted payload for resumption.
-- Successful reconciliation requires the receipt cumulative to equal the
-  voucher's signed ceiling. Upstream verify and settle establish that exact
-  value; accepting a lower one would let a stale historical receipt mask the
+- Successful reconciliation validates the receipt cumulative against the
+  attempt's trusted bounds, never above the voucher's signed ceiling. A
+  metered receipt — carrying `extra.chargedAmount`, produced when the server
+  settles via `X402Context.settle({ amountAtomic })` — must report exactly
+  `pre-attempt cumulative + chargedAmount`, and the fold commits that
+  reported figure. An unmetered receipt must report the signed ceiling
+  exactly, since the plain lifecycle advances by the full offered amount;
+  accepting a lower one there would let a stale historical receipt mask the
   current exchange while the merchant retains the higher-value voucher.
 - A receipt that cannot be recorded — a storage failure, a terminal task with
   no usable receipt, a non-terminal unary return, or a transport/parser/SSE

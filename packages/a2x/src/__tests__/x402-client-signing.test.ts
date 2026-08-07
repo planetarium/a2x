@@ -847,15 +847,15 @@ describe('reconcileX402BatchSettlement cumulative binding', () => {
     expect(applied).toEqual([CHANNEL]);
   });
 
-  it('refuses a below-ceiling cumulative even when presented as a metered charge', async () => {
-    // There is no metered below-ceiling settlement in the integrated peer
-    // range (>=2.20 <3): `@x402/evm`'s verify pins the voucher ceiling to
-    // exactly `server cumulative + requirements.amount`, and settle advances
-    // by that same amount, so an honest success receipt always reports the
-    // ceiling. A `chargedAmount` marker on the receipt does not change that
-    // — it always echoes `requirements.amount`. Accepting less would let a
-    // merchant hold the payer's signing base below its own and wedge the
-    // channel on the next voucher.
+  it('accepts and stores a metered cumulative below the signed ceiling', async () => {
+    // The voucher authorizes a ceiling of `base + offered amount`, but a2x's
+    // own server can meter the call via `X402Context.settle({ amountAtomic })`
+    // — verify runs against the offered amount while settle advances the
+    // server cumulative by only the metered charge. A successful receipt
+    // therefore legitimately reports `pre-attempt base + chargedAmount`,
+    // anywhere up to the ceiling, and the fold must commit that reported
+    // figure — writing the ceiling would overstate what the merchant may
+    // claim against the next voucher.
     const storage = memoryChannelStorage();
     await storage.set(CHANNEL.toLowerCase(), {
       balance: '10000',
@@ -876,6 +876,37 @@ describe('reconcileX402BatchSettlement cumulative binding', () => {
       },
     });
 
+    expect(applied).toEqual([CHANNEL]);
+    expect(await storage.get(CHANNEL.toLowerCase())).toMatchObject({
+      balance: '10000',
+      chargedCumulativeAmount: '5500',
+    });
+  });
+
+  it('refuses a metered cumulative inconsistent with its chargedAmount', async () => {
+    // The metered acceptance is an exact cross-field equation, not a range:
+    // a reported figure that does not equal `pre-attempt base + chargedAmount`
+    // is a fabrication even when it sits below the ceiling.
+    const storage = memoryChannelStorage();
+    await storage.set(CHANNEL.toLowerCase(), {
+      balance: '10000',
+      chargedCumulativeAmount: '5000',
+    });
+    const inconsistent = receiptWithCumulative('5600');
+    inconsistent.extra!.chargedAmount = '500';
+
+    const { applied } = await reconcileX402BatchSettlement([inconsistent], {
+      storage,
+      bindings: {
+        channelId: CHANNEL,
+        maxClaimableAmount: '6000',
+        preAttemptState: {
+          balance: '10000',
+          chargedCumulativeAmount: '5000',
+        },
+      },
+    });
+
     expect(applied).toEqual([]);
     expect(await storage.get(CHANNEL.toLowerCase())).toEqual({
       balance: '10000',
@@ -883,12 +914,34 @@ describe('reconcileX402BatchSettlement cumulative binding', () => {
     });
   });
 
+  it('records an opening deposit when the metered charge is zero', async () => {
+    // Zero usage does not undo the on-chain deposit. The payer must retain
+    // the funded balance even though its cumulative remains at zero.
+    const storage = memoryChannelStorage();
+    const zeroCharge = receiptWithCumulative('0');
+    zeroCharge.extra!.chargedAmount = '0';
+
+    const { applied } = await reconcileX402BatchSettlement([zeroCharge], {
+      storage,
+      bindings: {
+        channelId: CHANNEL,
+        maxClaimableAmount: '1000',
+        depositAmount: '5000',
+        preAttemptState: undefined,
+      },
+    });
+
+    expect(applied).toEqual([CHANNEL]);
+    expect(await storage.get(CHANNEL.toLowerCase())).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '0',
+    });
+  });
+
   it('records an opening deposit when the authorized amount is zero', async () => {
-    // A zero-priced call can still open a funded channel: the deposit is
-    // sized by policy/strategy, not by one call's price, and the ceiling is
-    // `base + amount = 0`, so the receipt legitimately reports a zero
-    // cumulative. Zero usage must not drop the on-chain deposit from
-    // storage — otherwise the next call funds the channel again.
+    // The unmetered edge of the same guarantee: a zero-priced call can still
+    // open a funded channel (the deposit is sized by policy/strategy, not by
+    // one call's price), and the ceiling is `base + amount = 0`.
     const storage = memoryChannelStorage();
     const zeroCharge = receiptWithCumulative('0');
 

@@ -878,8 +878,8 @@ export async function reconcileX402BatchSettlement(
       continue;
     }
     // Unlike the remote-controlled receipt, the snapshot is caller-trusted
-    // input: silently coercing garbage here would corrupt the floor the whole
-    // fold rests on, so fail loudly instead.
+    // input: silently coercing garbage here would corrupt the floor and base
+    // the whole fold rests on, so fail loudly instead.
     const pre = binding.preAttemptState;
     let preBalance = 0n;
     if (pre?.balance !== undefined) {
@@ -895,7 +895,27 @@ export async function reconcileX402BatchSettlement(
         );
       }
     }
-    allowed.set(key, { ceiling, deposit, pre, floor: preBalance + deposit });
+    let preCumulative = 0n;
+    if (pre?.chargedCumulativeAmount !== undefined) {
+      try {
+        preCumulative = BigInt(pre.chargedCumulativeAmount);
+      } catch {
+        preCumulative = -1n;
+      }
+      if (preCumulative < 0n) {
+        throw new X402PaymentRequiredError(
+          `preAttemptState.chargedCumulativeAmount for channel ${binding.channelId} is not a ` +
+            'non-negative integer; the metered cumulative cannot be validated against it.',
+        );
+      }
+    }
+    allowed.set(key, {
+      ceiling,
+      deposit,
+      pre,
+      floor: preBalance + deposit,
+      preCumulative,
+    });
   }
 
   const relevant: {
@@ -921,12 +941,13 @@ export async function reconcileX402BatchSettlement(
     if (id === undefined) continue;
     const bounds = allowed.get(id.toLowerCase());
     if (bounds === undefined) continue;
-    // A settled payment must advance the signing base to exactly what this
-    // voucher authorized. A receipt carrying only
-    // `balance` / `totalClaimed` performs a partial update that leaves
-    // `chargedCumulativeAmount` untouched — and counting that as applied
-    // would mask exactly the desync `applied.length === 0` exists to report.
-    const cumulative = parseCumulative(receipt.extra, bounds.ceiling);
+    // A settled payment must advance the signing base to a figure this
+    // attempt can vouch for — see `parseAcceptedCumulative`. A receipt
+    // carrying only `balance` / `totalClaimed` performs a partial update
+    // that leaves `chargedCumulativeAmount` untouched — and counting that as
+    // applied would mask exactly the desync `applied.length === 0` exists to
+    // report.
+    const cumulative = parseAcceptedCumulative(receipt.extra, bounds);
     if (cumulative === undefined) continue;
     relevant.push({
       receipt,
@@ -969,7 +990,10 @@ export async function reconcileX402BatchSettlement(
         // deterministic, so a retry repairs a torn write — cumulative
         // committed without the balance, or vice versa — instead of having
         // to guess from the half-committed record which halves survived.
-        await options.storage.set(key, foldChannelState(bounds, receipt));
+        await options.storage.set(
+          key,
+          foldChannelState(bounds, cumulative, receipt),
+        );
         applied.push(channelIdOf(receipt.extra)!);
       });
     } catch (err) {
@@ -987,7 +1011,7 @@ export async function reconcileX402BatchSettlement(
 
 /** What one attempt's binding proves, parsed once for the fold. */
 interface TrustedAttemptBounds {
-  /** Cumulative ceiling the voucher authorized — the fold's next cumulative. */
+  /** Cumulative ceiling the voucher authorized — the most a receipt may report. */
   ceiling: bigint;
   /** Deposit this attempt funded (0 for a voucher-only payload). */
   deposit: bigint;
@@ -995,6 +1019,8 @@ interface TrustedAttemptBounds {
   pre: X402ChannelState | undefined;
   /** `preAttemptState.balance + deposit` — the trusted balance floor. */
   floor: bigint;
+  /** `preAttemptState.chargedCumulativeAmount` — the metered charge's base. */
+  preCumulative: bigint;
 }
 
 /**
@@ -1018,11 +1044,13 @@ interface TrustedAttemptBounds {
  * Mirrors the write set of `@x402/evm`'s own `processSettleResponse`
  * (`chargedCumulativeAmount`, `balance`, `totalClaimed`), except that the
  * base is the trusted snapshot rather than the record currently in storage,
- * and the cumulative/balance come from the binding's bounds rather than the
- * merchant's figures. Quarantine markers never survive a successful fold.
+ * the cumulative is the accepted figure `parseAcceptedCumulative` already
+ * bounded, and the balance floor comes from the binding rather than the
+ * merchant. Quarantine markers never survive a successful fold.
  */
 function foldChannelState(
   bounds: TrustedAttemptBounds,
+  cumulative: bigint,
   receipt: X402SettleResponse,
 ): X402ChannelState {
   const channelState = (receipt.extra?.channelState ?? {}) as Record<
@@ -1049,7 +1077,7 @@ function foldChannelState(
 
   const next: X402ChannelState = {
     ...pre,
-    chargedCumulativeAmount: bounds.ceiling.toString(),
+    chargedCumulativeAmount: cumulative.toString(),
     balance: balance.toString(),
   };
   // `totalClaimed` only mirrors the merchant's on-chain claims for
@@ -1128,8 +1156,8 @@ function channelIdOf(
 }
 
 /**
- * Parse a receipt cumulative when it is usable and within what the matching
- * voucher authorized.
+ * Parse a receipt cumulative when this attempt can vouch for it, returning
+ * the figure the fold must commit.
  *
  * The cumulative must be **present** and usable. The peer writes only the keys
  * it finds, so a receipt carrying just `balance` / `totalClaimed` performs a
@@ -1137,17 +1165,34 @@ function channelIdOf(
  * then re-signs the same voucher next call. For a settled payment that is a
  * desync, not a valid no-op, so such a receipt is refused rather than counted.
  *
- * A successful upstream settlement reports exactly the ceiling the payer
- * signed: verify requires `maxClaimableAmount === current + request amount`,
- * and settle advances the cumulative by that same request amount. Accepting a
- * smaller figure would let an old receipt satisfy a new exchange, or let a
- * merchant retain a higher-value voucher while keeping the payer's signing
- * base stale. Whether an equal receipt is an idempotent retry is checked
- * immediately before the storage write, where the current state is available.
+ * Two settlement shapes are honest, and each is validated against the
+ * attempt's trusted bounds:
+ *
+ * - **Metered** — the receipt carries `extra.chargedAmount`, the per-call
+ *   service charge. a2x's own server meters batch calls via
+ *   `X402Context.settle({ amountAtomic })`: verify pins the voucher ceiling
+ *   to `base + offered amount`, while settle advances the server cumulative
+ *   by only the metered charge, so the receipt legitimately reports
+ *   `pre-attempt cumulative + chargedAmount` — anywhere up to the ceiling.
+ *   The receipt is accepted only when it reports **exactly** that sum: the
+ *   cross-field equation ties the merchant's two figures to the trusted
+ *   snapshot, and the ceiling still caps it.
+ * - **Unmetered** — no usable `chargedAmount`. The peer's plain lifecycle
+ *   advances by the full requirement amount, which verify pinned to the
+ *   ceiling, so the receipt must report the ceiling exactly.
+ *
+ * Anything else is refused: a figure above the ceiling was never authorized
+ * (reporting 5000 after a 1000 voucher would make the payer's next call sign
+ * an inflated cumulative plus a top-up to cover it), and an unmetered figure
+ * below it would let an old receipt satisfy a new exchange or let a merchant
+ * retain a higher-value voucher while keeping the payer's signing base
+ * stale. Whether an accepted receipt is an idempotent retry is checked
+ * immediately before the storage write, where the current state is
+ * available.
  */
-function parseCumulative(
+function parseAcceptedCumulative(
   extra: Record<string, unknown> | undefined,
-  ceiling: bigint,
+  bounds: TrustedAttemptBounds,
 ): bigint | undefined {
   const channelState = extra?.channelState as
     | { chargedCumulativeAmount?: unknown }
@@ -1155,9 +1200,34 @@ function parseCumulative(
   const reported = channelState?.chargedCumulativeAmount;
   if (reported === undefined || reported === null) return undefined;
   if (typeof reported !== 'string' && typeof reported !== 'number') return undefined;
+  let value: bigint;
   try {
-    const value = BigInt(String(reported));
-    return value >= 0n && value === ceiling ? value : undefined;
+    value = BigInt(String(reported));
+  } catch {
+    return undefined;
+  }
+  if (value < 0n || value > bounds.ceiling) return undefined;
+
+  const charged = parseChargedAmount(extra);
+  if (charged !== undefined) {
+    return value === bounds.preCumulative + charged ? value : undefined;
+  }
+  return value === bounds.ceiling ? value : undefined;
+}
+
+/**
+ * The receipt's `extra.chargedAmount`, when it is a usable amount. An
+ * unusable figure cannot vouch for a metered settlement, so the receipt
+ * falls back to the stricter unmetered equality.
+ */
+function parseChargedAmount(
+  extra: Record<string, unknown> | undefined,
+): bigint | undefined {
+  const raw = extra?.chargedAmount;
+  if (typeof raw !== 'string' && typeof raw !== 'number') return undefined;
+  try {
+    const value = BigInt(String(raw));
+    return value >= 0n ? value : undefined;
   } catch {
     return undefined;
   }
