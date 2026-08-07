@@ -9,6 +9,7 @@ import {
   getX402BatchSettlementBinding,
   reconcileX402BatchSettlement,
   signX402Payment,
+  type X402BatchSettlementBinding,
   type X402ClientChannelStorage,
 } from '../x402/client.js';
 import {
@@ -835,6 +836,62 @@ describe('reconcileX402BatchSettlement cumulative binding', () => {
     expect(applied).toEqual([CHANNEL]);
   });
 
+  it('accepts and stores a metered cumulative below the signed ceiling', async () => {
+    // The batch voucher authorizes a ceiling, while settle increments the
+    // server state by the metered requirement amount. A successful receipt
+    // therefore legitimately reports a cumulative between the pre-attempt
+    // base and the signed ceiling.
+    const storage = memoryChannelStorage();
+    await storage.set(CHANNEL.toLowerCase(), {
+      balance: '10000',
+      chargedCumulativeAmount: '5000',
+    });
+    const metered = receiptWithCumulative('5500');
+    metered.extra!.chargedAmount = '500';
+
+    const { applied } = await reconcileX402BatchSettlement([metered], {
+      storage,
+      bindings: {
+        channelId: CHANNEL,
+        maxClaimableAmount: '6000',
+        preAttemptState: {
+          balance: '10000',
+          chargedCumulativeAmount: '5000',
+        },
+      },
+    });
+
+    expect(applied).toEqual([CHANNEL]);
+    expect(await storage.get(CHANNEL.toLowerCase())).toMatchObject({
+      balance: '10000',
+      chargedCumulativeAmount: '5500',
+    });
+  });
+
+  it('records an opening deposit when the metered charge is zero', async () => {
+    // Zero usage does not undo the on-chain deposit. The payer must retain the
+    // funded balance even though its cumulative remains at zero.
+    const storage = memoryChannelStorage();
+    const zeroCharge = receiptWithCumulative('0');
+    zeroCharge.extra!.chargedAmount = '0';
+
+    const { applied } = await reconcileX402BatchSettlement([zeroCharge], {
+      storage,
+      bindings: {
+        channelId: CHANNEL,
+        maxClaimableAmount: '1000',
+        depositAmount: '5000',
+        preAttemptState: undefined,
+      },
+    });
+
+    expect(applied).toEqual([CHANNEL]);
+    expect(await storage.get(CHANNEL.toLowerCase())).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '0',
+    });
+  });
+
   it('refuses a cumulative below the signed ceiling, including a stale local value', async () => {
     // Upstream verify requires signedMax === current + request amount and
     // settle advances by that same amount, so success reports the ceiling
@@ -882,6 +939,42 @@ describe('reconcileX402BatchSettlement cumulative binding', () => {
       },
     );
     expect(applied).toEqual([]);
+  });
+
+  it('rejects an unchecked binding that omits the required pre-attempt snapshot key', async () => {
+    // JavaScript and deserialized callers can bypass the TypeScript-required
+    // property. Treating omission as a fresh channel silently drops the
+    // trusted existing balance from the reconciliation floor.
+    const storage = memoryChannelStorage();
+    await storage.set(CHANNEL.toLowerCase(), {
+      balance: '5000',
+      chargedCumulativeAmount: '1000',
+    });
+    const receipt = {
+      ...receiptWithCumulative('2000'),
+      extra: {
+        channelState: {
+          channelId: CHANNEL,
+          balance: '0',
+          chargedCumulativeAmount: '2000',
+        },
+      },
+    } as X402SettleResponse;
+    const unchecked = {
+      channelId: CHANNEL,
+      maxClaimableAmount: '2000',
+    } as unknown as X402BatchSettlementBinding;
+
+    await expect(
+      reconcileX402BatchSettlement([receipt], {
+        storage,
+        bindings: unchecked,
+      }),
+    ).rejects.toThrow(/preAttemptState/);
+    expect(await storage.get(CHANNEL.toLowerCase())).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '1000',
+    });
   });
 });
 

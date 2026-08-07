@@ -634,6 +634,60 @@ describe('X402Context.verify and X402Context.settle', () => {
     });
   });
 
+  it.each([
+    ['voucher', ''],
+    ['deposit', '50000'],
+  ] as const)(
+    'uses batch chargedAmount as the per-call settled amount for a %s payload',
+    async (type, upstreamAmount) => {
+      // Upstream uses `amount` for the immediate transfer: empty for an
+      // off-chain voucher and the funding amount for a deposit. The actual
+      // service charge promised by X402SettleResponse.amount is reported in
+      // the batch-specific chargedAmount field.
+      const channelState = {
+        channelId: `0x${'cd'.repeat(32)}`,
+        balance: '50000',
+        totalClaimed: '0',
+        chargedCumulativeAmount: '3000',
+      };
+      const facilitator: X402Facilitator = {
+        verify: vi.fn(async () => ({ isValid: true } as Awaited<ReturnType<X402Facilitator['verify']>>)),
+        settle: vi.fn(async () => ({
+          success: true,
+          transaction: '',
+          network: 'eip155:84532',
+          amount: upstreamAmount,
+          extra: { channelState, chargedAmount: '3000' },
+        } as Awaited<ReturnType<X402Facilitator['settle']>>)),
+      };
+      const ctx = new X402Context({ x402Version: 2, facilitator });
+      await drain(
+        ctx.requestPayment(
+          {
+            taskId: 't-batch-amount',
+            activatedExtensions: [X402_FOUNDATION_EXTENSION_URI],
+          },
+          { accepts: [BATCH_ACCEPT] },
+        ),
+      );
+      const classified = await ctx.classify({
+        taskId: 't-batch-amount',
+        message: buildBatchSubmittedMessage(type),
+      });
+      if (classified.kind !== 'valid') throw new Error('expected valid');
+
+      const receipt = await ctx.settle(
+        { taskId: 't-batch-amount' },
+        classified,
+      );
+
+      expect(receipt.amount).toBe('3000');
+      expect((await ctx.store.get('t-batch-amount'))?.receipt?.amount).toBe(
+        '3000',
+      );
+    },
+  );
+
   it('settle omits extra when the facilitator sends none, or sends a non-object', async () => {
     // `exact` / `upto` never populate it, and the facilitator response is
     // remote-controlled — an array or scalar must not reach the receipt typed
