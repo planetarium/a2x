@@ -572,6 +572,8 @@ receipt.extra?.channelState   // { channelId, balance, totalClaimed, chargedCumu
 
 `exact` and `upto` never populate `extra`. It exists because the payer cannot function without it — see below.
 
+`receipt.amount` reports the per-call service charge, taken from the facilitator's `extra.chargedAmount`. The facilitator's own top-level `amount` names the immediate transfer instead — empty for an off-chain voucher, the whole funding total for a deposit payload — neither of which is what the call settled for.
+
 #### Payer side: storage is not optional
 
 Unlike `exact` and `upto`, the payer here is **stateful**, so the scheme is registered only when you supply its config:

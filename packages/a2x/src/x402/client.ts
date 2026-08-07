@@ -301,24 +301,38 @@ function _buildRuntime(
   })();
 }
 
+/**
+ * Assert `storage` satisfies the `X402ClientChannelStorage` contract at
+ * runtime, for plain-JavaScript and unchecked configuration boundaries.
+ *
+ * @internal Not part of `@a2x/sdk/x402`'s public surface.
+ */
+export function assertUsableChannelStorage(
+  storage: unknown,
+): X402ClientChannelStorage {
+  if (
+    typeof storage !== 'object' ||
+    storage === null ||
+    typeof (storage as { get?: unknown }).get !== 'function' ||
+    typeof (storage as { set?: unknown }).set !== 'function' ||
+    typeof (storage as { delete?: unknown }).delete !== 'function'
+  ) {
+    throw new X402PaymentRequiredError(
+      'batchSettlement.storage must provide callable get, set, and delete methods; ' +
+        'the SDK does not fall back to in-memory channel storage.',
+    );
+  }
+  return storage as X402ClientChannelStorage;
+}
+
 function _loadRuntime(
   signer: LocalAccount,
   batchSettlement?: X402BatchSettlementOptions,
 ): Promise<X402ClientRuntime> {
   if (batchSettlement !== undefined) {
-    const storage = (batchSettlement as { storage?: unknown }).storage;
-    if (
-      typeof storage !== 'object' ||
-      storage === null ||
-      typeof (storage as { get?: unknown }).get !== 'function' ||
-      typeof (storage as { set?: unknown }).set !== 'function' ||
-      typeof (storage as { delete?: unknown }).delete !== 'function'
-    ) {
-      throw new X402PaymentRequiredError(
-        'batchSettlement.storage must provide callable get, set, and delete methods; ' +
-          'the SDK does not fall back to in-memory channel storage.',
-      );
-    }
+    assertUsableChannelStorage(
+      (batchSettlement as { storage?: unknown }).storage,
+    );
 
     return _buildRuntime(signer, batchSettlement);
   }
@@ -532,10 +546,24 @@ export async function signX402Payment(
     throw new X402NoSupportedRequirementError();
   }
 
+  // Interpose on the scheme's storage reads for a batch attempt: the exact
+  // state the signer consumed is the only trustworthy reconciliation basis,
+  // and a separate read after signing could observe another process's write.
+  // Validated before wrapping: the recorder is itself a well-formed storage,
+  // so it must not mask a malformed caller storage past the early rejection.
+  const recorder =
+    requirement.scheme === BATCH_SETTLEMENT_SCHEME &&
+    options.batchSettlement !== undefined
+      ? createSigningReadRecorder(
+          assertUsableChannelStorage(
+            (options.batchSettlement as { storage?: unknown }).storage,
+          ),
+        )
+      : undefined;
   const runtime = await _loadRuntime(
     options.signer,
-    requirement.scheme === BATCH_SETTLEMENT_SCHEME
-      ? options.batchSettlement
+    recorder !== undefined
+      ? { ...options.batchSettlement!, storage: recorder.storage }
       : undefined,
   );
 
@@ -548,11 +576,11 @@ export async function signX402Payment(
   const payload = await runtime.createPaymentPayload(narrowed);
 
   const batch =
-    requirement.scheme === BATCH_SETTLEMENT_SCHEME &&
-    options.batchSettlement !== undefined
+    recorder !== undefined
       ? await captureBatchSettlementBinding(
           payload,
-          options.batchSettlement.storage,
+          options.batchSettlement!.storage,
+          recorder,
         )
       : undefined;
 
@@ -568,15 +596,57 @@ export async function signX402Payment(
 }
 
 /**
+ * The caller's channel storage with its reads observed, so the binding can
+ * carry the exact state the signing math consumed.
+ *
+ * Two properties are load-bearing. **First read wins**: the scheme reads a
+ * channel once to choose the voucher base and deposit, and that read — not a
+ * repeat performed later — is the attempt's trusted snapshot; a separate
+ * post-signing read could observe another process's write and bind the
+ * attempt to a state the signer never saw. **Reads are copied both ways**:
+ * the scheme hands the record it read to the caller's `depositStrategy` as
+ * `clientContext`, so returning the live object would let a strategy mutate
+ * the caller's stored record — and the snapshot — after the signer already
+ * computed its cumulative and balance from it.
+ */
+interface SigningReadRecorder {
+  storage: X402ClientChannelStorage;
+  /** First-read state per lowercased channel key; `has()` marks a read. */
+  reads: Map<string, X402ChannelState | undefined>;
+}
+
+function createSigningReadRecorder(
+  inner: X402ClientChannelStorage,
+): SigningReadRecorder {
+  const reads = new Map<string, X402ChannelState | undefined>();
+  return {
+    reads,
+    storage: {
+      async get(key) {
+        const state = await inner.get(key);
+        const normalized = key.toLowerCase();
+        if (!reads.has(normalized)) {
+          reads.set(normalized, state === undefined ? undefined : { ...state });
+        }
+        return state === undefined ? undefined : { ...state };
+      },
+      set: (key, state) => inner.set(key, state),
+      delete: (key) => inner.delete(key),
+    },
+  };
+}
+
+/**
  * Complete a signed `batch-settlement` payload's binding with the trusted
  * pre-attempt snapshot, and refuse a quarantined channel.
  *
  * The snapshot is the reconciliation's only trusted balance/cumulative
  * source: a fold computed from it is deterministic, so a retry after a torn
  * storage write rewrites the exact same state instead of guessing from
- * whatever half-committed record the failure left behind. It is read *after*
- * signing because the channel id is only derivable then — safe, since
- * signing never writes storage.
+ * whatever half-committed record the failure left behind. It is the state
+ * the scheme actually read while signing (see `SigningReadRecorder`); the
+ * direct read below is only the fallback for a runtime that produced a
+ * voucher without touching storage.
  *
  * Both failure modes here throw before the payload is returned, i.e. before
  * anything reaches the merchant: a voucher that never leaves the process
@@ -585,21 +655,27 @@ export async function signX402Payment(
 async function captureBatchSettlementBinding(
   payload: X402PaymentPayload,
   storage: X402ClientChannelStorage,
+  recorder: SigningReadRecorder,
 ): Promise<X402BatchSettlementBinding | undefined> {
   const partial = getX402BatchSettlementBinding(payload);
   if (!partial) return undefined;
 
+  const key = partial.channelId.toLowerCase();
   let preAttemptState: X402ChannelState | undefined;
-  try {
-    preAttemptState = await storage.get(partial.channelId.toLowerCase());
-  } catch (cause) {
-    const error = new X402PaymentRequiredError(
-      `Signed a batch-settlement payload for channel ${partial.channelId} but could not ` +
-        'snapshot the pre-attempt channel state; refusing to hand back a payload whose ' +
-        'reconciliation basis is unknown.',
-    );
-    (error as { cause?: unknown }).cause = cause;
-    throw error;
+  if (recorder.reads.has(key)) {
+    preAttemptState = recorder.reads.get(key);
+  } else {
+    try {
+      preAttemptState = await storage.get(key);
+    } catch (cause) {
+      const error = new X402PaymentRequiredError(
+        `Signed a batch-settlement payload for channel ${partial.channelId} but could not ` +
+          'snapshot the pre-attempt channel state; refusing to hand back a payload whose ' +
+          'reconciliation basis is unknown.',
+      );
+      (error as { cause?: unknown }).cause = cause;
+      throw error;
+    }
   }
 
   if (preAttemptState?.quarantinedAt !== undefined) {
@@ -777,6 +853,19 @@ export async function reconcileX402BatchSettlement(
         `bindings must not contain the same batch-settlement channel more than once: ${binding.channelId}`,
       );
     }
+    // TypeScript already requires the key, but plain-JavaScript and
+    // deserialized callers can omit it — and treating omission as "fresh
+    // channel" would silently drop the trusted existing balance from the
+    // fold's floor. An explicit `preAttemptState: undefined` states the
+    // channel had no record; an absent key states nothing, so it fails.
+    if (!('preAttemptState' in (binding as object))) {
+      throw new X402PaymentRequiredError(
+        `bindings entry for channel ${binding.channelId} omits preAttemptState. ` +
+          'Pass the channel snapshot captured when the payload was signed ' +
+          '(SignedX402Payment.batch carries it), or explicitly undefined for a ' +
+          'channel that had no record.',
+      );
+    }
     let ceiling: bigint;
     let deposit: bigint;
     try {
@@ -863,9 +952,18 @@ export async function reconcileX402BatchSettlement(
           // payer back below a newer attempt's committed state.
           return;
         }
-        // Zero authorized and nothing recorded: there is no channel to
-        // create from this receipt.
-        if (storedCumulative === undefined && cumulative === 0n) return;
+        // Zero authorized, nothing funded, nothing recorded: there is no
+        // channel to create from this receipt. A zero-cumulative receipt for
+        // an attempt that DID fund a deposit must still be written — zero
+        // usage does not undo the on-chain deposit, and dropping it would
+        // make the next call fund the channel again.
+        if (
+          storedCumulative === undefined &&
+          cumulative === 0n &&
+          bounds.deposit === 0n
+        ) {
+          return;
+        }
         // Equality means the receipt was (at least partially) applied
         // already. Rewriting the fold's output is deliberate: the write is
         // deterministic, so a retry repairs a torn write — cumulative

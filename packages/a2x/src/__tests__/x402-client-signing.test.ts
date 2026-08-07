@@ -298,9 +298,15 @@ describe('signX402Payment batch-settlement registration', () => {
       ['eip155:*', 'upto'],
       ['eip155:*', 'batch-settlement'],
     ]);
-    // The caller's storage must reach the scheme by identity — a copy would
-    // silently give the payer a second, empty channel record.
-    expect(captured.batchOptions[0]!.storage).toBe(storage);
+    // The scheme receives the signing-read recorder, which must read and
+    // write through the caller's records — a detached copy would silently
+    // give the payer a second, empty channel record.
+    const schemeStorage = captured.batchOptions[0]!
+      .storage as X402ClientChannelStorage;
+    await storage.set('0xseeded', { balance: '7' });
+    expect(await schemeStorage.get('0xseeded')).toEqual({ balance: '7' });
+    await schemeStorage.set('0xwritten', { balance: '9' });
+    expect(await storage.get('0xwritten')).toEqual({ balance: '9' });
   });
 
   it.each([
@@ -350,6 +356,8 @@ describe('signX402Payment batch-settlement registration', () => {
 
     const firstStorage = memoryChannelStorage();
     const secondStorage = memoryChannelStorage();
+    await firstStorage.set('0xmark', { balance: '1' });
+    await secondStorage.set('0xmark', { balance: '2' });
     const config = { storage: firstStorage };
     captured.batchOptions = [];
     await signX402Payment(v2RequiredTask([V2_BATCH_ACCEPT]), {
@@ -363,10 +371,13 @@ describe('signX402Payment batch-settlement registration', () => {
       batchSettlement: config,
       allowBatchSettlement: true,
     });
-    expect(captured.batchOptions.map((options) => options.storage)).toEqual([
-      firstStorage,
-      secondStorage,
-    ]);
+    // Each signing wraps the storage configured at that moment; the wrapper
+    // reads through to the record set on the respective caller storage.
+    const [first, second] = captured.batchOptions.map(
+      (options) => options.storage as X402ClientChannelStorage,
+    );
+    expect(await first!.get('0xmark')).toEqual({ balance: '1' });
+    expect(await second!.get('0xmark')).toEqual({ balance: '2' });
   });
 
   it('does not construct an invalid batch scheme when exact was selected', async () => {
@@ -836,11 +847,15 @@ describe('reconcileX402BatchSettlement cumulative binding', () => {
     expect(applied).toEqual([CHANNEL]);
   });
 
-  it('accepts and stores a metered cumulative below the signed ceiling', async () => {
-    // The batch voucher authorizes a ceiling, while settle increments the
-    // server state by the metered requirement amount. A successful receipt
-    // therefore legitimately reports a cumulative between the pre-attempt
-    // base and the signed ceiling.
+  it('refuses a below-ceiling cumulative even when presented as a metered charge', async () => {
+    // There is no metered below-ceiling settlement in the integrated peer
+    // range (>=2.20 <3): `@x402/evm`'s verify pins the voucher ceiling to
+    // exactly `server cumulative + requirements.amount`, and settle advances
+    // by that same amount, so an honest success receipt always reports the
+    // ceiling. A `chargedAmount` marker on the receipt does not change that
+    // — it always echoes `requirements.amount`. Accepting less would let a
+    // merchant hold the payer's signing base below its own and wedge the
+    // channel on the next voucher.
     const storage = memoryChannelStorage();
     await storage.set(CHANNEL.toLowerCase(), {
       balance: '10000',
@@ -861,25 +876,27 @@ describe('reconcileX402BatchSettlement cumulative binding', () => {
       },
     });
 
-    expect(applied).toEqual([CHANNEL]);
-    expect(await storage.get(CHANNEL.toLowerCase())).toMatchObject({
+    expect(applied).toEqual([]);
+    expect(await storage.get(CHANNEL.toLowerCase())).toEqual({
       balance: '10000',
-      chargedCumulativeAmount: '5500',
+      chargedCumulativeAmount: '5000',
     });
   });
 
-  it('records an opening deposit when the metered charge is zero', async () => {
-    // Zero usage does not undo the on-chain deposit. The payer must retain the
-    // funded balance even though its cumulative remains at zero.
+  it('records an opening deposit when the authorized amount is zero', async () => {
+    // A zero-priced call can still open a funded channel: the deposit is
+    // sized by policy/strategy, not by one call's price, and the ceiling is
+    // `base + amount = 0`, so the receipt legitimately reports a zero
+    // cumulative. Zero usage must not drop the on-chain deposit from
+    // storage — otherwise the next call funds the channel again.
     const storage = memoryChannelStorage();
     const zeroCharge = receiptWithCumulative('0');
-    zeroCharge.extra!.chargedAmount = '0';
 
     const { applied } = await reconcileX402BatchSettlement([zeroCharge], {
       storage,
       bindings: {
         channelId: CHANNEL,
-        maxClaimableAmount: '1000',
+        maxClaimableAmount: '0',
         depositAmount: '5000',
         preAttemptState: undefined,
       },

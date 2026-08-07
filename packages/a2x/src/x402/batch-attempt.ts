@@ -33,11 +33,9 @@ import {
   X402_METADATA_KEYS,
   X402_PAYMENT_STATUS,
 } from './constants.js';
+import { X402ReconciliationError } from './errors.js';
 import {
-  X402PaymentRequiredError,
-  X402ReconciliationError,
-} from './errors.js';
-import {
+  assertUsableChannelStorage,
   reconcileX402BatchSettlement,
   type X402BatchSettlementBinding,
   type X402ClientChannelStorage,
@@ -64,18 +62,7 @@ const _batchAttemptQueues = new WeakMap<
 export async function acquireBatchAttemptLock(
   storage: X402ClientChannelStorage,
 ): Promise<(error?: X402ReconciliationError) => void> {
-  if (
-    typeof storage !== 'object' ||
-    storage === null ||
-    typeof (storage as { get?: unknown }).get !== 'function' ||
-    typeof (storage as { set?: unknown }).set !== 'function' ||
-    typeof (storage as { delete?: unknown }).delete !== 'function'
-  ) {
-    throw new X402PaymentRequiredError(
-      'batchSettlement.storage must provide callable get, set, and delete methods; ' +
-        'the SDK does not fall back to in-memory channel storage.',
-    );
-  }
+  assertUsableChannelStorage(storage);
 
   const previous =
     _batchAttemptQueues.get(storage) ?? Promise.resolve(undefined);

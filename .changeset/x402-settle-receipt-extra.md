@@ -17,6 +17,13 @@ dropped rather than typed as a record). Retaining it lets a stateful server
 recover after settlement even if it stops before emitting the terminal A2A
 event. `exact` and `upto` never populate it, so existing receipts are unchanged.
 
+For a `batch-settlement` receipt, `X402SettleResponse.amount` now reports the
+per-call service charge from `extra.chargedAmount`. Upstream's top-level
+`amount` names the immediate transfer — empty for an off-chain voucher, the
+whole funding total for a deposit payload — so passing it through verbatim
+would record either nothing or the deposit as "what this call settled for".
+Other schemes keep the facilitator's `amount` unchanged.
+
 Also corrects the documented meaning of `transaction`. It reads "Transaction
 hash on success, empty string on failure", but a successful `batch-settlement`
 voucher settles off-chain and upstream returns `{ success: true, transaction:

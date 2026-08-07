@@ -662,6 +662,17 @@ export abstract class BaseX402Context {
     // the signature commits to — so it wins over the facilitator's echo.
     const payer =
       classified.submission.payer ?? (raw.payer as string | undefined);
+    // For `batch-settlement`, the per-call service charge rides
+    // `extra.chargedAmount`: the top-level `amount` names the immediate
+    // transfer, which is empty for an off-chain voucher and the whole funding
+    // total for a deposit payload — neither is what this call settled for.
+    const chargedAmount =
+      requirementScheme(classified.requirement) === 'batch-settlement' &&
+      isPlainObject(raw.extra) &&
+      typeof raw.extra.chargedAmount === 'string' &&
+      /^\d+$/.test(raw.extra.chargedAmount)
+        ? raw.extra.chargedAmount
+        : undefined;
     const receipt: X402SettleResponse = {
       success: raw.success,
       transaction: raw.transaction ?? '',
@@ -680,8 +691,13 @@ export abstract class BaseX402Context {
       // or a structured `success: false` result). A non-2xx failure surfaces
       // as a thrown `SettleError` whose constructor drops `amount` upstream
       // in `@x402/core`, so the exception path above cannot recover it.
-      // V1 facilitators never set it.
-      ...(raw.amount !== undefined ? { amount: raw.amount } : {}),
+      // V1 facilitators never set it. A batch `chargedAmount` wins over the
+      // raw transfer amount — see above.
+      ...(chargedAmount !== undefined
+        ? { amount: chargedAmount }
+        : raw.amount !== undefined
+          ? { amount: raw.amount }
+          : {}),
       // Scheme-specific settlement state, forwarded verbatim. Stateful schemes
       // put the payer's next-request inputs here — `batch-settlement`'s
       // `extra.channelState` is what advances the payer's cumulative voucher —
