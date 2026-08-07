@@ -32,8 +32,11 @@ a cent.
 - Reconciliation rejects duplicate same-channel bindings, serializes each
   channel for callers sharing one storage object in a process, and ignores
   late receipts instead of letting a delayed read-check-write roll cumulative
-  state back. Backends shared across processes still require one writer per
-  channel because the upstream storage contract has no atomic compare-and-set.
+  state back. If a failed storage write committed the cumulative but not the
+  deposit balance, retrying the receipt repairs the trusted balance floor
+  before counting it as applied. Backends shared across processes still
+  require one writer per channel because the upstream storage contract has no
+  atomic compare-and-set.
 - `A2XClient` also serializes the complete sign, submit, and
   reconcile/quarantine lifetime for batch attempts sharing one storage object.
   The peer does not reserve state while signing, so without that lease two

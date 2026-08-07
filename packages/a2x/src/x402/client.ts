@@ -754,10 +754,21 @@ export async function reconcileX402BatchSettlement(
           return;
         }
         if (priorCumulative !== undefined && cumulative === priorCumulative) {
-          // Reconciliation is intentionally idempotent: a retry after an
-          // ambiguous storage write should not add this attempt's deposit again.
-          applied.push(channelIdOf(receipt.extra)!);
-          return;
+          // Equality normally means this receipt was already applied. A
+          // rejected storage write can still have committed only the
+          // cumulative, however, leaving the deposit balance absent/stale.
+          // Upstream creates a deposit only when the new cumulative exceeds
+          // the pre-attempt balance, so a stored balance below that cumulative
+          // proves the write is incomplete and the trusted floor must be
+          // repaired before this retry can count as applied.
+          const priorBalance = parseStoredBalance(prior);
+          const depositWriteIncomplete =
+            deposit > 0n &&
+            (priorBalance === undefined || priorBalance < cumulative);
+          if (!depositWriteIncomplete) {
+            applied.push(channelIdOf(receipt.extra)!);
+            return;
+          }
         }
         if (priorCumulative === undefined && cumulative === 0n) return;
         await mod.processSettleResponse(
@@ -880,6 +891,18 @@ function parseStoredCumulative(
   if (state?.chargedCumulativeAmount === undefined) return undefined;
   try {
     const value = BigInt(state.chargedCumulativeAmount);
+    return value >= 0n ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseStoredBalance(
+  state: X402ChannelState | undefined,
+): bigint | undefined {
+  if (state?.balance === undefined) return undefined;
+  try {
+    const value = BigInt(state.balance);
     return value >= 0n ? value : undefined;
   } catch {
     return undefined;

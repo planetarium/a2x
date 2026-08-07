@@ -2640,6 +2640,101 @@ describe('reconcileX402BatchSettlement — storage after upstream merge', () => 
     });
   });
 
+  it('repairs an opening deposit when a failed write persisted only the cumulative', async () => {
+    const channels = new Map<string, Record<string, unknown>>();
+    let writes = 0;
+    const storage = {
+      get: async (key: string) => channels.get(key),
+      set: async (key: string, state: Record<string, unknown>) => {
+        writes += 1;
+        if (writes === 1) {
+          channels.set(key, {
+            chargedCumulativeAmount: state.chargedCumulativeAmount,
+          });
+          throw new Error('partial write');
+        }
+        channels.set(key, state);
+      },
+      delete: async (key: string) => {
+        channels.delete(key);
+      },
+    };
+    const opening = receipt({
+      chargedCumulativeAmount: '1000',
+      balance: '0',
+    });
+
+    await expect(
+      reconcileX402BatchSettlement([opening], {
+        storage,
+        bindings: openingDeposit,
+      }),
+    ).rejects.toThrow(AggregateError);
+    expect(channels.get(KEY)).toEqual({ chargedCumulativeAmount: '1000' });
+
+    await expect(
+      reconcileX402BatchSettlement([opening], {
+        storage,
+        bindings: openingDeposit,
+      }),
+    ).resolves.toEqual({ applied: [CHANNEL] });
+    expect(channels.get(KEY)).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '1000',
+    });
+    expect(writes).toBe(2);
+  });
+
+  it('repairs a top-up when a failed write persisted only the new cumulative', async () => {
+    const channels = new Map<string, Record<string, unknown>>([
+      [KEY, { balance: '5000', chargedCumulativeAmount: '5000' }],
+    ]);
+    let writes = 0;
+    const storage = {
+      get: async (key: string) => channels.get(key),
+      set: async (key: string, state: Record<string, unknown>) => {
+        writes += 1;
+        if (writes === 1) {
+          channels.set(key, {
+            balance: '5000',
+            chargedCumulativeAmount: state.chargedCumulativeAmount,
+          });
+          throw new Error('partial write');
+        }
+        channels.set(key, state);
+      },
+      delete: async (key: string) => {
+        channels.delete(key);
+      },
+    };
+    const topUp = receipt({
+      chargedCumulativeAmount: '6000',
+      balance: '5000',
+    });
+    const binding = {
+      channelId: CHANNEL,
+      maxClaimableAmount: '6000',
+      depositAmount: '5000',
+    };
+
+    await expect(
+      reconcileX402BatchSettlement([topUp], { storage, bindings: binding }),
+    ).rejects.toThrow(AggregateError);
+    expect(channels.get(KEY)).toEqual({
+      balance: '5000',
+      chargedCumulativeAmount: '6000',
+    });
+
+    await expect(
+      reconcileX402BatchSettlement([topUp], { storage, bindings: binding }),
+    ).resolves.toEqual({ applied: [CHANNEL] });
+    expect(channels.get(KEY)).toEqual({
+      balance: '10000',
+      chargedCumulativeAmount: '6000',
+    });
+    expect(writes).toBe(2);
+  });
+
   it('serializes concurrent receipts so a delayed older write cannot roll back', async () => {
     const channels = new Map<string, Record<string, unknown>>([
       [KEY, { balance: '5000', chargedCumulativeAmount: '1000' }],
