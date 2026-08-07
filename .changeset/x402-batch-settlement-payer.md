@@ -88,12 +88,18 @@ a cent.
   `LocalAccount` is not), so the next call is rejected for a cumulative
   mismatch or opens a fresh on-chain deposit. Set
   `A2XClientX402Options.onReconcileError` to record and continue instead.
-- Quarantine survives a restart. Alongside the raised error, the SDK
-  best-effort persists `quarantinedAt` / `quarantineReason` onto the
-  channel's stored record; while the marker is present, signing against the
-  channel throws the new `X402ChannelQuarantinedError` before the payload
-  reaches the merchant. A successful reconciliation fold — the repair path —
-  clears the marker, or remove it manually after verifying the stored state.
+- Quarantine survives a restart, and carries its repair inputs.
+  `X402ReconciliationError` retains the attempt's complete binding
+  (pre-attempt snapshot included) and the paid task's id — on a transport or
+  stream failure that id is the caller's only handle for fetching the
+  settled receipt, since the client consumed the `payment-required` task
+  internally. Alongside the raised error, the SDK best-effort persists
+  `quarantinedAt` / `quarantineReason` plus the same recovery record
+  (`quarantineBinding` / `quarantineTaskId`) onto the channel's stored
+  record; while the marker is present, signing against the channel throws
+  the new `X402ChannelQuarantinedError` before the payload reaches the
+  merchant. A successful reconciliation fold — the repair path — clears the
+  marker, or remove it manually after verifying the stored state.
 - A matching success receipt suppresses contradictory retry prompts anywhere
   later in the same response stream, including a separate SSE event, so one
   call cannot make the payer authorize two cumulative vouchers.

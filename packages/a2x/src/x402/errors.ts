@@ -8,6 +8,8 @@
  */
 
 import type { X402ErrorCode } from './constants.js';
+// Type-only, erased at runtime — no import cycle with client.ts.
+import type { X402BatchSettlementBinding } from './client.js';
 
 export class X402Error extends Error {
   constructor(message: string) {
@@ -105,15 +107,32 @@ export class X402ReconciliationError extends X402Error {
   /** The terminal task, when one arrived before reconciliation failed. */
   readonly task?: unknown;
   /**
+   * The quarantined attempt's complete binding — channel, voucher ceiling,
+   * deposit, and the trusted pre-attempt snapshot. This is the repair fold's
+   * input: pass it as `reconcileX402BatchSettlement`'s `bindings` together
+   * with the receipt (from `task`, or fetched via `tasks/get` on `taskId`)
+   * to restore the channel and clear its quarantine marker. Without it the
+   * snapshot cannot be reconstructed after the fact.
+   */
+  readonly binding?: X402BatchSettlementBinding;
+  /**
+   * Id of the A2A task the attempt paid. On failures with no terminal
+   * `task` — a transport error after submission, a closed stream — this is
+   * the only handle for fetching the settled receipt via `tasks/get`; the
+   * high-level client consumed the `payment-required` task internally, so
+   * the caller never saw the id anywhere else.
+   */
+  readonly taskId?: string;
+  /**
    * Why the state did not move.
    *
    * `write-failed` — the storage backend threw. Usually transient.
    *
    * `no-matching-receipt` — the payment settled but nothing was written,
    * because the merchant returned no receipt for the channel this payment
-   * signed, named a different channel, or reported a cumulative above the
-   * ceiling the voucher authorized. Unlike a write failure this can be the
-   * merchant misbehaving, not infrastructure.
+   * signed, named a different channel, or reported a cumulative the binding
+   * cannot vouch for. Unlike a write failure this can be the merchant
+   * misbehaving, not infrastructure.
    *
    * `ambiguous-response` — the signed submission was sent, but the transport,
    * parser, or SSE stream ended before a usable receipt or terminal retry
@@ -133,6 +152,8 @@ export class X402ReconciliationError extends X402Error {
         | 'write-failed'
         | 'no-matching-receipt'
         | 'ambiguous-response';
+      binding?: X402BatchSettlementBinding;
+      taskId?: string;
     },
   ) {
     const reason = options?.reason ?? 'write-failed';
@@ -150,6 +171,8 @@ export class X402ReconciliationError extends X402Error {
     this.name = 'X402ReconciliationError';
     this.channelId = channelId;
     this.task = task;
+    this.binding = options?.binding;
+    this.taskId = options?.taskId;
     this.reason = reason;
     if (options && 'cause' in options) {
       (this as { cause?: unknown }).cause = options.cause;
@@ -167,10 +190,12 @@ export class X402ReconciliationError extends X402Error {
  * deposit. Unlike the in-process abort that `X402ReconciliationError`
  * propagates to queued attempts, the marker survives a process restart.
  *
- * Recovery: repair the channel record (for example by re-running
- * `reconcileX402BatchSettlement` with the original attempt's binding and the
- * receipt fetched via `tasks/get`), which clears the marker on a successful
- * fold — or remove the marker manually once the state is verified.
+ * Recovery: the stored marker carries its own repair inputs —
+ * `quarantineBinding` (the attempt's complete binding, snapshot included)
+ * and `quarantineTaskId` (the paid task, whose receipt `tasks/get` returns).
+ * Re-running `reconcileX402BatchSettlement` with that pair clears the marker
+ * on a successful fold — or remove the marker manually once the state is
+ * verified.
  */
 export class X402ChannelQuarantinedError extends X402Error {
   /** Channel whose stored state is marked quarantined. */

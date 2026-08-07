@@ -829,6 +829,10 @@ export class A2XClient {
           storage: batchSettlement.storage,
           release,
           onReconcileError: x402.onReconcileError,
+          // The follow-up rides the same A2A task, so this id addresses the
+          // settled receipt via tasks/get even when the exchange's response
+          // is lost — the caller never observes it anywhere else.
+          taskId: task.id,
         }),
       };
     } catch (cause) {

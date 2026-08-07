@@ -1806,6 +1806,66 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     expect(error!.reason).toBe('no-matching-receipt');
   });
 
+  it('repairs a quarantined channel from the error recovery data', async () => {
+    // The full documented recovery loop: a settled payment loses its receipt
+    // (here: the merchant omits it), the channel is quarantined — and the
+    // error's own binding plus a receipt fetched later via the task id are
+    // sufficient to restore the exact post-attempt state and clear the
+    // marker, without the caller having retained anything else.
+    const { channels, storage } = channelStorage();
+    const completedNoReceipt = (requests: Array<{ body: unknown }>) => {
+      const task = completedTaskWithChannelReceipt(
+        signedChannelId(requests),
+      ) as { status: { message: { metadata: Record<string, unknown> } } };
+      delete task.status.message.metadata[X402_METADATA_KEYS.RECEIPTS];
+      return task;
+    };
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      (requests) => jsonRpcOk(completedNoReceipt(requests)),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+    const error = await client
+      .sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      })
+      .then(
+        () => undefined,
+        (reason: unknown) => reason as X402ReconciliationError,
+      );
+    expect(error!.reason).toBe('no-matching-receipt');
+    const key = signedChannelId(rpcRequests).toLowerCase();
+    expect(channels.get(key)).toMatchObject({
+      quarantineTaskId: 't1',
+      quarantineBinding: { channelId: signedChannelId(rpcRequests) },
+    });
+
+    // Later, the operator fetches the task (t1 = error.taskId) and gets the
+    // receipt the response omitted. The repair is the ordinary fold.
+    const recovered = completedTaskWithChannelReceipt(
+      signedChannelId(rpcRequests),
+    ) as Task;
+    const { applied } = await reconcileX402BatchSettlement(
+      (recovered.status.message!.metadata![
+        X402_METADATA_KEYS.RECEIPTS
+      ] as never[]) ?? [],
+      { storage, bindings: error!.binding! },
+    );
+    expect(applied).toEqual([signedChannelId(rpcRequests)]);
+    expect(channels.get(key)).toEqual({
+      balance: '5000',
+      totalClaimed: '0',
+      chargedCumulativeAmount: '1000',
+    });
+  });
+
   it.each(['failed', 'canceled', 'rejected'])(
     'raises when a terminal %s task omits x402 metadata',
     async (state) => {
@@ -1876,6 +1936,16 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     expect(error!.reason).toBe('ambiguous-response');
     expect(error!.channelId).toBe(signedChannelId(rpcRequests));
     expect(error!.task).toBeUndefined();
+    // With no terminal task, the error's own recovery data is the caller's
+    // only route to the receipt: the payment-required task was consumed
+    // internally, so its id was never observable elsewhere.
+    expect(error!.taskId).toBe('t1');
+    expect(error!.binding).toMatchObject({
+      channelId: signedChannelId(rpcRequests),
+      maxClaimableAmount: '1000',
+      depositAmount: '5000',
+    });
+    expect(error!.binding!.preAttemptState).toBeUndefined();
     expect((error as Error & { cause?: unknown }).cause).toEqual(
       new Error('connection reset after submit'),
     );
@@ -1920,9 +1990,19 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     expect(seen[0]!.reason).toBe('ambiguous-response');
     expect(seen[0]!.channelId).toBe(signedChannelId(rpcRequests));
     expect((seen[0]!.task as Task).status.state).toBe('working');
+    // The marker persists the recovery record too: after a restart the error
+    // object is gone, and this is what getTask + reconcile repair reads.
     expect(
       channels.get(signedChannelId(rpcRequests).toLowerCase()),
-    ).toMatchObject({ quarantineReason: 'ambiguous-response' });
+    ).toMatchObject({
+      quarantineReason: 'ambiguous-response',
+      quarantineTaskId: 't1',
+      quarantineBinding: {
+        channelId: signedChannelId(rpcRequests),
+        maxClaimableAmount: '1000',
+        depositAmount: '5000',
+      },
+    });
   });
 
   it.each(['error', 'eof'])('quarantines a submitted channel on streaming %s', async (ending) => {
@@ -2079,6 +2159,14 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     expect(error).toBeInstanceOf(X402ReconciliationError);
     expect(error!.channelId).toBe(signedChannelId(rpcRequests));
     expect((error!.task as Task).status.state).toBe('completed');
+    // The receipt is on the task, but only the binding — snapshot included —
+    // makes the repair fold computable once storage recovers.
+    expect(error!.taskId).toBe('t1');
+    expect(error!.binding).toMatchObject({
+      channelId: signedChannelId(rpcRequests),
+      maxClaimableAmount: '1000',
+      depositAmount: '5000',
+    });
   });
 
   it('routes a reconciliation failure to onReconcileError instead of throwing', async () => {

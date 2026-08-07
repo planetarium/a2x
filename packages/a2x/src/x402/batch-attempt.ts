@@ -117,6 +117,7 @@ export class X402BatchAttempt {
   private readonly _onReconcileError?: (
     error: X402ReconciliationError,
   ) => void | Promise<void>;
+  private readonly _taskId?: string;
   private _resolved = false;
 
   constructor(options: {
@@ -126,11 +127,20 @@ export class X402BatchAttempt {
     onReconcileError?: (
       error: X402ReconciliationError,
     ) => void | Promise<void>;
+    /**
+     * Id of the A2A task this attempt pays. Carried onto the quarantine
+     * error and marker: on an exit with no terminal task, it is the only
+     * handle the caller has for fetching the settled receipt via
+     * `tasks/get` — the high-level client consumed the `payment-required`
+     * task internally, so the id is not observable anywhere else.
+     */
+    taskId?: string;
   }) {
     this.binding = options.binding;
     this._storage = options.storage;
     this._release = options.release;
     this._onReconcileError = options.onReconcileError;
+    this._taskId = options.taskId;
   }
 
   /**
@@ -250,16 +260,24 @@ export class X402BatchAttempt {
     cause: unknown,
   ): Promise<void> {
     this._resolved = true;
+    const taskId = this._taskId ?? task?.id;
     const error = new X402ReconciliationError(this.binding.channelId, task, {
       cause,
       reason,
+      // The repair fold's inputs must survive this attempt: the binding's
+      // snapshot cannot be reconstructed later, and on an exit with no
+      // terminal task the id is the only way to fetch the receipt at all.
+      binding: this.binding,
+      ...(taskId !== undefined ? { taskId } : {}),
     });
 
-    // Persist the quarantine before releasing the lease, so the block
-    // outlives this process: the in-memory queue below stops attempts already
-    // waiting, but a restart would otherwise sign a fresh deposit from the
-    // same desynced storage. Best-effort — when storage itself is the thing
-    // failing, the in-memory abort and the surfaced error still stand.
+    // Persist the quarantine — and the recovery record — before releasing
+    // the lease, so both outlive this process: the in-memory queue below
+    // stops attempts already waiting, but a restart would otherwise sign a
+    // fresh deposit from the same desynced storage, and the error object
+    // carrying the binding dies with the process. Best-effort — when storage
+    // itself is the thing failing, the in-memory abort and the surfaced
+    // error still stand.
     try {
       const key = this.binding.channelId.toLowerCase();
       const current =
@@ -268,6 +286,8 @@ export class X402BatchAttempt {
         ...(current ?? {}),
         quarantinedAt: new Date().toISOString(),
         quarantineReason: reason,
+        quarantineBinding: this.binding,
+        ...(taskId !== undefined ? { quarantineTaskId: taskId } : {}),
       });
     } catch {
       // Marker write is advisory; the error path below is the guarantee.

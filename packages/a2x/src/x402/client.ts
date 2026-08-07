@@ -123,6 +123,16 @@ export interface X402ChannelState {
   quarantinedAt?: string;
   /** `X402ReconciliationError.reason` recorded alongside `quarantinedAt`. */
   quarantineReason?: string;
+  /**
+   * The quarantined attempt's complete binding, persisted so the repair fold
+   * survives a process restart: pass it as `reconcileX402BatchSettlement`'s
+   * `bindings` with the receipt fetched via `tasks/get` on
+   * `quarantineTaskId`. The in-memory `X402ReconciliationError` carries the
+   * same pair, but it dies with the process that raised it.
+   */
+  quarantineBinding?: X402BatchSettlementBinding;
+  /** Id of the A2A task the quarantined attempt paid. */
+  quarantineTaskId?: string;
 }
 
 /**
@@ -789,8 +799,13 @@ export function defaultSelect(
  * failed storage write (and it clears any quarantine marker on the record).
  *
  * Receipts from other schemes, malformed ones, any naming a channel outside
- * `bindings`, and any whose cumulative differs from what the matching voucher
- * authorized are all ignored, so passing a whole task's receipts is safe:
+ * `bindings`, and any whose cumulative the matching binding cannot vouch for
+ * are all ignored. A cumulative is vouched for when it stays at or below the
+ * signed ceiling AND either equals `preAttemptState cumulative +
+ * extra.chargedAmount` (a metered settlement) or, absent a usable
+ * `chargedAmount`, equals the ceiling exactly (the unmetered lifecycle) —
+ * see `parseAcceptedCumulative`. Passing a whole task's receipts is
+ * therefore safe:
  *
  * ```ts
  * const signed = await signX402Payment(task, { signer, batchSettlement });
@@ -1060,6 +1075,8 @@ function foldChannelState(
   const {
     quarantinedAt: _quarantinedAt,
     quarantineReason: _quarantineReason,
+    quarantineBinding: _quarantineBinding,
+    quarantineTaskId: _quarantineTaskId,
     ...pre
   } = bounds.pre ?? {};
 

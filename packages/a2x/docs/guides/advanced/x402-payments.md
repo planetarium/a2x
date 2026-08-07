@@ -665,7 +665,7 @@ if (applied.length === 0) {
 
 Persist `signed.batch` alongside the payload if reconciliation may happen in a later process: the snapshot cannot be reconstructed afterwards. A caller resuming from a persisted *payload* alone can rebuild the payload-provable half with `getX402BatchSettlementBinding(payload)`, but must combine it with the snapshot it captured at signing time to form the `bindings` entry.
 
-Skip reconciliation and the payer's cumulative amount never advances: every subsequent call re-signs an identical voucher against a channel it still believes is unfunded — and therefore signs a **fresh deposit** each time. Receipts from other schemes, malformed ones (including non-object array entries), any naming a channel outside `bindings`, and any whose cumulative differs from the signed ceiling are ignored; a receipt that fails to apply raises an `AggregateError` after the others have been tried, so one bad entry cannot drop a good one.
+Skip reconciliation and the payer's cumulative amount never advances: every subsequent call re-signs an identical voucher against a channel it still believes is unfunded — and therefore signs a **fresh deposit** each time. Receipts from other schemes, malformed ones (including non-object array entries), any naming a channel outside `bindings`, and any whose cumulative the binding cannot vouch for are ignored. A cumulative is vouched for when it stays at or below the signed ceiling **and** either equals `preAttemptState cumulative + extra.chargedAmount` (a metered settlement — see the ceiling bullet above) or, absent a usable `chargedAmount`, equals the ceiling exactly (the unmetered lifecycle). A receipt that fails to apply raises an `AggregateError` after the others have been tried, so one bad entry cannot drop a good one.
 
 When `bindings` is an array, every entry must name a distinct channel. Reconcile successive attempts on the same channel separately; collapsing them into one call would lose which deposit floor belongs to which cumulative voucher. Reconciliation calls through the same storage object are serialized per channel inside the process, so a delayed older receipt cannot overwrite a newer cumulative.
 
@@ -685,16 +685,26 @@ A matching success receipt takes precedence over a contradictory retry prompt an
 
 The merchant requires the next voucher's cumulative to equal exactly `charged + amount`, and `@x402/evm`'s corrective-recovery path needs a signer with `readContract`, which a viem `LocalAccount` does not have. A payer that loses a receipt stays desynced until its storage is repaired out of band, and the next call can sign a fresh on-chain deposit.
 
-Because that is a funds-bearing failure, `A2XClient` **throws** `X402ReconciliationError` rather than continuing quietly — an operator who is never told cannot quarantine the channel first. It carries `channelId`, the merchant's terminal `task` when available, and a `reason`: `write-failed` (your storage threw — usually transient), `no-matching-receipt` (a terminal task arrived but nothing was recorded), or `ambiguous-response` (the response ended before either safe outcome was known). When present, `task` means catching the error still leaves you the result the merchant produced — including on the streaming path, where reconciliation runs before the terminal event is yielded and a throw means you never see that event:
+Because that is a funds-bearing failure, `A2XClient` **throws** `X402ReconciliationError` rather than continuing quietly — an operator who is never told cannot quarantine the channel first. It carries `channelId`, the merchant's terminal `task` when available, and a `reason`: `write-failed` (your storage threw — usually transient), `no-matching-receipt` (a terminal task arrived but nothing was recorded), or `ambiguous-response` (the response ended before either safe outcome was known). It also carries everything the repair needs: `binding` — the attempt's complete `X402BatchSettlementBinding`, including the pre-attempt snapshot that cannot be reconstructed afterwards — and `taskId`, the paid task's id, which on a transport or stream failure is the only handle for fetching the settled receipt (the client consumed the `payment-required` task internally, so you never saw the id). When present, `task` means catching the error still leaves you the result the merchant produced — including on the streaming path, where reconciliation runs before the terminal event is yielded and a throw means you never see that event:
 
 ```ts
 try {
   const task = await client.sendMessage({ message });
 } catch (err) {
   if (err instanceof X402ReconciliationError) {
-    await quarantineChannel(err.channelId);
-    if (err.task) return err.task as Task;
-    // No task means the response was ambiguous; quarantine before retrying.
+    // Repair: fetch the receipt the response lost, then re-run the fold
+    // with the attempt's own binding. A successful fold restores the exact
+    // post-attempt state and clears the quarantine marker.
+    const final = (err.task as Task | undefined) ??
+      (err.taskId ? await client.getTask(err.taskId) : undefined);
+    if (final && err.binding) {
+      await reconcileX402BatchSettlement(getX402Receipts(final), {
+        storage,
+        bindings: err.binding,
+      });
+      return final;
+    }
+    // Nothing to repair from yet — leave the channel quarantined.
   }
   throw err;
 }
@@ -718,12 +728,12 @@ The handler does not release already-queued calls to sign from stale storage. Th
 
 #### Quarantine survives a restart
 
-The in-process rejection above dies with the process. To stop a restarted payer from signing a fresh deposit out of the same desynced storage, the SDK also **persists** the quarantine: alongside raising `X402ReconciliationError` it best-effort writes `quarantinedAt` / `quarantineReason` onto the channel's stored record. While that marker is present, signing against the channel throws `X402ChannelQuarantinedError` — before the payload ever reaches the merchant.
+The in-process rejection above dies with the process — and so does the error object carrying the repair inputs. To stop a restarted payer from signing a fresh deposit out of the same desynced storage, the SDK also **persists** the quarantine: alongside raising `X402ReconciliationError` it best-effort writes `quarantinedAt` / `quarantineReason` onto the channel's stored record, together with the recovery record — `quarantineBinding` (the attempt's complete binding) and `quarantineTaskId` (the paid task's id). While that marker is present, signing against the channel throws `X402ChannelQuarantinedError` — before the payload ever reaches the merchant.
 
 Two ways to lift it:
 
-- **Repair**: re-run `reconcileX402BatchSettlement` with the attempt's binding and the receipt (fetched via `getTask` if the original response was lost). A successful fold rewrites the exact post-attempt state and clears the marker.
-- **Manual**: after verifying the stored state out of band, remove the `quarantinedAt` / `quarantineReason` keys yourself.
+- **Repair**: re-run `reconcileX402BatchSettlement` with the attempt's binding and the receipt — after a restart, read `quarantineBinding` off the stored record and fetch the receipt via `getTask(quarantineTaskId)`. A successful fold rewrites the exact post-attempt state and clears the marker.
+- **Manual**: after verifying the stored state out of band, remove the `quarantine*` keys yourself.
 
 The marker write is advisory — when storage itself is what failed, it fails too, and the raised error plus the in-process abort remain the guarantee.
 
