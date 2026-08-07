@@ -96,6 +96,23 @@ a cent.
   `LocalAccount` is not), so the next call is rejected for a cumulative
   mismatch or opens a fresh on-chain deposit. Set
   `A2XClientX402Options.onReconcileError` to record and continue instead.
+- A submitted attempt survives a crash. Immediately before the signed
+  payload is handed to `fetch`, the client awaits a durable
+  `pendingAttempt` record — attempt id, repair binding, task id — on the
+  channel (a failed write aborts before anything is sent). A process that
+  dies mid-flight therefore leaves the record behind, and a restarted payer
+  signing against the channel gets the new `X402AttemptPendingError`
+  instead of authorizing a second deposit while the merchant may hold the
+  first. The record clears when the owning attempt's receipt folds, its
+  rejection is proven by a valid retry prompt, or its quarantine marker
+  supersedes it.
+- Deletion erases the generation: replay protection lives in the stored
+  record, so an unversioned `delete` (the peer's cooperative refund does
+  this when a channel drains) makes absence indistinguishable from a
+  never-opened channel, and a stale receipt can resurrect it. Documented on
+  the storage contract: retire refunded channels by keeping a record or
+  rotating `salt`; a tombstone helper is planned with the transactional
+  storage extension.
 - Quarantine survives a restart, and carries its repair inputs.
   `X402ReconciliationError` retains the attempt's complete binding
   (pre-attempt snapshot included) and the paid task's id — on a transport or

@@ -732,6 +732,18 @@ x402: {
 
 The handler does not release already-queued calls to sign from stale storage. Those callers are rejected with the same reconciliation error before payload creation, so repair or retire the channel before retrying them.
 
+#### A submitted attempt survives a crash
+
+Quarantine only helps when some exit path lives long enough to write it. One does not: hand the signed payload to `fetch`, then lose the process before any response, catch, or `finally` runs. The in-process lease, the attempt object, and its binding all die with the process, and a restarted payer would read the unchanged pre-attempt record — and sign a second real deposit while the merchant may hold the first.
+
+`A2XClient` therefore **persists the attempt before the transport boundary**: immediately before the request body is handed to `fetch`, it awaits a durable write of `pendingAttempt` — `{ attemptId, binding, taskId, submittedAt }` — onto the channel record (a failed write aborts the request before anything is sent, which moves no funds). While that record exists, signing against the channel throws `X402AttemptPendingError`, whatever process is asking. The record clears when the owning attempt's receipt folds, a valid retry prompt proves its rejection, or its quarantine marker supersedes it.
+
+After a crash, recovery is the same shape as quarantine repair: read `pendingAttempt` off the stored record, fetch the task via `getTask(pendingAttempt.taskId)`, and run `reconcileX402BatchSettlement` with `pendingAttempt.binding`. A folded receipt clears the record and payments resume; if the task shows the payload never reached the merchant (the crash landed between the write and `fetch`), remove `pendingAttempt` manually — a conservatively blocked unsent voucher is safe, just operator-visible.
+
+#### Deletion erases the generation
+
+Replay protection lives in the stored record (`lastAppliedAttemptId`), so a **deleted** record is indistinguishable from a channel that never opened — a stale receipt from before the deletion can resurrect it, balance and all. a2x never deletes channel records, but `@x402/evm`'s cooperative refund path does when a channel drains. If you share this storage with that flow, do not let it perform an unversioned delete: retire the channel by keeping a record in place (any record preserves the generation), or rotate `batchSettlement.salt` so future payments derive a fresh channel id and old receipts have nothing to match. A first-class tombstone/retirement helper is planned alongside the transactional storage extension.
+
 #### Quarantine survives a restart
 
 The in-process rejection above dies with the process — and so does the error object carrying the repair inputs. To stop a restarted payer from signing a fresh deposit out of the same desynced storage, the SDK also **persists** the quarantine: alongside raising `X402ReconciliationError` it best-effort writes `quarantinedAt` / `quarantineReason` onto the channel's stored record, together with the recovery record — `quarantineBinding` (the attempt's complete binding) and `quarantineTaskId` (the paid task's id). While that marker is present, signing against the channel throws `X402ChannelQuarantinedError` — before the payload ever reaches the merchant.

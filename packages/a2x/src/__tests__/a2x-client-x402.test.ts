@@ -29,6 +29,7 @@ import {
 import type { Task } from '../types/task.js';
 import { reconcileX402BatchSettlement } from '../x402/client.js';
 import {
+  X402AttemptPendingError,
   X402NoSupportedRequirementError,
   X402PaymentFailedError,
   X402ReconciliationError,
@@ -1601,7 +1602,11 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
         batchSettlement: {
           storage: {
             ...storage,
-            set: async () => {
+            set: async (key: string, state: Record<string, unknown>) => {
+              // The submitted-attempt record must land — the scenario under
+              // test is the reconcile fold's write failing, not a pre-submit
+              // abort.
+              if ('pendingAttempt' in state) return storage.set(key, state);
               throw new Error('durable store unavailable');
             },
           },
@@ -2143,6 +2148,121 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     expect(channels.size).toBe(0);
   });
 
+  it('blocks a restarted payer while a submitted attempt is unresolved', async () => {
+    // The in-process lease dies with the process. The durable submitted
+    // record — written before the payload reaches fetch — is what stops a
+    // restarted payer from reading the unchanged pre-attempt channel and
+    // signing a second real deposit while the merchant may hold the first.
+    const { channels, storage } = channelStorage();
+    let submissionSeen!: () => void;
+    const submitted = new Promise<void>((resolve) => {
+      submissionSeen = resolve;
+    });
+    let call = 0;
+    const recorded: Array<{ body: unknown }> = [];
+    const dyingFetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/agent-card.json') || url.endsWith('/agent.json')) {
+        return agentCardResponse();
+      }
+      recorded.push({
+        body: init?.body ? JSON.parse(init.body as string) : undefined,
+      });
+      if (call++ === 0) return jsonRpcOk(batchRequiredTask());
+      // The process "dies" mid-flight: no response, and none of this
+      // client's catch/finally paths ever run again.
+      submissionSeen();
+      return new Promise<Response>(() => {});
+    }) as unknown as typeof globalThis.fetch;
+    const client1 = new A2XClient(AGENT_URL, {
+      fetch: dyingFetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+    const inFlight = client1.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    inFlight.catch(() => {});
+    await submitted;
+
+    const key = signedChannelId(recorded).toLowerCase();
+    expect(channels.get(key)).toMatchObject({
+      pendingAttempt: {
+        taskId: 't1',
+        binding: { channelId: signedChannelId(recorded) },
+      },
+    });
+
+    // "Restart": a new client reads the same durable records through a new
+    // storage object (fresh in-process lease), so only the persisted record
+    // stands between it and a duplicate deposit.
+    const restartedStorage = {
+      get: async (k: string) => channels.get(k),
+      set: async (k: string, state: Record<string, unknown>) => {
+        channels.set(k, state);
+      },
+      delete: async (k: string) => {
+        channels.delete(k);
+      },
+    };
+    const { fetch: fetch2, rpcRequests: requests2 } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+    ]);
+    const client2 = new A2XClient(AGENT_URL, {
+      fetch: fetch2,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage: restartedStorage },
+        allowBatchSettlement: true,
+      },
+    });
+    await expect(
+      client2.sendMessage({
+        message: { messageId: 'm2', role: 'user', parts: [{ text: 'again' }] },
+      }),
+    ).rejects.toBeInstanceOf(X402AttemptPendingError);
+    // Exactly one signed payload ever reached a transport.
+    expect(recorded).toHaveLength(2);
+    expect(requests2).toHaveLength(1);
+
+    // Repair: the record carries the binding and task id; the receipt
+    // fetched via tasks/get folds, clears the record, and payments resume.
+    const pending = (
+      channels.get(key) as {
+        pendingAttempt: {
+          attemptId: string;
+          taskId: string;
+          binding: Parameters<
+            typeof reconcileX402BatchSettlement
+          >[1]['bindings'];
+        };
+      }
+    ).pendingAttempt;
+    expect(pending.taskId).toBe('t1');
+    const recovered = completedTaskWithChannelReceipt(
+      signedChannelId(recorded),
+    ) as Task;
+    const { applied } = await reconcileX402BatchSettlement(
+      recovered.status.message!.metadata![
+        X402_METADATA_KEYS.RECEIPTS
+      ] as never[],
+      { storage: restartedStorage, bindings: pending.binding },
+    );
+    expect(applied).toEqual([signedChannelId(recorded)]);
+    expect(channels.get(key)).toEqual({
+      balance: '5000',
+      totalClaimed: '0',
+      chargedCumulativeAmount: '1000',
+      lastAppliedAttemptId: pending.attemptId,
+    });
+  });
+
   it('quarantines a non-terminal unary response after batch submission', async () => {
     const { channels, storage } = channelStorage();
     const working = batchRequiredTask() as {
@@ -2331,7 +2451,11 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
         batchSettlement: {
           storage: {
             ...storage,
-            set: async () => {
+            set: async (key: string, state: Record<string, unknown>) => {
+              // The submitted-attempt record must land — the scenario under
+              // test is the reconcile fold's write failing, not a pre-submit
+              // abort.
+              if ('pendingAttempt' in state) return storage.set(key, state);
               throw new Error('durable store unavailable');
             },
           },
@@ -2377,7 +2501,11 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
         batchSettlement: {
           storage: {
             ...storage,
-            set: async () => {
+            set: async (key: string, state: Record<string, unknown>) => {
+              // The submitted-attempt record must land — the scenario under
+              // test is the reconcile fold's write failing, not a pre-submit
+              // abort.
+              if ('pendingAttempt' in state) return storage.set(key, state);
               throw new Error('durable store unavailable');
             },
           },

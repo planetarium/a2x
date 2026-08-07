@@ -411,7 +411,11 @@ export class A2XClient {
         try {
           task = await this._sendMessageOnce(
             this._buildSubmitFollowup(params, task, signed.metadata),
-            () => {
+            async () => {
+              // Durable before in-memory: a process that dies mid-flight
+              // must leave the submitted-attempt record behind, or a restart
+              // signs a second deposit. A failed write aborts before fetch.
+              await batch?.markSubmitted();
               submitted = true;
             },
           );
@@ -449,7 +453,7 @@ export class A2XClient {
           task.status.state === 'input-required' &&
           getX402PaymentRequirements(task)
         ) {
-          batch?.acceptRetry();
+          await batch?.acceptRetry();
           continue;
         }
         if (batch && !reconciled) {
@@ -520,7 +524,9 @@ export class A2XClient {
         for await (const event of this._sendMessageStreamOnce(
           currentParams,
           signal,
-          () => {
+          async () => {
+            // Durable before in-memory — see the blocking path.
+            await batch?.markSubmitted();
             submitted = true;
           },
         )) {
@@ -565,7 +571,7 @@ export class A2XClient {
             // A valid retry prompt proves the previous voucher was rejected.
             // Clear before yielding so consumer-driven iterator close cannot
             // mistake this safe exit for an ambiguous response.
-            batch?.acceptRetry();
+            await batch?.acceptRetry();
             batch = undefined;
           }
 
@@ -648,7 +654,7 @@ export class A2XClient {
 
   private async _sendMessageOnce(
     params: SendMessageParams,
-    onTransport?: () => void,
+    onTransport?: () => void | Promise<void>,
   ): Promise<Task> {
     await this._ensureResolved();
     await this._ensureAuthenticated();
@@ -670,7 +676,7 @@ export class A2XClient {
   private async *_sendMessageStreamOnce(
     params: SendMessageParams,
     signal?: AbortSignal,
-    onTransport?: () => void,
+    onTransport?: () => void | Promise<void>,
   ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
     await this._ensureResolved();
     await this._ensureAuthenticated();
@@ -681,7 +687,7 @@ export class A2XClient {
     params: SendMessageParams,
     signal: AbortSignal | undefined,
     isRetry: boolean,
-    onTransport?: () => void,
+    onTransport?: () => void | Promise<void>,
   ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
     const formatted = this._formatParams(params);
     const request = this._buildJsonRpcRequest(
@@ -700,7 +706,7 @@ export class A2XClient {
     // request submitted, so a payload that cannot even be encoded never
     // counts as having possibly reached the merchant.
     const body = JSON.stringify(request);
-    onTransport?.();
+    await onTransport?.();
     const response = await this._fetchImpl(url.toString(), {
       method: 'POST',
       headers,
@@ -1161,7 +1167,7 @@ export class A2XClient {
 
   private async _postJsonRpc(
     request: JSONRPCRequest,
-    onTransport?: () => void,
+    onTransport?: () => void | Promise<void>,
   ): Promise<unknown> {
     const headers = this._buildHeaders();
     const url = new URL(this._endpointUrl!);
@@ -1172,7 +1178,7 @@ export class A2XClient {
     // request submitted, so a payload that cannot even be encoded never
     // counts as having possibly reached the merchant.
     const body = JSON.stringify(request);
-    onTransport?.();
+    await onTransport?.();
     const response = await this._fetchImpl(url.toString(), {
       method: 'POST',
       headers,

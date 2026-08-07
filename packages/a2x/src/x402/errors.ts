@@ -182,6 +182,53 @@ export class X402ReconciliationError extends X402Error {
 
 /**
  * Thrown when signing selected a `batch-settlement` channel whose stored
+ * state carries an unresolved submitted attempt
+ * (`X402ChannelState.pendingAttempt`).
+ *
+ * The pending record is written durably before a signed payload reaches the
+ * transport, so it survives a process that dies mid-flight — the one case
+ * the in-process lease cannot. The merchant may hold that attempt's deposit
+ * authorization or voucher, so signing again could authorize a second real
+ * deposit.
+ *
+ * Recovery mirrors the quarantine repair: the pending record carries the
+ * attempt's binding and task id — fetch the task via `tasks/get` and run
+ * `reconcileX402BatchSettlement` with the binding. A folded receipt (or a
+ * proven rejection) clears the record; if the task shows the payload never
+ * reached the merchant, remove `pendingAttempt` manually.
+ */
+export class X402AttemptPendingError extends X402Error {
+  /** Channel whose stored state carries the pending attempt. */
+  readonly channelId: string;
+  /** Id of the unresolved attempt. */
+  readonly attemptId: string;
+  /** Id of the A2A task the pending attempt paid, when recorded. */
+  readonly taskId?: string;
+  /** The pending attempt's complete binding — the repair fold's input. */
+  readonly binding?: unknown;
+
+  constructor(
+    channelId: string,
+    pending: { attemptId: string; taskId?: string; binding?: unknown },
+  ) {
+    super(
+      `batch-settlement channel ${channelId} has an unresolved submitted attempt ` +
+        `${pending.attemptId}${pending.taskId ? ` (task ${pending.taskId})` : ''}. ` +
+        'A previous payload was handed to the transport and its outcome is unknown — ' +
+        'the merchant may hold that voucher or deposit authorization. Reconcile the ' +
+        "pending attempt's receipt (tasks/get + reconcileX402BatchSettlement with the " +
+        'recorded binding) or retire the record before signing again.',
+    );
+    this.name = 'X402AttemptPendingError';
+    this.channelId = channelId;
+    this.attemptId = pending.attemptId;
+    this.taskId = pending.taskId;
+    this.binding = pending.binding;
+  }
+}
+
+/**
+ * Thrown when signing selected a `batch-settlement` channel whose stored
  * state carries a quarantine marker (`X402ChannelState.quarantinedAt`).
  *
  * The SDK writes that marker when an attempt on the channel ended without a

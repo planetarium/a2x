@@ -22,6 +22,7 @@ import {
   type X402PaymentStatus,
 } from './constants.js';
 import {
+  X402AttemptPendingError,
   X402ChannelQuarantinedError,
   X402InvalidVersionError,
   X402NoSupportedRequirementError,
@@ -143,6 +144,23 @@ export interface X402ChannelState {
    * receipt cannot roll back a newer attempt's balance or metadata.
    */
   lastAppliedAttemptId?: string;
+  /**
+   * The attempt whose signed payload was handed to the transport and has not
+   * resolved yet. Written **before** the request body reaches `fetch`, so a
+   * process that dies mid-flight leaves a durable record: the merchant may
+   * hold that attempt's deposit authorization or voucher, and a restarted
+   * payer must not sign another one on top. While present, signing throws
+   * `X402AttemptPendingError`; the record clears when the owning attempt's
+   * receipt folds, its rejection is proven, or an operator retires it. It
+   * carries the attempt's binding and task id — everything the
+   * `tasks/get` + `reconcileX402BatchSettlement` repair needs.
+   */
+  pendingAttempt?: {
+    attemptId: string;
+    binding: X402BatchSettlementBinding;
+    taskId?: string;
+    submittedAt: string;
+  };
 }
 
 /**
@@ -162,6 +180,16 @@ export interface X402ChannelState {
  * per-channel exclusion themselves. The interface has no cross-process
  * compare-and-set, so replicas sharing a backend must route each channel
  * through one writer.
+ *
+ * **`delete` erases the channel's generation.** Reconciliation's replay
+ * protection lives in the stored record (`lastAppliedAttemptId`); once the
+ * record is deleted, absence is indistinguishable from a channel that never
+ * opened, and a stale receipt from before the deletion can resurrect it.
+ * a2x never deletes records, but `@x402/evm`'s cooperative refund path does
+ * when a channel drains. Do not share this storage with flows that perform
+ * an unversioned delete: when retiring a refunded channel, either keep a
+ * record in place of deleting, or rotate `salt` so future payments derive a
+ * fresh channel id and the old receipts have nothing to match.
  */
 export interface X402ClientChannelStorage {
   get(key: string): Promise<X402ChannelState | undefined>;
@@ -705,6 +733,16 @@ async function captureBatchSettlementBinding(
       preAttemptState.quarantineReason,
     );
   }
+  // An unresolved submitted attempt is the crash-shaped sibling of the
+  // quarantine marker: the payload reached the transport but no exit path
+  // survived to record the outcome. Signing on top could authorize a second
+  // real deposit while the merchant holds the first.
+  if (preAttemptState?.pendingAttempt !== undefined) {
+    throw new X402AttemptPendingError(
+      partial.channelId,
+      preAttemptState.pendingAttempt,
+    );
+  }
 
   // `null`, not `undefined`, for a fresh channel: the binding gets persisted
   // (quarantine marker, caller attempt stores), and JSON.stringify would
@@ -1142,6 +1180,7 @@ function foldChannelState(
     quarantineBinding: _quarantineBinding,
     quarantineTaskId: _quarantineTaskId,
     lastAppliedAttemptId: _lastAppliedAttemptId,
+    pendingAttempt: _pendingAttempt,
     ...pre
   } = bounds.pre ?? {};
 
@@ -1192,6 +1231,15 @@ function foldChannelState(
     if (stored.quarantineTaskId !== undefined) {
       next.quarantineTaskId = stored.quarantineTaskId;
     }
+  }
+  // Same ownership rule for the submitted-attempt record: this fold IS the
+  // owning attempt's resolution, so its own record clears; another attempt's
+  // record stays until that attempt resolves.
+  if (
+    stored?.pendingAttempt !== undefined &&
+    stored.pendingAttempt.attemptId !== bounds.attemptId
+  ) {
+    next.pendingAttempt = stored.pendingAttempt;
   }
   return next;
 }

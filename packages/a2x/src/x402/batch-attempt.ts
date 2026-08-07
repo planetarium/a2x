@@ -119,6 +119,7 @@ export class X402BatchAttempt {
   ) => void | Promise<void>;
   private readonly _taskId?: string;
   private _resolved = false;
+  private _pendingWritten = false;
 
   constructor(options: {
     binding: X402BatchSettlementBinding;
@@ -217,16 +218,66 @@ export class X402BatchAttempt {
   }
 
   /**
+   * Durably record that this attempt's signed payload is about to be handed
+   * to the transport. Must be awaited **before** `fetch`: a process that
+   * dies mid-flight leaves no in-memory state, and without this record a
+   * restarted payer reads the unchanged pre-attempt channel and signs a
+   * second real deposit while the merchant may hold the first. While the
+   * record exists, signing against the channel throws
+   * `X402AttemptPendingError`; it clears when this attempt's receipt folds,
+   * its rejection is proven, or its quarantine marker supersedes it.
+   *
+   * A throw here aborts the request before anything is sent — an unsent
+   * voucher moves no funds, so the caller releases clean. Idempotent, for
+   * the auth-refresh retry that re-enters the transport boundary.
+   */
+  async markSubmitted(): Promise<void> {
+    if (this._resolved || this._pendingWritten) return;
+    const key = this.binding.channelId.toLowerCase();
+    const current =
+      (await this._storage.get(key)) ?? this.binding.preAttemptState;
+    await this._storage.set(key, {
+      ...(current ?? {}),
+      pendingAttempt: {
+        attemptId: this.binding.attemptId,
+        binding: this.binding,
+        ...(this._taskId !== undefined ? { taskId: this._taskId } : {}),
+        submittedAt: new Date().toISOString(),
+      },
+    });
+    this._pendingWritten = true;
+  }
+
+  /**
    * A valid `payment-required` re-prompt arrived: the merchant provably
    * rejected this attempt's voucher, so the channel is safe to release for
    * the next signing attempt. No-op once resolved — a receipt already
    * applied wins over a later contradictory prompt, since the voucher was
    * accepted and signing again would authorize the same call twice.
+   *
+   * Clears this attempt's durable submitted record (best-effort: if the
+   * clear itself fails, the stale record blocks the next signing loudly
+   * rather than permitting a duplicate — the safe direction).
    */
-  acceptRetry(): void {
+  async acceptRetry(): Promise<void> {
     if (this._resolved) return;
     this._resolved = true;
+    await this._clearPendingRecord();
     this._release();
+  }
+
+  private async _clearPendingRecord(): Promise<void> {
+    if (!this._pendingWritten) return;
+    try {
+      const key = this.binding.channelId.toLowerCase();
+      const current = await this._storage.get(key);
+      if (current?.pendingAttempt?.attemptId !== this.binding.attemptId) return;
+      const { pendingAttempt: _pendingAttempt, ...rest } = current;
+      await this._storage.set(key, rest);
+    } catch {
+      // Fail safe: a stale record refuses the next signing instead of
+      // permitting a duplicate deposit.
+    }
   }
 
   /**
@@ -282,8 +333,15 @@ export class X402BatchAttempt {
       const key = this.binding.channelId.toLowerCase();
       const current =
         (await this._storage.get(key)) ?? this.binding.preAttemptState;
+      // The marker supersedes this attempt's submitted record — it carries
+      // the same recovery data plus the failure reason.
+      const { pendingAttempt, ...rest } = current ?? {};
       await this._storage.set(key, {
-        ...(current ?? {}),
+        ...rest,
+        ...(pendingAttempt !== undefined &&
+        pendingAttempt.attemptId !== this.binding.attemptId
+          ? { pendingAttempt }
+          : {}),
         quarantinedAt: new Date().toISOString(),
         quarantineReason: reason,
         quarantineBinding: this.binding,

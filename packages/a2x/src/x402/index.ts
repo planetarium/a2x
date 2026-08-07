@@ -278,4 +278,5 @@ export {
   X402PeerMissingError,
   X402ReconciliationError,
   X402ChannelQuarantinedError,
+  X402AttemptPendingError,
 } from './errors.js';
