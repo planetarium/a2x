@@ -54,6 +54,8 @@ export type X402EntryStatus =
  *    to settle is not evidence of what settled, so the key is left off rather
  *    than filled with an inference. Also absent on entries written by older
  *    SDK versions.
+ *  - `extra` — scheme-specific settlement state. Stateful schemes use this
+ *    for crash recovery (for example `batch-settlement`'s channel state).
  *  - `settledAt` — wall-clock instant the SDK observed the settlement returning.
  */
 export interface X402EntryReceipt {
@@ -61,6 +63,7 @@ export interface X402EntryReceipt {
   network: string;
   payer?: string;
   amount?: string;
+  extra?: Record<string, unknown>;
   settledAt: Date;
 }
 

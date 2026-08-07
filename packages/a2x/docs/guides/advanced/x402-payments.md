@@ -202,7 +202,7 @@ The entry retains:
 - `storedAt` / `updatedAt` — timestamps
 - `expiresAt` — TTL (if set on `requestPayment`)
 - `verifiedAt` — populated once `status` reaches `verified`
-- `receipt` — populated once `status === 'completed'`. Trimmed to `{ transaction, network, payer, amount, settledAt }`, where `amount` is what was actually charged (see [Reconciliation](#reconciliation-the-settled-amount))
+- `receipt` — populated once `status === 'completed'`. Trimmed to `{ transaction, network, payer, amount, extra, settledAt }`, where `amount` is what was actually charged (see [Reconciliation](#reconciliation-the-settled-amount)) and `extra` is the facilitator's optional scheme-specific settlement state — `batch-settlement` puts `channelState` there, and a custom durable store that trims it loses the recovery data batch reconciliation depends on
 - `failure` — populated once `status === 'failed'` or `'rejected'`. Contains `{ point, code, reason, failedAt }`
 
 `failure.point` identifies where the round-trip broke:
@@ -440,11 +440,11 @@ An `upto` payload carries `permit2Authorization` + `signature` instead of the `e
 
 `parseX402PaymentSubmission` surfaces both shapes: `submission.authorization` for EIP-3009, `submission.permit2Authorization` for Permit2, and `submission.payer` scheme-agnostically. Receipts backfill `payer` from whichever the payload carries when the facilitator omits it.
 
-Once `classify` has matched a requirement, `payer` is read from the field **that requirement's scheme actually signs** — not sniffed from whichever key is present. A payload is client-controlled and may carry both an `authorization` and a `permit2Authorization`; without scheme-driven extraction a decoy key could name someone else as the payer on the receipt and in your audit store. `extractX402Payer(payload, scheme?)` applies the same dispatch when you drive the pipeline yourself; pass `scheme` whenever you know it.
+Once `classify` has matched a requirement, `payer` is read from the field **that requirement's scheme actually signs** — not sniffed from whichever key is present. `exact` uses its EIP-3009 or Permit2 authorization, `upto` uses its Permit2 authorization, and `batch-settlement` uses `channelConfig.payer`. A payload is client-controlled and may carry decoy authorization objects; without scheme-driven extraction one could name someone else as the payer on the receipt and in your audit store. `extractX402Payer(payload, scheme?)` applies the same dispatch when you drive the pipeline yourself; pass `scheme` whenever you know it.
 
 #### Reconciliation: the settled `amount`
 
-The store entry's receipt now carries `amount` alongside `transaction` / `network` / `payer` / `settledAt`:
+The store entry's receipt carries `amount` and scheme-specific `extra` alongside `transaction` / `network` / `payer` / `settledAt`:
 
 ```ts
 const entry = await x402.store.get(taskId);
@@ -454,6 +454,8 @@ if (entry?.status === 'completed') {
 ```
 
 Under a usage-based scheme this is the key reconciliation datum and it is **not** recoverable from `entry.accepts`, which records the authorized maximum.
+
+For stateful schemes, `extra` is retained in the durable entry as well as the wire receipt. A `batch-settlement` server can therefore recover `extra.channelState` after settling even if the process stops before it emits the terminal A2A event.
 
 It records **only what the facilitator confirmed**. When the facilitator reports no amount (every V1 facilitator, and some V2 ones), the key is absent rather than backfilled from what the SDK asked to settle — a request is not evidence of a settlement, and an audit trail that cannot tell the two apart is worse than one with a gap. Check for the key before relying on it.
 
@@ -471,6 +473,305 @@ class MyContext extends X402Context {
 ```
 
 `classify` calls the hook **before** anything is written to the store, so returning an empty array leaves the entry at `offered` — no `failed` record to repair.
+
+### Batch settlement (prepaid channels)
+
+`exact` and `upto` both settle on-chain once per call. The x402 V2 [`batch-settlement` scheme](https://github.com/coinbase/x402/blob/main/specs/schemes/batch-settlement/scheme_batch_settlement.md) removes that from the per-call path: the payer opens and funds an on-chain **channel** once, then each subsequent call costs only an off-chain **cumulative voucher**. The merchant records vouchers as they arrive and redeems many of them in a single transaction, out of band.
+
+That matters when settlement latency sits in the response critical path, and when per-call gas is large relative to per-call value — metering a 1000-token prompt at ~$3/MTok prices the call at ~$0.003, which is not worth an individual on-chain transfer.
+
+#### Merchant side: inject a resource server as the facilitator
+
+**The SDK does not own the batch lifecycle**, deliberately. Voucher accounting is not bookkeeping that fits behind `X402Context.settle()`: it needs cap enforcement against the payer's signed ceiling, a compare-and-set on the cumulative amount, and a request reservation established during *verify* — all of which live in `@x402/evm`'s **server-side** scheme as `@x402/core` lifecycle hooks. Redemption is a separate background concern that must be a singleton across horizontally-scaled deployments, which is not something a library should start on your behalf.
+
+The seam is `facilitator`. `X402Context` accepts any `{ verify, settle }` pair, and `@x402/core`'s `x402ResourceServer` knows how to drive those hooks. Because the resource server is V2-only while the SDK facilitator type covers both x402 versions, narrow the already-V2 context at the adapter boundary:
+
+```ts
+import { x402ResourceServer, HTTPFacilitatorClient } from '@x402/core/server';
+import type { PaymentPayload, PaymentRequirements } from '@x402/core/types';
+import { BatchSettlementEvmScheme } from '@x402/evm/batch-settlement/server';
+import { RedisChannelStorage } from '@x402/evm/batch-settlement/server/redis-storage';
+import { X402Context } from '@a2x/sdk/x402';
+
+const facilitatorClient = new HTTPFacilitatorClient({ url: 'https://x402.org/facilitator' });
+
+const scheme = new BatchSettlementEvmScheme(MERCHANT, {
+  storage: new RedisChannelStorage({ client: redis }),
+  receiverAuthorizerSigner,
+});
+
+const resourceServer = new x402ResourceServer(facilitatorClient)
+  .register('eip155:84532', scheme);
+await resourceServer.initialize();
+
+const x402 = new X402Context({
+  x402Version: 2,
+  facilitator: {
+    verify: (payload, requirement) => {
+      if (payload.x402Version !== 2 || !('amount' in requirement)) {
+        throw new Error('batch-settlement requires x402 V2');
+      }
+      return resourceServer.verifyPayment(
+        payload as unknown as PaymentPayload,
+        requirement as unknown as PaymentRequirements,
+      );
+    },
+    settle: (payload, requirement) => {
+      if (payload.x402Version !== 2 || !('amount' in requirement)) {
+        throw new Error('batch-settlement requires x402 V2');
+      }
+      return resourceServer.settlePayment(
+        payload as unknown as PaymentPayload,
+        requirement as unknown as PaymentRequirements,
+      );
+    },
+  },
+});
+```
+
+Your agent's `run()` is then the ordinary pipeline — `classify` → `verify` → `settle` → `completedEvent` — with no batch-specific code. `X402Context` recognizes both the opening deposit and subsequent voucher-only payload shapes; `settle` returns as soon as the voucher is recorded, so nothing waits on a block.
+
+Redemption stays yours, on whatever cadence suits your economics:
+
+```ts
+const manager = scheme.createChannelManager(facilitatorClient, 'eip155:84532');
+setInterval(() => manager.claimAndSettle(), 60 * 60 * 1000);   // one singleton, not per-replica
+setInterval(() => manager.refundIdleChannels({ idleSecs: 7 * 24 * 60 * 60 }), 24 * 60 * 60 * 1000);
+```
+
+Your offering must advertise `extra.receiverAuthorizer` (the address authorized to countersign claims) — the payer's channel id is derived from it, and signing fails without it:
+
+```ts
+const ACCEPTS = [{
+  scheme: 'batch-settlement',
+  network: 'eip155:84532',
+  amount: '3000',
+  asset: USDC_BASE_SEPOLIA,
+  payTo: MERCHANT,
+  resource: 'https://api.example.com/chat',
+  description: 'Metered access, settled in batches',
+  extra: {
+    name: 'USDC', version: '2',              // EIP-712 domain for the deposit
+    receiverAuthorizer: RECEIVER_AUTHORIZER,
+  },
+}];
+```
+
+`batch-settlement` is V2-only. Configuring this offering on an
+`x402Version: 1` context throws before the offering is stored or emitted.
+
+#### Receipts have no transaction hash
+
+A successful voucher settlement returns `success: true` with an **empty** `transaction` — there is no chain write to name yet. Do not read an empty `transaction` as failure; branch on `success`.
+
+What it carries instead is `receipt.extra`, the scheme's post-settlement state, forwarded verbatim from the facilitator:
+
+```ts
+receipt.extra?.channelState   // { channelId, balance, totalClaimed, chargedCumulativeAmount, … }
+```
+
+`exact` and `upto` never populate `extra`. It exists because the payer cannot function without it — see below.
+
+`receipt.amount` reports the per-call service charge, taken from the facilitator's `extra.chargedAmount`. The facilitator's own top-level `amount` names the immediate transfer instead — empty for an off-chain voucher, the whole funding total for a deposit payload — neither of which is what the call settled for.
+
+#### Payer side: storage is not optional
+
+Unlike `exact` and `upto`, the payer here is **stateful**, so the scheme is registered only when you supply its config:
+
+```ts
+import { A2XClient } from '@a2x/sdk/client';
+
+const client = new A2XClient(url, {
+  x402: {
+    signer,
+    batchSettlement: { storage: myChannelStorage },
+    allowBatchSettlement: true,
+  },
+});
+```
+
+`storage` is required and has deliberately no default. a2x types its signer as a viem `LocalAccount`, which has no `readContract`, so `@x402/evm`'s on-chain channel recovery never runs — **this storage is the only record that a channel exists**. If it comes back empty against a channel that is already funded, the next call signs a fresh deposit into it: real funds moved, on top of a balance you already have. Implement `X402ClientChannelStorage` over whatever you already persist:
+
+```ts
+import type { X402ClientChannelStorage } from '@a2x/sdk/x402';
+
+const myChannelStorage: X402ClientChannelStorage = {
+  get:    (key)        => db.channels.findUnique({ where: { key } }),
+  set:    (key, state) => db.channels.upsert({ where: { key }, create: { key, ...state }, update: state }),
+  delete: (key)        => db.channels.delete({ where: { key } }),
+};
+```
+
+The requirement is enforced at runtime as well as by TypeScript. Supplying an empty config, `storage: undefined`, or an object without callable `get`, `set`, and `delete` methods throws `X402PaymentRequiredError` before the upstream scheme is constructed. It never selects `@x402/evm`'s in-memory fallback accidentally across a plain-JavaScript or unchecked configuration boundary.
+
+`@x402/evm` ships `InMemoryClientChannelStorage` and a file-backed one under `@x402/evm/batch-settlement/client/file-storage`; the in-memory one is for tests and short-lived scripts only.
+
+Deposit sizing defaults to 5× the request amount, so one funding covers the next four calls. Tune it with `depositPolicy` (`depositMultiplier`, an integer ≥ 3) or take full control per deposit with `depositStrategy`:
+
+```ts
+batchSettlement: {
+  storage: myChannelStorage,
+  depositPolicy: { depositMultiplier: 20 },
+  depositStrategy: ({ requestAmount, minimumDepositAmount, depositAmount }) => {
+    if (BigInt(requestAmount) > MAX_PER_CALL) return false;   // skip: sign a voucher-only payload
+    return depositAmount;                                     // or any amount >= minimumDepositAmount
+  },
+},
+```
+
+`maxAmount` bounds the **deposit**, not just the per-request amount:
+
+1. **Before selection** — the per-request amount is filtered against the cap like every other scheme. A multiplier outside `@x402/evm`'s accepted range (integers ≥ 3) also fails closed here rather than leaking a generic scheme-construction error.
+2. **At signing** — after the scheme derives the channel id and reads storage, any deposit it actually sizes is checked before it is signed, including one a `depositStrategy` returned and the policy amount a strategy defers to with `undefined`. Exceeding the cap throws rather than silently authorizing.
+
+The second check cannot be replaced with a static `depositMultiplier x amount` filter. A channel may already have enough balance, in which case the same request emits a voucher-only payload and authorizes no new deposit; rejecting it by the opening-deposit estimate would make `maxAmount` disable the channel after it was funded. Conversely, when initial funding or a top-up is required, the signing hook sees the exact amount the peer is about to authorize and keeps the cap authoritative.
+
+#### Reconciliation is mandatory
+
+`@x402/evm` normally advances the payer's channel state from its own HTTP client's `onPaymentResponse` hook, reading the `PAYMENT-RESPONSE` header. **a2x carries payments over A2A task metadata and never runs that hook**, so the step is explicit.
+
+`A2XClient` does it for you on both the blocking and streaming paths, bound to **what that exchange actually signed**: the channel, and the cumulative ceiling its voucher authorized. Both halves are a security boundary, not an optimization.
+
+- **The channel id.** Ids derive from public inputs, so the one you share with any given merchant is computable by anyone — and a receipt names the channel it updates. Without this, a merchant you *did* pay could name a channel belonging to a **different** merchant and overwrite its cumulative, bricking it or forcing an invalid top-up.
+- **The ceiling.** Without it, the same merchant can inflate its *own* channel instead: report 5000 back after a 1000 voucher, and your next 1000 call signs a 6000 cumulative plus a top-up to cover it — letting the merchant claim far more than the calls cost. A figure above the ceiling was never authorized and is always refused. Below it, two shapes are honest and validated exactly. A **metered** receipt carries `extra.chargedAmount` — the server settled via `X402Context.settle({ amountAtomic })`, so the cumulative advanced by only the actual charge — and is accepted only when it reports exactly `pre-attempt cumulative + chargedAmount`; the fold then commits that reported figure. An **unmetered** receipt (no usable `chargedAmount`) must report the ceiling exactly, because the plain lifecycle advances by the full offered amount that verify pinned the ceiling to; a smaller value there is stale and could let an old receipt mask this exchange while the merchant retains the higher-value voucher. A receipt with **no** cumulative at all is also refused — it would perform a partial write that leaves the signing base where it was, which for a spent voucher is a desync rather than a no-op.
+- **The deposit and the snapshot.** A merchant reporting `balance: "0"` every round makes the scheme treat the channel as unfunded and sign a fresh deposit every round. `maxAmount` does not stop that — it caps each deposit individually, not their aggregate. Within a payment flow the channel balance only ever goes up, by exactly the deposits you sign, so a reported balance below `pre-attempt balance + this deposit` is one the merchant could not have reached honestly, and it is **replaced** by that floor. The floor's base is the **pre-attempt snapshot** captured when the payload was signed, not whatever storage holds when the receipt is folded: after a torn or failed write, the stored record is precisely the thing that cannot be trusted. A balance *above* the floor is kept: overstating can only make you under-fund a later call, which costs you nothing.
+
+Two cases `A2XClient` does not cover, where you reconcile yourself — and must supply the same binding:
+
+```ts
+import {
+  reconcileX402BatchSettlement,
+  getX402Receipts,
+} from '@a2x/sdk/x402';
+
+// (a) You drove the dance manually with `signX402Payment`.
+// (b) The receipt reached you via `getTask` rather than the send that paid.
+const signed = await signX402Payment(task, {
+  signer,
+  batchSettlement,
+  allowBatchSettlement: true,
+});
+// `signed.batch` is the complete binding: channel, voucher ceiling, deposit,
+// and the trusted pre-attempt snapshot read right after signing.
+// …resubmit with `signed.metadata`, then on the terminal task:
+const { applied } = await reconcileX402BatchSettlement(getX402Receipts(final), {
+  storage: myChannelStorage,
+  bindings: signed.batch!,
+});
+if (applied.length === 0) {
+  // The voucher is spent and local state did not move — see below.
+}
+```
+
+Persist `signed.batch` alongside the payload if reconciliation may happen in a later process: neither the snapshot nor the `attemptId` can be reconstructed afterwards, and a resumed reconcile must reuse the persisted `attemptId` — minting a new one severs the attempt from its own storage writes and quarantine marker. The binding is JSON-safe by construction — a fresh channel's `preAttemptState` is `null`, never an `undefined` that `JSON.stringify` would silently drop (an absent key is rejected at reconcile time, so a lossy round trip would otherwise break the repair for exactly the opening-deposit case). A caller resuming from a persisted *payload* alone can rebuild the payload-provable half with `getX402BatchSettlementBinding(payload)`, but must combine it with the snapshot and attempt id it captured at signing time to form the `bindings` entry.
+
+Skip reconciliation and the payer's cumulative amount never advances: every subsequent call re-signs an identical voucher against a channel it still believes is unfunded — and therefore signs a **fresh deposit** each time. Receipts from other schemes, malformed ones (including non-object array entries), any naming a channel outside `bindings`, and any whose cumulative the binding cannot vouch for are ignored. A cumulative is vouched for when it stays at or below the signed ceiling **and** either equals `preAttemptState cumulative + extra.chargedAmount` (a metered settlement — see the ceiling bullet above) or, absent a usable `chargedAmount`, equals the ceiling exactly (the unmetered lifecycle). Ignored receipts do not throw — they simply leave `applied` empty, which is why an empty `applied` after a settled payment must be treated as a failure (below). `AggregateError` is reserved for storage operations that throw, raised after the other receipts have been tried so one failing write cannot drop a good receipt.
+
+When `bindings` is an array, every entry must name a distinct channel. Reconcile successive attempts on the same channel separately; collapsing them into one call would lose which deposit floor belongs to which cumulative voucher. Reconciliation calls through the same storage object are serialized per channel inside the process, so a delayed older receipt cannot overwrite a newer cumulative.
+
+The write itself is a **deterministic fold**: `trusted snapshot + binding + receipt → next state`, computed without reading the record being replaced. That makes retries exact rather than best-effort — re-running the same binding and receipt rewrites the same state, so a torn write (cumulative committed without the balance, or the reverse) is repaired by simply reconciling again, for deposits and voucher-only payments alike.
+
+Attempts are ordered by **identity, not by the cumulative**: a metered call may charge zero, so two attempts can share a cumulative while the newer one moved real funds. Every binding carries an `attemptId` (minted by `signX402Payment` — reuse the persisted one when resuming), and every successful fold stamps it onto the record as `lastAppliedAttemptId`. A fold rewrites a record it already stamped (the idempotent retry), and refuses one that no longer descends from its own snapshot — so a replayed older receipt cannot roll back a newer attempt's balance even at an equal cumulative. A successful fold clears a quarantine marker only when that marker is **owned by the same attempt** (or names no owner); a marker some other attempt wrote survives, because the merchant may still hold that attempt's spendable voucher.
+
+That receipt lock alone cannot make concurrent signing safe: `@x402/evm` only reads storage while it creates a payload and does not reserve the next cumulative or deposit. Two overlapping attempts can therefore read the same empty state and each authorize a fresh deposit before either receipt exists. `A2XClient` prevents this in-process by holding one lease per storage object across the complete sign → submit → reconcile/quarantine lifetime (conservatively serializing different channels that share that object because the channel id is not available until after signing). If the lease holder is quarantined, attempts already queued behind it are rejected with the same `X402ReconciliationError` before they can sign from stale storage; repair or retire the channel before retrying. The low-level helpers cannot retain a lock across your network call, so manual flows must serialize that entire lifetime per channel themselves. The storage interface has no cross-process compare-and-set operation; when multiple processes or replicas share a backend, route each channel through one owner or add an application-level durable reservation before signing.
+
+**An empty `applied` after a settled payment is a failure, not a no-op.** The voucher is spent either way, so "nothing to record" and "the merchant withheld or falsified the receipt" have identical consequences: local state did not move, and the next call re-signs or re-deposits. `A2XClient` raises `X402ReconciliationError` with `reason: 'no-matching-receipt'` in that case; a caller driving the helper directly should treat it the same way.
+
+The SDK also fails closed when the merchant returns any terminal A2A task (`completed`, `failed`, `canceled`, or `rejected`) but omits a usable receipt. Settlement can succeed before agent execution later fails, and once the payer handed over a voucher the merchant may retain and redeem it; neither a remote status marker nor the task's final state can prove that local channel state is safe to reuse.
+
+The binding becomes outstanding as soon as the signed submission is handed to the transport. If blocking transport/JSON parsing fails, a non-blocking unary call returns an intermediate task, a follow-up SSE stream errors or is aborted, the caller closes that stream early, or the stream reaches EOF before a receipt or a complete retry prompt, `A2XClient` raises the same quarantine error with `reason: 'ambiguous-response'`. A status marker alone is not a retry prompt: `x402.payment.required` must also be present before the client treats the previous voucher as rejected. A known intermediate unary response is available as `task`; transport failures and streaming exits have no complete task, and the original transport/stream failure is available as `cause` when one occurred. In every case the merchant must be assumed to hold the voucher until an operator reconciles or retires the channel.
+
+A matching success receipt takes precedence over a contradictory retry prompt anywhere later in the same response stream, whether it appears in the same event or a separate event. Once that receipt advances durable channel state, `A2XClient` does not sign again for the call; doing so would authorize the same work twice. This batch-only guard does not change `exact` or `upto` retry behavior.
+
+#### A missed receipt does not self-heal
+
+The merchant requires the next voucher's cumulative to equal exactly `charged + amount`, and `@x402/evm`'s corrective-recovery path needs a signer with `readContract`, which a viem `LocalAccount` does not have. A payer that loses a receipt stays desynced until its storage is repaired out of band, and the next call can sign a fresh on-chain deposit.
+
+Because that is a funds-bearing failure, `A2XClient` **throws** `X402ReconciliationError` rather than continuing quietly — an operator who is never told cannot quarantine the channel first. It carries `channelId`, the merchant's terminal `task` when available, and a `reason`: `write-failed` (your storage threw — usually transient), `no-matching-receipt` (a terminal task arrived but nothing was recorded), or `ambiguous-response` (the response ended before either safe outcome was known). It also carries everything the repair needs: `binding` — the attempt's complete `X402BatchSettlementBinding`, including the pre-attempt snapshot that cannot be reconstructed afterwards — and `taskId`, the paid task's id, which on a transport or stream failure is the only handle for fetching the settled receipt (the client consumed the `payment-required` task internally, so you never saw the id). When present, `task` means catching the error still leaves you the result the merchant produced — including on the streaming path, where reconciliation runs before the terminal event is yielded and a throw means you never see that event:
+
+```ts
+try {
+  const task = await client.sendMessage({ message });
+} catch (err) {
+  if (err instanceof X402ReconciliationError) {
+    // Repair: fetch the receipt the response lost, then re-run the fold
+    // with the attempt's own binding. A successful fold restores the exact
+    // post-attempt state and clears the quarantine marker.
+    const final = (err.task as Task | undefined) ??
+      (err.taskId ? await client.getTask(err.taskId) : undefined);
+    if (final && err.binding) {
+      const { applied } = await reconcileX402BatchSettlement(
+        getX402Receipts(final),
+        { storage, bindings: err.binding },
+      );
+      // Check `applied`: ignored receipts do not throw, so an empty result
+      // means the fetched task still lacks a usable receipt and the channel
+      // is still quarantined — returning here would report a repair that
+      // never happened.
+      if (applied.length > 0) return final;
+    }
+    // Nothing to repair from yet — leave the channel quarantined.
+  }
+  throw err;
+}
+```
+
+Prefer the originating call to record and continue? Supply a handler:
+
+```ts
+x402: {
+  signer,
+  batchSettlement: { storage },
+  allowBatchSettlement: true,
+  onReconcileError: async (err) => {
+    await pageOperator(err);
+    await quarantineChannel(err.channelId);
+  },
+}
+```
+
+The handler does not release already-queued calls to sign from stale storage. Those callers are rejected with the same reconciliation error before payload creation, so repair or retire the channel before retrying them.
+
+#### A submitted attempt survives a crash
+
+Quarantine only helps when some exit path lives long enough to write it. One does not: hand the signed payload to `fetch`, then lose the process before any response, catch, or `finally` runs. The in-process lease, the attempt object, and its binding all die with the process, and a restarted payer would read the unchanged pre-attempt record — and sign a second real deposit while the merchant may hold the first.
+
+`A2XClient` therefore **persists the attempt before the transport boundary**: immediately before the request body is handed to `fetch`, it awaits a durable write of `pendingAttempt` — `{ attemptId, binding, taskId, submittedAt }` — onto the channel record (a failed write aborts the request before anything is sent, which moves no funds). While that record exists, signing against the channel throws `X402AttemptPendingError`, whatever process is asking. The record clears when the owning attempt's receipt folds, a valid retry prompt proves its rejection, or its quarantine marker supersedes it.
+
+After a crash, recovery is the same shape as quarantine repair: read `pendingAttempt` off the stored record, fetch the task via `getTask(pendingAttempt.taskId)`, and run `reconcileX402BatchSettlement` with `pendingAttempt.binding`. A folded receipt clears the record and payments resume; if the task shows the payload never reached the merchant (the crash landed between the write and `fetch`), remove `pendingAttempt` manually — a conservatively blocked unsent voucher is safe, just operator-visible.
+
+#### Deletion erases the generation
+
+Replay protection lives in the stored record (`lastAppliedAttemptId`), so a **deleted** record is indistinguishable from a channel that never opened — a stale receipt from before the deletion can resurrect it, balance and all. a2x never deletes channel records, but `@x402/evm`'s cooperative refund path does when a channel drains. If you share this storage with that flow, do not let it perform an unversioned delete.
+
+The supported retirement is **salt rotation**: change `batchSettlement.salt` so future payments derive a fresh channel id, and never reuse the old channel. Retaining an arbitrary record instead does **not** preserve a new generation — keeping the old `lastAppliedAttemptId` leaves the old receipt as the record's owner, so replaying that receipt rewrites the record, pre-refund balance included; and keeping a positive balance makes the signer treat the refunded channel as still funded. A manually retained record is safe only when it simultaneously carries a generation no payment attempt owns **and** refuses signing. With the current primitives that means replacing the record with exactly:
+
+```ts
+await storage.set(channelId.toLowerCase(), {
+  lastAppliedAttemptId: `retired:${crypto.randomUUID()}`, // owned by no attempt → every replay fails provenance
+  quarantinedAt: new Date().toISOString(),                // signing refuses while present
+  quarantineReason: 'retired',
+});
+```
+
+A first-class retirement/tombstone operation is planned alongside the transactional storage extension.
+
+#### Quarantine survives a restart
+
+The in-process rejection above dies with the process — and so does the error object carrying the repair inputs. To stop a restarted payer from signing a fresh deposit out of the same desynced storage, the SDK also **persists** the quarantine: alongside raising `X402ReconciliationError` it best-effort writes `quarantinedAt` / `quarantineReason` onto the channel's stored record, together with the recovery record — `quarantineBinding` (the attempt's complete binding) and `quarantineTaskId` (the paid task's id). While that marker is present, signing against the channel throws `X402ChannelQuarantinedError` — before the payload ever reaches the merchant.
+
+Two ways to lift it:
+
+- **Repair**: re-run `reconcileX402BatchSettlement` with the attempt's binding and the receipt — after a restart, read `quarantineBinding` off the stored record and fetch the receipt via `getTask(quarantineTaskId)`. A successful fold rewrites the exact post-attempt state and clears the marker. Only the owning attempt's fold clears it: the marker carries the attempt's id in its binding, and a different attempt reconciling the same channel leaves the block in place.
+- **Manual**: after verifying the stored state out of band, remove the `quarantine*` keys yourself.
+
+The marker write is advisory — when storage itself is what failed, it fails too, and the raised error plus the in-process abort remain the guarantee.
+
+#### Selection is opt-in, and separate from `allowUpto`
+
+The default selector never picks `batch-settlement` on its own. `allowBatchSettlement` is its own flag rather than part of `allowUpto` because the consent differs in kind: `upto` widens *how much* of an authorization the merchant may draw, while funding a channel moves money **before any service is rendered**, recoverable only through a cooperative refund or the idle-channel path.
+
+Preference order under the default selector is `exact` → `upto` → `batch-settlement`: the widest consent wins only when nothing narrower is on offer. Like `upto`, it is V2-only and requires a CAIP-2 network, and an explicit `selectRequirement` bypasses the flag entirely (but still needs `batchSettlement` configured, or the scheme was never registered).
 
 ### Conditional pricing
 
@@ -680,7 +981,7 @@ If the merchant's terminal task records a payment failure (the latest receipt is
 | `selectRequirement` | first EVM `scheme === 'exact'` | Predicate over the (already filtered) requirements. Return `undefined` to abort. |
 | `allowUpto` | `false` | Let the default selector fall back to an EVM `upto` offer when no `exact` one fits. See [Paying an `upto` offer](#paying-an-upto-offer). |
 | `onPaymentRequired` | none | Hook between `payment-required` and signing. Return `false` to send `payment-rejected` cleanly; throw to abort *locally* without telling the merchant. |
-| `maxRetries` | `0` | Additional sign+resubmit attempts when the merchant re-issues `payment-required` on the same task. |
+| `maxRetries` | `0` | Additional sign+resubmit attempts when the merchant re-issues a complete `payment-required` envelope on the same task. A reconciled batch attempt is never paid again. |
 
 ### Extension activation header
 
@@ -779,8 +1080,13 @@ for (const receipt of getX402Receipts(task)) {
   console.log(receipt.success, receipt.transaction, receipt.network);
   // Present only when the facilitator reported a settled amount (x402 V2).
   if (receipt.amount !== undefined) console.log('charged:', receipt.amount);
+  // Scheme-specific settlement state. `exact` / `upto` never set it;
+  // `batch-settlement` reports `extra.channelState`.
+  if (receipt.extra) console.log('scheme state:', receipt.extra);
 }
 ```
+
+`transaction` is empty on failure — **and also on a successful settlement under a scheme that does not touch the chain per call**, such as a `batch-settlement` voucher. Branch on `success`, never on whether `transaction` is populated.
 
 ## Server-side enforcement
 
@@ -796,7 +1102,7 @@ When the merchant agent declares the extension with `required: true` on its Agen
 
 - **Both x402 protocol versions** (V1 `x402Version: 1` and V2 `x402Version: 2`). The server emits the one its deployment configured; the client signs whichever it receives.
 - **Standalone Flow.** The Embedded Flow (x402 nested in an AP2 `CartMandate` / `PaymentMandate`) and its signing models are not implemented in either version — those were described in a2a-x402 v0.2 but have no counterpart in the foundation V2 transport, so their V2 semantics are currently undefined.
-- **`exact` and `upto` schemes, EVM networks** (`base`, `base-sepolia`, `polygon`, `avalanche`, …). `upto` is V2-only and requires `@x402/evm` ≥ 2.19; the client will not auto-select it (see [Paying an `upto` offer](#paying-an-upto-offer)). Other schemes pass through the pipeline untouched — override `BaseX402Context.validatePayloadShape` to validate them. Adding Solana support means passing a Solana-compatible signer in a later release.
+- **`exact`, `upto`, and `batch-settlement` schemes, EVM networks** (`base`, `base-sepolia`, `polygon`, `avalanche`, …). `upto` and `batch-settlement` are V2-only and require `@x402/evm` ≥ 2.20 (the declared peer floor); the client auto-selects neither (see [Paying an `upto` offer](#paying-an-upto-offer) and [Batch settlement](#batch-settlement-prepaid-channels)). For `batch-settlement` the SDK covers the **payer** end-to-end; the merchant end is wired by injecting an `x402ResourceServer` as the facilitator, and redemption stays out of the SDK. Other schemes pass through the pipeline untouched — override `BaseX402Context.validatePayloadShape` to validate them. Adding Solana support means passing a Solana-compatible signer in a later release.
 
 ## Reference
 

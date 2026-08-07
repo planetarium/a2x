@@ -1,7 +1,7 @@
 /**
  * Guards the network table in `x402/networks.ts` against drift from
  * `@x402/evm`'s `EVM_NETWORK_CHAIN_ID_MAP`, which the table mirrors. The
- * peer range (`>=2.19.0 <3`) admits future minors that may add networks;
+ * peer range (`>=2.20.0 <3`) admits future minors that may add networks;
  * if the local table falls behind, `isEvmNetwork` stops selecting
  * requirements the signer could actually fulfil, and `toCaip2` /
  * `toBareName` stop round-tripping the new name. The table is module-

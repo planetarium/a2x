@@ -16,6 +16,7 @@ A self-contained TypeScript SDK for building [A2A (Agent-to-Agent)](https://a2a-
 - **Built-in auth** — API Key, Bearer, OAuth 2.0 (Authorization Code, Client Credentials, Device Code), OpenID Connect, and Mutual TLS.
 - **x402 payments** — Charge per call with on-chain cryptocurrency payments, supporting both x402 protocol versions (legacy V1 and the [x402 Foundation](https://github.com/x402-foundation/x402) V2 transport) — each deployment speaks one, V1 by default, V2 via `new X402Context({ x402Version: 2 })`. Express payment gating inline in `agent.run()` with `x402RequestPayment()`; the agent calls `facilitator.verify()` and `facilitator.settle()` directly using the SDK's stateless helpers — no SDK-owned flow, full control over what runs between verify and settle.
 - **Usage-based payments** — Native support for the x402 V2 `upto` scheme: the payer signs a Permit2 authorization up to a maximum, the agent meters the work and settles only the actual charge with `settle(ctx, classified, { amountAtomic })`, clamped SDK-side so a metering bug can never overcharge. Bill by LLM tokens instead of a flat fee.
+- **Batched payments** — Native payer support for the x402 V2 `batch-settlement` scheme: fund an on-chain channel once, then pay per call with an off-chain voucher. Takes settlement out of the response critical path and amortizes gas across many calls — the difference between viable and not for sub-cent metered pricing. Opt-in via `x402: { signer, batchSettlement: { storage }, allowBatchSettlement: true }`.
 - **Zero runtime dependencies** — Core module uses only Node.js built-in APIs.
 - **TypeScript-first** — Full type safety with types derived from A2A JSON Schema.
 
@@ -317,6 +318,8 @@ Install the optional peers:
 ```bash
 npm install @x402/core @x402/evm viem
 ```
+
+Use `@x402/core` and `@x402/evm` `>=2.20.0 <3`.
 
 Server (the agent owns the flow; `X402Context` bundles the offering store + facilitator + event builders into one object):
 

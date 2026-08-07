@@ -17,15 +17,22 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import { privateKeyToAccount } from 'viem/accounts';
-import { A2XClient } from '../client/a2x-client.js';
+import {
+  A2XClient,
+  type A2XClientX402Options,
+} from '../client/a2x-client.js';
 import {
   X402_EXTENSION_URI,
   X402_METADATA_KEYS,
   X402_PAYMENT_STATUS,
 } from '../x402/constants.js';
+import type { Task } from '../types/task.js';
+import { reconcileX402BatchSettlement } from '../x402/client.js';
 import {
+  X402AttemptPendingError,
   X402NoSupportedRequirementError,
   X402PaymentFailedError,
+  X402ReconciliationError,
 } from '../x402/errors.js';
 
 const TEST_ACCOUNT = privateKeyToAccount(
@@ -206,7 +213,16 @@ function jsonRpcOk(result: unknown): Response {
  * Build a fake fetch that serves a sequence of responses for /a2a calls,
  * always returning the AgentCard for /.well-known/* probes.
  */
-function scriptedFetch(replies: Array<() => Response>): {
+function scriptedFetch(
+  replies: Array<
+    (
+      rpcRequests: Array<{
+        body: unknown;
+        headers: Record<string, string>;
+      }>,
+    ) => Response
+  >,
+): {
   fetch: typeof globalThis.fetch;
   rpcRequests: Array<{ body: unknown; headers: Record<string, string> }>;
 } {
@@ -234,7 +250,7 @@ function scriptedFetch(replies: Array<() => Response>): {
       throw new Error(`No scripted reply for RPC call #${cursor + 1}`);
     }
     cursor += 1;
-    return make();
+    return make(rpcRequests);
   }) as unknown as typeof globalThis.fetch;
   return { fetch, rpcRequests };
 }
@@ -618,6 +634,2127 @@ describe('A2XClient.sendMessage — native x402 dance', () => {
   });
 });
 
+describe('A2XClient.sendMessage — batch-settlement', () => {
+  /** A channel id the payer never signed, used to test the binding. */
+  const FOREIGN_CHANNEL_ID = `0x${'cd'.repeat(32)}`;
+
+  /**
+   * Channel id out of the payload the client submitted, as a real merchant
+   * would echo it. Reconciliation is bound to the channel the payer actually
+   * signed, so the fixture cannot invent one.
+   */
+  function signedChannelId(
+    rpcRequests: Array<{ body: unknown }>,
+  ): string {
+    const submission = rpcRequests.at(-1)!.body as {
+      params: { message: { metadata: Record<string, unknown> } };
+    };
+    const payload = submission.params.message.metadata[
+      X402_METADATA_KEYS.PAYLOAD
+    ] as { payload: { voucher: { channelId: string } } };
+    return payload.payload.voucher.channelId;
+  }
+
+  /** A V2 `payment-required` whose only option is a `batch-settlement` offer. */
+  function batchRequiredTask(): unknown {
+    return {
+      kind: 'task',
+      id: 't1',
+      contextId: 'c1',
+      status: {
+        state: 'input-required',
+        timestamp: new Date().toISOString(),
+        message: {
+          messageId: 'x402-batch-1',
+          role: 'agent',
+          parts: [{ kind: 'text', text: 'open a channel' }],
+          metadata: {
+            [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REQUIRED,
+            [X402_METADATA_KEYS.REQUIRED]: {
+              x402Version: 2,
+              resource: { url: 'https://example.com/protected' },
+              accepts: [
+                {
+                  scheme: 'batch-settlement',
+                  network: 'eip155:84532',
+                  asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+                  amount: '1000',
+                  payTo: '0x000000000000000000000000000000000000dEaD',
+                  maxTimeoutSeconds: 300,
+                  extra: {
+                    name: 'USDC',
+                    version: '2',
+                    receiverAuthorizer:
+                      '0x5555555555555555555555555555555555555555',
+                  },
+                },
+              ],
+            },
+          },
+        },
+      },
+      artifacts: [],
+      history: [],
+    };
+  }
+
+  /** Terminal task carrying the merchant's post-voucher channel snapshot. */
+  function completedTaskWithChannelReceipt(
+    channelId: string,
+    chargedCumulativeAmount = '1000',
+  ): unknown {
+    return {
+      kind: 'task',
+      id: 't1',
+      contextId: 'c1',
+      status: {
+        state: 'completed',
+        timestamp: new Date().toISOString(),
+        message: {
+          messageId: 'x402-batch-2',
+          role: 'agent',
+          parts: [{ kind: 'text', text: 'done' }],
+          metadata: {
+            [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.COMPLETED,
+            [X402_METADATA_KEYS.RECEIPTS]: [
+              {
+                success: true,
+                // Voucher settlements never carry a tx hash.
+                transaction: '',
+                network: 'eip155:84532',
+                extra: {
+                  channelState: {
+                    channelId,
+                    balance: '5000',
+                    totalClaimed: '0',
+                    chargedCumulativeAmount,
+                  },
+                },
+              },
+            ],
+          },
+        },
+      },
+      artifacts: [],
+      history: [],
+    };
+  }
+
+  /** Contradictory response: the voucher succeeded, but payment is requested again. */
+  function retryTaskWithChannelReceipt(channelId: string): unknown {
+    const task = completedTaskWithChannelReceipt(channelId) as {
+      status: {
+        state: string;
+        message: { metadata: Record<string, unknown> };
+      };
+    };
+    const required = batchRequiredTask() as {
+      status: { message: { metadata: Record<string, unknown> } };
+    };
+    task.status.state = 'input-required';
+    task.status.message.metadata[X402_METADATA_KEYS.STATUS] =
+      X402_PAYMENT_STATUS.REQUIRED;
+    task.status.message.metadata[X402_METADATA_KEYS.REQUIRED] =
+      required.status.message.metadata[X402_METADATA_KEYS.REQUIRED];
+    return task;
+  }
+
+  function batchSse(events: unknown[]): Response {
+    const encoder = new TextEncoder();
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          for (const event of events) {
+            controller.enqueue(
+              encoder.encode(
+                `data: ${JSON.stringify({ jsonrpc: '2.0', id: 1, result: event })}\n\n`,
+              ),
+            );
+          }
+          controller.close();
+        },
+      }),
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    );
+  }
+
+  function batchStatusEvent(state: string, message: unknown) {
+    return {
+      kind: 'status-update',
+      taskId: 't1',
+      contextId: 'c1',
+      status: { state, timestamp: new Date().toISOString(), message },
+      final: false,
+    };
+  }
+
+  function channelStorage() {
+    const channels = new Map<string, Record<string, unknown>>();
+    return {
+      channels,
+      storage: {
+        get: async (key: string) => channels.get(key),
+        set: async (key: string, state: Record<string, unknown>) => {
+          channels.set(key, state);
+        },
+        delete: async (key: string) => {
+          channels.delete(key);
+        },
+      },
+    };
+  }
+
+  it('signs a batch-settlement offer and folds the receipt back into channel storage', async () => {
+    const { channels, storage } = channelStorage();
+    // The reply thunk runs after the submission is recorded, so it can echo
+    // the channel the client actually signed — `recorded` is bound to the
+    // live array below before any request is made.
+    let recorded: Array<{ body: unknown }> = [];
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(completedTaskWithChannelReceipt(signedChannelId(recorded))),
+    ]);
+    recorded = rpcRequests;
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    expect(task.status.state).toBe('completed');
+    expect(rpcRequests).toHaveLength(2);
+
+    // No local channel existed, so the first payload funds one: an ERC-3009
+    // deposit bundled with the opening voucher, not a bare voucher.
+    const followup = (
+      rpcRequests[1]!.body as {
+        params: { message: { metadata: Record<string, unknown> } };
+      }
+    ).params.message.metadata;
+    const payload = followup[X402_METADATA_KEYS.PAYLOAD] as {
+      accepted: { scheme: string };
+      payload: { type: string; deposit: { amount: string } };
+    };
+    expect(payload.accepted.scheme).toBe('batch-settlement');
+    expect(payload.payload.type).toBe('deposit');
+    // Default policy funds 5x the request amount, so one deposit covers the
+    // next four calls as pure vouchers.
+    expect(payload.payload.deposit.amount).toBe('5000');
+
+    // The reconcile step is what makes the *next* call a cheap voucher instead
+    // of a second deposit — without it the payer re-funds the same channel
+    // forever, since a LocalAccount cannot read the channel back off-chain.
+    expect(channels.get(signedChannelId(rpcRequests).toLowerCase())).toEqual({
+      balance: '5000',
+      totalClaimed: '0',
+      chargedCumulativeAmount: '1000',
+      lastAppliedAttemptId: expect.any(String) as unknown as string,
+    });
+  });
+
+  it('serializes concurrent batch attempts until the first receipt is reconciled', async () => {
+    const { channels, storage } = channelStorage();
+    const submitted: Array<{
+      payload: {
+        type: string;
+        voucher: { channelId: string; maxClaimableAmount: string };
+      };
+    }> = [];
+    let submissionCount = 0;
+    let initialCount = 0;
+    let resolveBothInitial!: () => void;
+    const bothInitial = new Promise<void>((resolve) => {
+      resolveBothInitial = resolve;
+    });
+    let resolveFirstSubmission!: () => void;
+    const firstSubmission = new Promise<void>((resolve) => {
+      resolveFirstSubmission = resolve;
+    });
+    let resolveSecondSubmission!: () => void;
+    const secondSubmission = new Promise<void>((resolve) => {
+      resolveSecondSubmission = resolve;
+    });
+    let releaseFirstResponse!: () => void;
+    const firstResponseGate = new Promise<void>((resolve) => {
+      releaseFirstResponse = resolve;
+    });
+
+    const fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/agent-card.json') || url.endsWith('/agent.json')) {
+        return agentCardResponse();
+      }
+      const body = init?.body
+        ? (JSON.parse(init.body as string) as {
+            params?: { message?: { metadata?: Record<string, unknown> } };
+          })
+        : undefined;
+      const payment = body?.params?.message?.metadata?.[
+        X402_METADATA_KEYS.PAYLOAD
+      ] as (typeof submitted)[number] | undefined;
+      if (!payment) {
+        initialCount += 1;
+        if (initialCount === 2) resolveBothInitial();
+        return jsonRpcOk(batchRequiredTask());
+      }
+
+      submitted.push(payment);
+      submissionCount += 1;
+      if (submissionCount === 1) {
+        resolveFirstSubmission();
+        await firstResponseGate;
+      } else {
+        resolveSecondSubmission();
+      }
+      return jsonRpcOk(
+        completedTaskWithChannelReceipt(
+          payment.payload.voucher.channelId,
+          payment.payload.voucher.maxClaimableAmount,
+        ),
+      );
+    }) as unknown as typeof globalThis.fetch;
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+
+    const calls = Promise.all([
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'one' }] },
+      }),
+      client.sendMessage({
+        message: { messageId: 'm2', role: 'user', parts: [{ text: 'two' }] },
+      }),
+    ]);
+    await Promise.all([bothInitial, firstSubmission]);
+    const overlapped = await Promise.race([
+      secondSubmission.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 100)),
+    ]);
+    releaseFirstResponse();
+    await calls;
+
+    expect(overlapped).toBe(false);
+    expect(submitted).toHaveLength(2);
+    expect(submitted[0]!.payload.type).toBe('deposit');
+    expect(submitted[0]!.payload.voucher.maxClaimableAmount).toBe('1000');
+    expect(submitted[1]!.payload.type).toBe('voucher');
+    expect(submitted[1]!.payload.voucher.maxClaimableAmount).toBe('2000');
+    expect(
+      channels.get(submitted[0]!.payload.voucher.channelId.toLowerCase()),
+    ).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '2000',
+    });
+  });
+
+  it('aborts queued batch attempts when the predecessor is quarantined', async () => {
+    const { channels, storage } = channelStorage();
+    const submitted: Array<{
+      payload: {
+        type: string;
+        voucher: { channelId: string; maxClaimableAmount: string };
+      };
+    }> = [];
+    let selectedCount = 0;
+    let resolveBothSelected!: () => void;
+    const bothSelected = new Promise<void>((resolve) => {
+      resolveBothSelected = resolve;
+    });
+    let resolveFirstSubmission!: () => void;
+    const firstSubmission = new Promise<void>((resolve) => {
+      resolveFirstSubmission = resolve;
+    });
+    let releaseFirstResponse!: () => void;
+    const firstResponseGate = new Promise<void>((resolve) => {
+      releaseFirstResponse = resolve;
+    });
+
+    const fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/agent-card.json') || url.endsWith('/agent.json')) {
+        return agentCardResponse();
+      }
+      const body = init?.body
+        ? (JSON.parse(init.body as string) as {
+            params?: { message?: { metadata?: Record<string, unknown> } };
+          })
+        : undefined;
+      const payment = body?.params?.message?.metadata?.[
+        X402_METADATA_KEYS.PAYLOAD
+      ] as (typeof submitted)[number] | undefined;
+      if (!payment) return jsonRpcOk(batchRequiredTask());
+
+      submitted.push(payment);
+      resolveFirstSubmission();
+      await firstResponseGate;
+      const task = completedTaskWithChannelReceipt(
+        payment.payload.voucher.channelId,
+        payment.payload.voucher.maxClaimableAmount,
+      ) as {
+        status: { message: { metadata: Record<string, unknown> } };
+      };
+      delete task.status.message.metadata[X402_METADATA_KEYS.RECEIPTS];
+      return jsonRpcOk(task);
+    }) as unknown as typeof globalThis.fetch;
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        selectRequirement: (requirements) => {
+          selectedCount += 1;
+          if (selectedCount === 2) resolveBothSelected();
+          return requirements[0];
+        },
+      },
+    });
+
+    const calls = Promise.allSettled([
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'one' }] },
+      }),
+      client.sendMessage({
+        message: { messageId: 'm2', role: 'user', parts: [{ text: 'two' }] },
+      }),
+    ]);
+    await Promise.all([bothSelected, firstSubmission]);
+    expect(submitted).toHaveLength(1);
+    releaseFirstResponse();
+    const outcomes = await calls;
+
+    expect(submitted).toHaveLength(1);
+    // The quarantine is persisted as a marker on the signed channel, so the
+    // block survives a restart; no payment state is invented alongside it.
+    const quarantinedKey =
+      submitted[0]!.payload.voucher.channelId.toLowerCase();
+    expect([...channels.keys()]).toEqual([quarantinedKey]);
+    expect(channels.get(quarantinedKey)).toMatchObject({
+      quarantineReason: 'no-matching-receipt',
+      quarantinedAt: expect.any(String) as unknown,
+    });
+    expect(outcomes).toHaveLength(2);
+    for (const outcome of outcomes) {
+      expect(outcome.status).toBe('rejected');
+      if (outcome.status === 'rejected') {
+        expect(outcome.reason).toBeInstanceOf(X402ReconciliationError);
+        expect((outcome.reason as X402ReconciliationError).reason).toBe(
+          'no-matching-receipt',
+        );
+      }
+    }
+  });
+
+  it('reconciles through the storage snapshot used to sign the attempt', async () => {
+    const storageAState = channelStorage();
+    const storageBState = channelStorage();
+    const storageA = {
+      ...storageAState.storage,
+      get: async (key: string) =>
+        storageAState.channels.get(key) ?? {
+          balance: '5000',
+          chargedCumulativeAmount: '1000',
+          totalClaimed: '0',
+        },
+    };
+    let x402!: A2XClientX402Options;
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      (requests) => {
+        const task = completedTaskWithChannelReceipt(
+          signedChannelId(requests),
+          '2000',
+        ) as {
+          status: { message: { metadata: Record<string, unknown> } };
+        };
+        const receipts = task.status.message.metadata[
+          X402_METADATA_KEYS.RECEIPTS
+        ] as Array<{ extra: { channelState: { balance?: string } } }>;
+        delete receipts[0]!.extra.channelState.balance;
+        x402.batchSettlement = { storage: storageBState.storage };
+        return jsonRpcOk(task);
+      },
+    ]);
+    x402 = {
+      signer: TEST_ACCOUNT,
+      batchSettlement: { storage: storageA },
+      allowBatchSettlement: true,
+    };
+    const client = new A2XClient(AGENT_URL, { fetch, x402 });
+
+    await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+
+    expect(
+      storageAState.channels.get(signedChannelId(rpcRequests).toLowerCase()),
+    ).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '2000',
+    });
+    expect(storageBState.channels.size).toBe(0);
+  });
+
+  it('does not retry a batch payment after applying its success receipt', async () => {
+    const { channels, storage } = channelStorage();
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      (requests) =>
+        jsonRpcOk(retryTaskWithChannelReceipt(signedChannelId(requests))),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+        maxRetries: 1,
+      },
+    });
+
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+
+    expect(task.status.state).toBe('input-required');
+    expect(rpcRequests).toHaveLength(2);
+    expect(channels.get(signedChannelId(rpcRequests).toLowerCase())).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '1000',
+    });
+  });
+
+  it('does not select a batch-settlement offer without allowBatchSettlement', async () => {
+    const { storage } = channelStorage();
+    const { fetch } = scriptedFetch([() => jsonRpcOk(batchRequiredTask())]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: { signer: TEST_ACCOUNT, batchSettlement: { storage } },
+    });
+    await expect(
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      }),
+    ).rejects.toThrow(X402NoSupportedRequirementError);
+  });
+
+  it('reconciles over streaming even when the consumer breaks on the final event', async () => {
+    // Regression guard. The receipt rides the final status event, and the
+    // idiomatic consumer breaks out of its loop right there — which calls the
+    // generator's return() at the suspended yield. Reconciling *after* the
+    // yield would never run, and the next call would sign a second real
+    // deposit into an already-funded channel.
+    const { channels, storage } = channelStorage();
+    const encoder = new TextEncoder();
+    const sse = (events: unknown[]) =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            for (const ev of events) {
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({ jsonrpc: '2.0', id: 1, result: ev })}\n\n`,
+                ),
+              );
+            }
+            controller.close();
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      );
+
+    const required = batchRequiredTask() as {
+      status: { message: { metadata: Record<string, unknown> } };
+    };
+    const statusEvent = (
+      state: string,
+      message: unknown,
+      final: boolean,
+    ) => ({
+      kind: 'status-update',
+      taskId: 't1',
+      contextId: 'c1',
+      status: { state, timestamp: new Date().toISOString(), message },
+      final,
+    });
+
+    let call = 0;
+    const recorded: Array<{ body: unknown }> = [];
+    const fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/agent-card.json') || url.endsWith('/agent.json')) {
+        return agentCardResponse();
+      }
+      recorded.push({ body: init?.body ? JSON.parse(init.body as string) : undefined });
+      if (call++ === 0) {
+        return sse([
+          statusEvent('input-required', required.status.message, false),
+        ]);
+      }
+      // Echo the channel the client actually signed, as a merchant would.
+      const completed = completedTaskWithChannelReceipt(
+        signedChannelId(recorded),
+      ) as { status: { message: unknown } };
+      return sse([statusEvent('completed', completed.status.message, true)]);
+    }) as unknown as typeof globalThis.fetch;
+
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+
+    for await (const event of client.sendMessageStream({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    })) {
+      // Exactly the pattern that used to lose the receipt.
+      if ('status' in event && event.status?.state === 'completed') break;
+    }
+
+    expect(channels.get(signedChannelId(recorded).toLowerCase())).toEqual({
+      balance: '5000',
+      totalClaimed: '0',
+      chargedCumulativeAmount: '1000',
+      lastAppliedAttemptId: expect.any(String) as unknown as string,
+    });
+  });
+
+  it('does not retry a streamed batch payment after applying its success receipt', async () => {
+    const { channels, storage } = channelStorage();
+    const required = batchRequiredTask() as {
+      status: { message: unknown };
+    };
+    const { fetch, rpcRequests } = scriptedFetch([
+      () =>
+        batchSse([
+          batchStatusEvent('input-required', required.status.message),
+        ]),
+      (requests) => {
+        const retry = retryTaskWithChannelReceipt(signedChannelId(requests)) as {
+          status: { message: unknown };
+        };
+        return batchSse([
+          batchStatusEvent('input-required', retry.status.message),
+        ]);
+      },
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+        maxRetries: 1,
+      },
+    });
+
+    const states: string[] = [];
+    for await (const event of client.sendMessageStream({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    })) {
+      if ('status' in event) states.push(event.status!.state as string);
+    }
+
+    expect(states).toEqual(['input-required', 'input-required']);
+    expect(rpcRequests).toHaveLength(2);
+    expect(channels.get(signedChannelId(rpcRequests).toLowerCase())).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '1000',
+    });
+  });
+
+  it('does not retry when a later stream event contradicts an applied receipt', async () => {
+    const { channels, storage } = channelStorage();
+    const required = batchRequiredTask() as {
+      status: { message: unknown };
+    };
+    const { fetch, rpcRequests } = scriptedFetch([
+      () =>
+        batchSse([
+          batchStatusEvent('input-required', required.status.message),
+        ]),
+      (requests) => {
+        const completed = completedTaskWithChannelReceipt(
+          signedChannelId(requests),
+        ) as { status: { message: unknown } };
+        return batchSse([
+          batchStatusEvent('working', completed.status.message),
+          batchStatusEvent('input-required', required.status.message),
+        ]);
+      },
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+        maxRetries: 1,
+      },
+    });
+
+    const states: string[] = [];
+    for await (const event of client.sendMessageStream({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    })) {
+      if ('status' in event) states.push(event.status!.state as string);
+    }
+
+    expect(states).toEqual(['input-required', 'working', 'input-required']);
+    expect(rpcRequests).toHaveLength(2);
+    expect(channels.get(signedChannelId(rpcRequests).toLowerCase())).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '1000',
+    });
+  });
+
+  it('quarantines a streamed batch payment on a marker-only retry response', async () => {
+    const { channels, storage } = channelStorage();
+    const required = batchRequiredTask() as {
+      status: { message: unknown };
+    };
+    const markerOnlyMessage = {
+      messageId: 'x402-batch-retry',
+      role: 'agent',
+      parts: [{ kind: 'text', text: 'try again' }],
+      metadata: {
+        [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REQUIRED,
+      },
+    };
+
+    const { fetch, rpcRequests } = scriptedFetch([
+      () =>
+        batchSse([
+          batchStatusEvent('input-required', required.status.message),
+        ]),
+      () =>
+        batchSse([
+          batchStatusEvent('input-required', markerOnlyMessage),
+        ]),
+    ]);
+    const seen: X402ReconciliationError[] = [];
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+        onReconcileError: (error) => {
+          seen.push(error);
+        },
+      },
+    });
+
+    const states: string[] = [];
+    for await (const event of client.sendMessageStream({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    })) {
+      if ('status' in event) states.push(event.status!.state as string);
+    }
+
+    expect(states).toEqual(['input-required', 'input-required']);
+    expect(rpcRequests).toHaveLength(2);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.reason).toBe('ambiguous-response');
+    expect(seen[0]!.channelId).toBe(signedChannelId(rpcRequests));
+    expect(
+      channels.get(signedChannelId(rpcRequests).toLowerCase()),
+    ).toMatchObject({ quarantineReason: 'ambiguous-response' });
+  });
+
+  it('quarantines the channel when the consumer closes a paid stream early', async () => {
+    const { channels, storage } = channelStorage();
+    const encoder = new TextEncoder();
+    const sse = (events: unknown[]) =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            for (const event of events) {
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({ jsonrpc: '2.0', id: 1, result: event })}\n\n`,
+                ),
+              );
+            }
+            controller.close();
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      );
+    const required = batchRequiredTask() as {
+      status: { message: unknown };
+    };
+    const statusEvent = (state: string, message: unknown) => ({
+      kind: 'status-update',
+      taskId: 't1',
+      contextId: 'c1',
+      status: { state, timestamp: new Date().toISOString(), message },
+      final: false,
+    });
+    const verifiedMessage = {
+      messageId: 'x402-batch-2',
+      role: 'agent',
+      parts: [{ kind: 'text', text: 'payment verified' }],
+      metadata: {
+        [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.VERIFIED,
+      },
+    };
+
+    let call = 0;
+    const recorded: Array<{ body: unknown }> = [];
+    const fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/agent-card.json') || url.endsWith('/agent.json')) {
+        return agentCardResponse();
+      }
+      recorded.push({
+        body: init?.body ? JSON.parse(init.body as string) : undefined,
+      });
+      if (call++ === 0) {
+        return sse([statusEvent('input-required', required.status.message)]);
+      }
+      return sse([statusEvent('working', verifiedMessage)]);
+    }) as unknown as typeof globalThis.fetch;
+    const seen: X402ReconciliationError[] = [];
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+        onReconcileError: (error) => {
+          seen.push(error);
+        },
+      },
+    });
+
+    for await (const event of client.sendMessageStream({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    })) {
+      if ('status' in event && event.status?.state === 'working') break;
+    }
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.reason).toBe('ambiguous-response');
+    expect(seen[0]!.channelId).toBe(signedChannelId(recorded));
+    expect(seen[0]!.task).toBeUndefined();
+    expect(
+      channels.get(signedChannelId(recorded).toLowerCase()),
+    ).toMatchObject({ quarantineReason: 'ambiguous-response' });
+  });
+
+  it('ignores receipts from an exchange it did not pay with a voucher', async () => {
+    // The storage key is the *merchant-supplied* channelId, and channel ids
+    // derive from public inputs — so any agent could name the channel this
+    // payer shares with a different merchant. Folding receipts from a task we
+    // never paid would let it plant a bogus cumulative and brick that channel.
+    const { channels, storage } = channelStorage();
+    const { fetch } = scriptedFetch([
+      () => jsonRpcOk(completedTaskWithChannelReceipt(FOREIGN_CHANNEL_ID)),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    expect(task.status.state).toBe('completed');
+    expect(channels.size).toBe(0);
+  });
+
+  it('refuses a foreign channel write AND raises, since the voucher is spent', async () => {
+    // The gate above stops agents we never paid. This is the other half: a
+    // merchant we *did* pay must not be able to name someone else's channel —
+    // ids are computable from public inputs, so it could brick a channel this
+    // payer shares with a different merchant, or force an invalid top-up.
+    //
+    // Refusing the write is necessary but not sufficient: the voucher is
+    // spent and our own channel state did not move, so the next call would
+    // see no funded channel and sign a fresh real deposit. Swallowing that as
+    // a completed task is the unsafe half.
+    const { channels, storage } = channelStorage();
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(completedTaskWithChannelReceipt(FOREIGN_CHANNEL_ID)),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+    const error = await client
+      .sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      })
+      .then(
+        () => undefined,
+        (e: unknown) => e as X402ReconciliationError,
+      );
+    expect(error).toBeInstanceOf(X402ReconciliationError);
+    expect(error!.reason).toBe('no-matching-receipt');
+    // Nothing foreign was written — only the signed channel's quarantine
+    // marker — and the caller still has its result.
+    expect(channels.has(FOREIGN_CHANNEL_ID.toLowerCase())).toBe(false);
+    expect([...channels.keys()]).toEqual([
+      signedChannelId(rpcRequests).toLowerCase(),
+    ]);
+    expect(
+      channels.get(signedChannelId(rpcRequests).toLowerCase()),
+    ).toMatchObject({ quarantineReason: 'no-matching-receipt' });
+    expect((error!.task as Task).status.state).toBe('completed');
+  });
+
+  it('preserves the paid result on a streaming reconciliation failure', async () => {
+    // Reconciliation runs before the final event is yielded, so a throw means
+    // the consumer never sees that event. The error must therefore carry a
+    // task-shaped value or the result is lost outright — the blocking path
+    // already did this; streaming passed `undefined`.
+    const { storage } = channelStorage();
+    const encoder = new TextEncoder();
+    const sse = (events: unknown[]) =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            for (const ev of events) {
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({ jsonrpc: '2.0', id: 1, result: ev })}\n\n`,
+                ),
+              );
+            }
+            controller.close();
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      );
+    const required = batchRequiredTask() as {
+      status: { message: { metadata: Record<string, unknown> } };
+    };
+    const statusEvent = (state: string, message: unknown, final: boolean) => ({
+      kind: 'status-update',
+      taskId: 't1',
+      contextId: 'c1',
+      status: { state, timestamp: new Date().toISOString(), message },
+      final,
+    });
+
+    let call = 0;
+    const recorded: Array<{ body: unknown }> = [];
+    const fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/agent-card.json') || url.endsWith('/agent.json')) {
+        return agentCardResponse();
+      }
+      recorded.push({
+        body: init?.body ? JSON.parse(init.body as string) : undefined,
+      });
+      if (call++ === 0) {
+        return sse([
+          statusEvent('input-required', required.status.message, false),
+        ]);
+      }
+      const completed = completedTaskWithChannelReceipt(
+        signedChannelId(recorded),
+      ) as { status: { message: unknown } };
+      return sse([statusEvent('completed', completed.status.message, true)]);
+    }) as unknown as typeof globalThis.fetch;
+
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: {
+          storage: {
+            ...storage,
+            set: async (key: string, state: Record<string, unknown>) => {
+              // The submitted-attempt record must land — the scenario under
+              // test is the reconcile fold's write failing, not a pre-submit
+              // abort.
+              if ('pendingAttempt' in state) return storage.set(key, state);
+              throw new Error('durable store unavailable');
+            },
+          },
+        },
+        allowBatchSettlement: true,
+      },
+    });
+
+    let caught: X402ReconciliationError | undefined;
+    try {
+      for await (const _event of client.sendMessageStream({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      })) {
+        // consume
+      }
+    } catch (err) {
+      caught = err as X402ReconciliationError;
+    }
+    expect(caught).toBeInstanceOf(X402ReconciliationError);
+    expect(caught!.reason).toBe('write-failed');
+    // The task the consumer never got to see is on the error.
+    expect((caught!.task as Task).status.state).toBe('completed');
+    expect((caught!.task as Task).id).toBe('t1');
+  });
+
+  it('records the deposit even when the merchant reports it away', async () => {
+    // End-to-end against the real `@x402/evm`. The merchant settles the
+    // voucher but reports `balance: "0"`; if that survives, the next call sees
+    // an unfunded channel and signs another real deposit — and `maxAmount`
+    // would not stop it, since it caps deposits individually.
+    const { channels, storage } = channelStorage();
+    let recorded: Array<{ body: unknown }> = [];
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => {
+        const task = completedTaskWithChannelReceipt(
+          signedChannelId(recorded),
+        ) as { status: { message: { metadata: Record<string, unknown> } } };
+        const receipts = task.status.message.metadata[
+          X402_METADATA_KEYS.RECEIPTS
+        ] as Array<{ extra: { channelState: { balance: string } } }>;
+        receipts[0]!.extra.channelState.balance = '0';
+        return jsonRpcOk(task);
+      },
+    ]);
+    recorded = rpcRequests;
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+    await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+
+    // Asserts the state after upstream's merge, not the input we handed it —
+    // the peer assigns `balance` only when the receipt still carries the key,
+    // so a guard that merely deleted it would leave this undefined.
+    expect(channels.get(signedChannelId(rpcRequests).toLowerCase())).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '1000',
+    });
+  });
+
+  it('clears the batch binding when a streaming retry signs another scheme', async () => {
+    // Under `retryOnFailure` a later attempt can select a different scheme.
+    // Carrying the batch binding forward would test that attempt's `exact`
+    // receipt against it and report a successful payment as unreconciled.
+    const { storage } = channelStorage();
+    const encoder = new TextEncoder();
+    const sse = (events: unknown[]) =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            for (const ev of events) {
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({ jsonrpc: '2.0', id: 1, result: ev })}\n\n`,
+                ),
+              );
+            }
+            controller.close();
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      );
+    const statusEvent = (state: string, message: unknown, final: boolean) => ({
+      kind: 'status-update',
+      taskId: 't1',
+      contextId: 'c1',
+      status: { state, timestamp: new Date().toISOString(), message },
+      final,
+    });
+    const batchRequired = batchRequiredTask() as {
+      status: { message: unknown };
+    };
+    // Second prompt offers only `exact`, so the retry switches scheme.
+    const exactRequired = paymentRequiredTask() as {
+      status: { message: unknown };
+    };
+    const exactCompleted = completedTaskWithReceipt() as {
+      status: { message: unknown };
+    };
+
+    let call = 0;
+    const fetch = (async (input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/agent-card.json') || url.endsWith('/agent.json')) {
+        return agentCardResponse();
+      }
+      const streams = [
+        sse([statusEvent('input-required', batchRequired.status.message, false)]),
+        sse([statusEvent('input-required', exactRequired.status.message, false)]),
+        sse([statusEvent('completed', exactCompleted.status.message, true)]),
+      ];
+      return streams[call++]!;
+    }) as unknown as typeof globalThis.fetch;
+
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+        maxRetries: 1,
+      },
+    });
+
+    const states: string[] = [];
+    for await (const event of client.sendMessageStream({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    })) {
+      if ('status' in event) states.push(event.status!.state as string);
+    }
+    // The exact payment succeeded and must not be reported as unreconciled.
+    expect(states.at(-1)).toBe('completed');
+  });
+
+  it('raises when a settled payment comes back with no receipt at all', async () => {
+    const { storage } = channelStorage();
+    const completedNoReceipt = () => {
+      const task = completedTaskWithChannelReceipt(FOREIGN_CHANNEL_ID) as {
+        status: { message: { metadata: Record<string, unknown> } };
+      };
+      delete task.status.message.metadata[X402_METADATA_KEYS.RECEIPTS];
+      return task;
+    };
+    const { fetch } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(completedNoReceipt()),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+    await expect(
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      }),
+    ).rejects.toBeInstanceOf(X402ReconciliationError);
+  });
+
+  it('raises when a completed task omits both the x402 status and receipt', async () => {
+    // Once the merchant completes a task after receiving our voucher, the
+    // voucher may be spent. Trusting the remote status marker as the only
+    // settlement signal lets it suppress both keys and leave local state stale.
+    const { storage } = channelStorage();
+    const completedWithoutX402Metadata = () => {
+      const task = completedTaskWithChannelReceipt(FOREIGN_CHANNEL_ID) as {
+        status: { message: { metadata: Record<string, unknown> } };
+      };
+      delete task.status.message.metadata[X402_METADATA_KEYS.STATUS];
+      delete task.status.message.metadata[X402_METADATA_KEYS.RECEIPTS];
+      return task;
+    };
+    const { fetch } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(completedWithoutX402Metadata()),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+    const error = await client
+      .sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      })
+      .then(
+        () => undefined,
+        (reason: unknown) => reason as X402ReconciliationError,
+      );
+    expect(error).toBeInstanceOf(X402ReconciliationError);
+    expect(error!.reason).toBe('no-matching-receipt');
+  });
+
+  it('repairs a quarantined channel from the error recovery data', async () => {
+    // The full documented recovery loop: a settled payment loses its receipt
+    // (here: the merchant omits it), the channel is quarantined — and the
+    // error's own binding plus a receipt fetched later via the task id are
+    // sufficient to restore the exact post-attempt state and clear the
+    // marker, without the caller having retained anything else.
+    const { channels, storage } = channelStorage();
+    const completedNoReceipt = (requests: Array<{ body: unknown }>) => {
+      const task = completedTaskWithChannelReceipt(
+        signedChannelId(requests),
+      ) as { status: { message: { metadata: Record<string, unknown> } } };
+      delete task.status.message.metadata[X402_METADATA_KEYS.RECEIPTS];
+      return task;
+    };
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      (requests) => jsonRpcOk(completedNoReceipt(requests)),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+    const error = await client
+      .sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      })
+      .then(
+        () => undefined,
+        (reason: unknown) => reason as X402ReconciliationError,
+      );
+    expect(error!.reason).toBe('no-matching-receipt');
+    const key = signedChannelId(rpcRequests).toLowerCase();
+    expect(channels.get(key)).toMatchObject({
+      quarantineTaskId: 't1',
+      quarantineBinding: { channelId: signedChannelId(rpcRequests) },
+    });
+
+    // Later, the operator fetches the task (t1 = error.taskId) and gets the
+    // receipt the response omitted. The repair is the ordinary fold.
+    const recovered = completedTaskWithChannelReceipt(
+      signedChannelId(rpcRequests),
+    ) as Task;
+    const { applied } = await reconcileX402BatchSettlement(
+      (recovered.status.message!.metadata![
+        X402_METADATA_KEYS.RECEIPTS
+      ] as never[]) ?? [],
+      { storage, bindings: error!.binding! },
+    );
+    expect(applied).toEqual([signedChannelId(rpcRequests)]);
+    expect(channels.get(key)).toEqual({
+      balance: '5000',
+      totalClaimed: '0',
+      chargedCumulativeAmount: '1000',
+      lastAppliedAttemptId: expect.any(String) as unknown as string,
+    });
+  });
+
+  it('repairs a fresh-channel quarantine through a JSON round-tripping storage', async () => {
+    // Durable storages persist records with JSON.stringify (the peer's
+    // file-backed one does exactly that), which drops undefined-valued keys.
+    // The fresh-channel sentinel on the persisted recovery record must be
+    // the JSON-safe `null`, or the restart repair fails its required-key
+    // check for precisely the most important case: a quarantined opening
+    // deposit into a channel with no prior record.
+    const records = new Map<string, string>();
+    const storage = {
+      get: async (key: string) => {
+        const raw = records.get(key);
+        return raw === undefined
+          ? undefined
+          : (JSON.parse(raw) as Record<string, unknown>);
+      },
+      set: async (key: string, state: Record<string, unknown>) => {
+        records.set(key, JSON.stringify(state));
+      },
+      delete: async (key: string) => {
+        records.delete(key);
+      },
+    };
+    const completedNoReceipt = (requests: Array<{ body: unknown }>) => {
+      const task = completedTaskWithChannelReceipt(
+        signedChannelId(requests),
+      ) as { status: { message: { metadata: Record<string, unknown> } } };
+      delete task.status.message.metadata[X402_METADATA_KEYS.RECEIPTS];
+      return task;
+    };
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      (requests) => jsonRpcOk(completedNoReceipt(requests)),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+    await expect(
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      }),
+    ).rejects.toBeInstanceOf(X402ReconciliationError);
+
+    // "Restart": everything in memory is gone; the round-tripped marker is
+    // the only surviving recovery record.
+    const key = signedChannelId(rpcRequests).toLowerCase();
+    const marker = (await storage.get(key)) as {
+      quarantineTaskId?: string;
+      quarantineBinding?: Record<string, unknown>;
+    };
+    expect(marker.quarantineTaskId).toBe('t1');
+    expect(
+      Object.hasOwn(marker.quarantineBinding!, 'preAttemptState'),
+    ).toBe(true);
+    expect(marker.quarantineBinding!.preAttemptState).toBeNull();
+
+    const recovered = completedTaskWithChannelReceipt(
+      signedChannelId(rpcRequests),
+    ) as Task;
+    const { applied } = await reconcileX402BatchSettlement(
+      recovered.status.message!.metadata![
+        X402_METADATA_KEYS.RECEIPTS
+      ] as never[],
+      {
+        storage,
+        bindings: marker.quarantineBinding as never,
+      },
+    );
+    expect(applied).toEqual([signedChannelId(rpcRequests)]);
+    expect(await storage.get(key)).toEqual({
+      balance: '5000',
+      totalClaimed: '0',
+      chargedCumulativeAmount: '1000',
+      lastAppliedAttemptId: expect.any(String) as unknown as string,
+    });
+  });
+
+  it.each(['failed', 'canceled', 'rejected'])(
+    'raises when a terminal %s task omits x402 metadata',
+    async (state) => {
+      const { storage } = channelStorage();
+      const terminalWithoutX402Metadata = () => {
+        const task = completedTaskWithChannelReceipt(FOREIGN_CHANNEL_ID) as {
+          status: {
+            state: string;
+            message: { metadata: Record<string, unknown> };
+          };
+        };
+        task.status.state = state;
+        delete task.status.message.metadata[X402_METADATA_KEYS.STATUS];
+        delete task.status.message.metadata[X402_METADATA_KEYS.RECEIPTS];
+        return task;
+      };
+      const { fetch } = scriptedFetch([
+        () => jsonRpcOk(batchRequiredTask()),
+        () => jsonRpcOk(terminalWithoutX402Metadata()),
+      ]);
+      const client = new A2XClient(AGENT_URL, {
+        fetch,
+        x402: {
+          signer: TEST_ACCOUNT,
+          batchSettlement: { storage },
+          allowBatchSettlement: true,
+        },
+      });
+      const error = await client
+        .sendMessage({
+          message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+        })
+        .then(
+          () => undefined,
+          (reason: unknown) => reason as X402ReconciliationError,
+        );
+      expect(error).toBeInstanceOf(X402ReconciliationError);
+      expect(error!.reason).toBe('no-matching-receipt');
+      expect((error!.task as Task).status.state).toBe(state);
+    },
+  );
+
+  it('quarantines a submitted channel when the blocking response rejects', async () => {
+    const { storage } = channelStorage();
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => {
+        throw new Error('connection reset after submit');
+      },
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+    const error = await client
+      .sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      })
+      .then(
+        () => undefined,
+        (reason: unknown) => reason as X402ReconciliationError,
+      );
+    expect(error).toBeInstanceOf(X402ReconciliationError);
+    expect(error!.reason).toBe('ambiguous-response');
+    expect(error!.channelId).toBe(signedChannelId(rpcRequests));
+    expect(error!.task).toBeUndefined();
+    // With no terminal task, the error's own recovery data is the caller's
+    // only route to the receipt: the payment-required task was consumed
+    // internally, so its id was never observable elsewhere.
+    expect(error!.taskId).toBe('t1');
+    expect(error!.binding).toMatchObject({
+      channelId: signedChannelId(rpcRequests),
+      maxClaimableAmount: '1000',
+      depositAmount: '5000',
+    });
+    // `null`, not `undefined`: the fresh-channel sentinel must survive the
+    // JSON round trip durable storages and attempt stores perform.
+    expect(error!.binding!.preAttemptState).toBeNull();
+    expect((error as Error & { cause?: unknown }).cause).toEqual(
+      new Error('connection reset after submit'),
+    );
+  });
+
+  it('releases cleanly when follow-up serialization fails before the transport', async () => {
+    // `_formatParams` deep-clones via JSON.stringify before fetch ever runs,
+    // so a follow-up that cannot be encoded fails with the voucher still
+    // inside this process. That is the signed-but-not-submitted exit: no
+    // quarantine marker, no reconciliation error, and the lease must release
+    // clean so the very next call can pay through the same storage.
+    const { channels, storage } = channelStorage();
+    let toJsonCalls = 0;
+    const trap = {
+      // Serializes fine for the initial request (and for every call after
+      // the failure), but the *first follow-up* yields a BigInt, which
+      // JSON.stringify rejects before the request reaches the transport.
+      toJSON: () => (++toJsonCalls === 2 ? { boom: 1n } : { ok: true }),
+    };
+    let recorded: Array<{ body: unknown }> = [];
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(completedTaskWithChannelReceipt(signedChannelId(recorded))),
+    ]);
+    recorded = rpcRequests;
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+
+    const error = await client
+      .sendMessage({
+        message: {
+          messageId: 'm1',
+          role: 'user',
+          parts: [{ text: 'hi' }],
+          metadata: { trap },
+        },
+      })
+      .then(
+        () => undefined,
+        (reason: unknown) => reason,
+      );
+    expect(error).toBeInstanceOf(TypeError);
+    expect(error).not.toBeInstanceOf(X402ReconciliationError);
+    // Only the initial request reached the wire; nothing was quarantined.
+    expect(rpcRequests).toHaveLength(1);
+    expect(channels.size).toBe(0);
+
+    // The lease released clean: the next payment on the same storage signs,
+    // submits, and reconciles without any operator intervention.
+    const task = await client.sendMessage({
+      message: {
+        messageId: 'm2',
+        role: 'user',
+        parts: [{ text: 'hi again' }],
+        metadata: { trap },
+      },
+    });
+    expect(task.status.state).toBe('completed');
+    expect(
+      channels.get(signedChannelId(rpcRequests).toLowerCase()),
+    ).toMatchObject({ chargedCumulativeAmount: '1000' });
+  });
+
+  it('releases a stream cleanly when follow-up serialization fails before the transport', async () => {
+    const { channels, storage } = channelStorage();
+    let toJsonCalls = 0;
+    const trap = {
+      toJSON: () => (++toJsonCalls === 2 ? { boom: 1n } : { ok: true }),
+    };
+    const required = batchRequiredTask() as { status: { message: unknown } };
+    const { fetch, rpcRequests } = scriptedFetch([
+      () =>
+        batchSse([batchStatusEvent('input-required', required.status.message)]),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+
+    let error: unknown;
+    try {
+      for await (const _event of client.sendMessageStream({
+        message: {
+          messageId: 'm1',
+          role: 'user',
+          parts: [{ text: 'hi' }],
+          metadata: { trap },
+        },
+      })) {
+        // consume
+      }
+    } catch (reason) {
+      error = reason;
+    }
+    expect(error).toBeInstanceOf(TypeError);
+    expect(error).not.toBeInstanceOf(X402ReconciliationError);
+    expect(rpcRequests).toHaveLength(1);
+    expect(channels.size).toBe(0);
+  });
+
+  it('blocks a restarted payer while a submitted attempt is unresolved', async () => {
+    // The in-process lease dies with the process. The durable submitted
+    // record — written before the payload reaches fetch — is what stops a
+    // restarted payer from reading the unchanged pre-attempt channel and
+    // signing a second real deposit while the merchant may hold the first.
+    const { channels, storage } = channelStorage();
+    let submissionSeen!: () => void;
+    const submitted = new Promise<void>((resolve) => {
+      submissionSeen = resolve;
+    });
+    let call = 0;
+    const recorded: Array<{ body: unknown }> = [];
+    const dyingFetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/agent-card.json') || url.endsWith('/agent.json')) {
+        return agentCardResponse();
+      }
+      recorded.push({
+        body: init?.body ? JSON.parse(init.body as string) : undefined,
+      });
+      if (call++ === 0) return jsonRpcOk(batchRequiredTask());
+      // The process "dies" mid-flight: no response, and none of this
+      // client's catch/finally paths ever run again.
+      submissionSeen();
+      return new Promise<Response>(() => {});
+    }) as unknown as typeof globalThis.fetch;
+    const client1 = new A2XClient(AGENT_URL, {
+      fetch: dyingFetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+    const inFlight = client1.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    inFlight.catch(() => {});
+    await submitted;
+
+    const key = signedChannelId(recorded).toLowerCase();
+    expect(channels.get(key)).toMatchObject({
+      pendingAttempt: {
+        taskId: 't1',
+        binding: { channelId: signedChannelId(recorded) },
+      },
+    });
+
+    // "Restart": a new client reads the same durable records through a new
+    // storage object (fresh in-process lease), so only the persisted record
+    // stands between it and a duplicate deposit.
+    const restartedStorage = {
+      get: async (k: string) => channels.get(k),
+      set: async (k: string, state: Record<string, unknown>) => {
+        channels.set(k, state);
+      },
+      delete: async (k: string) => {
+        channels.delete(k);
+      },
+    };
+    const { fetch: fetch2, rpcRequests: requests2 } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+    ]);
+    const client2 = new A2XClient(AGENT_URL, {
+      fetch: fetch2,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage: restartedStorage },
+        allowBatchSettlement: true,
+      },
+    });
+    await expect(
+      client2.sendMessage({
+        message: { messageId: 'm2', role: 'user', parts: [{ text: 'again' }] },
+      }),
+    ).rejects.toBeInstanceOf(X402AttemptPendingError);
+    // Exactly one signed payload ever reached a transport.
+    expect(recorded).toHaveLength(2);
+    expect(requests2).toHaveLength(1);
+
+    // Repair: the record carries the binding and task id; the receipt
+    // fetched via tasks/get folds, clears the record, and payments resume.
+    const pending = (
+      channels.get(key) as {
+        pendingAttempt: {
+          attemptId: string;
+          taskId: string;
+          binding: Parameters<
+            typeof reconcileX402BatchSettlement
+          >[1]['bindings'];
+        };
+      }
+    ).pendingAttempt;
+    expect(pending.taskId).toBe('t1');
+    const recovered = completedTaskWithChannelReceipt(
+      signedChannelId(recorded),
+    ) as Task;
+    const { applied } = await reconcileX402BatchSettlement(
+      recovered.status.message!.metadata![
+        X402_METADATA_KEYS.RECEIPTS
+      ] as never[],
+      { storage: restartedStorage, bindings: pending.binding },
+    );
+    expect(applied).toEqual([signedChannelId(recorded)]);
+    expect(channels.get(key)).toEqual({
+      balance: '5000',
+      totalClaimed: '0',
+      chargedCumulativeAmount: '1000',
+      lastAppliedAttemptId: pending.attemptId,
+    });
+  });
+
+  it('quarantines a non-terminal unary response after batch submission', async () => {
+    const { channels, storage } = channelStorage();
+    const working = batchRequiredTask() as {
+      status: {
+        state: string;
+        message: { metadata: Record<string, unknown> };
+      };
+    };
+    working.status.state = 'working';
+    working.status.message.metadata = {
+      [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.VERIFIED,
+    };
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(working),
+    ]);
+    const seen: X402ReconciliationError[] = [];
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+        onReconcileError: (error) => {
+          seen.push(error);
+        },
+      },
+    });
+
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      configuration: { blocking: false },
+    });
+
+    expect(task.status.state).toBe('working');
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.reason).toBe('ambiguous-response');
+    expect(seen[0]!.channelId).toBe(signedChannelId(rpcRequests));
+    expect((seen[0]!.task as Task).status.state).toBe('working');
+    // The marker persists the recovery record too: after a restart the error
+    // object is gone, and this is what getTask + reconcile repair reads.
+    expect(
+      channels.get(signedChannelId(rpcRequests).toLowerCase()),
+    ).toMatchObject({
+      quarantineReason: 'ambiguous-response',
+      quarantineTaskId: 't1',
+      quarantineBinding: {
+        channelId: signedChannelId(rpcRequests),
+        maxClaimableAmount: '1000',
+        depositAmount: '5000',
+      },
+    });
+  });
+
+  it.each(['error', 'eof'])('quarantines a submitted channel on streaming %s', async (ending) => {
+    const { storage } = channelStorage();
+    const encoder = new TextEncoder();
+    const sse = (events: unknown[]) =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            for (const event of events) {
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({ jsonrpc: '2.0', id: 1, result: event })}\n\n`,
+                ),
+              );
+            }
+            controller.close();
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      );
+    const required = batchRequiredTask() as {
+      status: { message: unknown };
+    };
+    const requiredEvent = {
+      kind: 'status-update',
+      taskId: 't1',
+      contextId: 'c1',
+      status: {
+        state: 'input-required',
+        timestamp: new Date().toISOString(),
+        message: required.status.message,
+      },
+      final: false,
+    };
+
+    let call = 0;
+    const rpcRequests: Array<{ body: unknown }> = [];
+    const fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/agent-card.json') || url.endsWith('/agent.json')) {
+        return agentCardResponse();
+      }
+      rpcRequests.push({
+        body: init?.body ? JSON.parse(init.body as string) : undefined,
+      });
+      if (call++ === 0) return sse([requiredEvent]);
+      if (ending === 'error') throw new Error('stream reset after submit');
+      return sse([]);
+    }) as unknown as typeof globalThis.fetch;
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+
+    let error: X402ReconciliationError | undefined;
+    try {
+      for await (const _event of client.sendMessageStream({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      })) {
+        // consume
+      }
+    } catch (reason) {
+      error = reason as X402ReconciliationError;
+    }
+    expect(error).toBeInstanceOf(X402ReconciliationError);
+    expect(error!.reason).toBe('ambiguous-response');
+    expect(error!.channelId).toBe(signedChannelId(rpcRequests));
+  });
+
+  it('raises when the merchant inflates the cumulative beyond the signed ceiling', async () => {
+    // Reporting 9999 after a 1000 voucher would make the payer's next call
+    // sign a cumulative above what it ever authorized, plus a top-up to cover
+    // the gap — letting the merchant claim far more than the calls cost.
+    const { channels, storage } = channelStorage();
+    let recorded: Array<{ body: unknown }> = [];
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => {
+        const task = completedTaskWithChannelReceipt(
+          signedChannelId(recorded),
+        ) as {
+          status: { message: { metadata: Record<string, unknown> } };
+        };
+        const receipts = task.status.message.metadata[
+          X402_METADATA_KEYS.RECEIPTS
+        ] as Array<{ extra: { channelState: { chargedCumulativeAmount: string } } }>;
+        receipts[0]!.extra.channelState.chargedCumulativeAmount = '9999';
+        return jsonRpcOk(task);
+      },
+    ]);
+    recorded = rpcRequests;
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+    await expect(
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      }),
+    ).rejects.toBeInstanceOf(X402ReconciliationError);
+    // The inflated receipt is refused; only the quarantine marker lands.
+    expect(
+      channels.get(signedChannelId(rpcRequests).toLowerCase()),
+    ).toMatchObject({ quarantineReason: 'no-matching-receipt' });
+  });
+
+  it('throws X402ReconciliationError carrying the task when storage fails', async () => {
+    // A lost receipt is a funds-bearing failure with no self-heal path, so it
+    // must not pass silently — but the caller still keeps the result it paid
+    // for, on the error.
+    const { storage } = channelStorage();
+    let recorded: Array<{ body: unknown }> = [];
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(completedTaskWithChannelReceipt(signedChannelId(recorded))),
+    ]);
+    recorded = rpcRequests;
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: {
+          storage: {
+            ...storage,
+            set: async (key: string, state: Record<string, unknown>) => {
+              // The submitted-attempt record must land — the scenario under
+              // test is the reconcile fold's write failing, not a pre-submit
+              // abort.
+              if ('pendingAttempt' in state) return storage.set(key, state);
+              throw new Error('durable store unavailable');
+            },
+          },
+        },
+        allowBatchSettlement: true,
+      },
+    });
+
+    const error = await client
+      .sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      })
+      .then(
+        () => undefined,
+        (e: unknown) => e as X402ReconciliationError,
+      );
+    expect(error).toBeInstanceOf(X402ReconciliationError);
+    expect(error!.channelId).toBe(signedChannelId(rpcRequests));
+    expect((error!.task as Task).status.state).toBe('completed');
+    // The receipt is on the task, but only the binding — snapshot included —
+    // makes the repair fold computable once storage recovers.
+    expect(error!.taskId).toBe('t1');
+    expect(error!.binding).toMatchObject({
+      channelId: signedChannelId(rpcRequests),
+      maxClaimableAmount: '1000',
+      depositAmount: '5000',
+    });
+  });
+
+  it('routes a reconciliation failure to onReconcileError instead of throwing', async () => {
+    const { storage } = channelStorage();
+    let recorded: Array<{ body: unknown }> = [];
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(completedTaskWithChannelReceipt(signedChannelId(recorded))),
+    ]);
+    recorded = rpcRequests;
+    const seen: X402ReconciliationError[] = [];
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: {
+          storage: {
+            ...storage,
+            set: async (key: string, state: Record<string, unknown>) => {
+              // The submitted-attempt record must land — the scenario under
+              // test is the reconcile fold's write failing, not a pre-submit
+              // abort.
+              if ('pendingAttempt' in state) return storage.set(key, state);
+              throw new Error('durable store unavailable');
+            },
+          },
+        },
+        allowBatchSettlement: true,
+        onReconcileError: (error) => {
+          seen.push(error);
+        },
+      },
+    });
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    expect(task.status.state).toBe('completed');
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.channelId).toBe(signedChannelId(rpcRequests));
+  });
+
+  it('refuses an unfunded channel whose actual deposit exceeds maxAmount', async () => {
+    // The offer costs 1000 and passes a 1000 request cap, but opening its
+    // channel signs a 5x deposit authorization. The signing-time hook sees the
+    // actual 5000 deposit after storage reports the channel is unfunded.
+    const { storage } = channelStorage();
+    const { fetch } = scriptedFetch([() => jsonRpcOk(batchRequiredTask())]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+        maxAmount: 1000n,
+      },
+    });
+    await expect(
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      }),
+    ).rejects.toThrow(/deposit of 5000 exceeds maxAmount 1000/);
+  });
+
+  it('allows a funded channel to pay voucher-only below maxAmount', async () => {
+    // A static 5x pre-filter rejected this even though the peer reads storage,
+    // sees enough balance, and never invokes the deposit-sizing hook.
+    const { channels, storage } = channelStorage();
+    const fundedStorage = {
+      ...storage,
+      get: async (key: string) =>
+        channels.get(key) ?? {
+          balance: '5000',
+          chargedCumulativeAmount: '0',
+          totalClaimed: '0',
+        },
+    };
+    let recorded: Array<{ body: unknown }> = [];
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(completedTaskWithChannelReceipt(signedChannelId(recorded))),
+    ]);
+    recorded = rpcRequests;
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage: fundedStorage },
+        allowBatchSettlement: true,
+        maxAmount: 1000n,
+      },
+    });
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    expect(task.status.state).toBe('completed');
+
+    const followup = (
+      rpcRequests[1]!.body as {
+        params: { message: { metadata: Record<string, unknown> } };
+      }
+    ).params.message.metadata;
+    const payload = followup[X402_METADATA_KEYS.PAYLOAD] as {
+      payload: { type: string };
+    };
+    expect(payload.payload.type).toBe('voucher');
+  });
+
+  it('fails closed on an unusable depositMultiplier instead of throwing', async () => {
+    // `BigInt(5.5)` throws a RangeError. Raised inside offer filtering that
+    // would surface from `sendMessage` as an opaque runtime error rather than
+    // an x402 one — and a cap that cannot compute the deposit must not report
+    // it affordable. `@x402/evm` rejects any multiplier below 3 anyway, so
+    // excluding the offer loses nothing that could have been signed.
+    // 1 and 2 are integers but below `@x402/evm`'s floor of 3 — accepting
+    // them would pass the affordability filter only to fail during scheme
+    // construction with a generic error.
+    for (const depositMultiplier of [5.5, 0, -1, NaN, 1, 2]) {
+      const { storage } = channelStorage();
+      const { fetch } = scriptedFetch([() => jsonRpcOk(batchRequiredTask())]);
+      const client = new A2XClient(AGENT_URL, {
+        fetch,
+        x402: {
+          signer: TEST_ACCOUNT,
+          batchSettlement: { storage, depositPolicy: { depositMultiplier } },
+          allowBatchSettlement: true,
+          maxAmount: 1_000_000n,
+        },
+      });
+      await expect(
+        client.sendMessage({
+          message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+        }),
+        `depositMultiplier: ${depositMultiplier}`,
+      ).rejects.toThrow(X402NoSupportedRequirementError);
+    }
+  });
+
+  it('honors a valid custom depositMultiplier when capping', async () => {
+    // 1000 x 20 = 20000, over a 10000 cap.
+    const { storage } = channelStorage();
+    const { fetch } = scriptedFetch([() => jsonRpcOk(batchRequiredTask())]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage, depositPolicy: { depositMultiplier: 20 } },
+        allowBatchSettlement: true,
+        maxAmount: 10_000n,
+      },
+    });
+    await expect(
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      }),
+    ).rejects.toThrow(/deposit of 20000 exceeds maxAmount 10000/);
+  });
+
+  it('admits a depositStrategy result that fits maxAmount', async () => {
+    // The offer filter cannot predict a strategy's figure, so the cap is
+    // enforced where the deposit is actually sized. 1000 fits a 1000 cap.
+    const { storage } = channelStorage();
+    let recorded: Array<{ body: unknown }> = [];
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(completedTaskWithChannelReceipt(signedChannelId(recorded))),
+    ]);
+    recorded = rpcRequests;
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: {
+          storage,
+          depositStrategy: ({ minimumDepositAmount }) => minimumDepositAmount,
+        },
+        allowBatchSettlement: true,
+        maxAmount: 1000n,
+      },
+    });
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    expect(task.status.state).toBe('completed');
+  });
+
+  it('refuses a depositStrategy result that exceeds maxAmount', async () => {
+    // Without this the strategy would slip past a cap the option documents as
+    // always enforced, signing an authorization larger than the wallet agreed
+    // to. The offer filter cannot catch it — only the sizing site can.
+    const { storage } = channelStorage();
+    const { fetch } = scriptedFetch([() => jsonRpcOk(batchRequiredTask())]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: {
+          storage,
+          depositStrategy: () => '999999',
+        },
+        allowBatchSettlement: true,
+        maxAmount: 1000n,
+      },
+    });
+    await expect(
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      }),
+    ).rejects.toThrow(/exceeds maxAmount/);
+  });
+
+  it('caps the policy-computed deposit a strategy defers to with undefined', async () => {
+    // `undefined` means "use the policy amount" — that is the value that
+    // would be signed, so it is checked too. 5 x 1000 over a 2000 cap.
+    const { storage } = channelStorage();
+    const { fetch } = scriptedFetch([() => jsonRpcOk(batchRequiredTask())]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage, depositStrategy: () => undefined },
+        allowBatchSettlement: true,
+        maxAmount: 2000n,
+      },
+    });
+    await expect(
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      }),
+    ).rejects.toThrow(/exceeds maxAmount/);
+  });
+
+  it('admits the same offer once maxAmount covers the whole deposit', async () => {
+    const { storage } = channelStorage();
+    let recorded: Array<{ body: unknown }> = [];
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(batchRequiredTask()),
+      () => jsonRpcOk(completedTaskWithChannelReceipt(signedChannelId(recorded))),
+    ]);
+    recorded = rpcRequests;
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+        maxAmount: 5000n,
+      },
+    });
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    expect(task.status.state).toBe('completed');
+  });
+
+  it('leaves storage untouched when no batchSettlement is configured', async () => {
+    // A plain `exact` payer must never pay the cost of the batch peer, and
+    // receipts without channelState must not reach it.
+    const { fetch } = scriptedFetch([
+      () => jsonRpcOk(paymentRequiredTask()),
+      () => jsonRpcOk(completedTaskWithReceipt()),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: { signer: TEST_ACCOUNT },
+    });
+    const task = await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    expect(task.status.state).toBe('completed');
+  });
+});
+
 describe('A2XClient.sendMessageStream — native x402 dance', () => {
   function sseResponse(events: string[]): Response {
     const encoder = new TextEncoder();
@@ -774,5 +2911,688 @@ describe('A2XClient.sendMessageStream — native x402 dance', () => {
       events.push(ev);
     }
     expect(events).toHaveLength(1);
+  });
+});
+
+/**
+ * Storage semantics of `reconcileX402BatchSettlement` against the **real**
+ * `@x402/evm`, which merges onto the stored record and assigns each field only
+ * when the receipt still carries it. Asserting on the receipt handed to the
+ * peer cannot observe that, which is how a guard that merely deleted a
+ * distrusted `balance` looked correct while leaving storage unfunded.
+ */
+describe('reconcileX402BatchSettlement — storage after upstream merge', () => {
+  const CHANNEL = `0x${'cd'.repeat(32)}`;
+  const KEY = CHANNEL.toLowerCase();
+
+  function store() {
+    const channels = new Map<string, Record<string, unknown>>();
+    return {
+      channels,
+      storage: {
+        get: async (key: string) => channels.get(key),
+        set: async (key: string, state: Record<string, unknown>) => {
+          channels.set(key, state);
+        },
+        delete: async (key: string) => {
+          channels.delete(key);
+        },
+      },
+    };
+  }
+
+  function receipt(channelState: Record<string, unknown>) {
+    return {
+      success: true,
+      transaction: '',
+      network: 'eip155:84532',
+      extra: { channelState: { channelId: CHANNEL, ...channelState } },
+    };
+  }
+
+  const openingDeposit = {
+    channelId: CHANNEL,
+    maxClaimableAmount: '1000',
+    depositAmount: '5000',
+    // Fresh channel: nothing was stored when the attempt signed.
+    attemptId: 'attempt-101',
+    preAttemptState: undefined,
+  };
+
+  it('establishes the signed deposit when the merchant reports zero', async () => {
+    const { channels, storage } = store();
+    await reconcileX402BatchSettlement(
+      [
+        receipt({
+          chargedCumulativeAmount: '1000',
+          balance: '0',
+          totalClaimed: '0',
+        }),
+      ],
+      { storage, bindings: openingDeposit },
+    );
+    expect(channels.get(KEY)).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '1000',
+    });
+  });
+
+  it('establishes it when the merchant omits balance entirely', async () => {
+    // Deleting the key would leave the peer's merge with no balance at all —
+    // indistinguishable from an unfunded channel on the next call.
+    const { channels, storage } = store();
+    await reconcileX402BatchSettlement(
+      [receipt({ chargedCumulativeAmount: '1000', totalClaimed: '0' })],
+      { storage, bindings: openingDeposit },
+    );
+    expect(channels.get(KEY)).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '1000',
+    });
+  });
+
+  it('adds a top-up to the snapshot balance rather than keeping the stale figure', async () => {
+    const { channels, storage } = store();
+    await storage.set(KEY, { balance: '5000', chargedCumulativeAmount: '5000' });
+    await reconcileX402BatchSettlement(
+      [receipt({ chargedCumulativeAmount: '6000', balance: '5000' })],
+      {
+        storage,
+        bindings: {
+          channelId: CHANNEL,
+          maxClaimableAmount: '6000',
+          depositAmount: '5000',
+          attemptId: 'attempt-102',
+          preAttemptState: { balance: '5000', chargedCumulativeAmount: '5000' },
+        },
+      },
+    );
+    expect(channels.get(KEY)).toMatchObject({
+      balance: '10000',
+      chargedCumulativeAmount: '6000',
+    });
+  });
+
+  it('keeps an honest balance at or above the floor', async () => {
+    const { channels, storage } = store();
+    await reconcileX402BatchSettlement(
+      [receipt({ chargedCumulativeAmount: '1000', balance: '5000' })],
+      { storage, bindings: openingDeposit },
+    );
+    expect(channels.get(KEY)).toMatchObject({ balance: '5000' });
+  });
+
+  it('holds a voucher-only payment at the snapshot balance', async () => {
+    // No deposit signed, so the floor is the pre-attempt snapshot — the
+    // merchant cannot talk it down, and nothing new is established either.
+    const { channels, storage } = store();
+    await storage.set(KEY, { balance: '5000', chargedCumulativeAmount: '1000' });
+    await reconcileX402BatchSettlement(
+      [receipt({ chargedCumulativeAmount: '2000', balance: '0' })],
+      {
+        storage,
+        bindings: {
+          channelId: CHANNEL,
+          maxClaimableAmount: '2000',
+          attemptId: 'attempt-103',
+          preAttemptState: { balance: '5000', chargedCumulativeAmount: '1000' },
+        },
+      },
+    );
+    expect(channels.get(KEY)).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '2000',
+    });
+  });
+
+  it('does not reapply deposits or roll back on replayed receipts', async () => {
+    const { channels, storage } = store();
+    await storage.set(KEY, { balance: '5000', chargedCumulativeAmount: '2000' });
+    await reconcileX402BatchSettlement(
+      [receipt({ chargedCumulativeAmount: '1000', balance: '5000' })],
+      {
+        storage,
+        bindings: {
+          channelId: CHANNEL,
+          maxClaimableAmount: '1000',
+          depositAmount: '5000',
+          attemptId: 'attempt-104',
+          preAttemptState: undefined,
+        },
+      },
+    );
+    expect(channels.get(KEY)).toEqual({
+      balance: '5000',
+      chargedCumulativeAmount: '2000',
+    });
+
+    const opening = receipt({ chargedCumulativeAmount: '3000', balance: '5000' });
+    const fresh = store();
+    const binding = {
+      channelId: CHANNEL,
+      maxClaimableAmount: '3000',
+      depositAmount: '5000',
+      attemptId: 'attempt-105',
+      preAttemptState: undefined,
+    };
+    await reconcileX402BatchSettlement([opening], {
+      storage: fresh.storage,
+      bindings: binding,
+    });
+    await reconcileX402BatchSettlement([opening], {
+      storage: fresh.storage,
+      bindings: binding,
+    });
+    expect(fresh.channels.get(KEY)).toEqual({
+      balance: '5000',
+      chargedCumulativeAmount: '3000',
+      lastAppliedAttemptId: 'attempt-105',
+    });
+  });
+
+  it('does not roll back a newer zero-charge top-up on an equal-cumulative replay', async () => {
+    // The cumulative cannot order attempts: a metered call may charge zero,
+    // so a later top-up can leave it unchanged while moving real funds. The
+    // attempt stamp — not the cumulative — must reject the older replay, or
+    // the fold rewrites the balance to the old figure and the next payment
+    // authorizes another deposit on top of 30000 already funded.
+    const { channels, storage } = store();
+    const openingBinding = {
+      channelId: CHANNEL,
+      maxClaimableAmount: '500',
+      depositAmount: '5000',
+      attemptId: 'attempt-open',
+      preAttemptState: undefined,
+    };
+    const openingReceipt = receipt({
+      chargedCumulativeAmount: '500',
+      balance: '5000',
+    });
+    await expect(
+      reconcileX402BatchSettlement([openingReceipt], {
+        storage,
+        bindings: openingBinding,
+      }),
+    ).resolves.toEqual({ applied: [CHANNEL] });
+
+    // Zero-charge metered top-up: same cumulative, 25000 more funded.
+    const topUpReceipt = receipt({
+      chargedCumulativeAmount: '500',
+      balance: '30000',
+    });
+    topUpReceipt.extra!.chargedAmount = '0';
+    await expect(
+      reconcileX402BatchSettlement([topUpReceipt], {
+        storage,
+        bindings: {
+          channelId: CHANNEL,
+          maxClaimableAmount: '1500',
+          depositAmount: '25000',
+          attemptId: 'attempt-topup',
+          preAttemptState: {
+            balance: '5000',
+            chargedCumulativeAmount: '500',
+            lastAppliedAttemptId: 'attempt-open',
+          },
+        },
+      }),
+    ).resolves.toEqual({ applied: [CHANNEL] });
+    expect(channels.get(KEY)).toMatchObject({ balance: '30000' });
+
+    // Replaying the opening attempt passes the cumulative comparison (500 is
+    // not greater than 500) but fails the provenance check.
+    const { applied } = await reconcileX402BatchSettlement([openingReceipt], {
+      storage,
+      bindings: openingBinding,
+    });
+    expect(applied).toEqual([]);
+    expect(channels.get(KEY)).toEqual({
+      balance: '30000',
+      chargedCumulativeAmount: '500',
+      lastAppliedAttemptId: 'attempt-topup',
+    });
+  });
+
+  it('preserves another attempt\'s quarantine across an already-applied replay', async () => {
+    // A quarantined attempt leaves storage at its pre-attempt state, so the
+    // preceding attempt's receipt still folds (its own idempotent rewrite).
+    // That rewrite must not strip the newer attempt's marker: the merchant
+    // may hold that attempt's spendable voucher, and clearing its block
+    // would reopen the channel underneath it.
+    const { channels, storage } = store();
+    const bindingA = {
+      channelId: CHANNEL,
+      maxClaimableAmount: '500',
+      depositAmount: '5000',
+      attemptId: 'attempt-a',
+      preAttemptState: undefined,
+    };
+    const receiptA = receipt({
+      chargedCumulativeAmount: '500',
+      balance: '5000',
+    });
+    await reconcileX402BatchSettlement([receiptA], {
+      storage,
+      bindings: bindingA,
+    });
+
+    // Attempt B submitted and went ambiguous: the state machine persists its
+    // marker onto A's post-attempt record.
+    const bindingB = {
+      channelId: CHANNEL,
+      maxClaimableAmount: '1500',
+      depositAmount: '25000',
+      attemptId: 'attempt-b',
+      preAttemptState: {
+        balance: '5000',
+        chargedCumulativeAmount: '500',
+        lastAppliedAttemptId: 'attempt-a',
+      },
+    };
+    await storage.set(KEY, {
+      ...channels.get(KEY)!,
+      quarantinedAt: '2026-01-01T00:00:00.000Z',
+      quarantineReason: 'ambiguous-response',
+      quarantineBinding: bindingB,
+      quarantineTaskId: 't-b',
+    });
+
+    // Replaying A's already-applied receipt rewrites A's own state but must
+    // leave B's marker in place.
+    await expect(
+      reconcileX402BatchSettlement([receiptA], {
+        storage,
+        bindings: bindingA,
+      }),
+    ).resolves.toEqual({ applied: [CHANNEL] });
+    expect(channels.get(KEY)).toMatchObject({
+      balance: '5000',
+      quarantinedAt: '2026-01-01T00:00:00.000Z',
+      quarantineReason: 'ambiguous-response',
+      quarantineTaskId: 't-b',
+      quarantineBinding: { attemptId: 'attempt-b' },
+    });
+
+    // Only B's own repair clears B's marker.
+    const receiptB = receipt({
+      chargedCumulativeAmount: '500',
+      balance: '30000',
+    });
+    receiptB.extra!.chargedAmount = '0';
+    await expect(
+      reconcileX402BatchSettlement([receiptB], {
+        storage,
+        bindings: bindingB,
+      }),
+    ).resolves.toEqual({ applied: [CHANNEL] });
+    expect(channels.get(KEY)).toEqual({
+      balance: '30000',
+      chargedCumulativeAmount: '500',
+      lastAppliedAttemptId: 'attempt-b',
+    });
+  });
+
+  it('a retirement record blocks replays of the retired channel', async () => {
+    // The documented refund retirement: replace the record with a generation
+    // no payment attempt owns plus a quarantine marker. Merely keeping the
+    // old record (old stamp, zeroed balance) would NOT do — the old receipt
+    // still owns that stamp and its replay would rewrite the record,
+    // pre-refund balance included.
+    const { channels, storage } = store();
+    const openingBinding = {
+      channelId: CHANNEL,
+      maxClaimableAmount: '500',
+      depositAmount: '5000',
+      attemptId: 'attempt-old',
+      preAttemptState: undefined,
+    };
+    const openingReceipt = receipt({
+      chargedCumulativeAmount: '500',
+      balance: '5000',
+    });
+    await reconcileX402BatchSettlement([openingReceipt], {
+      storage,
+      bindings: openingBinding,
+    });
+
+    // Channel refunded and retired per the documented shape.
+    const retirement = {
+      lastAppliedAttemptId: 'retired:00000000-0000-4000-8000-000000000000',
+      quarantinedAt: '2026-01-01T00:00:00.000Z',
+      quarantineReason: 'retired',
+    };
+    await storage.set(KEY, retirement);
+
+    // The old attempt neither owns the retirement generation nor descends
+    // from it, so its replayed receipt cannot resurrect the channel.
+    const { applied } = await reconcileX402BatchSettlement([openingReceipt], {
+      storage,
+      bindings: openingBinding,
+    });
+    expect(applied).toEqual([]);
+    expect(channels.get(KEY)).toEqual(retirement);
+  });
+
+  it('repairs an opening deposit when a failed write persisted only the cumulative', async () => {
+    const channels = new Map<string, Record<string, unknown>>();
+    let writes = 0;
+    const storage = {
+      get: async (key: string) => channels.get(key),
+      set: async (key: string, state: Record<string, unknown>) => {
+        writes += 1;
+        if (writes === 1) {
+          channels.set(key, {
+            chargedCumulativeAmount: state.chargedCumulativeAmount,
+          });
+          throw new Error('partial write');
+        }
+        channels.set(key, state);
+      },
+      delete: async (key: string) => {
+        channels.delete(key);
+      },
+    };
+    const opening = receipt({
+      chargedCumulativeAmount: '1000',
+      balance: '0',
+    });
+
+    await expect(
+      reconcileX402BatchSettlement([opening], {
+        storage,
+        bindings: openingDeposit,
+      }),
+    ).rejects.toThrow(AggregateError);
+    expect(channels.get(KEY)).toEqual({ chargedCumulativeAmount: '1000' });
+
+    await expect(
+      reconcileX402BatchSettlement([opening], {
+        storage,
+        bindings: openingDeposit,
+      }),
+    ).resolves.toEqual({ applied: [CHANNEL] });
+    expect(channels.get(KEY)).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '1000',
+    });
+    expect(writes).toBe(2);
+  });
+
+  it('repairs a top-up when a failed write persisted only the new cumulative', async () => {
+    const channels = new Map<string, Record<string, unknown>>([
+      [KEY, { balance: '5000', chargedCumulativeAmount: '5000' }],
+    ]);
+    let writes = 0;
+    const storage = {
+      get: async (key: string) => channels.get(key),
+      set: async (key: string, state: Record<string, unknown>) => {
+        writes += 1;
+        if (writes === 1) {
+          channels.set(key, {
+            balance: '5000',
+            chargedCumulativeAmount: state.chargedCumulativeAmount,
+          });
+          throw new Error('partial write');
+        }
+        channels.set(key, state);
+      },
+      delete: async (key: string) => {
+        channels.delete(key);
+      },
+    };
+    const topUp = receipt({
+      chargedCumulativeAmount: '6000',
+      balance: '5000',
+    });
+    const binding = {
+      channelId: CHANNEL,
+      maxClaimableAmount: '6000',
+      depositAmount: '5000',
+      attemptId: 'attempt-106',
+      preAttemptState: { balance: '5000', chargedCumulativeAmount: '5000' },
+    };
+
+    await expect(
+      reconcileX402BatchSettlement([topUp], { storage, bindings: binding }),
+    ).rejects.toThrow(AggregateError);
+    expect(channels.get(KEY)).toEqual({
+      balance: '5000',
+      chargedCumulativeAmount: '6000',
+    });
+
+    // The half-written record holds the stale balance; only the snapshot in
+    // the binding can restore `previous balance + deposit` rather than the
+    // deposit alone.
+    await expect(
+      reconcileX402BatchSettlement([topUp], { storage, bindings: binding }),
+    ).resolves.toEqual({ applied: [CHANNEL] });
+    expect(channels.get(KEY)).toEqual({
+      balance: '10000',
+      chargedCumulativeAmount: '6000',
+      lastAppliedAttemptId: 'attempt-106',
+    });
+    expect(writes).toBe(2);
+  });
+
+  it('repairs a top-up when a failed write persisted only the balance', async () => {
+    // The reverse torn write: balance committed, cumulative lost. The floor
+    // comes from the snapshot, so the retry must not re-add the deposit to
+    // the already-bumped stored balance.
+    const channels = new Map<string, Record<string, unknown>>([
+      [KEY, { balance: '5000', chargedCumulativeAmount: '5000' }],
+    ]);
+    let writes = 0;
+    const storage = {
+      get: async (key: string) => channels.get(key),
+      set: async (key: string, state: Record<string, unknown>) => {
+        writes += 1;
+        if (writes === 1) {
+          channels.set(key, {
+            balance: state.balance,
+            chargedCumulativeAmount: '5000',
+          });
+          throw new Error('partial write');
+        }
+        channels.set(key, state);
+      },
+      delete: async (key: string) => {
+        channels.delete(key);
+      },
+    };
+    const topUp = receipt({
+      chargedCumulativeAmount: '6000',
+      balance: '5000',
+    });
+    const binding = {
+      channelId: CHANNEL,
+      maxClaimableAmount: '6000',
+      depositAmount: '5000',
+      attemptId: 'attempt-107',
+      preAttemptState: { balance: '5000', chargedCumulativeAmount: '5000' },
+    };
+
+    await expect(
+      reconcileX402BatchSettlement([topUp], { storage, bindings: binding }),
+    ).rejects.toThrow(AggregateError);
+    expect(channels.get(KEY)).toEqual({
+      balance: '10000',
+      chargedCumulativeAmount: '5000',
+    });
+
+    await expect(
+      reconcileX402BatchSettlement([topUp], { storage, bindings: binding }),
+    ).resolves.toEqual({ applied: [CHANNEL] });
+    expect(channels.get(KEY)).toEqual({
+      balance: '10000', // snapshot 5000 + deposit 5000 — not 15000
+      chargedCumulativeAmount: '6000',
+      lastAppliedAttemptId: 'attempt-107',
+    });
+    expect(writes).toBe(2);
+  });
+
+  it('repairs a voucher-only payment when a failed write dropped the balance', async () => {
+    // With no deposit in the binding, the old repair heuristic had nothing to
+    // detect an incomplete write with — a retry would report applied while
+    // the balance stayed lost, and the next call would open a fresh deposit.
+    // The snapshot makes the retry exact instead.
+    const channels = new Map<string, Record<string, unknown>>([
+      [KEY, { balance: '5000', chargedCumulativeAmount: '1000' }],
+    ]);
+    let writes = 0;
+    const storage = {
+      get: async (key: string) => channels.get(key),
+      set: async (key: string, state: Record<string, unknown>) => {
+        writes += 1;
+        if (writes === 1) {
+          channels.set(key, {
+            chargedCumulativeAmount: state.chargedCumulativeAmount,
+          });
+          throw new Error('partial write');
+        }
+        channels.set(key, state);
+      },
+      delete: async (key: string) => {
+        channels.delete(key);
+      },
+    };
+    const voucher = receipt({
+      chargedCumulativeAmount: '2000',
+      balance: '5000',
+    });
+    const binding = {
+      channelId: CHANNEL,
+      maxClaimableAmount: '2000',
+      attemptId: 'attempt-108',
+      preAttemptState: { balance: '5000', chargedCumulativeAmount: '1000' },
+    };
+
+    await expect(
+      reconcileX402BatchSettlement([voucher], { storage, bindings: binding }),
+    ).rejects.toThrow(AggregateError);
+    expect(channels.get(KEY)).toEqual({ chargedCumulativeAmount: '2000' });
+
+    await expect(
+      reconcileX402BatchSettlement([voucher], { storage, bindings: binding }),
+    ).resolves.toEqual({ applied: [CHANNEL] });
+    expect(channels.get(KEY)).toEqual({
+      balance: '5000',
+      chargedCumulativeAmount: '2000',
+      lastAppliedAttemptId: 'attempt-108',
+    });
+    expect(writes).toBe(2);
+  });
+
+  it('clears a quarantine marker on a successful fold', async () => {
+    // Re-running the attempt's binding + receipt is the documented repair
+    // path for a quarantined channel: an exact fold proves the state again,
+    // so the marker must not survive it.
+    const { channels, storage } = store();
+    await storage.set(KEY, {
+      balance: '5000',
+      chargedCumulativeAmount: '1000',
+      quarantinedAt: '2026-01-01T00:00:00.000Z',
+      quarantineReason: 'ambiguous-response',
+    });
+    await reconcileX402BatchSettlement(
+      [receipt({ chargedCumulativeAmount: '2000', balance: '5000' })],
+      {
+        storage,
+        bindings: {
+          channelId: CHANNEL,
+          maxClaimableAmount: '2000',
+          attemptId: 'attempt-109',
+          preAttemptState: { balance: '5000', chargedCumulativeAmount: '1000' },
+        },
+      },
+    );
+    expect(channels.get(KEY)).toEqual({
+      balance: '5000',
+      chargedCumulativeAmount: '2000',
+      lastAppliedAttemptId: 'attempt-109',
+    });
+  });
+
+  it('rejects a binding whose snapshot balance is unparseable', async () => {
+    // The snapshot is caller-trusted input; garbage there would silently
+    // corrupt the floor, so it fails loudly instead of degrading.
+    const { storage } = store();
+    await expect(
+      reconcileX402BatchSettlement(
+        [receipt({ chargedCumulativeAmount: '2000', balance: '5000' })],
+        {
+          storage,
+          bindings: {
+            channelId: CHANNEL,
+            maxClaimableAmount: '2000',
+            attemptId: 'attempt-110',
+            preAttemptState: { balance: 'not-a-number' },
+          },
+        },
+      ),
+    ).rejects.toThrow(/preAttemptState\.balance/);
+  });
+
+  it('serializes concurrent receipts so a delayed older write cannot roll back', async () => {
+    const channels = new Map<string, Record<string, unknown>>([
+      [KEY, { balance: '5000', chargedCumulativeAmount: '1000' }],
+    ]);
+    let newerWritten!: () => void;
+    const waitForNewer = new Promise<void>((resolve) => {
+      newerWritten = resolve;
+    });
+    const storage = {
+      get: async (key: string) => channels.get(key),
+      set: async (key: string, state: Record<string, unknown>) => {
+        if (state.chargedCumulativeAmount === '2000') {
+          // Without per-channel serialization, let the newer call finish
+          // first and this delayed write deterministically rolls it back.
+          await Promise.race([
+            waitForNewer,
+            new Promise<void>((resolve) => setTimeout(resolve, 25)),
+          ]);
+        }
+        channels.set(key, state);
+        if (state.chargedCumulativeAmount === '3000') newerWritten();
+      },
+      delete: async (key: string) => {
+        channels.delete(key);
+      },
+    };
+
+    await Promise.all([
+      reconcileX402BatchSettlement(
+        [receipt({ chargedCumulativeAmount: '2000', balance: '5000' })],
+        {
+          storage,
+          bindings: {
+            channelId: CHANNEL,
+            maxClaimableAmount: '2000',
+            attemptId: 'attempt-111',
+            preAttemptState: { balance: '5000', chargedCumulativeAmount: '1000' },
+          },
+        },
+      ),
+      reconcileX402BatchSettlement(
+        [receipt({ chargedCumulativeAmount: '3000', balance: '5000' })],
+        {
+          storage,
+          bindings: {
+            channelId: CHANNEL,
+            maxClaimableAmount: '3000',
+            attemptId: 'attempt-112',
+            preAttemptState: {
+              balance: '5000',
+              chargedCumulativeAmount: '2000',
+              lastAppliedAttemptId: 'attempt-111',
+            },
+          },
+        },
+      ),
+    ]);
+
+    expect(channels.get(KEY)).toMatchObject({
+      balance: '5000',
+      chargedCumulativeAmount: '3000',
+    });
   });
 });

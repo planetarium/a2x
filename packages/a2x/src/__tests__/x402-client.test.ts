@@ -17,6 +17,7 @@ import {
   getX402Status,
   rejectX402Payment,
   signX402Payment,
+  type X402ClientChannelStorage,
 } from '../x402/client.js';
 import type {
   X402PaymentRequiredResponse,
@@ -67,6 +68,44 @@ const BASE_ACCEPT = {
   asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
   extra: { name: 'USDC', version: '2' },
 };
+
+const BATCH_ACCEPT = {
+  scheme: 'batch-settlement',
+  network: 'eip155:84532',
+  amount: '3000',
+  asset: BASE_ACCEPT.asset,
+  payTo: PAY_TO,
+  maxTimeoutSeconds: 300,
+  extra: {
+    name: 'USDC',
+    version: '2',
+    receiverAuthorizer: '0x5555555555555555555555555555555555555555',
+  },
+};
+
+function batchPaymentRequiredTask(): Task {
+  return {
+    id: 't-batch',
+    contextId: 'c-batch',
+    status: {
+      state: TaskState.INPUT_REQUIRED,
+      timestamp: new Date().toISOString(),
+      message: {
+        messageId: 'msg-batch',
+        role: 'agent',
+        parts: [{ text: 'pay from the channel' }],
+        metadata: {
+          [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REQUIRED,
+          [X402_METADATA_KEYS.REQUIRED]: {
+            x402Version: 2,
+            resource: { url: 'https://example.com/protected' },
+            accepts: [BATCH_ACCEPT],
+          },
+        },
+      },
+    },
+  };
+}
 
 describe('getX402PaymentRequirements', () => {
   it('returns the X402PaymentRequiredResponse when the task is in payment-required', () => {
@@ -291,6 +330,67 @@ describe('signX402Payment', () => {
     expect(auth.witness.facilitator.toLowerCase()).toBe(facilitatorAddress);
     // The field names the SDK's validation and payer backfill depend on.
     expect(signed.payload).toHaveProperty('x402Version', 2);
+  });
+
+  it('binds the exact channel snapshot used by the real batch signer', async () => {
+    // The peer reads storage to choose the voucher base. A later read is not
+    // evidence of what was signed: another process may have changed the
+    // record between the two calls.
+    const signingSnapshot = {
+      balance: '5000',
+      chargedCumulativeAmount: '1000',
+    };
+    const laterState = {
+      balance: '0',
+      chargedCumulativeAmount: '1000',
+    };
+    let reads = 0;
+    const storage: X402ClientChannelStorage = {
+      get: async () => (++reads === 1 ? signingSnapshot : laterState),
+      set: async () => {},
+      delete: async () => {},
+    };
+
+    const signed = await signX402Payment(batchPaymentRequiredTask(), {
+      signer: TEST_ACCOUNT,
+      allowBatchSettlement: true,
+      batchSettlement: { storage },
+    });
+
+    expect(signed.batch?.preAttemptState).toEqual(signingSnapshot);
+  });
+
+  it('isolates the signing snapshot from depositStrategy mutation', async () => {
+    // Upstream exposes its clientContext to the strategy. If that object is
+    // the storage-owned record, a strategy can mutate the reconciliation
+    // basis after the signer has already computed its cumulative and balance.
+    const storedState = {
+      balance: '5000',
+      chargedCumulativeAmount: '5000',
+    };
+    const expectedSnapshot = { ...storedState };
+    const storage: X402ClientChannelStorage = {
+      get: async () => storedState,
+      set: async () => {},
+      delete: async () => {},
+    };
+
+    const signed = await signX402Payment(batchPaymentRequiredTask(), {
+      signer: privateKeyToAccount(
+        '0x1211111111111111111111111111111111111111111111111111111111111111',
+      ),
+      allowBatchSettlement: true,
+      batchSettlement: {
+        storage,
+        depositStrategy: (context) => {
+          context.clientContext.balance = '0';
+          return '5000';
+        },
+      },
+    });
+
+    expect(storedState).toEqual(expectedSnapshot);
+    expect(signed.batch?.preAttemptState).toEqual(expectedSnapshot);
   });
 
   it('throws X402InvalidVersionError when the merchant claims a non-1 x402Version (spec §6/§9)', async () => {

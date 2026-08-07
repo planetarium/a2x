@@ -218,6 +218,8 @@ export interface X402FacilitatorSettleResponse {
   errorReason?: string;
   errorMessage?: string;
   amount?: string;
+  /** Scheme-specific settlement state (e.g. `batch-settlement`'s `channelState`). */
+  extra?: Record<string, unknown>;
   [key: string]: unknown;
 }
 
@@ -227,7 +229,17 @@ export interface X402FacilitatorSettleResponse {
  */
 export interface X402SettleResponse {
   success: boolean;
-  /** Transaction hash on success, empty string on failure. */
+  /**
+   * Transaction hash, or the empty string when no transaction was broadcast.
+   *
+   * Empty on failure — and also on a **successful** settlement under a scheme
+   * that does not touch the chain per call. `batch-settlement` vouchers settle
+   * off-chain against a funded channel and upstream returns
+   * `{ success: true, transaction: '' }` for them; the redeeming transaction
+   * happens later, out of band. So an empty `transaction` never by itself means
+   * the payment failed — branch on `success`, and read `extra` for what the
+   * scheme recorded instead.
+   */
   transaction: string;
   /** Network the settlement occurred on (bare name for V1, CAIP-2 for V2). */
   network: string;
@@ -250,6 +262,21 @@ export interface X402SettleResponse {
    * where the settled amount can be less than the signed authorization.
    */
   amount?: string;
+  /**
+   * Scheme-specific settlement fields, forwarded verbatim from the
+   * facilitator's response. **Optional** — `exact` and `upto` never populate
+   * it.
+   *
+   * Stateful schemes carry their post-settlement state here, and the payer
+   * needs it to stay in sync. `batch-settlement` reports
+   * `extra.channelState` — the channel's balance, total claimed, and charged
+   * cumulative amount — which is the only way a payer learns that its voucher
+   * was accepted and what the next one must be cumulative over. Losing it
+   * would make the payer re-sign an identical voucher (and re-deposit) on
+   * every call, so the receipt passes it through untouched rather than
+   * trimming to the fields a2x itself understands.
+   */
+  extra?: Record<string, unknown>;
 }
 
 /**
@@ -330,9 +357,16 @@ export interface X402Accept {
    * throws, because neither the signing runtime nor the reference facilitator
    * has a V1 path for it.
    *
+   * `"batch-settlement"` pays out of a pre-funded on-chain channel: the payer
+   * deposits once, then each call carries only an off-chain cumulative
+   * voucher, and the merchant redeems many of them in one transaction out of
+   * band. Also **x402 V2 only**. Offerings must set `extra.receiverAuthorizer`
+   * (the channel id derives from it). Its voucher settlements succeed with an
+   * empty `transaction` and report channel state in the receipt's `extra`.
+   *
    * Other scheme strings pass through the pipeline untouched — payload-shape
    * validation for them is up to the caller (override
    * `BaseX402Context.validatePayloadShape`).
    */
-  scheme?: 'exact' | 'upto' | (string & {});
+  scheme?: 'exact' | 'upto' | 'batch-settlement' | (string & {});
 }

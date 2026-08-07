@@ -9,6 +9,7 @@ import type { Message } from '../types/common.js';
 import {
   X402_ERROR_CODES,
   X402_EXTENSION_URI,
+  X402_FOUNDATION_EXTENSION_URI,
   X402_METADATA_KEYS,
   X402_PAYMENT_STATUS,
 } from '../x402/constants.js';
@@ -33,6 +34,16 @@ const ACCEPT: X402Accept = {
   payTo: '0x2222222222222222222222222222222222222222',
   resource: 'https://api.example.com/premium',
   description: 'Premium agent access',
+};
+
+const BATCH_ACCEPT: X402Accept = {
+  ...ACCEPT,
+  scheme: 'batch-settlement',
+  extra: {
+    name: 'USDC',
+    version: '2',
+    receiverAuthorizer: '0x3333333333333333333333333333333333333333',
+  },
 };
 
 function buildSubmittedMessage(overrides: {
@@ -72,6 +83,70 @@ function buildSubmittedMessage(overrides: {
 
 function buildPlainMessage(): Message {
   return { messageId: 'm0', role: 'user', parts: [{ text: 'hi' }] };
+}
+
+function buildBatchSubmittedMessage(
+  type: 'voucher' | 'deposit',
+  overrides: { omitVoucher?: boolean } = {},
+): Message {
+  const inner: Record<string, unknown> = {
+    type,
+    channelConfig: {
+      payer: '0x1234567890123456789012345678901234567890',
+      payerAuthorizer: '0x1234567890123456789012345678901234567890',
+      receiver: BATCH_ACCEPT.payTo,
+      receiverAuthorizer: BATCH_ACCEPT.extra!.receiverAuthorizer,
+      token: BATCH_ACCEPT.asset,
+      withdrawDelay: 3600,
+      salt: `0x${'00'.repeat(32)}`,
+    },
+    ...(!overrides.omitVoucher
+      ? {
+          voucher: {
+            channelId: `0x${'cd'.repeat(32)}`,
+            maxClaimableAmount: BATCH_ACCEPT.amount,
+            signature: '0xabc',
+          },
+        }
+      : {}),
+    ...(type === 'deposit'
+      ? {
+          deposit: {
+            amount: '50000',
+            authorization: {
+              erc3009Authorization: {
+                validAfter: '0',
+                validBefore: '9999999999',
+                salt: `0x${'11'.repeat(32)}`,
+                signature: '0xdef',
+              },
+            },
+          },
+        }
+      : {}),
+  };
+  const payload: X402PaymentPayload = {
+    x402Version: 2,
+    accepted: {
+      scheme: 'batch-settlement',
+      network: 'eip155:84532',
+      asset: BATCH_ACCEPT.asset,
+      amount: BATCH_ACCEPT.amount,
+      payTo: BATCH_ACCEPT.payTo,
+      maxTimeoutSeconds: 300,
+      extra: BATCH_ACCEPT.extra,
+    },
+    payload: inner,
+  };
+  return {
+    messageId: 'm-batch',
+    role: 'user',
+    parts: [],
+    metadata: {
+      [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.SUBMITTED,
+      [X402_METADATA_KEYS.PAYLOAD]: payload,
+    },
+  };
 }
 
 function makeMockFacilitator(): X402Facilitator {
@@ -314,6 +389,100 @@ describe('X402Context.classify', () => {
     }
   });
 
+  it.each(['voucher', 'deposit'] as const)(
+    'accepts a well-formed batch-settlement %s before resource-server verification',
+    async (type) => {
+      const ctx = new X402Context({
+        x402Version: 2,
+        facilitator: makeMockFacilitator(),
+      });
+      await drain(
+        ctx.requestPayment(
+          {
+            taskId: 't1',
+            activatedExtensions: [X402_FOUNDATION_EXTENSION_URI],
+          },
+          { accepts: [BATCH_ACCEPT] },
+        ),
+      );
+      const result = await ctx.classify({
+        taskId: 't1',
+        message: buildBatchSubmittedMessage(type),
+      });
+      expect(result.kind).toBe('valid');
+    },
+  );
+
+  it('attributes a batch settlement to channelConfig.payer, ignoring decoy authorization', async () => {
+    const payer = '0x1234567890123456789012345678901234567890';
+    const message = buildBatchSubmittedMessage('voucher');
+    const payload = message.metadata![
+      X402_METADATA_KEYS.PAYLOAD
+    ] as X402PaymentPayload;
+    (payload.payload as Record<string, unknown>).authorization = {
+      from: '0xbad0000000000000000000000000000000000000',
+    };
+    const facilitator: X402Facilitator = {
+      verify: vi.fn(async () => ({ isValid: true } as Awaited<ReturnType<X402Facilitator['verify']>>)),
+      settle: vi.fn(async () => ({
+        success: true,
+        transaction: '',
+        network: 'eip155:84532',
+      } as Awaited<ReturnType<X402Facilitator['settle']>>)),
+    };
+    const ctx = new X402Context({ x402Version: 2, facilitator });
+    await drain(
+      ctx.requestPayment(
+        {
+          taskId: 't1',
+          activatedExtensions: [X402_FOUNDATION_EXTENSION_URI],
+        },
+        { accepts: [BATCH_ACCEPT] },
+      ),
+    );
+    const classified = await ctx.classify({ taskId: 't1', message });
+    if (classified.kind !== 'valid') throw new Error('expected valid');
+    expect(classified.submission.payer).toBe(payer);
+    const receipt = await ctx.settle({ taskId: 't1' }, classified);
+    expect(receipt.payer).toBe(payer);
+    expect((await ctx.store.get('t1'))?.receipt?.payer).toBe(payer);
+  });
+
+  it('rejects a malformed batch-settlement payload before verification', async () => {
+    const ctx = new X402Context({
+      x402Version: 2,
+      facilitator: makeMockFacilitator(),
+    });
+    await drain(
+      ctx.requestPayment(
+        {
+          taskId: 't1',
+          activatedExtensions: [X402_FOUNDATION_EXTENSION_URI],
+        },
+        { accepts: [BATCH_ACCEPT] },
+      ),
+    );
+    const result = await ctx.classify({
+      taskId: 't1',
+      message: buildBatchSubmittedMessage('voucher', { omitVoucher: true }),
+    });
+    expect(result.kind).toBe('invalid-shape');
+  });
+
+  it('rejects a batch-settlement offering under V1 before storing it', async () => {
+    const ctx = new X402Context({ facilitator: makeMockFacilitator() });
+    const request = async () => {
+      await drain(
+        ctx.requestPayment(
+          { taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] },
+          { accepts: [BATCH_ACCEPT] },
+        ),
+      );
+    };
+    await expect(request()).rejects.toThrow(/x402 V2 only/);
+    expect(await ctx.store.get('t1')).toBeUndefined();
+  });
+
   it('throws when ctx.taskId is missing on a submitted message', async () => {
     const ctx = new X402Context({ facilitator: makeMockFacilitator() });
     await expect(
@@ -420,6 +589,129 @@ describe('X402Context.verify and X402Context.settle', () => {
     if (classified.kind !== 'valid') throw new Error('expected valid');
     const receipt = await ctx.settle({ taskId: 't1' }, classified);
     expect(receipt.amount).toBe('2500');
+  });
+
+  it('settle forwards scheme-specific extra onto the receipt', async () => {
+    // `batch-settlement` reports the channel's post-settlement state here, and
+    // it is the payer's only way to advance its cumulative voucher. Trimming
+    // the receipt to a2x-known fields would make every subsequent call re-sign
+    // an identical voucher and re-deposit.
+    const channelState = {
+      channelId: `0x${'cd'.repeat(32)}`,
+      balance: '15000',
+      totalClaimed: '0',
+      chargedCumulativeAmount: '3000',
+    };
+    const facilitator: X402Facilitator = {
+      verify: vi.fn(async () => ({ isValid: true } as Awaited<ReturnType<X402Facilitator['verify']>>)),
+      settle: vi.fn(async () => ({
+        success: true,
+        // A voucher settles off-chain against a funded channel — upstream
+        // returns success with an empty transaction, and that must not be
+        // read as failure.
+        transaction: '',
+        network: 'base-sepolia',
+        extra: { channelState, chargedAmount: '3000' },
+      } as Awaited<ReturnType<X402Facilitator['settle']>>)),
+    };
+    const ctx = new X402Context({ facilitator });
+    await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
+    const classified = await ctx.classify({
+      taskId: 't1',
+      message: buildSubmittedMessage(),
+    });
+    if (classified.kind !== 'valid') throw new Error('expected valid');
+    const receipt = await ctx.settle({ taskId: 't1' }, classified);
+    expect(receipt.success).toBe(true);
+    expect(receipt.transaction).toBe('');
+    expect(receipt.extra).toEqual({ channelState, chargedAmount: '3000' });
+    // Success with no transaction still records a completed entry.
+    const stored = await ctx.store.get('t1');
+    expect(stored?.status).toBe('completed');
+    expect(stored?.receipt?.extra).toEqual({
+      channelState,
+      chargedAmount: '3000',
+    });
+  });
+
+  it.each([
+    ['voucher', ''],
+    ['deposit', '50000'],
+  ] as const)(
+    'uses batch chargedAmount as the per-call settled amount for a %s payload',
+    async (type, upstreamAmount) => {
+      // Upstream uses `amount` for the immediate transfer: empty for an
+      // off-chain voucher and the funding amount for a deposit. The actual
+      // service charge promised by X402SettleResponse.amount is reported in
+      // the batch-specific chargedAmount field.
+      const channelState = {
+        channelId: `0x${'cd'.repeat(32)}`,
+        balance: '50000',
+        totalClaimed: '0',
+        chargedCumulativeAmount: '3000',
+      };
+      const facilitator: X402Facilitator = {
+        verify: vi.fn(async () => ({ isValid: true } as Awaited<ReturnType<X402Facilitator['verify']>>)),
+        settle: vi.fn(async () => ({
+          success: true,
+          transaction: '',
+          network: 'eip155:84532',
+          amount: upstreamAmount,
+          extra: { channelState, chargedAmount: '3000' },
+        } as Awaited<ReturnType<X402Facilitator['settle']>>)),
+      };
+      const ctx = new X402Context({ x402Version: 2, facilitator });
+      await drain(
+        ctx.requestPayment(
+          {
+            taskId: 't-batch-amount',
+            activatedExtensions: [X402_FOUNDATION_EXTENSION_URI],
+          },
+          { accepts: [BATCH_ACCEPT] },
+        ),
+      );
+      const classified = await ctx.classify({
+        taskId: 't-batch-amount',
+        message: buildBatchSubmittedMessage(type),
+      });
+      if (classified.kind !== 'valid') throw new Error('expected valid');
+
+      const receipt = await ctx.settle(
+        { taskId: 't-batch-amount' },
+        classified,
+      );
+
+      expect(receipt.amount).toBe('3000');
+      expect((await ctx.store.get('t-batch-amount'))?.receipt?.amount).toBe(
+        '3000',
+      );
+    },
+  );
+
+  it('settle omits extra when the facilitator sends none, or sends a non-object', async () => {
+    // `exact` / `upto` never populate it, and the facilitator response is
+    // remote-controlled — an array or scalar must not reach the receipt typed
+    // as a record.
+    for (const extra of [undefined, 'nope', ['a'], 42]) {
+      const facilitator: X402Facilitator = {
+        verify: vi.fn(async () => ({ isValid: true } as Awaited<ReturnType<X402Facilitator['verify']>>)),
+        settle: vi.fn(async () => ({
+          success: true,
+          transaction: '0xtx',
+          network: 'base-sepolia',
+          extra,
+        } as unknown as Awaited<ReturnType<X402Facilitator['settle']>>)),
+      };
+      const ctx = new X402Context({ facilitator });
+      await drain(ctx.requestPayment({ taskId: 't1', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
+      const classified = await ctx.classify({
+        taskId: 't1',
+        message: buildSubmittedMessage(),
+      });
+      if (classified.kind !== 'valid') throw new Error('expected valid');
+      const receipt = await ctx.settle({ taskId: 't1' }, classified);
+      expect('extra' in receipt).toBe(false);
+    }
   });
 
   it('settle preserves a zero amount — "0" is a report, not an omission', async () => {

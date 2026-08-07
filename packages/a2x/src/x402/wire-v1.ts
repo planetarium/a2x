@@ -21,17 +21,16 @@ export function encodeRequirementV1(
   accept: X402Accept,
 ): X402PaymentRequirementsV1 {
   const scheme = accept.scheme ?? 'exact';
-  // `upto` exists only in x402 V2. `@x402/core`'s client has no `registerV1`
-  // path for it, and the reference facilitator's Permit2 settlement reads V2
-  // fields (`accepted.scheme`, `requirements.amount`), so a V1 upto offering
-  // can be neither signed nor settled. Refusing it here — at the encode step,
-  // before `requestPayment` persists an entry — turns a silent dead end into a
-  // configuration error the operator can act on.
-  if (scheme === 'upto') {
+  // `upto` and `batch-settlement` exist only in x402 V2. `@x402/evm` has no
+  // `registerV1` path for either, and their settlement lifecycles read V2
+  // fields (`accepted.scheme`, `requirements.amount`), so advertising one in
+  // V1 can only dead-end. Refusing it here — before `requestPayment` persists
+  // an entry — turns that into a configuration error the operator can act on.
+  if (scheme === 'upto' || scheme === 'batch-settlement') {
     throw new Error(
-      'encodeRequirementV1: the "upto" scheme is x402 V2 only and cannot be encoded ' +
+      `encodeRequirementV1: the "${scheme}" scheme is x402 V2 only and cannot be encoded ` +
         'under x402Version 1. Configure the server with `new X402Context({ x402Version: 2 })` ' +
-        'to offer usage-based payments.',
+        `to offer ${scheme} payments.`,
     );
   }
   return {
