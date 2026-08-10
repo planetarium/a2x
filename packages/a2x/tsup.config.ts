@@ -20,6 +20,7 @@ export default defineConfig([
       'provider/openai/index': 'src/provider/openai/index.ts',
       'provider/google/index': 'src/provider/google/index.ts',
       'x402/index': 'src/x402/index.ts',
+      'x402-merchant/index': 'src/x402-merchant/index.ts',
     },
     format: ['esm', 'cjs'],
     dts: true,

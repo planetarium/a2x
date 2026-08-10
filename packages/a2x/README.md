@@ -14,7 +14,7 @@ A self-contained TypeScript SDK for building [A2A (Agent-to-Agent)](https://a2a-
 - **SSE streaming** — First-class `message/stream` support via Server-Sent Events.
 - **Multi-modal artifacts** — Agents can yield `text`, `file`, and `data` events; the default executor maps each into A2A `TextPart` / `FilePart` / `DataPart` artifacts.
 - **Built-in auth** — API Key, Bearer, OAuth 2.0 (Authorization Code, Client Credentials, Device Code), OpenID Connect, and Mutual TLS.
-- **x402 payments** — Charge per call with on-chain cryptocurrency payments, supporting both x402 protocol versions (legacy V1 and the [x402 Foundation](https://github.com/x402-foundation/x402) V2 transport) — each deployment speaks one, V1 by default, V2 via `new X402Context({ x402Version: 2 })`. Express payment gating inline in `agent.run()` with `x402RequestPayment()`; the agent calls `facilitator.verify()` and `facilitator.settle()` directly using the SDK's stateless helpers — no SDK-owned flow, full control over what runs between verify and settle.
+- **x402 payments** — Charge per call with on-chain cryptocurrency payments, supporting both x402 protocol versions (legacy V1 and the [x402 Foundation](https://github.com/x402-foundation/x402) V2 transport) — each deployment speaks one, V1 by default, V2 via `new X402Context({ x402Version: 2 })`. Compose the `@a2x/sdk/x402` mechanics directly, or opt into the host-neutral `@a2x/sdk/x402-merchant` gate for shared pricing, metering, frozen terms, and replay protection.
 - **Usage-based payments** — Native support for the x402 V2 `upto` scheme: the payer signs a Permit2 authorization up to a maximum, the agent meters the work and settles only the actual charge with `settle(ctx, classified, { amountAtomic })`, clamped SDK-side so a metering bug can never overcharge. Bill by LLM tokens instead of a flat fee.
 - **Batched payments** — Native payer support for the x402 V2 `batch-settlement` scheme: fund an on-chain channel once, then pay per call with an off-chain voucher. Takes settlement out of the response critical path and amortizes gas across many calls — the difference between viable and not for sub-cent metered pricing. Opt-in via `x402: { signer, batchSettlement: { storage }, allowBatchSettlement: true }`.
 - **Zero runtime dependencies** — Core module uses only Node.js built-in APIs.
@@ -397,6 +397,8 @@ const agent = new A2XServer({ taskStore, executor })
 
 For deployments that need full bespoke control (multiple facilitators, custom store routing, inserting logic mid-validation), the lower-level stateless helpers `X402Context` is built on (`parseX402PaymentSubmission`, `pickX402Requirement`, `validateX402PayloadShape`, `buildX402Payment*Metadata`, …) remain exported.
 
+For a reusable merchant flow, import `MerchantGate` from `@a2x/sdk/x402-merchant`. It returns `request-payment`, `refuse`, and `proceed` outcomes instead of SDK events, so a `BaseAgent.run()` generator and a custom executor can render the same policy differently. Rates, paid/free selection, exact settlement timing, and missing-usage behavior remain required host configuration. See the [x402 guide](./docs/guides/advanced/x402-payments.md#shared-merchant-policy-gate) for the complete example.
+
 Client (unchanged):
 
 ```typescript
@@ -441,6 +443,7 @@ a2xServerV03.getAgentCard(); // v0.3 card
 | `@a2x/sdk/openai` | `OpenAIProvider` |
 | `@a2x/sdk/google` | `GoogleProvider` |
 | `@a2x/sdk/x402` | x402 payments, V1 + V2 (server + client) |
+| `@a2x/sdk/x402-merchant` | Optional outcome-based merchant gate, pricing, metering, and frozen terms |
 
 ## Requirements
 

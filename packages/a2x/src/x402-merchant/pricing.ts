@@ -1,0 +1,140 @@
+import type { X402Accept } from '../x402/types.js';
+import type {
+  MerchantDetailedRates,
+  MerchantOffer,
+  MerchantPricing,
+  MerchantTotalRate,
+  MerchantUptoPricing,
+  MeterableUsage,
+  MeteredCharge,
+} from './types.js';
+
+const DECIMAL_ATOMIC = /^\d+$/;
+
+function atomic(value: string, field: string): bigint {
+  if (!DECIMAL_ATOMIC.test(value)) {
+    throw new Error(`${field} must be a decimal integer string, got ${JSON.stringify(value)}`);
+  }
+  return BigInt(value);
+}
+
+function tokenCount(value: number): bigint | undefined {
+  if (!Number.isSafeInteger(value) || value < 0) return undefined;
+  return BigInt(value);
+}
+
+function isDetailedRates(rates: MerchantUptoPricing['rates']): rates is MerchantDetailedRates {
+  return 'inputPerMillion' in rates;
+}
+
+function isTotalRate(rates: MerchantUptoPricing['rates']): rates is MerchantTotalRate {
+  return 'totalPerThousand' in rates;
+}
+
+function applyFloor(metered: bigint, pricing: MerchantUptoPricing): MeteredCharge {
+  const floor = atomic(pricing.minAmount ?? '0', 'minAmount');
+  if (metered < floor) {
+    return { kind: 'charge', amountAtomic: floor.toString(), basis: 'floor' };
+  }
+  return { kind: 'charge', amountAtomic: metered.toString(), basis: 'metered' };
+}
+
+function ceilDiv(numerator: bigint, denominator: bigint): bigint {
+  return numerator === 0n ? 0n : (numerator + denominator - 1n) / denominator;
+}
+
+/**
+ * Convert trusted, normalized usage into an atomic charge. Host adapters own
+ * the meaning of their raw counters: a runtime that uses zero as an
+ * "unreported" sentinel must emit `{ kind: 'unreported' }` instead.
+ */
+export function meterUsage(
+  pricing: MerchantUptoPricing,
+  usage: MeterableUsage | undefined,
+): MeteredCharge {
+  if (usage === undefined || usage.kind === 'unreported') return { kind: 'unpriceable' };
+
+  if (usage.kind === 'total') {
+    const total = tokenCount(usage.totalTokens);
+    if (total === undefined) return { kind: 'unpriceable' };
+    if (total === 0n) return { kind: 'charge', amountAtomic: '0', basis: 'zero' };
+    if (!isTotalRate(pricing.rates)) return { kind: 'unpriceable' };
+    const metered = ceilDiv(
+      total * atomic(pricing.rates.totalPerThousand, 'totalPerThousand'),
+      1_000n,
+    );
+    return applyFloor(metered, pricing);
+  }
+
+  const input = tokenCount(usage.inputTokens);
+  const output = tokenCount(usage.outputTokens);
+  const cached = tokenCount(usage.cachedInputTokens ?? 0);
+  if (input === undefined || output === undefined || cached === undefined || cached > input) {
+    return { kind: 'unpriceable' };
+  }
+  if (input === 0n && output === 0n) {
+    return { kind: 'charge', amountAtomic: '0', basis: 'zero' };
+  }
+
+  if (isTotalRate(pricing.rates)) {
+    const metered = ceilDiv(
+      (input + output) * atomic(pricing.rates.totalPerThousand, 'totalPerThousand'),
+      1_000n,
+    );
+    return applyFloor(metered, pricing);
+  }
+  if (!isDetailedRates(pricing.rates)) return { kind: 'unpriceable' };
+
+  const cachedRate = atomic(
+    pricing.rates.cachedInputPerMillion ?? pricing.rates.inputPerMillion,
+    'cachedInputPerMillion',
+  );
+  const micros =
+    (input - cached) * atomic(pricing.rates.inputPerMillion, 'inputPerMillion') +
+    cached * cachedRate +
+    output * atomic(pricing.rates.outputPerMillion, 'outputPerMillion');
+  return applyFloor(ceilDiv(micros, 1_000_000n), pricing);
+}
+
+export function pricingToAccept(pricing: MerchantPricing): X402Accept {
+  if (pricing.scheme === 'upto') {
+    const { maxAmount, minAmount: _minAmount, rates: _rates, unreportedUsage: _policy, ...accept } =
+      pricing;
+    return { ...accept, scheme: 'upto', amount: maxAmount };
+  }
+  return { ...pricing, scheme: pricing.scheme ?? 'exact' };
+}
+
+export function offerAccepts(offer: MerchantOffer): X402Accept[] {
+  return offer.accepts.map(pricingToAccept);
+}
+
+/** Fail fast on merchant configuration before publishing terms to a payer. */
+export function validateMerchantOffer(offer: MerchantOffer): void {
+  if (offer.accepts.length === 0) throw new Error('MerchantOffer.accepts must not be empty.');
+  if (
+    offer.expiresInSeconds !== undefined &&
+    (!Number.isFinite(offer.expiresInSeconds) || offer.expiresInSeconds <= 0)
+  ) {
+    throw new Error('MerchantOffer.expiresInSeconds must be greater than zero.');
+  }
+  for (const pricing of offer.accepts) {
+    const ceiling = atomic(
+      pricing.scheme === 'upto' ? pricing.maxAmount : pricing.amount,
+      pricing.scheme === 'upto' ? 'maxAmount' : 'amount',
+    );
+    if (ceiling <= 0n) throw new Error('Merchant pricing ceiling must be greater than zero.');
+    if (pricing.scheme !== 'upto') continue;
+    const floor = atomic(pricing.minAmount ?? '0', 'minAmount');
+    if (floor > ceiling) throw new Error('minAmount must not exceed maxAmount.');
+    if (isDetailedRates(pricing.rates)) {
+      atomic(pricing.rates.inputPerMillion, 'inputPerMillion');
+      atomic(pricing.rates.outputPerMillion, 'outputPerMillion');
+      if (pricing.rates.cachedInputPerMillion !== undefined) {
+        atomic(pricing.rates.cachedInputPerMillion, 'cachedInputPerMillion');
+      }
+    } else {
+      atomic(pricing.rates.totalPerThousand, 'totalPerThousand');
+    }
+  }
+}

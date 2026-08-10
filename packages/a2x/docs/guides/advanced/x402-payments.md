@@ -4,7 +4,7 @@ Charge per call with on-chain cryptocurrency payments. A2X implements the x402 A
 
 The flow: the merchant agent responds to an unpaid request with `input-required` + `x402.payment.required`. The client signs a `PaymentPayload` with its wallet and resubmits the same task. The merchant validates the payload, verifies it via an x402 **facilitator**, settles on-chain, and attaches the settlement receipt to the completed task. This flow is identical across versions — only the JSON envelope shapes differ (see [Protocol versions](#protocol-versions-v1--v2)).
 
-> **What changed in this release.** The SDK no longer ships a payment *flow* — only stateless helpers. The agent owns when to request payment, what was offered, how to validate the submission, whether to retry, and what to do between `verify` and `settle`. The previous `x402PaymentHook` / `inputRoundTripHooks` API is removed; see [Migrating from X402PaymentExecutor / x402PaymentHook](./migration-x402-v2.md) for the migration steps.
+> **Flow ownership.** The core `@a2x/sdk/x402` surface does not install or schedule a payment flow. The agent may compose its mechanics directly, or opt into the host-neutral `@a2x/sdk/x402-merchant` gate described below. The merchant still supplies paid/free selection, rates, settlement timing, missing-usage behavior, and event rendering. The previous framework-owned `x402PaymentHook` / `inputRoundTripHooks` API remains removed; see [Migrating from X402PaymentExecutor / x402PaymentHook](./migration-x402-v2.md).
 
 ## Installation
 
@@ -431,6 +431,98 @@ The clamp lives in the SDK on purpose: a metering bug (an off-by-a-decimal token
 Metering an **`exact`** requirement also throws. That scheme binds the payer's signature to one specific value, so a facilitator rejects any settle whose amount disagrees with it — better to fail on the call than after the work is done and the charge has been refused.
 
 The facilitator enforces the same bound on-chain; the SDK clamp is defence in depth, not a substitute for it.
+
+### Shared merchant-policy gate
+
+Use `@a2x/sdk/x402-merchant` when more than one host needs the same payment policy but renders different event types. `MerchantGate` consumes `X402Context` and returns plain outcomes:
+
+```ts
+import { X402Context } from '@a2x/sdk/x402';
+import { MerchantGate } from '@a2x/sdk/x402-merchant';
+
+const gate = new MerchantGate({
+  x402: new X402Context({ x402Version: 2 }),
+  exactTiming: 'after-work', // required: the SDK does not choose the risk allocation
+  pricing: async ({ taskId, contextId, message }) => {
+    const row = await pricingRepository.forRequest({ taskId, contextId, message });
+    if (!row) return null; // this request is free
+    return {
+      expiresInSeconds: 600,
+      accepts: [{
+        scheme: 'upto',
+        network: row.network,
+        maxAmount: row.maxAmount,
+        minAmount: row.minAmount,
+        asset: row.asset,
+        payTo: row.payTo,
+        resource: row.resource,
+        description: row.description,
+        extra: { facilitatorAddress: row.facilitatorAddress },
+        rates: {
+          inputPerMillion: row.inputPerMillion,
+          outputPerMillion: row.outputPerMillion,
+          cachedInputPerMillion: row.cachedInputPerMillion,
+        },
+        unreportedUsage: 'refuse', // also required: ceiling/floor/refuse are merchant policy
+      }],
+    };
+  },
+});
+```
+
+On the inbound turn, translate the outcome into the host's event system:
+
+```ts
+const opened = await gate.open({
+  taskId: ctx.taskId!,
+  contextId: ctx.contextId,
+  message: ctx.message!,
+  activatedExtensions: ctx.activatedExtensions,
+});
+
+if (opened.kind === 'request-payment') {
+  yield { type: 'request-input', message: opened.text, metadata: opened.metadata };
+  return;
+}
+if (opened.kind === 'refuse') {
+  yield x402.failedEvent(opened);
+  return;
+}
+
+const result = await runWork();
+if (!opened.obligation) {
+  yield { type: 'text', role: 'agent', text: result.text };
+  yield { type: 'done' };
+  return;
+}
+
+const settled = await gate.settle({
+  taskId: ctx.taskId!,
+  obligation: opened.obligation,
+  usage: result.usageAvailable
+    ? {
+        kind: 'detailed',
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        cachedInputTokens: result.cachedInputTokens,
+      }
+    : { kind: 'unreported' },
+});
+if (settled.kind === 'failed') {
+  yield x402.failedEvent(settled);
+  return;
+}
+yield { type: 'text', role: 'agent', text: result.text };
+yield { type: 'done', metadata: settled.receiptMetadata };
+```
+
+The pricing callback runs only on the unpaid turn. Its complete `MerchantOffer` is frozen by the sidecar and the submitted turn settles against that snapshot, not live rates. The default `InMemoryMerchantOfferingSidecar` also grants a one-shot execution claim, but it is only safe in a single process. Multi-replica deployments must inject a durable `MerchantOfferingSidecar` whose `publishing` and `claim` operations are atomic.
+
+Usage is semantic rather than inferred. A trusted zero reading is `{ kind: 'total', totalTokens: 0 }` and charges zero; a runtime that uses zero counters as an “accounting unavailable” sentinel must normalize them to `{ kind: 'unreported' }`. Detailed input/output rates cannot price a total-only reading, so that combination also follows the offer's required `unreportedUsage` policy. A `totalPerThousand` rate can price either usage shape.
+
+`exactTiming` is required because `before-work` protects the merchant from delivering work whose authorization later fails, while `after-work` protects the payer from being charged for work that fails. For `before-work`, `open()` returns an already-settled obligation; calling `settle()` after the work reuses its receipt and never charges twice.
+
+Session-scoped metering and a standard durable sidecar implementation are not part of this initial surface.
 
 #### What the payer's payload looks like
 
