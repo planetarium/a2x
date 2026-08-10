@@ -17,7 +17,10 @@ export interface MerchantOfferingSidecar {
 }
 
 export interface InMemoryMerchantOfferingSidecarOptions {
+  /** Maximum live entries. Defaults to 10,000. */
   maxEntries?: number;
+  /** TTL applied when an offer omits expiresInSeconds. Defaults to 600 seconds. */
+  defaultTtlSeconds?: number;
 }
 
 interface InMemoryEntry {
@@ -34,16 +37,22 @@ function cloneOffer(offer: MerchantOffer): MerchantOffer {
 export class InMemoryMerchantOfferingSidecar implements MerchantOfferingSidecar {
   private readonly entries = new Map<string, InMemoryEntry>();
   private readonly queues = new Map<string, Promise<void>>();
-  private readonly maxEntries?: number;
+  private readonly maxEntries: number;
+  private readonly defaultTtlSeconds: number;
 
   constructor(options: InMemoryMerchantOfferingSidecarOptions = {}) {
-    if (
-      options.maxEntries !== undefined &&
-      (!Number.isInteger(options.maxEntries) || options.maxEntries <= 0)
-    ) {
+    const maxEntries = options.maxEntries ?? 10_000;
+    const defaultTtlSeconds = options.defaultTtlSeconds ?? 600;
+    if (!Number.isInteger(maxEntries) || maxEntries <= 0) {
       throw new Error('InMemoryMerchantOfferingSidecar.maxEntries must be a positive integer.');
     }
-    this.maxEntries = options.maxEntries;
+    if (!Number.isFinite(defaultTtlSeconds) || defaultTtlSeconds <= 0) {
+      throw new Error(
+        'InMemoryMerchantOfferingSidecar.defaultTtlSeconds must be greater than zero.',
+      );
+    }
+    this.maxEntries = maxEntries;
+    this.defaultTtlSeconds = defaultTtlSeconds;
   }
 
   async publishing<T>(
@@ -60,9 +69,8 @@ export class InMemoryMerchantOfferingSidecar implements MerchantOfferingSidecar 
         ({
           offer: cloneOffer(offer),
           claimed: false,
-          ...(offer.expiresInSeconds !== undefined
-            ? { expiresAt: Date.now() + offer.expiresInSeconds * 1_000 }
-            : {}),
+          expiresAt:
+            Date.now() + (offer.expiresInSeconds ?? this.defaultTtlSeconds) * 1_000,
         } satisfies InMemoryEntry);
 
       if (created) {
@@ -122,7 +130,7 @@ export class InMemoryMerchantOfferingSidecar implements MerchantOfferingSidecar 
   }
 
   private evictForInsert(taskId: string): void {
-    if (this.entries.has(taskId) || this.maxEntries === undefined) return;
+    if (this.entries.has(taskId)) return;
     while (this.entries.size >= this.maxEntries) {
       const oldest = this.entries.keys().next().value;
       if (oldest === undefined) break;

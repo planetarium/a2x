@@ -113,6 +113,9 @@ export interface MerchantGateSettleInput {
 }
 
 export interface MerchantSettledCharge {
+  /** Amount requested from the facilitator, before receipt reconciliation. */
+  requestedAtomic: string;
+  /** Facilitator-reported amount when present, otherwise requestedAtomic. */
   amountAtomic: string;
   basis: 'exact' | 'metered' | 'floor' | 'zero' | 'unreported-ceiling' | 'unreported-floor';
 }

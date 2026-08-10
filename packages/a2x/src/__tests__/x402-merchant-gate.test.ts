@@ -4,6 +4,7 @@ import {
   MerchantGate,
   pricingToAccept,
   type MerchantExactPricing,
+  type MerchantGateErrorContext,
   type MerchantOffer,
   type MerchantUptoPricing,
 } from '../x402-merchant/index.js';
@@ -99,7 +100,11 @@ function uptoPayload(cap: string = UPTO.maxAmount): X402PaymentPayload {
   };
 }
 
-function fixture(offer: MerchantOffer, exactTiming: 'before-work' | 'after-work') {
+function fixture(
+  offer: MerchantOffer,
+  exactTiming: 'before-work' | 'after-work',
+  onError?: (error: unknown, context: MerchantGateErrorContext) => void | Promise<void>,
+) {
   const settledRequirements: X402PaymentRequirements[] = [];
   const facilitator: X402Facilitator = {
     verify: vi.fn(async () => ({ isValid: true })),
@@ -114,12 +119,14 @@ function fixture(offer: MerchantOffer, exactTiming: 'before-work' | 'after-work'
     }),
   };
   const resolver = vi.fn(async () => offer);
+  const x402 = new X402Context({ facilitator, x402Version: 2 });
   const gate = new MerchantGate({
-    x402: new X402Context({ facilitator, x402Version: 2 }),
+    x402,
     pricing: resolver,
     exactTiming,
+    ...(onError ? { onError } : {}),
   });
-  return { gate, facilitator, resolver, settledRequirements };
+  return { gate, facilitator, resolver, settledRequirements, x402 };
 }
 
 describe('MerchantGate', () => {
@@ -135,21 +142,45 @@ describe('MerchantGate', () => {
   });
 
   it('fails closed when pricing infrastructure throws', async () => {
+    const onError = vi.fn();
+    const infrastructureError = new Error('database unavailable at postgres://internal');
     const gate = new MerchantGate({
       x402: new X402Context({ x402Version: 2 }),
       pricing: async () => {
-        throw new Error('database unavailable');
+        throw infrastructureError;
       },
       exactTiming: 'after-work',
+      onError,
     });
-    await expect(gate.open({ taskId: 't-error', message: message() })).resolves.toMatchObject({
+    await expect(gate.open({ taskId: 't-error', message: message() })).resolves.toEqual({
       kind: 'refuse',
       code: X402_ERROR_CODES.SETTLEMENT_FAILED,
+      reason: 'Payment processing is unavailable.',
+    });
+    expect(onError).toHaveBeenCalledWith(infrastructureError, {
+      operation: 'open',
+      taskId: 't-error',
     });
   });
 
+  it('applies the default offer TTL to both lifecycle stores', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-08-10T00:00:00Z'));
+      const { gate, x402 } = fixture({ accepts: [EXACT] }, 'after-work');
+      await gate.open({ taskId: 't-default-ttl', message: message() });
+
+      expect((await gate.sidecar.getOffer('t-default-ttl'))?.expiresInSeconds).toBe(600);
+      expect((await x402.store.get('t-default-ttl'))?.expiresAt).toEqual(
+        new Date('2026-08-10T00:10:00Z'),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('freezes pricing on turn 1 and settles exact after work', async () => {
-    const { gate, resolver, settledRequirements } = fixture(
+    const { gate, resolver, settledRequirements, x402 } = fixture(
       { accepts: [EXACT], expiresInSeconds: 600 },
       'after-work',
     );
@@ -165,6 +196,8 @@ describe('MerchantGate', () => {
     const settled = await gate.settle({ taskId: 't-exact', obligation: second.obligation });
     expect(settled.kind).toBe('settled');
     expect(settledRequirements).toHaveLength(1);
+    await expect(gate.sidecar.getOffer('t-exact')).resolves.toBeUndefined();
+    await expect(x402.store.get('t-exact')).resolves.toBeUndefined();
   });
 
   it('settles exact before work when configured and never settles it twice', async () => {
@@ -189,6 +222,88 @@ describe('MerchantGate', () => {
       kind: 'refuse',
       code: X402_ERROR_CODES.DUPLICATE_NONCE,
     });
+  });
+
+  it('allows retry after verification fails before claiming execution', async () => {
+    const { gate, facilitator } = fixture({ accepts: [EXACT] }, 'after-work');
+    vi.mocked(facilitator.verify)
+      .mockResolvedValueOnce({ isValid: false, invalidReason: 'facilitator temporarily unavailable' })
+      .mockResolvedValueOnce({ isValid: true });
+    await gate.open({ taskId: 't-verify-retry', message: message() });
+
+    await expect(
+      gate.open({ taskId: 't-verify-retry', message: submitted(exactPayload()) }),
+    ).resolves.toMatchObject({ kind: 'refuse' });
+    await expect(
+      gate.open({ taskId: 't-verify-retry', message: submitted(exactPayload()) }),
+    ).resolves.toMatchObject({ kind: 'proceed' });
+  });
+
+  it('keeps requested and facilitator-confirmed settlement amounts', async () => {
+    const { gate, facilitator } = fixture({ accepts: [EXACT] }, 'after-work');
+    vi.mocked(facilitator.settle).mockResolvedValueOnce({
+      success: true,
+      transaction: '0xtx',
+      network: EXACT.network,
+      amount: '900',
+    });
+    await gate.open({ taskId: 't-reconcile', message: message() });
+    const opened = await gate.open({ taskId: 't-reconcile', message: submitted(exactPayload()) });
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+
+    await expect(
+      gate.settle({ taskId: 't-reconcile', obligation: opened.obligation }),
+    ).resolves.toMatchObject({
+      kind: 'settled',
+      charge: { requestedAtomic: '1000', amountAtomic: '900', basis: 'exact' },
+    });
+  });
+
+  it('hides settlement exceptions and reports them to the host', async () => {
+    const onError = vi.fn();
+    const settlementError = new Error('facilitator token leaked here');
+    const { gate, x402 } = fixture({ accepts: [EXACT] }, 'after-work', onError);
+    await gate.open({ taskId: 't-settle-error', message: message() });
+    const opened = await gate.open({
+      taskId: 't-settle-error',
+      message: submitted(exactPayload()),
+    });
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+    vi.spyOn(x402, 'settle').mockRejectedValueOnce(settlementError);
+
+    await expect(
+      gate.settle({ taskId: 't-settle-error', obligation: opened.obligation }),
+    ).resolves.toEqual({
+      kind: 'failed',
+      code: X402_ERROR_CODES.SETTLEMENT_FAILED,
+      reason: 'Payment settlement failed.',
+    });
+    expect(onError).toHaveBeenCalledWith(settlementError, {
+      operation: 'settle',
+      taskId: 't-settle-error',
+    });
+  });
+
+  it('keeps a successful settlement successful when cleanup fails', async () => {
+    const onError = vi.fn();
+    const cleanupError = new Error('sidecar cleanup failed');
+    const { gate, x402 } = fixture({ accepts: [EXACT] }, 'after-work', onError);
+    await gate.open({ taskId: 't-cleanup-error', message: message() });
+    const opened = await gate.open({
+      taskId: 't-cleanup-error',
+      message: submitted(exactPayload()),
+    });
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+    vi.spyOn(gate.sidecar, 'delete').mockRejectedValueOnce(cleanupError);
+
+    await expect(
+      gate.settle({ taskId: 't-cleanup-error', obligation: opened.obligation }),
+    ).resolves.toMatchObject({ kind: 'settled' });
+    expect(onError).toHaveBeenCalledWith(cleanupError, {
+      operation: 'cleanup',
+      taskId: 't-cleanup-error',
+    });
+    await expect(x402.store.get('t-cleanup-error')).resolves.toBeUndefined();
   });
 
   it('applies the required unreported-usage policy to upto', async () => {

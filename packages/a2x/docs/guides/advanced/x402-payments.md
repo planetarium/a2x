@@ -443,6 +443,9 @@ import { MerchantGate } from '@a2x/sdk/x402-merchant';
 const gate = new MerchantGate({
   x402: new X402Context({ x402Version: 2 }),
   exactTiming: 'after-work', // required: the SDK does not choose the risk allocation
+  onError: (error, { operation, taskId }) => {
+    logger.error({ error, operation, taskId }, 'x402 merchant operation failed');
+  },
   pricing: async ({ taskId, contextId, message }) => {
     const row = await pricingRepository.forRequest({ taskId, contextId, message });
     if (!row) return null; // this request is free
@@ -516,11 +519,19 @@ yield { type: 'text', role: 'agent', text: result.text };
 yield { type: 'done', metadata: settled.receiptMetadata };
 ```
 
-The pricing callback runs only on the unpaid turn. Its complete `MerchantOffer` is frozen by the sidecar and the submitted turn settles against that snapshot, not live rates. The default `InMemoryMerchantOfferingSidecar` also grants a one-shot execution claim, but it is only safe in a single process. Multi-replica deployments must inject a durable `MerchantOfferingSidecar` whose `publishing` and `claim` operations are atomic.
+The pricing callback runs only on the unpaid turn. Its complete `MerchantOffer` is frozen by the sidecar and the submitted turn settles against that snapshot, not live rates. When `expiresInSeconds` is omitted, `MerchantGate` applies a 10-minute TTL to both the sidecar snapshot and the underlying x402 offering; set `expiresInSeconds` on the offer to override it. The default `InMemoryMerchantOfferingSidecar` independently defaults to the same TTL and caps itself at 10,000 live entries. Standalone sidecar users can override those limits with `defaultTtlSeconds` and `maxEntries`. It also grants a one-shot execution claim, but it is only safe in a single process. Multi-replica deployments must inject a durable `MerchantOfferingSidecar` whose `publishing` and `claim` operations are atomic.
+
+Verification happens before the execution claim is consumed, so a transient verification failure can be retried on the same task. Once verification succeeds, only one concurrent caller receives the claim and may execute work. A successful settlement best-effort removes both lifecycle records. Cleanup failures do not turn a completed payment into a failure; they are reported through `onError` with `operation: 'cleanup'`.
+
+Unexpected exceptions that escape pricing, storage, or x402 operations are never copied into payer-facing refusal reasons. `open()` and `settle()` return fixed generic text and pass the original error to the optional `onError` callback for host-side logging. Structured verification and settlement failures keep their protocol reason and failure receipt.
 
 Usage is semantic rather than inferred. A trusted zero reading is `{ kind: 'total', totalTokens: 0 }` and charges zero; a runtime that uses zero counters as an “accounting unavailable” sentinel must normalize them to `{ kind: 'unreported' }`. Detailed input/output rates cannot price a total-only reading, so that combination also follows the offer's required `unreportedUsage` policy. A `totalPerThousand` rate can price either usage shape.
 
 `exactTiming` is required because `before-work` protects the merchant from delivering work whose authorization later fails, while `after-work` protects the payer from being charged for work that fails. For `before-work`, `open()` returns an already-settled obligation; calling `settle()` after the work reuses its receipt and never charges twice.
+
+On success, `settled.charge.requestedAtomic` is the amount the gate asked the facilitator to settle. `settled.charge.amountAtomic` is the facilitator-reported `receipt.amount` when it is a decimal amount, or the requested amount when the receipt omits it. Comparing the two surfaces settlement reconciliation mismatches without discarding the facilitator's authoritative value.
+
+Each offer must contain unique payment identities across scheme, normalized network, asset, payee, and amount. Duplicate entries fail during turn-1 validation instead of making an otherwise valid turn-2 payment ambiguous.
 
 Session-scoped metering and a standard durable sidecar implementation are not part of this initial surface.
 

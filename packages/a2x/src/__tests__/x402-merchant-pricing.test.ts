@@ -107,4 +107,21 @@ describe('x402 merchant pricing', () => {
       }),
     ).toThrow(/minAmount must not exceed maxAmount/);
   });
+
+  it('rejects duplicate payment identities before publishing', () => {
+    expect(() =>
+      validateMerchantOffer({
+        accepts: [
+          BASE_UPTO,
+          {
+            ...BASE_UPTO,
+            network: 'base-sepolia',
+            asset: `0x${BASE_UPTO.asset.slice(2).toUpperCase()}`,
+            payTo: `0x${BASE_UPTO.payTo.slice(2).toUpperCase()}`,
+            description: 'Duplicate with different display text',
+          },
+        ],
+      }),
+    ).toThrow(/duplicate payment identities/);
+  });
 });

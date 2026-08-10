@@ -36,7 +36,16 @@ export interface MerchantGateOptions {
   sidecar?: MerchantOfferingSidecar;
   /** Required: before/after work intentionally allocate failure risk differently. */
   exactTiming: 'before-work' | 'after-work';
+  /** Receives infrastructure errors that are intentionally hidden from payer-facing outcomes. */
+  onError?: (error: unknown, context: MerchantGateErrorContext) => void | Promise<void>;
 }
+
+export interface MerchantGateErrorContext {
+  operation: 'open' | 'settle' | 'cleanup';
+  taskId: string;
+}
+
+const DEFAULT_OFFER_TTL_SECONDS = 600;
 
 function sameIdentifier(a: string, b: string): boolean {
   return a.startsWith('0x') && b.startsWith('0x')
@@ -104,12 +113,6 @@ export class MerchantGate {
         return refusal(classified.code, classified.reason);
       }
 
-      if (!(await this.sidecar.claim(turn.taskId))) {
-        return refusal(
-          X402_ERROR_CODES.DUPLICATE_NONCE,
-          'This payment has already been submitted for this task.',
-        );
-      }
       const offer = await this.sidecar.getOffer(turn.taskId);
       if (!offer) {
         return refusal(
@@ -131,6 +134,13 @@ export class MerchantGate {
         return refusal(mapVerifyFailureToCode(reason), reason);
       }
 
+      if (!(await this.sidecar.claim(turn.taskId))) {
+        return refusal(
+          X402_ERROR_CODES.DUPLICATE_NONCE,
+          'This payment has already been submitted for this task.',
+        );
+      }
+
       if ((pricing.scheme ?? 'exact') === 'exact' && this.options.exactTiming === 'before-work') {
         const receipt = await this.options.x402.settle(turn, classified);
         if (!receipt.success) {
@@ -140,6 +150,7 @@ export class MerchantGate {
             receipt,
           );
         }
+        await this.cleanup(turn.taskId);
         return {
           kind: 'proceed',
           obligation: { kind: 'settled', receipt, pricing: pricing as MerchantExactPricing },
@@ -148,21 +159,22 @@ export class MerchantGate {
 
       return { kind: 'proceed', obligation: { kind: 'deferred', classified, pricing } };
     } catch (error) {
-      return refusal(
-        X402_ERROR_CODES.SETTLEMENT_FAILED,
-        error instanceof Error ? error.message : 'Payment processing is unavailable.',
-      );
+      await this.reportError(error, { operation: 'open', taskId: turn.taskId });
+      return refusal(X402_ERROR_CODES.SETTLEMENT_FAILED, 'Payment processing is unavailable.');
     }
   }
 
   async settle(input: MerchantGateSettleInput): Promise<MerchantGateSettleOutcome> {
     try {
-      return await this.settleObligation(input);
+      const outcome = await this.settleObligation(input);
+      if (outcome.kind === 'settled') await this.cleanup(input.taskId);
+      return outcome;
     } catch (error) {
+      await this.reportError(error, { operation: 'settle', taskId: input.taskId });
       return {
         kind: 'failed',
         code: X402_ERROR_CODES.SETTLEMENT_FAILED,
-        reason: error instanceof Error ? error.message : 'Payment settlement failed.',
+        reason: 'Payment settlement failed.',
       };
     }
   }
@@ -173,6 +185,7 @@ export class MerchantGate {
     const { obligation } = input;
     if (obligation.kind === 'settled') {
       return this.settledOutcome(obligation.receipt, {
+        requestedAtomic: pricingAmount(obligation.pricing),
         amountAtomic: pricingAmount(obligation.pricing),
         basis: 'exact',
       });
@@ -186,6 +199,7 @@ export class MerchantGate {
       );
       if (!receipt.success) return settlementFailure(receipt);
       return this.settledOutcome(receipt, {
+        requestedAtomic: pricing.amount,
         amountAtomic: pricing.amount,
         basis: 'exact',
       });
@@ -205,8 +219,12 @@ export class MerchantGate {
   private async requestPayment(
     turn: MerchantGateOpenInput,
   ): Promise<MerchantGateOpenOutcome> {
-    const offer = await this.options.pricing(turn);
-    if (!offer) return { kind: 'proceed' };
+    const resolvedOffer = await this.options.pricing(turn);
+    if (!resolvedOffer) return { kind: 'proceed' };
+    const offer =
+      resolvedOffer.expiresInSeconds === undefined
+        ? { ...resolvedOffer, expiresInSeconds: DEFAULT_OFFER_TTL_SECONDS }
+        : resolvedOffer;
     validateMerchantOffer(offer);
 
     return this.sidecar.publishing(turn.taskId, offer, async (frozenOffer) => {
@@ -250,10 +268,12 @@ export class MerchantGate {
     | Extract<MerchantGateSettleOutcome, { kind: 'failed' }> {
     const metered = meterUsage(pricing, usage);
     if (metered.kind === 'charge') {
+      const amountAtomic = this.clampUptoCharge(pricing, classified, metered.amountAtomic);
       return {
         kind: 'charge',
         charge: {
-          amountAtomic: this.clampUptoCharge(pricing, classified, metered.amountAtomic),
+          requestedAtomic: amountAtomic,
+          amountAtomic,
           basis: metered.basis,
         },
       };
@@ -266,22 +286,26 @@ export class MerchantGate {
       };
     }
     if (pricing.unreportedUsage === 'ceiling') {
+      const amountAtomic = this.clampUptoCharge(pricing, classified, pricing.maxAmount);
       return {
         kind: 'charge',
         charge: {
-          amountAtomic: this.clampUptoCharge(pricing, classified, pricing.maxAmount),
+          requestedAtomic: amountAtomic,
+          amountAtomic,
           basis: 'unreported-ceiling',
         },
       };
     }
+    const amountAtomic = this.clampUptoCharge(
+      pricing,
+      classified,
+      pricing.minAmount ?? '0',
+    );
     return {
       kind: 'charge',
       charge: {
-        amountAtomic: this.clampUptoCharge(
-          pricing,
-          classified,
-          pricing.minAmount ?? '0',
-        ),
+        requestedAtomic: amountAtomic,
+        amountAtomic,
         basis: 'unreported-floor',
       },
     };
@@ -312,5 +336,26 @@ export class MerchantGate {
       receiptMetadata: buildX402PaymentCompletedMetadata({ receipt }),
       charge: confirmedCharge,
     };
+  }
+
+  private async cleanup(taskId: string): Promise<void> {
+    for (const operation of [
+      () => this.sidecar.delete(taskId),
+      () => this.options.x402.clearOffering({ taskId }),
+    ]) {
+      try {
+        await operation();
+      } catch (error) {
+        await this.reportError(error, { operation: 'cleanup', taskId });
+      }
+    }
+  }
+
+  private async reportError(error: unknown, context: MerchantGateErrorContext): Promise<void> {
+    try {
+      await this.options.onError?.(error, context);
+    } catch {
+      // Error reporting must not change payment behavior or expose infrastructure details.
+    }
   }
 }

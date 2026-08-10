@@ -1,4 +1,5 @@
 import type { X402Accept } from '../x402/types.js';
+import { sameNetwork } from '../x402/networks.js';
 import type {
   MerchantDetailedRates,
   MerchantOffer,
@@ -29,6 +30,26 @@ function isDetailedRates(rates: MerchantUptoPricing['rates']): rates is Merchant
 
 function isTotalRate(rates: MerchantUptoPricing['rates']): rates is MerchantTotalRate {
   return 'totalPerThousand' in rates;
+}
+
+function sameIdentifier(a: string, b: string): boolean {
+  return a.startsWith('0x') && b.startsWith('0x')
+    ? a.toLowerCase() === b.toLowerCase()
+    : a === b;
+}
+
+function pricingAmount(pricing: MerchantPricing): string {
+  return pricing.scheme === 'upto' ? pricing.maxAmount : pricing.amount;
+}
+
+function samePricingIdentity(a: MerchantPricing, b: MerchantPricing): boolean {
+  return (
+    (a.scheme ?? 'exact') === (b.scheme ?? 'exact') &&
+    sameNetwork(a.network, b.network) &&
+    sameIdentifier(a.asset, b.asset) &&
+    sameIdentifier(a.payTo, b.payTo) &&
+    pricingAmount(a) === pricingAmount(b)
+  );
 }
 
 function applyFloor(metered: bigint, pricing: MerchantUptoPricing): MeteredCharge {
@@ -118,7 +139,10 @@ export function validateMerchantOffer(offer: MerchantOffer): void {
   ) {
     throw new Error('MerchantOffer.expiresInSeconds must be greater than zero.');
   }
-  for (const pricing of offer.accepts) {
+  for (const [index, pricing] of offer.accepts.entries()) {
+    if (offer.accepts.slice(0, index).some((candidate) => samePricingIdentity(candidate, pricing))) {
+      throw new Error('MerchantOffer.accepts must not contain duplicate payment identities.');
+    }
     const ceiling = atomic(
       pricing.scheme === 'upto' ? pricing.maxAmount : pricing.amount,
       pricing.scheme === 'upto' ? 'maxAmount' : 'amount',

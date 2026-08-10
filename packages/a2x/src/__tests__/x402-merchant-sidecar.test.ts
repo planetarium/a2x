@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   InMemoryMerchantOfferingSidecar,
   type MerchantOffer,
@@ -54,5 +54,29 @@ describe('InMemoryMerchantOfferingSidecar', () => {
       }),
     ).rejects.toThrow('store failed');
     expect(await sidecar.getOffer('task-1')).toBeUndefined();
+  });
+
+  it('expires offers after the default 10-minute TTL', async () => {
+    vi.useFakeTimers();
+    try {
+      const sidecar = new InMemoryMerchantOfferingSidecar();
+      await sidecar.publishing('task-1', offer('10'), async () => undefined);
+
+      vi.advanceTimersByTime(600_000);
+      await expect(sidecar.getOffer('task-1')).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('caps the default in-memory store at 10,000 live entries', async () => {
+    const sidecar = new InMemoryMerchantOfferingSidecar();
+    for (let index = 0; index <= 10_000; index += 1) {
+      await sidecar.publishing(`task-${index}`, offer('10'), async () => undefined);
+    }
+
+    expect(sidecar.size()).toBe(10_000);
+    await expect(sidecar.getOffer('task-0')).resolves.toBeUndefined();
+    await expect(sidecar.getOffer('task-10000')).resolves.toBeDefined();
   });
 });
