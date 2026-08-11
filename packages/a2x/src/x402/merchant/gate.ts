@@ -23,6 +23,7 @@ import type {
   MerchantGateOpenOutcome,
   MerchantGateSettleInput,
   MerchantGateSettleOutcome,
+  MerchantExactTiming,
   MerchantExactPricing,
   MerchantOffer,
   MerchantPricing,
@@ -36,7 +37,7 @@ export interface MerchantGateOptions {
   pricing: MerchantPricingResolver;
   sidecar?: MerchantOfferingSidecar;
   /** Required: before/after work intentionally allocate failure risk differently. */
-  exactTiming: 'before-work' | 'after-work';
+  exactTiming: MerchantExactTiming;
   /** Receives infrastructure errors that are intentionally hidden from payer-facing outcomes. */
   onError?: (error: unknown, context: MerchantGateErrorContext) => void | Promise<void>;
 }
