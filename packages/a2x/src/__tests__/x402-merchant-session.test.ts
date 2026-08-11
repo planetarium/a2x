@@ -364,7 +364,24 @@ describe('UptoSessionManager', () => {
     });
   });
 
-  it('waits for an in-flight turn after the guard but never past the signed deadline', async () => {
+  it('settles inline when the authorization guard has already passed', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-11T00:00:00Z'));
+    const deadlineSeconds = Math.floor(Date.now() / 1_000) + 20;
+    const { manager, settle } = fixture({ deadlineGuardSeconds: 30 });
+
+    const outcome = await manager.open({
+      contextId: 'c-expired-guard',
+      taskId: 't-expired-guard',
+      obligation: obligation({ deadlineSeconds }),
+      usage: { kind: 'total', totalTokens: 100 },
+    });
+
+    expect(settle).toHaveBeenCalledTimes(1);
+    expect(outcome.session).toMatchObject({ state: 'closed', endReason: 'deadline' });
+  });
+
+  it('settles at the guard when a turn is still in flight', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-08-11T00:00:00Z'));
     const deadlineSeconds = Math.floor(Date.now() / 1_000) + 60;
@@ -383,18 +400,16 @@ describe('UptoSessionManager', () => {
     await manager.beginTurn({ contextId: 'c-hard-deadline', turnId: 'm2' });
     await vi.advanceTimersByTimeAsync(1_000);
 
-    expect(settle).not.toHaveBeenCalled();
-    await expect(manager.lookup('c-hard-deadline')).resolves.toMatchObject({
-      closeRequestedReason: 'deadline',
-      pendingTurns: 1,
-    });
-
-    await vi.advanceTimersByTimeAsync(30_000);
     expect(settle).toHaveBeenCalledTimes(1);
+    expect(settle).toHaveBeenCalledWith(
+      expect.objectContaining({ usage: { kind: 'unreported' } }),
+    );
     await expect(manager.lookup('c-hard-deadline')).resolves.toMatchObject({
       state: 'closed',
       endReason: 'deadline',
       pendingTurns: 1,
+      pendingTurnIds: ['m2'],
+      usageIncomplete: true,
     });
   });
 
@@ -415,7 +430,7 @@ describe('UptoSessionManager', () => {
     });
     await manager.beginTurn({ contextId: 'c-unresolved-zero', turnId: 'm2' });
 
-    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(30_000);
 
     expect(lapse).not.toHaveBeenCalled();
     expect(settle).toHaveBeenCalledWith(
@@ -423,9 +438,36 @@ describe('UptoSessionManager', () => {
     );
     await expect(manager.lookup('c-unresolved-zero')).resolves.toMatchObject({
       state: 'closed',
-      usage: { kind: 'unreported' },
+      usage: { kind: 'total', totalTokens: 0 },
+      usageIncomplete: true,
       pendingTurns: 1,
     });
+  });
+
+  it('preserves already-metered value when floor policy sees unreported usage', async () => {
+    const pricing: MerchantUptoPricing = { ...PRICING, unreportedUsage: 'floor' };
+    const { manager, settle } = fixture();
+    await manager.open({
+      contextId: 'c-floor-history',
+      taskId: 't-floor-history',
+      obligation: obligation({ pricing }),
+      usage: { kind: 'total', totalTokens: 5_000 },
+    });
+
+    const outcome = await manager.recordTurn({
+      contextId: 'c-floor-history',
+      usage: { kind: 'unreported' },
+    });
+
+    expect(outcome?.session).toMatchObject({
+      state: 'closed',
+      chargeAtomic: '500',
+      usage: { kind: 'total', totalTokens: 5_000 },
+      usageIncomplete: true,
+    });
+    expect(settle).toHaveBeenCalledWith(
+      expect.objectContaining({ usage: { kind: 'total', totalTokens: 5_000 } }),
+    );
   });
 
   it('enforces max duration when a requested close is waiting on an in-flight turn', async () => {
@@ -617,6 +659,8 @@ describe('UptoSessionManager', () => {
   });
 
   it('reports recovered in-flight turns for host reconciliation', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-11T00:00:00Z'));
     const store = new InMemoryUptoSessionStore();
     const first = fixture({ store });
     await first.manager.open({
@@ -636,7 +680,9 @@ describe('UptoSessionManager', () => {
       contextId: 'c-pending-recovery',
       state: 'active',
       pendingTurns: 1,
+      pendingTurnIds: ['m2'],
     });
+    await vi.advanceTimersByTimeAsync(600_000);
     expect(recovered.settle).not.toHaveBeenCalled();
   });
 
@@ -677,6 +723,31 @@ describe('UptoSessionManager', () => {
     });
 
     expect(reopened.session).toMatchObject({ state: 'active', taskId: 't-new', turns: 1 });
+    manager.stop();
+  });
+
+  it('lapses a verified authorization that loses a concurrent context open', async () => {
+    const { lapse, manager } = fixture();
+    await manager.open({
+      contextId: 'c-open-race',
+      taskId: 't-open-winner',
+      obligation: obligation(),
+      usage: { kind: 'total', totalTokens: 100 },
+    });
+
+    await expect(
+      manager.open({
+        contextId: 'c-open-race',
+        taskId: 't-open-loser',
+        obligation: obligation(),
+        usage: { kind: 'total', totalTokens: 100 },
+      }),
+    ).rejects.toThrow('already live');
+    expect(lapse).toHaveBeenCalledWith('t-open-loser');
+    await expect(manager.lookup('c-open-race')).resolves.toMatchObject({
+      taskId: 't-open-winner',
+      state: 'active',
+    });
     manager.stop();
   });
 

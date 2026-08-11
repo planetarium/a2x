@@ -590,8 +590,22 @@ sessions = new UptoSessionManager({
 });
 
 const recovery = await sessions.recover();
-if (recovery.unresolved.length > 0) {
-  alertReconciliationQueue(recovery.unresolved);
+for (const unresolved of recovery.unresolved) {
+  // No timer is armed for unresolved work. Reconcile every id before serving traffic.
+  for (const turnId of unresolved.pendingTurnIds) {
+    const evidence = await taskRepository.lookupTurn(turnId);
+    if (evidence.usage) {
+      await sessions.finishTurn({
+        contextId: unresolved.contextId,
+        turnId,
+        usage: evidence.usage,
+      });
+    } else if (evidence.provesNoBillableWork) {
+      await sessions.cancelTurn({ contextId: unresolved.contextId, turnId });
+    } else {
+      alertReconciliationQueue(unresolved);
+    }
+  }
 }
 ```
 
@@ -686,21 +700,23 @@ if (sessionOutcome?.settlement?.kind === 'settled') {
 
 `usage` is required by `open()`, `recordTurn()`, and `finishTurn()`. When trusted usage is unavailable, pass `{ kind: 'unreported' }` explicitly so the frozen offer's unreported-usage policy is applied intentionally.
 
-The manager aggregates detailed readings with detailed readings and total readings with total readings. It may combine the two only when the frozen pricing uses `totalPerThousand`; a detailed rate cannot safely price a total-only turn, so that session becomes `unreported`. The frozen offer's `ceiling`, `floor`, or `refuse` policy is then applied by `MerchantGate` exactly as it is for one call. A trusted all-zero session lapses through `gate.lapse()` without consuming the authorization or applying the non-zero floor.
+The manager aggregates detailed readings with detailed readings and total readings with total readings. It may combine the two only when the frozen pricing uses `totalPerThousand`; a detailed rate cannot safely price a total-only turn, so the session records `usageIncomplete: true`. Trusted readings already accumulated remain in `usage` as a durable lower bound. `ceiling` still settles the cap, `refuse` still refuses to select a charge, and `floor` settles the greater of the configured floor and the charge supported by the retained readings. A trusted all-zero session lapses through `gate.lapse()` only when usage is complete.
 
 `open()` writes the first turn's usage and turn count in the same atomic `create` operation as the held authorization. A durable store must preserve the whole record so a crash cannot leave a verified first turn without its trusted usage.
 
-The signed Permit2 cap is intersected with the frozen offer ceiling. Reaching that budget settles inline. Idle and configured maximum-duration timers are process-local optimizations; the signed deadline minus `deadlineGuardSeconds` is the hard backstop. If a turn is still in flight at the guard, the manager stops admitting new work and waits until it finishes, but never beyond the actual authorization deadline. A turn still unresolved at a forced maximum or authorization deadline makes the session usage `unreported`; the frozen unreported-usage policy applies, and the session is never treated as a trusted zero-use lapse.
+The signed Permit2 cap is intersected with the frozen offer ceiling. Reaching that budget settles inline. Idle and configured maximum-duration timers are process-local optimizations. `settleBy` is the earlier of the configured maximum duration and the signed deadline minus `deadlineGuardSeconds`; settlement starts at that guarded instant, never at the on-chain deadline itself. If a turn is still in flight, the manager stops admitting work, marks usage incomplete, and settles immediately under the frozen unreported-usage policy. This may omit the unfinished turn's reading, but preserves the configured transaction-submission margin for the accumulated session charge.
 
 #### Durability and recovery
 
 `InMemoryUptoSessionStore` is single-process only, caps itself at 10,000 records, and retains successful/lapsed records for one hour. Failed settlement records do not expire automatically because they are reconciliation evidence.
 
-Production session mode must inject a shared `UptoSessionStore`. Its `create`, revision-based `compareAndSet`, and revision-based `delete` operations must be atomic across replicas. `compareAndSet` must reject records whose `contextId` differs from the lookup key. `create` may replace successful or lapsed closed records, but it must retain failed settlement evidence until an operator deletes the exact revision. The store must persist the complete held `UptoSessionRecord`, including the signed obligation, and return every active or settling record from `listRecoverable()`. Protect that payload as payment authorization data. The x402 lifecycle store, merchant offer store, session store, task state, and any host conversation mapping form one recovery domain even when implemented as separate tables or keys.
+Production session mode must inject a shared `UptoSessionStore`. Its `create`, revision-based `compareAndSet`, and revision-based `delete` operations must be atomic across replicas. `compareAndSet` must reject records whose `contextId` differs from the lookup key. `create` may replace successful or lapsed closed records, but it must retain failed settlement evidence until an operator deletes the exact revision. The store must persist the complete held `UptoSessionRecord`, including the signed obligation, retained usage, `usageIncomplete`, and pending turn ids, and return every active or settling record from `listRecoverable()`. Protect that payload as payment authorization data. The x402 lifecycle store, merchant offer store, session store, task state, and any host conversation mapping form one recovery domain even when implemented as separate tables or keys.
 
 Call `recover()` on startup (and from a periodic reaper in timerless/serverless deployments). It re-arms future active sessions and closes overdue active sessions through the same CAS transition. Multiple replicas may call it: only the winner of `active -> settling` invokes settlement.
 
-An active record with an in-flight turn is returned in `recovery.unresolved`; restore the turn's trusted usage with `finishTurn`, or call `cancelTurn` only when durable task state proves that no billable work was delivered. A record found in `settling` is also unresolved and is **never settled automatically again**: the payment may have escaped before the process stopped. If the facilitator returned an outcome but the terminal store write lost its CAS race, the manager best-effort attaches that settlement evidence to the still-settling record without claiming that it is closed. Reconcile it against the facilitator, then conditionally remove or repair the exact revision in the store.
+An active record with an in-flight turn is returned in `recovery.unresolved`, including its `pendingTurnIds`. The manager deliberately arms no timer for it: before accepting traffic, restore each turn's trusted usage with `finishTurn`, or call `cancelTurn` only when durable task state proves that no billable work was delivered. Ignoring this queue can let the authorization expire without a settlement attempt. A record found in `settling` is also unresolved and is **never settled automatically again**: the payment may have escaped before the process stopped. If the facilitator returned an outcome but the terminal store write lost its CAS race, the manager best-effort attaches that settlement evidence to the still-settling record without claiming that it is closed. Reconcile it against the facilitator, then conditionally remove or repair the exact revision in the store.
+
+Serialize the first paid turn per `contextId` across replicas. Two first turns can both finish resource work before either has created the held session; the atomic `create` selects one winner, lapses the losing task's unused authorization, and rejects the losing `open()`. Host serialization avoids making the payer retry work that already ran.
 
 Failed settlement closes the session but retains the gate's x402 evidence and blocks a replacement authorization for that context. After manual reconciliation, `forgetClosed(contextId)` conditionally removes that exact closed revision. Never call it merely to make a retry pass.
 

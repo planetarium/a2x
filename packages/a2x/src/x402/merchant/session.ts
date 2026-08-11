@@ -38,6 +38,8 @@ export interface UptoSessionRecord {
   state: UptoSessionState;
   obligation: UptoSessionObligation;
   usage?: MerchantMeterableUsage;
+  /** True after any turn could not be combined into the trusted usage total. */
+  usageIncomplete?: boolean;
   turns: number;
   pendingTurnIds: string[];
   completedTurnIds: string[];
@@ -60,7 +62,9 @@ export interface UptoSessionSnapshot {
   state: UptoSessionState;
   turns: number;
   pendingTurns: number;
+  pendingTurnIds: string[];
   usage?: MerchantMeterableUsage;
+  usageIncomplete: boolean;
   /** Null when the configured missing-usage policy refuses to select a charge. */
   chargeAtomic: string | null;
   authorizedMaxAtomic: string;
@@ -297,32 +301,59 @@ function detailedTotal(usage: Extract<MerchantMeterableUsage, { kind: 'detailed'
 function mergeUsage(
   pricing: MerchantUptoPricing,
   current: MerchantMeterableUsage | undefined,
+  currentIncomplete: boolean,
   next: MerchantMeterableUsage,
-): MerchantMeterableUsage {
-  if (!validUsage(next)) return { kind: 'unreported' };
-  if (current === undefined) return structuredClone(next);
-  if (current.kind === 'unreported' || next.kind === 'unreported') {
-    return { kind: 'unreported' };
+): { usage: MerchantMeterableUsage; incomplete: boolean } {
+  if (!validUsage(next) || next.kind === 'unreported') {
+    return {
+      usage: current ? structuredClone(current) : { kind: 'unreported' },
+      incomplete: true,
+    };
+  }
+  if (current === undefined) {
+    return { usage: structuredClone(next), incomplete: currentIncomplete };
+  }
+  if (current.kind === 'unreported') {
+    return { usage: structuredClone(next), incomplete: true };
   }
   if (current.kind === 'detailed' && next.kind === 'detailed') {
     return {
-      kind: 'detailed',
-      inputTokens: current.inputTokens + next.inputTokens,
-      outputTokens: current.outputTokens + next.outputTokens,
-      cachedInputTokens:
-        (current.cachedInputTokens ?? 0) + (next.cachedInputTokens ?? 0),
+      usage: {
+        kind: 'detailed',
+        inputTokens: current.inputTokens + next.inputTokens,
+        outputTokens: current.outputTokens + next.outputTokens,
+        cachedInputTokens:
+          (current.cachedInputTokens ?? 0) + (next.cachedInputTokens ?? 0),
+      },
+      incomplete: currentIncomplete,
     };
   }
   if (current.kind === 'total' && next.kind === 'total') {
-    return { kind: 'total', totalTokens: current.totalTokens + next.totalTokens };
+    return {
+      usage: { kind: 'total', totalTokens: current.totalTokens + next.totalTokens },
+      incomplete: currentIncomplete,
+    };
   }
   if ('totalPerThousand' in pricing.rates) {
     const currentTotal =
       current.kind === 'total' ? current.totalTokens : detailedTotal(current);
     const nextTotal = next.kind === 'total' ? next.totalTokens : detailedTotal(next);
-    return { kind: 'total', totalTokens: currentTotal + nextTotal };
+    return {
+      usage: { kind: 'total', totalTokens: currentTotal + nextTotal },
+      incomplete: currentIncomplete,
+    };
   }
-  return { kind: 'unreported' };
+  const currentCharge = meterMerchantUsage(pricing, current);
+  const nextCharge = meterMerchantUsage(pricing, next);
+  return {
+    usage:
+      nextCharge.kind === 'charge' &&
+      (currentCharge.kind !== 'charge' ||
+        BigInt(nextCharge.amountAtomic) > BigInt(currentCharge.amountAtomic))
+        ? structuredClone(next)
+        : structuredClone(current),
+    incomplete: true,
+  };
 }
 
 function signedCap(obligation: UptoSessionObligation): bigint | undefined {
@@ -339,6 +370,20 @@ function authorizedMax(obligation: UptoSessionObligation): bigint {
 function projectedCharge(record: UptoSessionRecord): bigint | undefined {
   const metered = meterMerchantUsage(record.obligation.pricing, record.usage);
   const cap = BigInt(record.authorizedMaxAtomic);
+  if (record.usageIncomplete) {
+    switch (record.obligation.pricing.unreportedUsage) {
+      case 'ceiling':
+        return cap;
+      case 'floor': {
+        const floor = BigInt(record.obligation.pricing.minAmount ?? '0');
+        const known = metered.kind === 'charge' ? BigInt(metered.amountAtomic) : 0n;
+        const charge = known > floor ? known : floor;
+        return charge < cap ? charge : cap;
+      }
+      case 'refuse':
+        return undefined;
+    }
+  }
   if (metered.kind === 'charge') {
     const charge = BigInt(metered.amountAtomic);
     return charge < cap ? charge : cap;
@@ -353,6 +398,18 @@ function projectedCharge(record: UptoSessionRecord): bigint | undefined {
     case 'refuse':
       return undefined;
   }
+}
+
+function settlementUsage(record: UptoSessionRecord): MerchantMeterableUsage | undefined {
+  if (!record.usageIncomplete) return record.usage;
+  if (record.obligation.pricing.unreportedUsage !== 'floor') {
+    return { kind: 'unreported' };
+  }
+  const metered = meterMerchantUsage(record.obligation.pricing, record.usage);
+  const floor = BigInt(record.obligation.pricing.minAmount ?? '0');
+  return metered.kind === 'charge' && BigInt(metered.amountAtomic) >= floor
+    ? record.usage
+    : { kind: 'unreported' };
 }
 
 function signedDeadlineMs(obligation: UptoSessionObligation): number | undefined {
@@ -370,7 +427,6 @@ export class UptoSessionManager {
     {
       idle?: ReturnType<typeof setTimeout>;
       deadline?: ReturnType<typeof setTimeout>;
-      hardDeadline?: ReturnType<typeof setTimeout>;
     }
   >();
   private readonly idleMs: number;
@@ -426,14 +482,15 @@ export class UptoSessionManager {
         ? Number.POSITIVE_INFINITY
         : signedDeadline - this.deadlineGuardMs,
     );
-    const usage = mergeUsage(input.obligation.pricing, undefined, input.usage);
+    const merged = mergeUsage(input.obligation.pricing, undefined, false, input.usage);
     const draft: UptoSessionRecord = {
       contextId: input.contextId,
       taskId: input.taskId,
       revision: 0,
       state: 'active',
       obligation: input.obligation,
-      usage,
+      usage: merged.usage,
+      usageIncomplete: merged.incomplete,
       turns: 1,
       pendingTurnIds: [],
       completedTurnIds: [],
@@ -447,16 +504,19 @@ export class UptoSessionManager {
     };
     const charge = projectedCharge(draft);
     const trigger =
-      usage.kind === 'unreported'
+      merged.incomplete
         ? 'usage-unreported'
         : charge !== undefined && charge >= BigInt(draft.authorizedMaxAtomic)
           ? 'budget-exhausted'
-          : undefined;
+          : now >= settleBy
+            ? 'deadline'
+            : undefined;
     const record: UptoSessionRecord = trigger
       ? { ...draft, closeRequestedReason: trigger }
       : draft;
     try {
       if (!(await this.store.create(record))) {
+        await this.options.gate.lapse(input.taskId);
         throw new Error(`An upto session is already live for context ${input.contextId}.`);
       }
       if (trigger) {
@@ -584,20 +644,13 @@ export class UptoSessionManager {
           this.arm(current);
           return { session: this.snapshot(current) };
         }
+        const closeReason = now >= Date.parse(current.settleBy) ? 'deadline' : reason;
         if (current.pendingTurnIds.length > 0) {
-          const hardDeadline = current.authorizationDeadline
-            ? Date.parse(current.authorizationDeadline)
-            : undefined;
-          const waitingAtAuthorizationGuard =
-            reason === 'deadline' &&
-            hardDeadline !== undefined &&
-            Date.parse(current.settleBy) === hardDeadline - this.deadlineGuardMs &&
-            now < hardDeadline;
-          if (reason !== 'deadline' || waitingAtAuthorizationGuard) {
+          if (closeReason !== 'deadline') {
             const waiting: UptoSessionRecord = {
               ...current,
               revision: current.revision + 1,
-              closeRequestedReason: current.closeRequestedReason ?? reason,
+              closeRequestedReason: current.closeRequestedReason ?? closeReason,
             };
             if (!(await this.store.compareAndSet(contextId, current.revision, waiting))) {
               continue;
@@ -610,10 +663,8 @@ export class UptoSessionManager {
           ...current,
           revision: current.revision + 1,
           state: 'settling',
-          ...(current.pendingTurnIds.length > 0
-            ? { usage: { kind: 'unreported' } as const }
-            : {}),
-          endReason: reason,
+          ...(current.pendingTurnIds.length > 0 ? { usageIncomplete: true } : {}),
+          endReason: closeReason,
           closeRequestedReason: undefined,
         };
         if (!(await this.store.compareAndSet(contextId, current.revision, settling))) {
@@ -623,14 +674,19 @@ export class UptoSessionManager {
 
         const charge = projectedCharge(settling);
         let settlement: UptoSessionSettlement;
-        if (charge === 0n && settling.pendingTurnIds.length === 0) {
+        if (
+          charge === 0n &&
+          settling.pendingTurnIds.length === 0 &&
+          !settling.usageIncomplete
+        ) {
           await this.options.gate.lapse(settling.taskId);
           settlement = { kind: 'lapsed' };
         } else {
+          const usage = settlementUsage(settling);
           const outcome = await this.options.gate.settle({
             taskId: settling.taskId,
             obligation: settling.obligation,
-            ...(settling.usage === undefined ? {} : { usage: settling.usage }),
+            ...(usage === undefined ? {} : { usage }),
           });
           settlement =
             outcome.kind === 'settled'
@@ -736,13 +792,9 @@ export class UptoSessionManager {
     this.disarm(record.contextId);
     const now = Date.now();
     if (record.closeRequestedReason) {
-      const timers: {
-        deadline?: ReturnType<typeof setTimeout>;
-        hardDeadline?: ReturnType<typeof setTimeout>;
-      } = {};
       const settleBy = Date.parse(record.settleBy);
       if (settleBy > now) {
-        timers.deadline = setTimeout(() => {
+        const deadline = setTimeout(() => {
           void this.close(record.contextId, 'deadline').catch((error) =>
             this.reportError(error, {
               operation: 'timer',
@@ -751,25 +803,8 @@ export class UptoSessionManager {
             }),
           );
         }, settleBy - now);
-        timers.deadline.unref?.();
-      }
-      if (record.authorizationDeadline) {
-        const authorizationDeadline = Date.parse(record.authorizationDeadline);
-        if (authorizationDeadline > now) {
-          timers.hardDeadline = setTimeout(() => {
-            void this.close(record.contextId, 'deadline').catch((error) =>
-              this.reportError(error, {
-                operation: 'timer',
-                contextId: record.contextId,
-                taskId: record.taskId,
-              }),
-            );
-          }, authorizationDeadline - now);
-          timers.hardDeadline.unref?.();
-        }
-      }
-      if (timers.deadline || timers.hardDeadline) {
-        this.timers.set(record.contextId, timers);
+        deadline.unref?.();
+        this.timers.set(record.contextId, { deadline });
       }
       return;
     }
@@ -800,7 +835,6 @@ export class UptoSessionManager {
     const timers = this.timers.get(contextId);
     if (timers?.idle) clearTimeout(timers.idle);
     if (timers?.deadline) clearTimeout(timers.deadline);
-    if (timers?.hardDeadline) clearTimeout(timers.hardDeadline);
     this.timers.delete(contextId);
   }
 
@@ -813,7 +847,9 @@ export class UptoSessionManager {
       state: record.state,
       turns: record.turns,
       pendingTurns: record.pendingTurnIds.length,
+      pendingTurnIds: [...record.pendingTurnIds],
       ...(record.usage === undefined ? {} : { usage: structuredClone(record.usage) }),
+      usageIncomplete: record.usageIncomplete ?? false,
       chargeAtomic: charge?.toString() ?? null,
       authorizedMaxAtomic: record.authorizedMaxAtomic,
       openedAt: record.openedAt,
@@ -857,7 +893,12 @@ export class UptoSessionManager {
         if (pendingTurnId && !current.pendingTurnIds.includes(pendingTurnId)) {
           return undefined;
         }
-        const usage = mergeUsage(current.obligation.pricing, current.usage, usageInput);
+        const merged = mergeUsage(
+          current.obligation.pricing,
+          current.usage,
+          current.usageIncomplete ?? false,
+          usageInput,
+        );
         const now = Date.now();
         const pendingTurnIds = pendingTurnId
           ? current.pendingTurnIds.filter((id) => id !== pendingTurnId)
@@ -868,7 +909,8 @@ export class UptoSessionManager {
         const draft: UptoSessionRecord = {
           ...current,
           revision: current.revision + 1,
-          usage,
+          usage: merged.usage,
+          usageIncomplete: merged.incomplete,
           turns: current.turns + 1,
           pendingTurnIds,
           completedTurnIds,
@@ -876,7 +918,7 @@ export class UptoSessionManager {
         };
         const charge = projectedCharge(draft);
         const trigger =
-          usage.kind === 'unreported'
+          merged.incomplete
             ? 'usage-unreported'
             : charge !== undefined && charge >= BigInt(draft.authorizedMaxAtomic)
               ? 'budget-exhausted'
@@ -888,7 +930,9 @@ export class UptoSessionManager {
             ? { ...draft, closeRequestedReason: draft.closeRequestedReason ?? trigger }
             : draft;
         if (!(await this.store.compareAndSet(contextId, current.revision, next))) continue;
-        if (trigger && pendingTurnIds.length === 0) return await this.close(contextId, trigger);
+        if (trigger && (pendingTurnIds.length === 0 || trigger === 'deadline')) {
+          return await this.close(contextId, trigger);
+        }
         this.arm(next);
         return { session: this.snapshot(next) };
       }
