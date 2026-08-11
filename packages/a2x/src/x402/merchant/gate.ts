@@ -156,6 +156,7 @@ export class MerchantGate {
       if ((pricing.scheme ?? 'exact') === 'exact' && this.options.exactTiming === 'before-work') {
         const receipt = await this.options.x402.settle(turn, classified);
         if (!receipt.success) {
+          await this.cleanup(turn.taskId);
           return refusal(
             X402_ERROR_CODES.SETTLEMENT_FAILED,
             receipt.errorReason ?? 'Payment settlement failed.',

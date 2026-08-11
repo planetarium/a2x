@@ -245,6 +245,29 @@ describe('MerchantGate', () => {
     expect(facilitator.settle).toHaveBeenCalledTimes(1);
   });
 
+  it('lets a before-work payment flow restart after settlement is refused', async () => {
+    const { gate, facilitator, x402 } = fixture({ accepts: [EXACT] }, 'before-work');
+    vi.mocked(facilitator.settle).mockResolvedValueOnce({
+      success: false,
+      errorReason: 'facilitator rejected payment',
+      network: EXACT.network,
+    });
+    await gate.open({ taskId: 't-before-retry', message: message() });
+
+    await expect(
+      gate.open({ taskId: 't-before-retry', message: submitted(exactPayload()) }),
+    ).resolves.toMatchObject({
+      kind: 'refuse',
+      code: X402_ERROR_CODES.SETTLEMENT_FAILED,
+      reason: 'facilitator rejected payment',
+    });
+    await expect(gate.sidecar.getOffer('t-before-retry')).resolves.toBeUndefined();
+    await expect(x402.store.get('t-before-retry')).resolves.toBeUndefined();
+    await expect(
+      gate.open({ taskId: 't-before-retry', message: message() }),
+    ).resolves.toMatchObject({ kind: 'request-payment' });
+  });
+
   it('rejects a replay through the one-shot claim', async () => {
     const { gate } = fixture({ accepts: [EXACT] }, 'after-work');
     await gate.open({ taskId: 't-replay', message: message() });
