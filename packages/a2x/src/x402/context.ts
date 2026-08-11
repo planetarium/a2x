@@ -620,7 +620,7 @@ export abstract class BaseX402Context {
       // actionable negative result instead of an exception.
       const reason = err instanceof Error ? err.message : 'Facilitator verify failed.';
       if (ctx.taskId) {
-        await this.store.update(ctx.taskId, {
+        await this.store.updateIfStatus(ctx.taskId, ['offered', 'failed', 'verified'], {
           status: 'failed',
           failure: {
             point: 'verify',
@@ -634,12 +634,12 @@ export abstract class BaseX402Context {
     }
     if (ctx.taskId) {
       if (result.isValid) {
-        await this.store.update(ctx.taskId, {
+        await this.store.updateIfStatus(ctx.taskId, ['offered', 'failed', 'verified'], {
           status: 'verified',
           verifiedAt: new Date(),
         });
       } else {
-        await this.store.update(ctx.taskId, {
+        await this.store.updateIfStatus(ctx.taskId, ['offered', 'failed', 'verified'], {
           status: 'failed',
           failure: {
             point: 'verify',
@@ -716,13 +716,14 @@ export abstract class BaseX402Context {
       // with no record. Mark it failed and return a negative receipt.
       const reason = err instanceof Error ? err.message : 'Facilitator settle failed.';
       if (ctx.taskId) {
-        await this.store.update(ctx.taskId, {
+        await this.store.updateIfStatus(ctx.taskId, ['offered', 'failed', 'verified'], {
           status: 'failed',
           failure: {
             point: 'settle',
             code: X402_ERROR_CODES.SETTLEMENT_FAILED,
             reason,
             failedAt: new Date(),
+            indeterminate: true,
           },
         });
       }
@@ -801,12 +802,12 @@ export abstract class BaseX402Context {
           ...(receipt.extra !== undefined ? { extra: receipt.extra } : {}),
           settledAt,
         };
-        await this.store.update(ctx.taskId, {
+        await this.store.updateIfStatus(ctx.taskId, ['offered', 'failed', 'verified'], {
           status: 'completed',
           receipt: stored,
         });
       } else {
-        await this.store.update(ctx.taskId, {
+        await this.store.updateIfStatus(ctx.taskId, ['offered', 'failed', 'verified'], {
           status: 'failed',
           failure: {
             point: 'settle',
@@ -997,7 +998,7 @@ export abstract class BaseX402Context {
       reason: result.reason,
       failedAt: new Date(),
     };
-    await this.store.update(taskId, {
+    await this.store.updateIfStatus(taskId, ['offered', 'failed'], {
       status: result.kind === 'rejected' ? 'rejected' : 'failed',
       failure,
     });

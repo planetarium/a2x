@@ -258,6 +258,7 @@ export {
 export type {
   InMemoryMerchantOfferStoreOptions,
   InMemoryUptoSessionStoreOptions,
+  MerchantOfferClaimStatus,
   MerchantDeferredObligation,
   MerchantBatchSettlementPricing,
   MerchantDetailedRates,

@@ -98,7 +98,7 @@ function refusal(
   code: X402ErrorCode,
   reason: string,
   failureReceipt?: X402SettleResponse,
-): MerchantGateOpenOutcome {
+): Extract<MerchantGateOpenOutcome, { kind: 'refuse' }> {
   return {
     kind: 'refuse',
     code,
@@ -125,6 +125,8 @@ export class MerchantGate {
 
   async open(turn: MerchantGateOpenInput): Promise<MerchantGateOpenOutcome> {
     try {
+      const replay = await this.replayRefusal(turn.taskId);
+      if (replay) return replay;
       const classified = await this.options.x402.classify({
         taskId: turn.taskId,
         ...(turn.message === undefined ? {} : { message: turn.message }),
@@ -193,6 +195,17 @@ export class MerchantGate {
         }
         const receipt = await this.options.x402.settle(turn, classified);
         if (!receipt.success) {
+          const lifecycle = await this.options.x402.store.get(turn.taskId);
+          if (lifecycle?.failure?.indeterminate === true) {
+            await this.reportError(new Error(lifecycle.failure.reason), {
+              operation: 'open',
+              taskId: turn.taskId,
+            });
+            return refusal(
+              X402_ERROR_CODES.SETTLEMENT_FAILED,
+              'Payment settlement outcome is unavailable.',
+            );
+          }
           await this.cancelVerification(
             turn.taskId,
             verification.cancellation,
@@ -205,7 +218,7 @@ export class MerchantGate {
             receipt,
           );
         }
-        await this.cleanup(turn.taskId, { retainX402Receipt: true });
+        await this.cleanup(turn.taskId, { retainX402Entry: true });
         return {
           kind: 'handled',
           operation: 'batch-refund',
@@ -218,6 +231,17 @@ export class MerchantGate {
       if ((pricing.scheme ?? 'exact') === 'exact' && this.options.exactTiming === 'before-work') {
         const receipt = await this.options.x402.settle(turn, classified);
         if (!receipt.success) {
+          const lifecycle = await this.options.x402.store.get(turn.taskId);
+          if (lifecycle?.failure?.indeterminate === true) {
+            await this.reportError(new Error(lifecycle.failure.reason), {
+              operation: 'open',
+              taskId: turn.taskId,
+            });
+            return refusal(
+              X402_ERROR_CODES.SETTLEMENT_FAILED,
+              'Payment settlement outcome is unavailable.',
+            );
+          }
           await this.cleanup(turn.taskId);
           return refusal(
             X402_ERROR_CODES.SETTLEMENT_FAILED,
@@ -225,7 +249,7 @@ export class MerchantGate {
             receipt,
           );
         }
-        await this.cleanup(turn.taskId);
+        await this.cleanup(turn.taskId, { retainX402Entry: true });
         return {
           kind: 'proceed',
           obligation: { kind: 'settled', receipt, pricing: pricing as MerchantExactPricing },
@@ -281,12 +305,28 @@ export class MerchantGate {
   async settle(input: MerchantGateSettleInput): Promise<MerchantGateSettleOutcome> {
     try {
       const outcome = await this.settleObligation(input);
+      let hasCompletedLifecycle = false;
       const isBatch =
         input.obligation.kind === 'deferred' &&
         input.obligation.scheme === 'batch-settlement';
       if (outcome.kind === 'settled') {
-        await this.cleanup(input.taskId, { retainX402Receipt: isBatch });
-      } else if (isBatch) {
+        await this.cleanup(input.taskId, { retainX402Entry: true });
+      } else {
+        const lifecycle = await this.options.x402.store.get(input.taskId);
+        hasCompletedLifecycle = lifecycle?.status === 'completed';
+        if (lifecycle?.failure?.indeterminate === true) {
+          await this.reportError(new Error(lifecycle.failure.reason), {
+            operation: 'settle',
+            taskId: input.taskId,
+          });
+          return {
+            kind: 'failed',
+            code: X402_ERROR_CODES.SETTLEMENT_FAILED,
+            reason: 'Payment settlement outcome is unavailable.',
+          };
+        }
+      }
+      if (outcome.kind === 'failed' && isBatch && !hasCompletedLifecycle) {
         await this.abort({
           taskId: input.taskId,
           obligation: input.obligation,
@@ -295,17 +335,10 @@ export class MerchantGate {
       }
       return outcome;
     } catch (error) {
-      if (
-        input.obligation.kind === 'deferred' &&
-        input.obligation.scheme === 'batch-settlement'
-      ) {
-        await this.abort({
-          taskId: input.taskId,
-          obligation: input.obligation,
-          reason: 'handler_threw',
-          error,
-        });
-      }
+      // Do not abort a batch obligation here. `x402.settle()` can reject after
+      // the resource server has settled successfully but lifecycle persistence
+      // has failed. A missing indeterminate marker is therefore not proof that
+      // settlement did not escape; releasing the claim could allow duplicate work.
       await this.reportError(error, { operation: 'settle', taskId: input.taskId });
       return {
         kind: 'failed',
@@ -534,10 +567,22 @@ export class MerchantGate {
 
   private async cleanup(
     taskId: string,
-    options: { retainX402Receipt?: boolean } = {},
+    options: { retainX402Entry?: boolean } = {},
   ): Promise<void> {
-    const operations = [() => this.offerStore.delete(taskId)];
-    if (!options.retainX402Receipt) {
+    const sharesLifecycleStore = Object.is(this.offerStore, this.options.x402.store);
+    const operations = [() => {
+      if (options.retainX402Entry && this.offerStore.deleteOffer) {
+        return this.offerStore.deleteOffer(taskId);
+      }
+      if (options.retainX402Entry && sharesLifecycleStore) {
+        throw new Error(
+          'MerchantGate: a shared offer/lifecycle store must implement deleteOffer() ' +
+            'to retain lifecycle state without retaining merchant terms.',
+        );
+      }
+      return this.offerStore.delete(taskId);
+    }];
+    if (!options.retainX402Entry) {
       operations.push(() => this.options.x402.clearOffering({ taskId }));
     }
     for (const operation of operations) {
@@ -547,6 +592,32 @@ export class MerchantGate {
         await this.reportError(error, { operation: 'cleanup', taskId });
       }
     }
+  }
+
+  private async replayRefusal(
+    taskId: string,
+  ): Promise<Extract<MerchantGateOpenOutcome, { kind: 'refuse' }> | undefined> {
+    const lifecycle = await this.options.x402.store.get(taskId);
+    if (lifecycle?.status === 'completed') {
+      return refusal(
+        X402_ERROR_CODES.DUPLICATE_NONCE,
+        'This task already has a completed payment.',
+      );
+    }
+    if (lifecycle?.status === 'rejected') {
+      return refusal(
+        lifecycle.failure?.code ?? X402_ERROR_CODES.INVALID_PAYLOAD,
+        lifecycle.failure?.reason ?? 'The payment was rejected for this task.',
+      );
+    }
+    const claimStatus = await this.offerStore.getClaimStatus?.(taskId);
+    if (claimStatus === 'claimed') {
+      return refusal(
+        X402_ERROR_CODES.DUPLICATE_NONCE,
+        'This payment is already in progress or has been submitted for this task.',
+      );
+    }
+    return undefined;
   }
 
   private async cancelVerification(

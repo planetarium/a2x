@@ -214,6 +214,8 @@ The entry retains:
 | `'settle'` | `facilitator.settle` returned `success: false` |
 | `'rejected-by-client'` | Client sent `x402.payment.status: payment-rejected` |
 
+When settlement throws instead of returning a structured refusal, `failure.indeterminate` is `true`: the request may have reached the facilitator and must be reconciled before retry.
+
 Read the entry back any time for audit / reconciliation:
 
 ```ts
@@ -273,6 +275,8 @@ const x402 = new X402Context({ store: new RedisX402Store(redis) });
 ```
 
 Lazy expiry contract: `get(taskId)` MUST return `undefined` after `entry.expiresAt`. Backends with native TTL (Redis `EXPIRE`, Postgres `WHERE expires_at > now()`) satisfy this trivially; in-memory or file-backed stores must check on read. No background reaper required — works in serverless deployments.
+
+`BaseX402Store.updateIfStatus(taskId, expected, patch)` prevents a late concurrent verify/classify result from regressing `completed` or `rejected` state. Its base implementation is a source-compatible read-then-update fallback. Multi-replica stores MUST override it with an atomic compare-and-set.
 
 `InMemoryX402Store` also accepts `{ maxEntries }` for LRU eviction when the cap is reached.
 
@@ -540,15 +544,39 @@ yield { type: 'text', role: 'agent', text: result.text };
 yield { type: 'done', metadata: settled.receiptMetadata };
 ```
 
-The pricing callback runs only on the unpaid turn. Its complete `MerchantOffer` is frozen by the offer store and the submitted turn settles against that snapshot, not live rates. When `expiresInSeconds` is omitted, `MerchantGate` applies a 10-minute TTL to both the offer-store snapshot and the underlying x402 offering; set `expiresInSeconds` on the offer to override it. The default `InMemoryMerchantOfferStore` independently defaults to the same TTL and caps itself at 10,000 live entries. Standalone store users can override those limits with `defaultTtlSeconds` and `maxEntries`. It also grants an execution claim. Multi-replica deployments must inject a durable `MerchantOfferStore` whose `publishing`, `claim`, and `release` operations are atomic.
+The pricing callback runs only on the unpaid turn. Its complete `MerchantOffer` is frozen by the offer store and the submitted turn settles against that snapshot, not live rates. When `expiresInSeconds` is omitted, `MerchantGate` applies a 10-minute TTL to both the offer-store snapshot and the underlying x402 offering; set `expiresInSeconds` on the offer to override it. The default `InMemoryMerchantOfferStore` independently defaults to the same TTL and caps itself at 10,000 live entries. Standalone store users can override those limits with `defaultTtlSeconds` and `maxEntries`. It also grants an execution claim. Multi-replica deployments must inject a durable `MerchantOfferStore` whose publication, claim, and release operations are atomic and whose claim status is shared across replicas.
 
-Verification happens before the execution claim is consumed, so a transient verification failure can be retried on the same task. Once verification succeeds, only one concurrent caller receives the claim and may execute work. Exact and `upto` retain the existing one-shot behavior. A canceled `batch-settlement` obligation releases both the task claim and the official scheme's channel reservation, so the same voucher can retry after failed work. Successful exact and `upto` settlement removes both lifecycle records; batch settlement removes the frozen offer but retains the completed x402 receipt until its TTL so `extra.channelState` remains available for crash recovery. Cleanup failures do not turn a completed payment into a failure; they are reported through `onError` with `operation: 'cleanup'`.
+Verification happens before the execution claim is consumed, so a transient verification failure can be retried on the same task. Once verification succeeds, only one concurrent caller receives the claim and may execute work. Exact and `upto` remain one-shot after that claim. A canceled `batch-settlement` obligation releases both the task claim and the official scheme's channel reservation, so the same voucher can retry after failed work. Cleanup failures do not turn a completed payment into a failure; they are reported through `onError` with `operation: 'cleanup'`.
+
+Successful settlement now removes the frozen merchant offer but retains the completed `X402StoreEntry` until its configured TTL. This gives every scheme a durable completed-replay answer and keeps its reconciliation receipt available. The lifecycle store must therefore have a bounded TTL and an operational expiry sweep when its backend does not expire rows natively.
+
+If one object implements both `MerchantOfferStore` and the x402 lifecycle store, it must implement `deleteOffer()` so cleanup can remove merchant terms without deleting the retained lifecycle entry. `MerchantGate` reports a cleanup configuration error through `onError` and retains both records when that method is missing; it never deletes completed reconciliation evidence to compensate for a misconfigured combined store.
+
+#### Replay and crash-recovery policy
+
+`MerchantGate` combines the x402 lifecycle entry with the offer store's claim; it does not add a new `X402Classification` variant. Exhaustive switches over `X402Classification` remain source-compatible. `MerchantOfferStore.getClaimStatus()` is an optional read-only fast path: a `claimed` result avoids a facilitator verify call, while an `available` result never grants execution. The post-verify `claim()` compare-and-set remains the arbiter under races.
+
+`BaseX402Context.classify()` remains a protocol-shape classifier, not an execution-policy lock. Direct low-level callers that do not use `MerchantGate` must inspect `x402.store` and provide their own nonce/execution claim before running work. `updateIfStatus()` protects lifecycle audit state from late writes; it does not by itself prevent a second facilitator call.
+
+| Lifecycle state | Durable claim | Gate behavior |
+|---|---|---|
+| `offered` | available | Normal submission flow. |
+| `failed` at classify or verify | available | Recoverable: a corrected submission can verify and compete for the claim. |
+| `verified` | available | Recoverable after a crash that happened before execution was claimed; verification runs again. |
+| `verified` or `failed` | claimed | Terminal for automatic replay. Work may be running, may have had side effects, or settlement may be uncertain. |
+| `rejected` | either | Terminal for that task because the payer explicitly declined its terms. |
+| `completed` | either/absent | Terminal; the retained receipt proves settlement and verification is skipped. |
+| expired/absent | absent | A submitted payment has no stored offering; an unpaid turn may create a new offer. |
+
+Two concurrent submissions can both observe `available` and both verify. Exactly one wins the later atomic `claim()`; every loser cancels any scheme reservation and receives `DUPLICATE_NONCE`. This is why `getClaimStatus()` is never a lock.
+
+A facilitator response with `success: false` is a definitive settlement refusal. In `before-work` mode the gate can delete both records and allow the task to restart. A thrown settlement transport/schema error is different: the transfer may already have been broadcast. `X402EntryFailure.indeterminate` is then `true`, and the claim is kept until expiry or explicit operator reconciliation. Only call `offerStore.release(taskId)` after proving that neither resource side effects nor settlement occurred. Batch abort remains the normal automatic release path because it also cancels the scheme reservation.
 
 Unexpected exceptions that escape pricing, storage, or x402 operations are never copied into payer-facing refusal reasons. `open()` and `settle()` return fixed generic text and pass the original error to the optional `onError` callback for host-side logging. Structured verification and settlement failures keep their protocol reason and failure receipt.
 
 Usage is semantic rather than inferred. A trusted zero reading is `{ kind: 'total', totalTokens: 0 }` and charges zero; a runtime that uses zero counters as an “accounting unavailable” sentinel must normalize them to `{ kind: 'unreported' }`. Each `rates` object must use exactly one form: detailed input/output rates or `totalPerThousand`. Detailed rates cannot price a total-only reading, so that combination also follows the offer's required `unreportedUsage` policy. A `totalPerThousand` rate can price either usage shape.
 
-`exactTiming` is required because `before-work` protects the merchant from delivering work whose authorization later fails, while `after-work` protects the payer from being charged for work that fails. For `before-work`, `open()` returns an already-settled obligation; calling `settle()` after the work reuses its receipt and never charges twice. If the facilitator definitively refuses settlement before work, the gate clears the frozen offer and execution claim so the payer can restart the payment flow on the same task.
+`exactTiming` is required because `before-work` protects the merchant from delivering work whose authorization later fails, while `after-work` protects the payer from being charged for work that fails. For `before-work`, `open()` returns an already-settled obligation; calling `settle()` after the work reuses its receipt and never charges twice. If the facilitator definitively refuses settlement before work, the gate clears the frozen offer and execution claim so the payer can restart the payment flow on the same task. An indeterminate transport failure keeps the claim, as described above.
 
 On success, `settled.charge.requestedAtomic` is the amount the gate asked the facilitator to settle. `settled.charge.amountAtomic` is the facilitator-reported `receipt.amount` when it is a decimal amount, or the requested amount when the receipt omits it. Comparing the two surfaces settlement reconciliation mismatches without discarding the facilitator's authoritative value.
 
@@ -721,6 +749,8 @@ Serialize the first paid turn per `contextId` across replicas. Two first turns c
 Failed settlement closes the session but retains the gate's x402 evidence and blocks a replacement authorization for that context. After manual reconciliation, `forgetClosed(contextId)` conditionally removes that exact closed revision. Never call it merely to make a retry pass.
 
 The offer and x402 lifecycle TTL must extend beyond `maxDurationSeconds` plus operational delay. Otherwise the held classification can outlive the records required by `MerchantGate.settle()`.
+
+A standard durable store implementation remains separate follow-up work. Custom multi-replica lifecycle, offer, and session stores must satisfy the atomicity requirements above.
 
 #### What the payer's payload looks like
 

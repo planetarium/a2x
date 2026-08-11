@@ -1,12 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Message } from '../types/common.js';
 import {
+  InMemoryMerchantOfferStore,
+  InMemoryX402Store,
   MerchantGate,
   merchantPricingToAccept,
   type MerchantBatchSettlementPricing,
   type MerchantExactPricing,
   type MerchantGateErrorContext,
   type MerchantOffer,
+  type MerchantOfferStore,
   type MerchantUptoPricing,
 } from '../x402/index.js';
 import {
@@ -27,6 +30,40 @@ import { encodeRequirementV2 } from '../x402/wire-v2.js';
 const PAY_TO = '0x2222222222222222222222222222222222222222';
 const ASSET = '0x036CbD53842c5426634e7929541eC2318f3dCF7e';
 const PAYER = '0x1234567890123456789012345678901234567890';
+
+class SharedStoreWithoutDeleteOffer
+  extends InMemoryX402Store
+  implements MerchantOfferStore {
+  private readonly offers = new InMemoryMerchantOfferStore();
+
+  publishing<T>(
+    taskId: string,
+    offer: MerchantOffer,
+    publish: (frozenOffer: MerchantOffer) => Promise<T>,
+  ): Promise<T> {
+    return this.offers.publishing(taskId, offer, publish);
+  }
+
+  getOffer(taskId: string): Promise<MerchantOffer | undefined> {
+    return this.offers.getOffer(taskId);
+  }
+
+  getClaimStatus(taskId: string) {
+    return this.offers.getClaimStatus(taskId);
+  }
+
+  claim(taskId: string): Promise<boolean> {
+    return this.offers.claim(taskId);
+  }
+
+  release(taskId: string): Promise<void> {
+    return this.offers.release(taskId);
+  }
+
+  override async delete(taskId: string): Promise<void> {
+    await Promise.all([super.delete(taskId), this.offers.delete(taskId)]);
+  }
+}
 
 const EXACT: MerchantExactPricing = {
   scheme: 'exact',
@@ -339,7 +376,9 @@ describe('MerchantGate', () => {
     expect(settled.kind).toBe('settled');
     expect(settledRequirements).toHaveLength(1);
     await expect(gate.offerStore.getOffer('t-exact')).resolves.toBeUndefined();
-    await expect(x402.store.get('t-exact')).resolves.toBeUndefined();
+    await expect(x402.store.get('t-exact')).resolves.toMatchObject({
+      status: 'completed',
+    });
   });
 
   it('reuses frozen pricing for unpaid retries without calling the resolver again', async () => {
@@ -408,7 +447,7 @@ describe('MerchantGate', () => {
   });
 
   it('rejects a replay through the one-shot claim', async () => {
-    const { gate } = fixture({ accepts: [EXACT] }, 'after-work');
+    const { gate, facilitator } = fixture({ accepts: [EXACT] }, 'after-work');
     await gate.open({ taskId: 't-replay', message: message() });
     await gate.open({ taskId: 't-replay', message: submitted(exactPayload()) });
     const replay = await gate.open({ taskId: 't-replay', message: submitted(exactPayload()) });
@@ -416,6 +455,105 @@ describe('MerchantGate', () => {
       kind: 'refuse',
       code: X402_ERROR_CODES.DUPLICATE_NONCE,
     });
+    expect(facilitator.verify).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses the atomic claim after concurrent verification as the arbiter', async () => {
+    const { gate, facilitator } = fixture({ accepts: [EXACT] }, 'after-work');
+    await gate.open({ taskId: 't-concurrent', message: message() });
+
+    const outcomes = await Promise.all([
+      gate.open({ taskId: 't-concurrent', message: submitted(exactPayload()) }),
+      gate.open({ taskId: 't-concurrent', message: submitted(exactPayload()) }),
+    ]);
+    expect(outcomes.filter((outcome) => outcome.kind === 'proceed')).toHaveLength(1);
+    expect(outcomes.filter((outcome) => outcome.kind === 'refuse')).toHaveLength(1);
+    expect(facilitator.verify).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not let a late concurrent verify regress completed lifecycle state', async () => {
+    const { gate, facilitator, x402 } = fixture({ accepts: [EXACT] }, 'before-work');
+    let releaseLateVerify!: () => void;
+    const lateVerify = new Promise<void>((resolve) => {
+      releaseLateVerify = resolve;
+    });
+    let verificationCount = 0;
+    vi.mocked(facilitator.verify).mockImplementation(async () => {
+      verificationCount += 1;
+      if (verificationCount === 2) await lateVerify;
+      return { isValid: true };
+    });
+    await gate.open({ taskId: 't-late-verify', message: message() });
+
+    const winner = gate.open({ taskId: 't-late-verify', message: submitted(exactPayload()) });
+    const loser = gate.open({ taskId: 't-late-verify', message: submitted(exactPayload()) });
+    await expect(winner).resolves.toMatchObject({
+      kind: 'proceed',
+      obligation: { kind: 'settled' },
+    });
+    releaseLateVerify();
+    await expect(loser).resolves.toMatchObject({
+      kind: 'refuse',
+      code: X402_ERROR_CODES.DUPLICATE_NONCE,
+    });
+    await expect(x402.store.get('t-late-verify')).resolves.toMatchObject({
+      status: 'completed',
+      receipt: { transaction: '0xtx' },
+    });
+  });
+
+  it('recovers a crash after verification but before the execution claim', async () => {
+    const { gate, facilitator, x402 } = fixture({ accepts: [EXACT] }, 'after-work');
+    await gate.open({ taskId: 't-verified-recovery', message: message() });
+    const classified = await x402.classify({
+      taskId: 't-verified-recovery',
+      message: submitted(exactPayload()),
+    });
+    if (classified.kind !== 'valid') throw new Error('expected valid');
+    await x402.verify({ taskId: 't-verified-recovery' }, classified);
+
+    await expect(
+      gate.open({ taskId: 't-verified-recovery', message: submitted(exactPayload()) }),
+    ).resolves.toMatchObject({ kind: 'proceed' });
+    expect(facilitator.verify).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps a claimed verified attempt terminal across gate reconstruction', async () => {
+    const { gate, facilitator, x402 } = fixture({ accepts: [EXACT] }, 'after-work');
+    await gate.open({ taskId: 't-claimed-restart', message: message() });
+    await gate.open({ taskId: 't-claimed-restart', message: submitted(exactPayload()) });
+
+    const restarted = new MerchantGate({
+      x402,
+      offerStore: gate.offerStore,
+      pricing: async () => ({ accepts: [EXACT] }),
+      exactTiming: 'after-work',
+    });
+    await expect(
+      restarted.open({ taskId: 't-claimed-restart', message: submitted(exactPayload()) }),
+    ).resolves.toMatchObject({
+      kind: 'refuse',
+      code: X402_ERROR_CODES.DUPLICATE_NONCE,
+    });
+    expect(facilitator.verify).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a client-rejected task terminal', async () => {
+    const { gate, facilitator } = fixture({ accepts: [EXACT] }, 'after-work');
+    await gate.open({ taskId: 't-rejected', message: message() });
+    await expect(
+      gate.open({
+        taskId: 't-rejected',
+        message: message({
+          [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REJECTED,
+        }),
+      }),
+    ).resolves.toMatchObject({ kind: 'refuse', reason: 'Client declined to pay.' });
+
+    await expect(
+      gate.open({ taskId: 't-rejected', message: submitted(exactPayload()) }),
+    ).resolves.toMatchObject({ kind: 'refuse', reason: 'Client declined to pay.' });
+    expect(facilitator.verify).not.toHaveBeenCalled();
   });
 
   it('allows retry after verification fails before claiming execution', async () => {
@@ -451,6 +589,167 @@ describe('MerchantGate', () => {
       kind: 'settled',
       charge: { requestedAtomic: '1000', amountAtomic: '900', basis: 'exact' },
     });
+  });
+
+  it('keeps an indeterminate before-work settlement claimed for reconciliation', async () => {
+    const onError = vi.fn();
+    const { gate, facilitator, x402 } = fixture(
+      { accepts: [EXACT] },
+      'before-work',
+      onError,
+    );
+    vi.mocked(facilitator.settle).mockRejectedValueOnce(new Error('connection lost'));
+    await gate.open({ taskId: 't-indeterminate', message: message() });
+
+    await expect(
+      gate.open({ taskId: 't-indeterminate', message: submitted(exactPayload()) }),
+    ).resolves.toMatchObject({
+      kind: 'refuse',
+      reason: 'Payment settlement outcome is unavailable.',
+    });
+    await expect(x402.store.get('t-indeterminate')).resolves.toMatchObject({
+      status: 'failed',
+      failure: { point: 'settle', indeterminate: true },
+    });
+    await expect(gate.offerStore.getClaimStatus?.('t-indeterminate')).resolves.toBe(
+      'claimed',
+    );
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: 'connection lost' }), {
+      operation: 'open',
+      taskId: 't-indeterminate',
+    });
+
+    await expect(
+      gate.open({ taskId: 't-indeterminate', message: submitted(exactPayload()) }),
+    ).resolves.toMatchObject({
+      kind: 'refuse',
+      code: X402_ERROR_CODES.DUPLICATE_NONCE,
+    });
+    expect(facilitator.verify).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not release a batch claim when settlement transport outcome is unknown', async () => {
+    const { gate, x402, cancel, settlePayment } = batchFixture();
+    await gate.open({ taskId: 't-batch-indeterminate', message: message() });
+    const accepted = (await x402.store.get('t-batch-indeterminate'))!.accepts[0]!;
+    const opened = await gate.open({
+      taskId: 't-batch-indeterminate',
+      message: submitted(batchPayload('voucher', accepted)),
+    });
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+    settlePayment.mockRejectedValueOnce(new Error('connection lost after commit'));
+
+    await expect(
+      gate.settle({
+        taskId: 't-batch-indeterminate',
+        obligation: opened.obligation,
+        usage: { kind: 'total', totalTokens: 100 },
+      }),
+    ).resolves.toEqual({
+      kind: 'failed',
+      code: X402_ERROR_CODES.SETTLEMENT_FAILED,
+      reason: 'Payment settlement outcome is unavailable.',
+    });
+    expect(cancel).not.toHaveBeenCalled();
+    await expect(gate.offerStore.getClaimStatus?.('t-batch-indeterminate')).resolves.toBe(
+      'claimed',
+    );
+  });
+
+  it('does not abort a late batch failure after another attempt completed', async () => {
+    const { gate, x402, cancel } = batchFixture({ settleSuccess: false });
+    await gate.open({ taskId: 't-batch-late-failure', message: message() });
+    const accepted = (await x402.store.get('t-batch-late-failure'))!.accepts[0]!;
+    const opened = await gate.open({
+      taskId: 't-batch-late-failure',
+      message: submitted(batchPayload('voucher', accepted)),
+    });
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+    const now = new Date();
+    await x402.store.updateIfStatus('t-batch-late-failure', ['verified'], {
+      status: 'completed',
+      receipt: {
+        transaction: '0xconcurrent',
+        network: BATCH.network,
+        settledAt: now,
+      },
+    });
+
+    await expect(
+      gate.settle({
+        taskId: 't-batch-late-failure',
+        obligation: opened.obligation,
+        usage: { kind: 'total', totalTokens: 100 },
+      }),
+    ).resolves.toMatchObject({ kind: 'failed' });
+    expect(cancel).not.toHaveBeenCalled();
+    await expect(x402.store.get('t-batch-late-failure')).resolves.toMatchObject({
+      status: 'completed',
+      receipt: { transaction: '0xconcurrent' },
+    });
+  });
+
+  it('keeps a batch claim when settlement evidence cannot be persisted', async () => {
+    const { gate, x402, cancel, resourceServer } = batchFixture();
+    await gate.open({ taskId: 't-batch-persistence-error', message: message() });
+    const accepted = (await x402.store.get('t-batch-persistence-error'))!.accepts[0]!;
+    const opened = await gate.open({
+      taskId: 't-batch-persistence-error',
+      message: submitted(batchPayload('voucher', accepted)),
+    });
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+    vi.spyOn(x402, 'settle').mockRejectedValueOnce(
+      new Error('lifecycle write failed after settlement'),
+    );
+
+    await expect(
+      gate.settle({
+        taskId: 't-batch-persistence-error',
+        obligation: opened.obligation,
+        usage: { kind: 'total', totalTokens: 100 },
+      }),
+    ).resolves.toEqual({
+      kind: 'failed',
+      code: X402_ERROR_CODES.SETTLEMENT_FAILED,
+      reason: 'Payment settlement failed.',
+    });
+    expect(cancel).not.toHaveBeenCalled();
+    await expect(
+      gate.offerStore.getClaimStatus?.('t-batch-persistence-error'),
+    ).resolves.toBe('claimed');
+
+    await expect(
+      gate.open({
+        taskId: 't-batch-persistence-error',
+        message: submitted(batchPayload('voucher', accepted)),
+      }),
+    ).resolves.toMatchObject({
+      kind: 'refuse',
+      code: X402_ERROR_CODES.DUPLICATE_NONCE,
+    });
+    expect(resourceServer.verifyPayment).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains completed lifecycle state and refuses a settled replay before verify', async () => {
+    const { gate, facilitator, x402 } = fixture({ accepts: [EXACT] }, 'after-work');
+    await gate.open({ taskId: 't-completed-replay', message: message() });
+    const opened = await gate.open({
+      taskId: 't-completed-replay',
+      message: submitted(exactPayload()),
+    });
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+    await gate.settle({ taskId: 't-completed-replay', obligation: opened.obligation });
+
+    await expect(x402.store.get('t-completed-replay')).resolves.toMatchObject({
+      status: 'completed',
+    });
+    await expect(
+      gate.open({ taskId: 't-completed-replay', message: submitted(exactPayload()) }),
+    ).resolves.toMatchObject({
+      kind: 'refuse',
+      code: X402_ERROR_CODES.DUPLICATE_NONCE,
+    });
+    expect(facilitator.verify).toHaveBeenCalledTimes(1);
   });
 
   it('hides settlement exceptions and reports them to the host', async () => {
@@ -497,7 +796,41 @@ describe('MerchantGate', () => {
       operation: 'cleanup',
       taskId: 't-cleanup-error',
     });
-    await expect(x402.store.get('t-cleanup-error')).resolves.toBeUndefined();
+    await expect(x402.store.get('t-cleanup-error')).resolves.toMatchObject({
+      status: 'completed',
+    });
+  });
+
+  it('reports a shared store that cannot delete merchant terms separately', async () => {
+    const onError = vi.fn();
+    const { facilitator } = fixture({ accepts: [EXACT] }, 'after-work');
+    const store = new SharedStoreWithoutDeleteOffer();
+    const x402 = new X402Context({ facilitator, store, x402Version: 2 });
+    const gate = new MerchantGate({
+      x402,
+      offerStore: store,
+      pricing: async () => ({ accepts: [EXACT] }),
+      exactTiming: 'after-work',
+      onError,
+    });
+    await gate.open({ taskId: 't-shared-store-cleanup', message: message() });
+    const opened = await gate.open({
+      taskId: 't-shared-store-cleanup',
+      message: submitted(exactPayload()),
+    });
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+
+    await expect(
+      gate.settle({ taskId: 't-shared-store-cleanup', obligation: opened.obligation }),
+    ).resolves.toMatchObject({ kind: 'settled' });
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining('must implement deleteOffer') }),
+      { operation: 'cleanup', taskId: 't-shared-store-cleanup' },
+    );
+    await expect(store.getOffer('t-shared-store-cleanup')).resolves.toBeDefined();
+    await expect(store.get('t-shared-store-cleanup')).resolves.toMatchObject({
+      status: 'completed',
+    });
   });
 
   it('applies the required unreported-usage policy to upto', async () => {
@@ -740,6 +1073,31 @@ describe('MerchantGate', () => {
         message: submitted(batchPayload('refund', accepted)),
       }),
     ).resolves.toMatchObject({ kind: 'refuse', reason: 'batch settle refused' });
+  });
+
+  it('keeps an indeterminate refund settlement claimed for reconciliation', async () => {
+    const { gate, x402, cancel, settlePayment } = batchFixture({ skipHandler: true });
+    settlePayment.mockRejectedValueOnce(new Error('connection lost after refund submission'));
+    await gate.open({ taskId: 't-batch-refund-indeterminate', message: message() });
+    const accepted = (await x402.store.get('t-batch-refund-indeterminate'))!.accepts[0]!;
+
+    await expect(
+      gate.open({
+        taskId: 't-batch-refund-indeterminate',
+        message: submitted(batchPayload('refund', accepted)),
+      }),
+    ).resolves.toMatchObject({
+      kind: 'refuse',
+      reason: 'Payment settlement outcome is unavailable.',
+    });
+    expect(cancel).not.toHaveBeenCalled();
+    await expect(x402.store.get('t-batch-refund-indeterminate')).resolves.toMatchObject({
+      status: 'failed',
+      failure: { point: 'settle', indeterminate: true },
+    });
+    await expect(
+      gate.offerStore.getClaimStatus?.('t-batch-refund-indeterminate'),
+    ).resolves.toBe('claimed');
   });
 
   it('fails closed before publishing batch terms without a registered resource server', async () => {
