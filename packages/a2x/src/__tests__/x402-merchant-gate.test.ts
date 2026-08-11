@@ -371,6 +371,19 @@ describe('MerchantGate', () => {
     expect(facilitator.settle).toHaveBeenCalledTimes(1);
   });
 
+  it('lapses a held authorization without settlement', async () => {
+    const { gate, facilitator, x402 } = fixture({ accepts: [UPTO] }, 'after-work');
+    await gate.open({ taskId: 't-lapse', message: message() });
+    const opened = await gate.open({ taskId: 't-lapse', message: submitted(uptoPayload()) });
+    expect(opened).toMatchObject({ kind: 'proceed', obligation: { scheme: 'upto' } });
+
+    await gate.lapse('t-lapse');
+
+    expect(facilitator.settle).not.toHaveBeenCalled();
+    await expect(gate.offerStore.getOffer('t-lapse')).resolves.toBeUndefined();
+    await expect(x402.store.get('t-lapse')).resolves.toBeUndefined();
+  });
+
   it('lets a before-work payment flow restart after settlement is refused', async () => {
     const { gate, facilitator, x402 } = fixture({ accepts: [EXACT] }, 'before-work');
     vi.mocked(facilitator.settle).mockResolvedValueOnce({

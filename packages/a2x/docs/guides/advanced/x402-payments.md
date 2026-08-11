@@ -554,7 +554,153 @@ On success, `settled.charge.requestedAtomic` is the amount the gate asked the fa
 
 Each offer must contain unique payment identities across scheme, normalized network, asset, payee, and amount. Duplicate entries fail during turn-1 validation instead of making an otherwise valid turn-2 payment ambiguous.
 
-Session-scoped metering and a standard durable offer-store implementation are not part of this initial surface.
+### Session-scoped `upto` metering
+
+An `upto` authorization is single-use: settling one turn consumes it even when the charge is far below the signed cap. `UptoSessionManager` can instead hold that verified authorization across one A2A `contextId`, meter multiple turns, and call the same `MerchantGate.settle()` exactly once when the conversation becomes idle, reaches its budget, approaches the signed deadline, or is closed by the host.
+
+The wire scheme remains `upto`; clients do not need a session-specific signer or payload. Session mode is merchant policy and is never enabled automatically.
+
+```ts
+import {
+  InMemoryUptoSessionStore,
+  MerchantGate,
+  UptoSessionManager,
+} from '@a2x/sdk/x402';
+
+const sessionStore = new InMemoryUptoSessionStore();
+let sessions!: UptoSessionManager;
+
+const gate = new MerchantGate({
+  x402,
+  exactTiming: 'after-work',
+  pricing: async (turn) => {
+    // Active conversations already hold a verified authorization.
+    if (turn.contextId && await sessions.active(turn.contextId)) return null;
+    return pricingRepository.offerFor(turn);
+  },
+});
+
+sessions = new UptoSessionManager({
+  gate,
+  store: sessionStore,
+  idleSeconds: 120,
+  maxDurationSeconds: 600,
+  deadlineGuardSeconds: 30,
+  onError: (error, context) => logger.error({ error, context }),
+});
+
+const recovery = await sessions.recover();
+if (recovery.unresolved.length > 0) {
+  alertReconciliationQueue(recovery.unresolved);
+}
+```
+
+Reserve an already-active session before starting work. The stable `turnId` makes completion idempotent, and the lease stops idle/deadline triggers from settling between the active-session check and usage recording:
+
+```ts
+const contextId = ctx.contextId;
+const turnId = ctx.message.messageId;
+const lease = contextId
+  ? await sessions.beginTurn({ contextId, turnId })
+  : { kind: 'inactive' as const };
+
+if (lease.kind === 'duplicate') {
+  // Reuse the host's durable turn result; never execute or meter it twice.
+  yield await replayTurnResult(turnId, lease.status);
+  return;
+}
+const leased = lease.kind === 'started';
+
+const opened = await gate.open({
+  taskId: ctx.taskId!,
+  contextId,
+  message: ctx.message,
+  activatedExtensions: ctx.activatedExtensions,
+});
+
+if (opened.kind !== 'proceed') {
+  if (leased && contextId) await sessions.cancelTurn({ contextId, turnId });
+  yield renderMerchantOutcome(opened);
+  return;
+}
+
+let result;
+try {
+  result = await runWork();
+} catch (error) {
+  if (leased && contextId) {
+    await sessions.cancelTurn({ contextId, turnId });
+  } else if (
+    opened.obligation?.kind === 'deferred' &&
+    opened.obligation.scheme === 'upto'
+  ) {
+    // The first turn never opened a session and delivered no work.
+    await gate.lapse(ctx.taskId!);
+  } else if (opened.obligation) {
+    await gate.abort({
+      taskId: ctx.taskId!,
+      obligation: opened.obligation,
+      reason: 'handler_threw',
+      error,
+    });
+  }
+  throw error;
+}
+
+const usage = result.usageAvailable
+  ? { kind: 'total' as const, totalTokens: result.totalTokens }
+  : { kind: 'unreported' as const };
+
+let sessionOutcome;
+if (leased && contextId) {
+  sessionOutcome = await sessions.finishTurn({ contextId, turnId, usage });
+} else if (
+  contextId &&
+  opened.obligation?.kind === 'deferred' &&
+  opened.obligation.scheme === 'upto'
+) {
+  // The paid first turn becomes the held authorization for this context.
+  sessionOutcome = await sessions.open({
+    contextId,
+    taskId: ctx.taskId!,
+    obligation: opened.obligation,
+    usage,
+  });
+} else if (opened.obligation) {
+  // Exact, batch-settlement, and context-less upto keep the per-call path.
+  const settled = await gate.settle({
+    taskId: ctx.taskId!,
+    obligation: opened.obligation,
+    usage,
+  });
+  yield renderSettlement(settled);
+  return;
+}
+
+if (sessionOutcome?.settlement?.kind === 'settled') {
+  yield renderSettlement(sessionOutcome.settlement.outcome);
+}
+```
+
+`recordTurn({ contextId, usage })` remains available when usage is already complete and there is no asynchronous work gap. Use the `beginTurn` / `finishTurn` pair around real resource work. A start result distinguishes `inactive`, a new `started` lease, and duplicate `pending` or `completed` turn ids; duplicate turns must reuse the host's durable result and never execute again. `cancelTurn` releases a lease that produced no billable work. Once a close is requested, new leases are refused; the last finishing or canceled lease performs the single settlement.
+
+The manager aggregates detailed readings with detailed readings and total readings with total readings. It may combine the two only when the frozen pricing uses `totalPerThousand`; a detailed rate cannot safely price a total-only turn, so that session becomes `unreported`. The frozen offer's `ceiling`, `floor`, or `refuse` policy is then applied by `MerchantGate` exactly as it is for one call. A trusted all-zero session lapses through `gate.lapse()` without consuming the authorization or applying the non-zero floor.
+
+The signed Permit2 cap is intersected with the frozen offer ceiling. Reaching that budget settles inline. Idle and configured maximum-duration timers are process-local optimizations; the signed deadline minus `deadlineGuardSeconds` is the hard backstop. If a turn is still in flight at the guard, the manager stops admitting new work and waits until it finishes, but never beyond the actual authorization deadline.
+
+#### Durability and recovery
+
+`InMemoryUptoSessionStore` is single-process only, caps itself at 10,000 records, and retains successful/lapsed records for one hour. Failed settlement records do not expire automatically because they are reconciliation evidence.
+
+Production session mode must inject a shared `UptoSessionStore`. Its `create`, revision-based `compareAndSet`, and revision-based `delete` operations must be atomic across replicas. It must persist the complete held `UptoSessionRecord`, including the signed obligation, and return every active or settling record from `listRecoverable()`. Protect that payload as payment authorization data. The x402 lifecycle store, merchant offer store, session store, task state, and any host conversation mapping form one recovery domain even when implemented as separate tables or keys.
+
+Call `recover()` on startup (and from a periodic reaper in timerless/serverless deployments). It re-arms future active sessions and closes overdue active sessions through the same CAS transition. Multiple replicas may call it: only the winner of `active -> settling` invokes settlement.
+
+An active record with an in-flight turn is returned in `recovery.unresolved`; restore the turn's trusted usage with `finishTurn`, or call `cancelTurn` only when durable task state proves that no billable work was delivered. A record found in `settling` is also unresolved and is **never settled automatically again**: the payment may have escaped before the process stopped. Reconcile it against the facilitator, then conditionally remove or repair the exact revision in the store.
+
+Failed settlement closes the session but retains the gate's x402 evidence and blocks a replacement authorization for that context. After manual reconciliation, `forgetClosed(contextId)` conditionally removes that exact closed revision. Never call it merely to make a retry pass.
+
+The offer and x402 lifecycle TTL must extend beyond `maxDurationSeconds` plus operational delay. Otherwise the held classification can outlive the records required by `MerchantGate.settle()`.
 
 #### What the payer's payload looks like
 
@@ -1211,7 +1357,7 @@ When the merchant agent declares the extension with `required: true` on its Agen
 
 - **Both x402 protocol versions** (V1 `x402Version: 1` and V2 `x402Version: 2`). The server emits the one its deployment configured; the client signs whichever it receives.
 - **Standalone Flow.** The Embedded Flow (x402 nested in an AP2 `CartMandate` / `PaymentMandate`) and its signing models are not implemented in either version — those were described in a2a-x402 v0.2 but have no counterpart in the foundation V2 transport, so their V2 semantics are currently undefined.
-- **`exact`, `upto`, and `batch-settlement` schemes, EVM networks** (`base`, `base-sepolia`, `polygon`, `avalanche`, …). `upto` and `batch-settlement` are V2-only and require `@x402/evm` ≥ 2.20 (the declared peer floor); the client auto-selects neither (see [Paying an `upto` offer](#paying-an-upto-offer) and [Batch settlement](#batch-settlement-prepaid-channels)). For `batch-settlement` the SDK covers the **payer** end-to-end; the merchant end is wired by injecting an `x402ResourceServer` as the facilitator, and redemption stays out of the SDK. Other schemes pass through the pipeline untouched — override `BaseX402Context.validatePayloadShape` to validate them. Adding Solana support means passing a Solana-compatible signer in a later release.
+- **`exact`, `upto`, and `batch-settlement` schemes, EVM networks** (`base`, `base-sepolia`, `polygon`, `avalanche`, …). `upto` and `batch-settlement` are V2-only and require `@x402/evm` ≥ 2.20 (the declared peer floor); the client auto-selects neither (see [Paying an `upto` offer](#paying-an-upto-offer) and [Batch settlement](#batch-settlement-prepaid-channels)). `UptoSessionManager` optionally meters one `upto` authorization across a conversation. For `batch-settlement` the SDK covers the **payer** end-to-end; the merchant configures an `x402ResourceServer` through `X402Context.resourceServer`, and redemption stays out of the SDK. Other schemes pass through the pipeline untouched — override `BaseX402Context.validatePayloadShape` to validate them. Adding Solana support means passing a Solana-compatible signer in a later release.
 
 ## Reference
 

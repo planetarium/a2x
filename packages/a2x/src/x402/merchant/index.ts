@@ -19,6 +19,27 @@ export {
   type InMemoryMerchantOfferStoreOptions,
   type MerchantOfferStore,
 } from './offer-store.js';
+export {
+  InMemoryUptoSessionStore,
+  UptoSessionManager,
+  type InMemoryUptoSessionStoreOptions,
+  type UptoSessionEndReason,
+  type UptoSessionFinishTurnInput,
+  type UptoSessionManagerErrorContext,
+  type UptoSessionManagerOptions,
+  type UptoSessionObligation,
+  type UptoSessionOpenInput,
+  type UptoSessionOutcome,
+  type UptoSessionRecord,
+  type UptoSessionRecordTurnInput,
+  type UptoSessionRecovery,
+  type UptoSessionSettlement,
+  type UptoSessionSnapshot,
+  type UptoSessionState,
+  type UptoSessionStore,
+  type UptoSessionTurnInput,
+  type UptoSessionTurnStart,
+} from './session.js';
 export type {
   MerchantDeferredObligation,
   MerchantBatchSettlementPricing,
