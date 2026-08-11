@@ -4,7 +4,7 @@ Charge per call with on-chain cryptocurrency payments. A2X implements the x402 A
 
 The flow: the merchant agent responds to an unpaid request with `input-required` + `x402.payment.required`. The client signs a `PaymentPayload` with its wallet and resubmits the same task. The merchant validates the payload, verifies it via an x402 **facilitator**, settles on-chain, and attaches the settlement receipt to the completed task. This flow is identical across versions — only the JSON envelope shapes differ (see [Protocol versions](#protocol-versions-v1--v2)).
 
-> **Flow ownership.** The core `@a2x/sdk/x402` surface does not install or schedule a payment flow. The agent may compose its mechanics directly, or opt into the host-neutral `@a2x/sdk/x402-merchant` gate described below. The merchant still supplies paid/free selection, rates, settlement timing, missing-usage behavior, and event rendering. The previous framework-owned `x402PaymentHook` / `inputRoundTripHooks` API remains removed; see [Migrating from X402PaymentExecutor / x402PaymentHook](./migration-x402-v2.md).
+> **Flow ownership.** The `@a2x/sdk/x402` entry exposes each protocol mechanic separately and an explicit host-neutral `MerchantGate` composition described below. Nothing installs or schedules a payment flow automatically. The merchant still supplies paid/free selection, rates, settlement timing, missing-usage behavior, and event rendering. The previous framework-owned `x402PaymentHook` / `inputRoundTripHooks` API remains removed; see [Migrating from X402PaymentExecutor / x402PaymentHook](./migration-x402-v2.md).
 
 ## Installation
 
@@ -434,11 +434,10 @@ The facilitator enforces the same bound on-chain; the SDK clamp is defence in de
 
 ### Shared merchant-policy gate
 
-Use `@a2x/sdk/x402-merchant` when more than one host needs the same payment policy but renders different event types. `MerchantGate` consumes `X402Context` and returns plain outcomes:
+Use `MerchantGate` when more than one host needs the same payment policy but renders different event types. It consumes `X402Context` and returns plain outcomes while sharing the same optional `@a2x/sdk/x402` entry:
 
 ```ts
-import { X402Context } from '@a2x/sdk/x402';
-import { MerchantGate } from '@a2x/sdk/x402-merchant';
+import { MerchantGate, X402Context } from '@a2x/sdk/x402';
 
 const gate = new MerchantGate({
   x402: new X402Context({ x402Version: 2 }),

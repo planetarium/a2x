@@ -2,17 +2,17 @@ import {
   X402_ERROR_CODES,
   mapVerifyFailureToCode,
   type X402ErrorCode,
-} from '../x402/constants.js';
-import type { BaseX402Context, X402ValidClassification } from '../x402/context.js';
-import { buildX402PaymentCompletedMetadata } from '../x402/payment.js';
-import { sameNetwork } from '../x402/networks.js';
+} from '../constants.js';
+import type { BaseX402Context, X402ValidClassification } from '../context.js';
+import { buildX402PaymentCompletedMetadata } from '../payment.js';
+import { sameNetwork } from '../networks.js';
 import {
   requirementNetwork,
   requirementPayTo,
   requirementScheme,
-} from '../x402/versions.js';
-import type { X402SettleResponse } from '../x402/types.js';
-import { meterUsage, offerAccepts, validateMerchantOffer } from './pricing.js';
+} from '../versions.js';
+import type { X402SettleResponse } from '../types.js';
+import { meterMerchantUsage, offerAccepts, validateMerchantOffer } from './pricing.js';
 import {
   InMemoryMerchantOfferingSidecar,
   type MerchantOfferingSidecar,
@@ -266,7 +266,7 @@ export class MerchantGate {
   ):
     | { kind: 'charge'; charge: MerchantSettledCharge }
     | Extract<MerchantGateSettleOutcome, { kind: 'failed' }> {
-    const metered = meterUsage(pricing, usage);
+    const metered = meterMerchantUsage(pricing, usage);
     if (metered.kind === 'charge') {
       const amountAtomic = this.clampUptoCharge(pricing, classified, metered.amountAtomic);
       return {

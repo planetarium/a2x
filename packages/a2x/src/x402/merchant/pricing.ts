@@ -1,13 +1,13 @@
-import type { X402Accept } from '../x402/types.js';
-import { sameNetwork } from '../x402/networks.js';
+import { sameNetwork } from '../networks.js';
+import type { X402Accept } from '../types.js';
 import type {
   MerchantDetailedRates,
   MerchantOffer,
   MerchantPricing,
   MerchantTotalRate,
   MerchantUptoPricing,
-  MeterableUsage,
-  MeteredCharge,
+  MerchantMeterableUsage,
+  MerchantMeteredCharge,
 } from './types.js';
 
 const DECIMAL_ATOMIC = /^\d+$/;
@@ -52,7 +52,7 @@ function samePricingIdentity(a: MerchantPricing, b: MerchantPricing): boolean {
   );
 }
 
-function applyFloor(metered: bigint, pricing: MerchantUptoPricing): MeteredCharge {
+function applyFloor(metered: bigint, pricing: MerchantUptoPricing): MerchantMeteredCharge {
   const floor = atomic(pricing.minAmount ?? '0', 'minAmount');
   if (metered < floor) {
     return { kind: 'charge', amountAtomic: floor.toString(), basis: 'floor' };
@@ -69,10 +69,10 @@ function ceilDiv(numerator: bigint, denominator: bigint): bigint {
  * the meaning of their raw counters: a runtime that uses zero as an
  * "unreported" sentinel must emit `{ kind: 'unreported' }` instead.
  */
-export function meterUsage(
+export function meterMerchantUsage(
   pricing: MerchantUptoPricing,
-  usage: MeterableUsage | undefined,
-): MeteredCharge {
+  usage: MerchantMeterableUsage | undefined,
+): MerchantMeteredCharge {
   if (usage === undefined || usage.kind === 'unreported') return { kind: 'unpriceable' };
 
   if (usage.kind === 'total') {
@@ -117,7 +117,7 @@ export function meterUsage(
   return applyFloor(ceilDiv(micros, 1_000_000n), pricing);
 }
 
-export function pricingToAccept(pricing: MerchantPricing): X402Accept {
+export function merchantPricingToAccept(pricing: MerchantPricing): X402Accept {
   if (pricing.scheme === 'upto') {
     const { maxAmount, minAmount: _minAmount, rates: _rates, unreportedUsage: _policy, ...accept } =
       pricing;
@@ -127,7 +127,7 @@ export function pricingToAccept(pricing: MerchantPricing): X402Accept {
 }
 
 export function offerAccepts(offer: MerchantOffer): X402Accept[] {
-  return offer.accepts.map(pricingToAccept);
+  return offer.accepts.map(merchantPricingToAccept);
 }
 
 /** Fail fast on merchant configuration before publishing terms to a payer. */

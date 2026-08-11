@@ -2,12 +2,12 @@ import { describe, expect, it, vi } from 'vitest';
 import type { Message } from '../types/common.js';
 import {
   MerchantGate,
-  pricingToAccept,
+  merchantPricingToAccept,
   type MerchantExactPricing,
   type MerchantGateErrorContext,
   type MerchantOffer,
   type MerchantUptoPricing,
-} from '../x402-merchant/index.js';
+} from '../x402/index.js';
 import {
   X402_ERROR_CODES,
   X402_METADATA_KEYS,
@@ -63,7 +63,7 @@ function submitted(payload: X402PaymentPayload): Message {
 function exactPayload(): X402PaymentPayload {
   return {
     x402Version: 2,
-    accepted: encodeRequirementV2(pricingToAccept(EXACT)),
+    accepted: encodeRequirementV2(merchantPricingToAccept(EXACT)),
     payload: {
       signature: '0xsig',
       authorization: {
@@ -81,7 +81,7 @@ function exactPayload(): X402PaymentPayload {
 function uptoPayload(cap: string = UPTO.maxAmount): X402PaymentPayload {
   return {
     x402Version: 2,
-    accepted: encodeRequirementV2(pricingToAccept(UPTO)),
+    accepted: encodeRequirementV2(merchantPricingToAccept(UPTO)),
     payload: {
       signature: '0xsig',
       permit2Authorization: {

@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
-  meterUsage,
-  pricingToAccept,
+  merchantPricingToAccept,
+  meterMerchantUsage,
   validateMerchantOffer,
   type MerchantUptoPricing,
-} from '../x402-merchant/index.js';
+} from '../x402/index.js';
 
 const BASE_UPTO: MerchantUptoPricing = {
   scheme: 'upto',
@@ -21,7 +21,7 @@ const BASE_UPTO: MerchantUptoPricing = {
 
 describe('x402 merchant pricing', () => {
   it('prices total-token usage with ceiling division', () => {
-    expect(meterUsage(BASE_UPTO, { kind: 'total', totalTokens: 1001 })).toEqual({
+    expect(meterMerchantUsage(BASE_UPTO, { kind: 'total', totalTokens: 1001 })).toEqual({
       kind: 'charge',
       amountAtomic: '11',
       basis: 'metered',
@@ -38,7 +38,7 @@ describe('x402 merchant pricing', () => {
       },
     };
     expect(
-      meterUsage(pricing, {
+      meterMerchantUsage(pricing, {
         kind: 'detailed',
         inputTokens: 1_000_000,
         cachedInputTokens: 500_000,
@@ -49,12 +49,12 @@ describe('x402 merchant pricing', () => {
 
   it('applies the floor only to non-zero work', () => {
     const pricing = { ...BASE_UPTO, minAmount: '100' };
-    expect(meterUsage(pricing, { kind: 'total', totalTokens: 1 })).toEqual({
+    expect(meterMerchantUsage(pricing, { kind: 'total', totalTokens: 1 })).toEqual({
       kind: 'charge',
       amountAtomic: '100',
       basis: 'floor',
     });
-    expect(meterUsage(pricing, { kind: 'total', totalTokens: 0 })).toEqual({
+    expect(meterMerchantUsage(pricing, { kind: 'total', totalTokens: 0 })).toEqual({
       kind: 'charge',
       amountAtomic: '0',
       basis: 'zero',
@@ -62,10 +62,10 @@ describe('x402 merchant pricing', () => {
   });
 
   it('does not infer whether a host zero is trusted', () => {
-    expect(meterUsage(BASE_UPTO, { kind: 'unreported' })).toEqual({
+    expect(meterMerchantUsage(BASE_UPTO, { kind: 'unreported' })).toEqual({
       kind: 'unpriceable',
     });
-    expect(meterUsage(BASE_UPTO, undefined)).toEqual({ kind: 'unpriceable' });
+    expect(meterMerchantUsage(BASE_UPTO, undefined)).toEqual({ kind: 'unpriceable' });
   });
 
   it('routes a total-only reading against split rates to unpriceable', () => {
@@ -73,7 +73,7 @@ describe('x402 merchant pricing', () => {
       ...BASE_UPTO,
       rates: { inputPerMillion: '2', outputPerMillion: '4' },
     };
-    expect(meterUsage(pricing, { kind: 'total', totalTokens: 10 })).toEqual({
+    expect(meterMerchantUsage(pricing, { kind: 'total', totalTokens: 10 })).toEqual({
       kind: 'unpriceable',
     });
   });
@@ -84,7 +84,7 @@ describe('x402 merchant pricing', () => {
       rates: { inputPerMillion: '2', outputPerMillion: '4' },
     };
     expect(
-      meterUsage(pricing, {
+      meterMerchantUsage(pricing, {
         kind: 'detailed',
         inputTokens: 2,
         cachedInputTokens: 3,
@@ -94,7 +94,7 @@ describe('x402 merchant pricing', () => {
   });
 
   it('converts maxAmount to the x402 offered amount', () => {
-    expect(pricingToAccept(BASE_UPTO)).toMatchObject({
+    expect(merchantPricingToAccept(BASE_UPTO)).toMatchObject({
       scheme: 'upto',
       amount: '1000000',
     });

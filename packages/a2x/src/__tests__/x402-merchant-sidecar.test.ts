@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   InMemoryMerchantOfferingSidecar,
   type MerchantOffer,
-} from '../x402-merchant/index.js';
+} from '../x402/index.js';
 
 function offer(amount: string): MerchantOffer {
   return {

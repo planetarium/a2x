@@ -43,11 +43,6 @@
       "types": "./dist/x402/index.d.ts",
       "import": "./dist/x402/index.js",
       "require": "./dist/x402/index.cjs"
-    },
-    "./x402-merchant": {
-      "types": "./dist/x402-merchant/index.d.ts",
-      "import": "./dist/x402-merchant/index.js",
-      "require": "./dist/x402-merchant/index.cjs"
     }
   },
   "main": "./dist/index.cjs",

@@ -1,6 +1,6 @@
-import type { BaseX402Context, X402ValidClassification } from '../x402/context.js';
-import type { X402ErrorCode } from '../x402/constants.js';
-import type { X402Accept, X402SettleResponse } from '../x402/types.js';
+import type { BaseX402Context, X402ValidClassification } from '../context.js';
+import type { X402ErrorCode } from '../constants.js';
+import type { X402Accept, X402SettleResponse } from '../types.js';
 
 export type MerchantExactTiming = 'before-work' | 'after-work';
 
@@ -59,7 +59,7 @@ export type MerchantPricingResolver = (
   turn: MerchantGateOpenInput,
 ) => MerchantOffer | null | Promise<MerchantOffer | null>;
 
-export type MeterableUsage =
+export type MerchantMeterableUsage =
   | {
       kind: 'detailed';
       inputTokens: number;
@@ -70,7 +70,7 @@ export type MeterableUsage =
   | { kind: 'total'; totalTokens: number }
   | { kind: 'unreported' };
 
-export type MeteredCharge =
+export type MerchantMeteredCharge =
   | {
       kind: 'charge';
       amountAtomic: string;
@@ -109,7 +109,7 @@ export type MerchantGateOpenOutcome =
 export interface MerchantGateSettleInput {
   taskId: string;
   obligation: MerchantObligation;
-  usage?: MeterableUsage;
+  usage?: MerchantMeterableUsage;
 }
 
 export interface MerchantSettledCharge {

@@ -1,5 +1,5 @@
 /**
- * Optional merchant-policy layer for `@a2x/sdk/x402`.
+ * Optional merchant-policy composition for `@a2x/sdk/x402`.
  *
  * The module returns host-neutral outcomes and leaves event rendering, work,
  * pricing lookup, settlement timing, and missing-usage policy explicit.
@@ -9,7 +9,11 @@ export {
   type MerchantGateErrorContext,
   type MerchantGateOptions,
 } from './gate.js';
-export { meterUsage, offerAccepts, pricingToAccept, validateMerchantOffer } from './pricing.js';
+export {
+  merchantPricingToAccept,
+  meterMerchantUsage,
+  validateMerchantOffer,
+} from './pricing.js';
 export {
   InMemoryMerchantOfferingSidecar,
   type InMemoryMerchantOfferingSidecarOptions,
@@ -35,6 +39,6 @@ export type {
   MerchantUnreportedUsagePolicy,
   MerchantUptoPricing,
   MerchantUsageRates,
-  MeterableUsage,
-  MeteredCharge,
+  MerchantMeterableUsage,
+  MerchantMeteredCharge,
 } from './types.js';
