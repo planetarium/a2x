@@ -1,6 +1,6 @@
 import type { MerchantOffer } from './types.js';
 
-export interface MerchantOfferingSidecar {
+export interface MerchantOfferStore {
   /**
    * Serialize publishers for a task and bind the frozen terms to the SDK's
    * offering write performed inside `publish`.
@@ -16,7 +16,7 @@ export interface MerchantOfferingSidecar {
   delete(taskId: string): Promise<void>;
 }
 
-export interface InMemoryMerchantOfferingSidecarOptions {
+export interface InMemoryMerchantOfferStoreOptions {
   /** Maximum live entries. Defaults to 10,000. */
   maxEntries?: number;
   /** TTL applied when an offer omits expiresInSeconds. Defaults to 600 seconds. */
@@ -34,21 +34,21 @@ function cloneOffer(offer: MerchantOffer): MerchantOffer {
 }
 
 /** Single-process default. Multi-replica deployments need an atomic shared implementation. */
-export class InMemoryMerchantOfferingSidecar implements MerchantOfferingSidecar {
+export class InMemoryMerchantOfferStore implements MerchantOfferStore {
   private readonly entries = new Map<string, InMemoryEntry>();
   private readonly queues = new Map<string, Promise<void>>();
   private readonly maxEntries: number;
   private readonly defaultTtlSeconds: number;
 
-  constructor(options: InMemoryMerchantOfferingSidecarOptions = {}) {
+  constructor(options: InMemoryMerchantOfferStoreOptions = {}) {
     const maxEntries = options.maxEntries ?? 10_000;
     const defaultTtlSeconds = options.defaultTtlSeconds ?? 600;
     if (!Number.isInteger(maxEntries) || maxEntries <= 0) {
-      throw new Error('InMemoryMerchantOfferingSidecar.maxEntries must be a positive integer.');
+      throw new Error('InMemoryMerchantOfferStore.maxEntries must be a positive integer.');
     }
     if (!Number.isFinite(defaultTtlSeconds) || defaultTtlSeconds <= 0) {
       throw new Error(
-        'InMemoryMerchantOfferingSidecar.defaultTtlSeconds must be greater than zero.',
+        'InMemoryMerchantOfferStore.defaultTtlSeconds must be greater than zero.',
       );
     }
     this.maxEntries = maxEntries;

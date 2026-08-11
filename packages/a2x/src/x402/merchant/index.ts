@@ -15,10 +15,10 @@ export {
   validateMerchantOffer,
 } from './pricing.js';
 export {
-  InMemoryMerchantOfferingSidecar,
-  type InMemoryMerchantOfferingSidecarOptions,
-  type MerchantOfferingSidecar,
-} from './sidecar.js';
+  InMemoryMerchantOfferStore,
+  type InMemoryMerchantOfferStoreOptions,
+  type MerchantOfferStore,
+} from './offer-store.js';
 export type {
   MerchantDeferredObligation,
   MerchantDetailedRates,

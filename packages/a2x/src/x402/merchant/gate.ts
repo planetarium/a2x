@@ -15,9 +15,9 @@ import {
 import type { X402SettleResponse } from '../types.js';
 import { meterMerchantUsage, offerAccepts, validateMerchantOffer } from './pricing.js';
 import {
-  InMemoryMerchantOfferingSidecar,
-  type MerchantOfferingSidecar,
-} from './sidecar.js';
+  InMemoryMerchantOfferStore,
+  type MerchantOfferStore,
+} from './offer-store.js';
 import type {
   MerchantGateOpenInput,
   MerchantGateOpenOutcome,
@@ -35,7 +35,7 @@ import type {
 export interface MerchantGateOptions {
   x402: BaseX402Context;
   pricing: MerchantPricingResolver;
-  sidecar?: MerchantOfferingSidecar;
+  offerStore?: MerchantOfferStore;
   /** Required: before/after work intentionally allocate failure risk differently. */
   exactTiming: MerchantExactTiming;
   /** Receives infrastructure errors that are intentionally hidden from payer-facing outcomes. */
@@ -109,10 +109,10 @@ function settlementFailure(receipt: X402SettleResponse): MerchantGateSettleOutco
 }
 
 export class MerchantGate {
-  readonly sidecar: MerchantOfferingSidecar;
+  readonly offerStore: MerchantOfferStore;
 
   constructor(private readonly options: MerchantGateOptions) {
-    this.sidecar = options.sidecar ?? new InMemoryMerchantOfferingSidecar();
+    this.offerStore = options.offerStore ?? new InMemoryMerchantOfferStore();
   }
 
   async open(turn: MerchantGateOpenInput): Promise<MerchantGateOpenOutcome> {
@@ -126,7 +126,7 @@ export class MerchantGate {
         return refusal(classified.code, classified.reason);
       }
 
-      const offer = await this.sidecar.getOffer(turn.taskId);
+      const offer = await this.offerStore.getOffer(turn.taskId);
       if (!offer) {
         return refusal(
           X402_ERROR_CODES.SETTLEMENT_FAILED,
@@ -147,7 +147,7 @@ export class MerchantGate {
         return refusal(mapVerifyFailureToCode(reason), reason);
       }
 
-      if (!(await this.sidecar.claim(turn.taskId))) {
+      if (!(await this.offerStore.claim(turn.taskId))) {
         return refusal(
           X402_ERROR_CODES.DUPLICATE_NONCE,
           'This payment has already been submitted for this task.',
@@ -241,7 +241,7 @@ export class MerchantGate {
         : resolvedOffer;
     validateMerchantOffer(offer);
 
-    const published = await this.sidecar.publishing(turn.taskId, offer, async (frozenOffer) => {
+    const published = await this.offerStore.publishing(turn.taskId, offer, async (frozenOffer) => {
       let outcome: Extract<MerchantGateOpenOutcome, { kind: 'request-payment' }> | undefined;
       for await (const event of this.options.x402.requestPayment(
         {
@@ -363,7 +363,7 @@ export class MerchantGate {
 
   private async cleanup(taskId: string): Promise<void> {
     for (const operation of [
-      () => this.sidecar.delete(taskId),
+      () => this.offerStore.delete(taskId),
       () => this.options.x402.clearOffering({ taskId }),
     ]) {
       try {

@@ -521,7 +521,7 @@ yield { type: 'text', role: 'agent', text: result.text };
 yield { type: 'done', metadata: settled.receiptMetadata };
 ```
 
-The pricing callback runs only on the unpaid turn. Its complete `MerchantOffer` is frozen by the sidecar and the submitted turn settles against that snapshot, not live rates. When `expiresInSeconds` is omitted, `MerchantGate` applies a 10-minute TTL to both the sidecar snapshot and the underlying x402 offering; set `expiresInSeconds` on the offer to override it. The default `InMemoryMerchantOfferingSidecar` independently defaults to the same TTL and caps itself at 10,000 live entries. Standalone sidecar users can override those limits with `defaultTtlSeconds` and `maxEntries`. It also grants a one-shot execution claim, but it is only safe in a single process. Multi-replica deployments must inject a durable `MerchantOfferingSidecar` whose `publishing` and `claim` operations are atomic.
+The pricing callback runs only on the unpaid turn. Its complete `MerchantOffer` is frozen by the offer store and the submitted turn settles against that snapshot, not live rates. When `expiresInSeconds` is omitted, `MerchantGate` applies a 10-minute TTL to both the offer-store snapshot and the underlying x402 offering; set `expiresInSeconds` on the offer to override it. The default `InMemoryMerchantOfferStore` independently defaults to the same TTL and caps itself at 10,000 live entries. Standalone store users can override those limits with `defaultTtlSeconds` and `maxEntries`. It also grants a one-shot execution claim, but it is only safe in a single process. Multi-replica deployments must inject a durable `MerchantOfferStore` whose `publishing` and `claim` operations are atomic.
 
 Verification happens before the execution claim is consumed, so a transient verification failure can be retried on the same task. Once verification succeeds, only one concurrent caller receives the claim and may execute work. A successful settlement best-effort removes both lifecycle records. Cleanup failures do not turn a completed payment into a failure; they are reported through `onError` with `operation: 'cleanup'`.
 
@@ -535,7 +535,7 @@ On success, `settled.charge.requestedAtomic` is the amount the gate asked the fa
 
 Each offer must contain unique payment identities across scheme, normalized network, asset, payee, and amount. Duplicate entries fail during turn-1 validation instead of making an otherwise valid turn-2 payment ambiguous.
 
-Session-scoped metering and a standard durable sidecar implementation are not part of this initial surface.
+Session-scoped metering and a standard durable offer-store implementation are not part of this initial surface.
 
 #### What the payer's payload looks like
 

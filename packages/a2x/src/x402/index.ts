@@ -242,14 +242,14 @@ export type {
 // Optional merchant-policy composition. Hosts still own paid/free selection,
 // rates, settlement timing, missing-usage behavior, and outcome rendering.
 export {
-  InMemoryMerchantOfferingSidecar,
+  InMemoryMerchantOfferStore,
   MerchantGate,
   merchantPricingToAccept,
   meterMerchantUsage,
   validateMerchantOffer,
 } from './merchant/index.js';
 export type {
-  InMemoryMerchantOfferingSidecarOptions,
+  InMemoryMerchantOfferStoreOptions,
   MerchantDeferredObligation,
   MerchantDetailedRates,
   MerchantExactPricing,
@@ -263,7 +263,7 @@ export type {
   MerchantMeterableUsage,
   MerchantMeteredCharge,
   MerchantOffer,
-  MerchantOfferingSidecar,
+  MerchantOfferStore,
   MerchantObligation,
   MerchantPricing,
   MerchantPricingResolver,

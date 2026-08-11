@@ -158,7 +158,7 @@ describe('MerchantGate', () => {
       code: X402_ERROR_CODES.INVALID_X402_VERSION,
       reason: expect.stringContaining('V1-only client'),
     });
-    await expect(gate.sidecar.getOffer('t-v1-only-client')).resolves.toBeUndefined();
+    await expect(gate.offerStore.getOffer('t-v1-only-client')).resolves.toBeUndefined();
     await expect(x402.store.get('t-v1-only-client')).resolves.toBeUndefined();
   });
 
@@ -202,7 +202,7 @@ describe('MerchantGate', () => {
       const { gate, x402 } = fixture({ accepts: [EXACT] }, 'after-work');
       await gate.open({ taskId: 't-default-ttl', message: message() });
 
-      expect((await gate.sidecar.getOffer('t-default-ttl'))?.expiresInSeconds).toBe(600);
+      expect((await gate.offerStore.getOffer('t-default-ttl'))?.expiresInSeconds).toBe(600);
       expect((await x402.store.get('t-default-ttl'))?.expiresAt).toEqual(
         new Date('2026-08-10T00:10:00Z'),
       );
@@ -228,7 +228,7 @@ describe('MerchantGate', () => {
     const settled = await gate.settle({ taskId: 't-exact', obligation: second.obligation });
     expect(settled.kind).toBe('settled');
     expect(settledRequirements).toHaveLength(1);
-    await expect(gate.sidecar.getOffer('t-exact')).resolves.toBeUndefined();
+    await expect(gate.offerStore.getOffer('t-exact')).resolves.toBeUndefined();
     await expect(x402.store.get('t-exact')).resolves.toBeUndefined();
   });
 
@@ -261,7 +261,7 @@ describe('MerchantGate', () => {
       code: X402_ERROR_CODES.SETTLEMENT_FAILED,
       reason: 'facilitator rejected payment',
     });
-    await expect(gate.sidecar.getOffer('t-before-retry')).resolves.toBeUndefined();
+    await expect(gate.offerStore.getOffer('t-before-retry')).resolves.toBeUndefined();
     await expect(x402.store.get('t-before-retry')).resolves.toBeUndefined();
     await expect(
       gate.open({ taskId: 't-before-retry', message: message() }),
@@ -341,7 +341,7 @@ describe('MerchantGate', () => {
 
   it('keeps a successful settlement successful when cleanup fails', async () => {
     const onError = vi.fn();
-    const cleanupError = new Error('sidecar cleanup failed');
+    const cleanupError = new Error('offer store cleanup failed');
     const { gate, x402 } = fixture({ accepts: [EXACT] }, 'after-work', onError);
     await gate.open({ taskId: 't-cleanup-error', message: message() });
     const opened = await gate.open({
@@ -349,7 +349,7 @@ describe('MerchantGate', () => {
       message: submitted(exactPayload()),
     });
     if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
-    vi.spyOn(gate.sidecar, 'delete').mockRejectedValueOnce(cleanupError);
+    vi.spyOn(gate.offerStore, 'delete').mockRejectedValueOnce(cleanupError);
 
     await expect(
       gate.settle({ taskId: 't-cleanup-error', obligation: opened.obligation }),

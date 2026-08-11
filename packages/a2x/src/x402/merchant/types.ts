@@ -37,7 +37,7 @@ export interface MerchantUptoPricing extends Omit<X402Accept, 'scheme' | 'amount
 export type MerchantPricing = MerchantExactPricing | MerchantUptoPricing;
 
 /**
- * Terms published together on turn 1. The sidecar freezes this complete value,
+ * Terms published together on turn 1. The offer store freezes this complete value,
  * so turn 2 never re-runs the pricing callback against live configuration.
  */
 export interface MerchantOffer {
