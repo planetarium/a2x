@@ -819,6 +819,35 @@ describe('X402Context.verify and X402Context.settle', () => {
     expect(entry?.failure?.point).toBe('settle');
     expect(entry?.failure?.code).toBe(X402_ERROR_CODES.SETTLEMENT_FAILED);
     expect(entry?.failure?.reason).toContain('on-chain reverted');
+    expect(entry?.failure?.indeterminate).toBeUndefined();
+  });
+
+  it('marks a settlement transport failure as indeterminate', async () => {
+    const facilitator: X402Facilitator = {
+      verify: vi.fn(async () => ({ isValid: true } as Awaited<ReturnType<X402Facilitator['verify']>>)),
+      settle: vi.fn(async () => {
+        throw new Error('connection lost after broadcast');
+      }),
+    };
+    const ctx = new X402Context({ facilitator });
+    await drain(ctx.requestPayment({ taskId: 't-indeterminate', activatedExtensions: [X402_EXTENSION_URI] }, { accepts: [ACCEPT] }));
+    const classified = await ctx.classify({
+      taskId: 't-indeterminate',
+      message: buildSubmittedMessage(),
+    });
+    if (classified.kind !== 'valid') throw new Error('expected valid');
+
+    const receipt = await ctx.settle({ taskId: 't-indeterminate' }, classified);
+
+    expect(receipt.success).toBe(false);
+    await expect(ctx.store.get('t-indeterminate')).resolves.toMatchObject({
+      status: 'failed',
+      failure: {
+        point: 'settle',
+        indeterminate: true,
+        reason: 'connection lost after broadcast',
+      },
+    });
   });
 });
 

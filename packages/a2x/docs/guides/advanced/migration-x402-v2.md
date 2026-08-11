@@ -19,7 +19,7 @@ The new design removes the framework-installed flow entirely. The `@a2x/sdk/x402
 | Item | 0.13.x | Next |
 |---|---|---|
 | Removed | `x402PaymentHook`, `readX402Settlement`, `X402_DOMAIN`, `InputRoundTripRecord`, `InputRoundTripHook`, `InputRoundTripOutcome`, `InputRoundTripContext`, `INPUT_ROUNDTRIP_METADATA_KEY`, `inputRoundTripHooks` (`AgentExecutorOptions`) | — |
-| Added (recommended façade) | — | `X402Context`, `X402Store`, `InMemoryX402Store`, `X402Classification` |
+| Added (recommended façade) | — | `X402Context`, `X402Store`, `InMemoryX402Store`, `X402Classification`, `MerchantGate` |
 | Added (low-level helpers) | — | `parseX402PaymentSubmission`, `pickX402Requirement`, `validateX402PayloadShape`, `normalizeX402Accept`, `buildX402PaymentRequiredMetadata`, `buildX402PaymentCompletedMetadata`, `buildX402PaymentFailedMetadata`, `buildX402PaymentVerifiedMetadata`; `metadata?` on `done` / `error` AgentEvents; `message` on `InvocationContext` |
 | Changed | `request-input` event had `domain` + `payload` fields | `request-input` event has only `metadata` + optional `message` |
 | Where verify+settle runs | Inside `x402PaymentHook.handleResume` | Inside `agent.run()` — `x402.verify(...)` and `x402.settle(...)` (or `facilitator.verify/settle` for the low-level path) |
@@ -165,6 +165,8 @@ async *run(ctx) {
 ```
 
 For production deployments that need offering state to survive restarts, plug an external store implementing `X402Store` (Postgres / Redis / Durable Object / …).
+
+`MerchantGate` deployments also need their frozen `MerchantOffer`, execution claim, and x402 lifecycle entry to survive restarts. Multi-replica implementations must make publication, claims, and lifecycle compare-and-set updates atomic. Completed lifecycle entries are retained until their TTL for replay detection and reconciliation; size the backend and expiry sweep accordingly.
 
 ### Detecting client rejection
 

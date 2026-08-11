@@ -86,6 +86,13 @@ export interface X402EntryFailure {
   code: X402ErrorCode;
   reason: string;
   failedAt: Date;
+  /**
+   * Settlement failed without a definitive response (for example, because of
+   * a transport or schema error) and may already have been broadcast. Retrying
+   * automatically could charge twice, so merchant policy must keep the claim
+   * until an operator reconciles the attempt.
+   */
+  indeterminate?: boolean;
 }
 
 export interface X402StoreEntry {
@@ -189,6 +196,21 @@ export abstract class BaseX402Store {
    * No-op when the entry is absent.
    */
   abstract update(taskId: string, patch: X402StoreEntryPatch): Promise<void>;
+  /**
+   * Apply a patch only when the current lifecycle status is one of `expected`.
+   * Stores shared across replicas MUST override this with a backend-level
+   * atomic compare-and-set operation.
+   */
+  async updateIfStatus(
+    taskId: string,
+    expected: readonly X402EntryStatus[],
+    patch: X402StoreEntryPatch,
+  ): Promise<boolean> {
+    const current = await this.get(taskId);
+    if (!current || !expected.includes(current.status)) return false;
+    await this.update(taskId, patch);
+    return true;
+  }
   /** Remove the entry (best-effort; no-op if absent). */
   abstract delete(taskId: string): Promise<void>;
 }
@@ -271,6 +293,21 @@ export class InMemoryX402Store extends BaseX402Store {
     // Refresh LRU position.
     this._entries.delete(taskId);
     this._entries.set(taskId, next);
+  }
+
+  override async updateIfStatus(
+    taskId: string,
+    expected: readonly X402EntryStatus[],
+    patch: X402StoreEntryPatch,
+  ): Promise<boolean> {
+    const cur = this._entries.get(taskId);
+    if (!cur || !expected.includes(cur.status)) return false;
+    if (cur.expiresAt && cur.expiresAt.getTime() <= Date.now()) {
+      this._entries.delete(taskId);
+      return false;
+    }
+    await this.update(taskId, patch);
+    return true;
   }
 
   async delete(taskId: string): Promise<void> {

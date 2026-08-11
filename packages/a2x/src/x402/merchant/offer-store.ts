@@ -11,12 +11,27 @@ export interface MerchantOfferStore {
     publish: (frozenOffer: MerchantOffer) => Promise<T>,
   ): Promise<T>;
   getOffer(taskId: string): Promise<MerchantOffer | undefined>;
+  /**
+   * Optional read-only replay hint. `claim()` remains the atomic arbiter:
+   * callers must not grant execution based on an `available` read.
+   */
+  getClaimStatus?(
+    taskId: string,
+  ): Promise<MerchantOfferClaimStatus | undefined>;
   /** Atomically grants one caller the right to act on the submitted payment. */
   claim(taskId: string): Promise<boolean>;
   /** Releases a claim when a retryable scheme cancels verified resource work. */
   release(taskId: string): Promise<void>;
+  /**
+   * Remove only merchant terms when the implementation also stores lifecycle state.
+   * Required when the same object is supplied as both stores and completed lifecycle
+   * entries are retained.
+   */
+  deleteOffer?(taskId: string): Promise<void>;
   delete(taskId: string): Promise<void>;
 }
+
+export type MerchantOfferClaimStatus = 'available' | 'claimed';
 
 export interface InMemoryMerchantOfferStoreOptions {
   /** Maximum live entries. Defaults to 10,000. */
@@ -103,6 +118,13 @@ export class InMemoryMerchantOfferStore implements MerchantOfferStore {
     return true;
   }
 
+  async getClaimStatus(
+    taskId: string,
+  ): Promise<MerchantOfferClaimStatus | undefined> {
+    const entry = this.liveEntry(taskId);
+    return entry ? (entry.claimed ? 'claimed' : 'available') : undefined;
+  }
+
   async release(taskId: string): Promise<void> {
     const entry = this.liveEntry(taskId);
     if (entry) entry.claimed = false;
@@ -110,6 +132,10 @@ export class InMemoryMerchantOfferStore implements MerchantOfferStore {
 
   async delete(taskId: string): Promise<void> {
     this.entries.delete(taskId);
+  }
+
+  async deleteOffer(taskId: string): Promise<void> {
+    await this.delete(taskId);
   }
 
   size(): number {

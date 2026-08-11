@@ -17,6 +17,7 @@ export {
 export {
   InMemoryMerchantOfferStore,
   type InMemoryMerchantOfferStoreOptions,
+  type MerchantOfferClaimStatus,
   type MerchantOfferStore,
 } from './offer-store.js';
 export {
