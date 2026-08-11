@@ -382,7 +382,8 @@ export class MerchantGate {
   private async requestPayment(
     turn: MerchantGateOpenInput,
   ): Promise<MerchantGateOpenOutcome> {
-    const resolvedOffer = await this.options.pricing(turn);
+    const frozenOffer = await this.offerStore.getOffer(turn.taskId);
+    const resolvedOffer = frozenOffer ?? (await this.options.pricing(turn));
     if (!resolvedOffer) return { kind: 'proceed' };
     const offer =
       resolvedOffer.expiresInSeconds === undefined

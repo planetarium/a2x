@@ -342,6 +342,22 @@ describe('MerchantGate', () => {
     await expect(x402.store.get('t-exact')).resolves.toBeUndefined();
   });
 
+  it('reuses frozen pricing for unpaid retries without calling the resolver again', async () => {
+    const { gate, resolver } = fixture(
+      { accepts: [EXACT], expiresInSeconds: 600 },
+      'after-work',
+    );
+    await expect(
+      gate.open({ taskId: 't-unpaid-retry', message: message() }),
+    ).resolves.toMatchObject({ kind: 'request-payment' });
+    resolver.mockRejectedValueOnce(new Error('pricing database unavailable'));
+
+    await expect(
+      gate.open({ taskId: 't-unpaid-retry', message: message() }),
+    ).resolves.toMatchObject({ kind: 'request-payment' });
+    expect(resolver).toHaveBeenCalledTimes(1);
+  });
+
   it('settles exact before work when configured and never settles it twice', async () => {
     const { gate, facilitator } = fixture({ accepts: [EXACT] }, 'before-work');
     await gate.open({ taskId: 't-before', message: message() });
