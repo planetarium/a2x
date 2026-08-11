@@ -165,6 +165,7 @@ describe('UptoSessionManager', () => {
       contextId: 'c-unreported',
       taskId: 't-unreported',
       obligation: obligation({ pricing }),
+      usage: { kind: 'unreported' },
     });
 
     expect(outcome.session).toMatchObject({
@@ -364,6 +365,34 @@ describe('UptoSessionManager', () => {
     await vi.advanceTimersByTimeAsync(30_000);
     expect(settle).toHaveBeenCalledTimes(1);
     await expect(manager.lookup('c-hard-deadline')).resolves.toMatchObject({
+      state: 'closed',
+      endReason: 'deadline',
+      pendingTurns: 1,
+    });
+  });
+
+  it('enforces max duration when a requested close is waiting on an in-flight turn', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-11T00:00:00Z'));
+    const { manager, settle } = fixture({
+      idleSeconds: 300,
+      maxDurationSeconds: 20,
+    });
+    await manager.open({
+      contextId: 'c-max-duration-pending',
+      taskId: 't-max-duration-pending',
+      obligation: obligation(),
+      usage: { kind: 'total', totalTokens: 100 },
+    });
+    await manager.beginTurn({ contextId: 'c-max-duration-pending', turnId: 'm2' });
+    await manager.close('c-max-duration-pending', 'manual');
+
+    await vi.advanceTimersByTimeAsync(19_999);
+    expect(settle).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(settle).toHaveBeenCalledTimes(1);
+    await expect(manager.lookup('c-max-duration-pending')).resolves.toMatchObject({
       state: 'closed',
       endReason: 'deadline',
       pendingTurns: 1,

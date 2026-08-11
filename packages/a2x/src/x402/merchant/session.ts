@@ -244,12 +244,12 @@ export interface UptoSessionOpenInput {
   contextId: string;
   taskId: string;
   obligation: UptoSessionObligation;
-  usage?: MerchantMeterableUsage;
+  usage: MerchantMeterableUsage;
 }
 
 export interface UptoSessionRecordTurnInput {
   contextId: string;
-  usage?: MerchantMeterableUsage;
+  usage: MerchantMeterableUsage;
 }
 
 export interface UptoSessionTurnInput {
@@ -259,7 +259,7 @@ export interface UptoSessionTurnInput {
 }
 
 export interface UptoSessionFinishTurnInput extends UptoSessionTurnInput {
-  usage?: MerchantMeterableUsage;
+  usage: MerchantMeterableUsage;
 }
 
 export type UptoSessionTurnStart =
@@ -292,9 +292,9 @@ function detailedTotal(usage: Extract<MerchantMeterableUsage, { kind: 'detailed'
 function mergeUsage(
   pricing: MerchantUptoPricing,
   current: MerchantMeterableUsage | undefined,
-  next: MerchantMeterableUsage | undefined,
+  next: MerchantMeterableUsage,
 ): MerchantMeterableUsage {
-  if (next === undefined || !validUsage(next)) return { kind: 'unreported' };
+  if (!validUsage(next)) return { kind: 'unreported' };
   if (current === undefined) return structuredClone(next);
   if (current.kind === 'unreported' || next.kind === 'unreported') {
     return { kind: 'unreported' };
@@ -362,7 +362,11 @@ export class UptoSessionManager {
   readonly store: UptoSessionStore;
   private readonly timers = new Map<
     string,
-    { idle?: ReturnType<typeof setTimeout>; deadline?: ReturnType<typeof setTimeout> }
+    {
+      idle?: ReturnType<typeof setTimeout>;
+      deadline?: ReturnType<typeof setTimeout>;
+      hardDeadline?: ReturnType<typeof setTimeout>;
+    }
   >();
   private readonly idleMs: number;
   private readonly maxDurationMs: number;
@@ -440,7 +444,7 @@ export class UptoSessionManager {
       }
       const outcome = await this.recordTurn({
         contextId: input.contextId,
-        ...(input.usage === undefined ? {} : { usage: input.usage }),
+        usage: input.usage,
       });
       if (!outcome) throw new Error('The newly opened upto session disappeared.');
       return outcome;
@@ -566,7 +570,12 @@ export class UptoSessionManager {
           const hardDeadline = current.authorizationDeadline
             ? Date.parse(current.authorizationDeadline)
             : undefined;
-          if (reason !== 'deadline' || (hardDeadline !== undefined && now < hardDeadline)) {
+          const waitingAtAuthorizationGuard =
+            reason === 'deadline' &&
+            hardDeadline !== undefined &&
+            Date.parse(current.settleBy) === hardDeadline - this.deadlineGuardMs &&
+            now < hardDeadline;
+          if (reason !== 'deadline' || waitingAtAuthorizationGuard) {
             const waiting: UptoSessionRecord = {
               ...current,
               revision: current.revision + 1,
@@ -687,8 +696,13 @@ export class UptoSessionManager {
     this.disarm(record.contextId);
     const now = Date.now();
     if (record.closeRequestedReason) {
-      if (record.authorizationDeadline) {
-        const deadline = setTimeout(() => {
+      const timers: {
+        deadline?: ReturnType<typeof setTimeout>;
+        hardDeadline?: ReturnType<typeof setTimeout>;
+      } = {};
+      const settleBy = Date.parse(record.settleBy);
+      if (settleBy > now) {
+        timers.deadline = setTimeout(() => {
           void this.close(record.contextId, 'deadline').catch((error) =>
             this.reportError(error, {
               operation: 'timer',
@@ -696,9 +710,26 @@ export class UptoSessionManager {
               taskId: record.taskId,
             }),
           );
-        }, Math.max(0, Date.parse(record.authorizationDeadline) - now));
-        deadline.unref?.();
-        this.timers.set(record.contextId, { deadline });
+        }, settleBy - now);
+        timers.deadline.unref?.();
+      }
+      if (record.authorizationDeadline) {
+        const authorizationDeadline = Date.parse(record.authorizationDeadline);
+        if (authorizationDeadline > now) {
+          timers.hardDeadline = setTimeout(() => {
+            void this.close(record.contextId, 'deadline').catch((error) =>
+              this.reportError(error, {
+                operation: 'timer',
+                contextId: record.contextId,
+                taskId: record.taskId,
+              }),
+            );
+          }, authorizationDeadline - now);
+          timers.hardDeadline.unref?.();
+        }
+      }
+      if (timers.deadline || timers.hardDeadline) {
+        this.timers.set(record.contextId, timers);
       }
       return;
     }
@@ -729,6 +760,7 @@ export class UptoSessionManager {
     const timers = this.timers.get(contextId);
     if (timers?.idle) clearTimeout(timers.idle);
     if (timers?.deadline) clearTimeout(timers.deadline);
+    if (timers?.hardDeadline) clearTimeout(timers.hardDeadline);
     this.timers.delete(contextId);
   }
 
@@ -772,7 +804,7 @@ export class UptoSessionManager {
 
   private async applyUsage(
     contextId: string,
-    usageInput: MerchantMeterableUsage | undefined,
+    usageInput: MerchantMeterableUsage,
     pendingTurnId?: string,
   ): Promise<UptoSessionOutcome | undefined> {
     try {
