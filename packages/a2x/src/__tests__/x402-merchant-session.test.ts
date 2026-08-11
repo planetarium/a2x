@@ -452,6 +452,46 @@ describe('UptoSessionManager', () => {
     expect(settle).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps a failed terminal write unresolved and preserves settlement evidence', async () => {
+    class TerminalWriteFailsOnceStore extends InMemoryUptoSessionStore {
+      private failed = false;
+
+      override async compareAndSet(
+        contextId: string,
+        expectedRevision: number,
+        record: UptoSessionRecord,
+      ): Promise<boolean> {
+        if (record.state === 'closed' && !this.failed) {
+          this.failed = true;
+          return false;
+        }
+        return await super.compareAndSet(contextId, expectedRevision, record);
+      }
+    }
+
+    const store = new TerminalWriteFailsOnceStore();
+    const { manager, settle } = fixture({ store });
+    await manager.open({
+      contextId: 'c-terminal-write',
+      taskId: 't-terminal-write',
+      obligation: obligation(),
+      usage: { kind: 'total', totalTokens: 100 },
+    });
+
+    const outcome = await manager.close('c-terminal-write');
+
+    expect(settle).toHaveBeenCalledTimes(1);
+    expect(outcome).toMatchObject({
+      session: { state: 'settling', settlement: { kind: 'settled' } },
+      settlement: { kind: 'settled' },
+    });
+    await expect(manager.recover()).resolves.toMatchObject({
+      closed: 0,
+      unresolved: [{ state: 'settling', settlement: { kind: 'settled' } }],
+    });
+    expect(settle).toHaveBeenCalledTimes(1);
+  });
+
   it('recovers overdue active sessions and re-arms future sessions', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-08-11T00:00:00Z'));

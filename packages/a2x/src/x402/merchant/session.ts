@@ -625,6 +625,25 @@ export class UptoSessionManager {
           closedAt: new Date().toISOString(),
         };
         if (!(await this.store.compareAndSet(contextId, settling.revision, closed))) {
+          let observed = await this.store.get(contextId);
+          if (
+            observed?.state === 'settling' &&
+            observed.taskId === settling.taskId &&
+            observed.settlement === undefined
+          ) {
+            const evidenced: UptoSessionRecord = {
+              ...observed,
+              revision: observed.revision + 1,
+              settlement,
+            };
+            observed = (await this.store.compareAndSet(
+              contextId,
+              observed.revision,
+              evidenced,
+            ))
+              ? evidenced
+              : await this.store.get(contextId);
+          }
           const error = new Error(
             'Upto session settled but its terminal record could not be persisted.',
           );
@@ -633,7 +652,7 @@ export class UptoSessionManager {
             contextId,
             taskId: settling.taskId,
           });
-          return { session: this.snapshot(closed), settlement };
+          return { session: this.snapshot(observed ?? settling), settlement };
         }
         return { session: this.snapshot(closed), settlement };
       }
