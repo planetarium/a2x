@@ -106,14 +106,14 @@ export function meterMerchantUsage(
   }
   if (!isDetailedRates(pricing.rates)) return { kind: 'unpriceable' };
 
-  const cachedRate = atomic(
-    pricing.rates.cachedInputPerMillion ?? pricing.rates.inputPerMillion,
-    'cachedInputPerMillion',
-  );
+  const inputRate = atomic(pricing.rates.inputPerMillion, 'inputPerMillion');
+  const outputRate = atomic(pricing.rates.outputPerMillion, 'outputPerMillion');
+  const cachedRate =
+    pricing.rates.cachedInputPerMillion === undefined
+      ? inputRate
+      : atomic(pricing.rates.cachedInputPerMillion, 'cachedInputPerMillion');
   const micros =
-    (input - cached) * atomic(pricing.rates.inputPerMillion, 'inputPerMillion') +
-    cached * cachedRate +
-    output * atomic(pricing.rates.outputPerMillion, 'outputPerMillion');
+    (input - cached) * inputRate + cached * cachedRate + output * outputRate;
   return applyFloor(ceilDiv(micros, 1_000_000n), pricing);
 }
 
@@ -149,6 +149,9 @@ export function validateMerchantOffer(offer: MerchantOffer): void {
     );
     if (ceiling <= 0n) throw new Error('Merchant pricing ceiling must be greater than zero.');
     if (pricing.scheme !== 'upto') continue;
+    if (!['ceiling', 'floor', 'refuse'].includes(pricing.unreportedUsage)) {
+      throw new Error('unreportedUsage must be one of ceiling, floor, or refuse.');
+    }
     const floor = atomic(pricing.minAmount ?? '0', 'minAmount');
     if (floor > ceiling) throw new Error('minAmount must not exceed maxAmount.');
     if (isDetailedRates(pricing.rates)) {

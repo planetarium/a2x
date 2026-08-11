@@ -93,6 +93,21 @@ describe('x402 merchant pricing', () => {
     ).toEqual({ kind: 'unpriceable' });
   });
 
+  it('attributes an invalid fallback input rate to inputPerMillion', () => {
+    const pricing: MerchantUptoPricing = {
+      ...BASE_UPTO,
+      rates: { inputPerMillion: 'invalid', outputPerMillion: '4' },
+    };
+
+    expect(() =>
+      meterMerchantUsage(pricing, {
+        kind: 'detailed',
+        inputTokens: 1,
+        outputTokens: 1,
+      }),
+    ).toThrow(/inputPerMillion/);
+  });
+
   it('converts maxAmount to the x402 offered amount', () => {
     expect(merchantPricingToAccept(BASE_UPTO)).toMatchObject({
       scheme: 'upto',
@@ -106,6 +121,18 @@ describe('x402 merchant pricing', () => {
         accepts: [{ ...BASE_UPTO, minAmount: '1000001' }],
       }),
     ).toThrow(/minAmount must not exceed maxAmount/);
+  });
+
+  it('rejects a missing or unknown unreported-usage policy', () => {
+    const { unreportedUsage: _policy, ...missingPolicy } = BASE_UPTO;
+    const unknownPolicy = {
+      ...BASE_UPTO,
+      unreportedUsage: 'discount',
+    } as unknown as MerchantUptoPricing;
+
+    for (const invalid of [missingPolicy as MerchantUptoPricing, unknownPolicy]) {
+      expect(() => validateMerchantOffer({ accepts: [invalid] })).toThrow(/unreportedUsage/);
+    }
   });
 
   it('rejects duplicate payment identities before publishing', () => {
