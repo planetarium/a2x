@@ -398,6 +398,36 @@ describe('UptoSessionManager', () => {
     });
   });
 
+  it('applies unreported usage policy instead of lapsing an unresolved turn', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-11T00:00:00Z'));
+    const deadlineSeconds = Math.floor(Date.now() / 1_000) + 60;
+    const { lapse, manager, settle } = fixture({
+      idleSeconds: 300,
+      maxDurationSeconds: 600,
+      deadlineGuardSeconds: 30,
+    });
+    await manager.open({
+      contextId: 'c-unresolved-zero',
+      taskId: 't-unresolved-zero',
+      obligation: obligation({ deadlineSeconds }),
+      usage: { kind: 'total', totalTokens: 0 },
+    });
+    await manager.beginTurn({ contextId: 'c-unresolved-zero', turnId: 'm2' });
+
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(lapse).not.toHaveBeenCalled();
+    expect(settle).toHaveBeenCalledWith(
+      expect.objectContaining({ usage: { kind: 'unreported' } }),
+    );
+    await expect(manager.lookup('c-unresolved-zero')).resolves.toMatchObject({
+      state: 'closed',
+      usage: { kind: 'unreported' },
+      pendingTurns: 1,
+    });
+  });
+
   it('enforces max duration when a requested close is waiting on an in-flight turn', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-08-11T00:00:00Z'));

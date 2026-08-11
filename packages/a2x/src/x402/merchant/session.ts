@@ -610,6 +610,9 @@ export class UptoSessionManager {
           ...current,
           revision: current.revision + 1,
           state: 'settling',
+          ...(current.pendingTurnIds.length > 0
+            ? { usage: { kind: 'unreported' } as const }
+            : {}),
           endReason: reason,
           closeRequestedReason: undefined,
         };
@@ -620,7 +623,7 @@ export class UptoSessionManager {
 
         const charge = projectedCharge(settling);
         let settlement: UptoSessionSettlement;
-        if (charge === 0n) {
+        if (charge === 0n && settling.pendingTurnIds.length === 0) {
           await this.options.gate.lapse(settling.taskId);
           settlement = { kind: 'lapsed' };
         } else {

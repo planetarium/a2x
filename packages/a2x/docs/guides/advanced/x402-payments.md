@@ -690,7 +690,7 @@ The manager aggregates detailed readings with detailed readings and total readin
 
 `open()` writes the first turn's usage and turn count in the same atomic `create` operation as the held authorization. A durable store must preserve the whole record so a crash cannot leave a verified first turn without its trusted usage.
 
-The signed Permit2 cap is intersected with the frozen offer ceiling. Reaching that budget settles inline. Idle and configured maximum-duration timers are process-local optimizations; the signed deadline minus `deadlineGuardSeconds` is the hard backstop. If a turn is still in flight at the guard, the manager stops admitting new work and waits until it finishes, but never beyond the actual authorization deadline.
+The signed Permit2 cap is intersected with the frozen offer ceiling. Reaching that budget settles inline. Idle and configured maximum-duration timers are process-local optimizations; the signed deadline minus `deadlineGuardSeconds` is the hard backstop. If a turn is still in flight at the guard, the manager stops admitting new work and waits until it finishes, but never beyond the actual authorization deadline. A turn still unresolved at a forced maximum or authorization deadline makes the session usage `unreported`; the frozen unreported-usage policy applies, and the session is never treated as a trusted zero-use lapse.
 
 #### Durability and recovery
 
