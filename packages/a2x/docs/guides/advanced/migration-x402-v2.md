@@ -1,6 +1,6 @@
 # Migrating off `x402PaymentHook` to the helper-only surface
 
-This guide is for projects on `@a2x/sdk` 0.13.x that use `x402PaymentHook` / `inputRoundTripHooks` / `readX402Settlement`. The next release removes the SDK-owned payment *flow* and ships only stateless helpers — agents own the entire payment lifecycle inside `BaseAgent.run()`.
+This guide is for projects on `@a2x/sdk` 0.13.x that use `x402PaymentHook` / `inputRoundTripHooks` / `readX402Settlement`. The replacement core surface removes the framework-owned payment flow: agents compose the lifecycle inside `BaseAgent.run()`. Newer releases also export an optional outcome-based `MerchantGate` from `@a2x/sdk/x402`, but it does not register hooks or choose merchant policy implicitly.
 
 **The wire format is unchanged.** All `x402.payment.*` metadata keys, status values, and error codes are bit-for-bit identical. Existing A2A clients keep working without modification. The breaking change is server-side authoring only.
 
@@ -12,7 +12,7 @@ This guide is for projects on `@a2x/sdk` 0.13.x that use `x402PaymentHook` / `in
 - **Flow ownership in the wrong place.** The merchant — not the SDK — is the authority on what was offered, how to validate, what to do between `verify` and `settle`, and whether to retry. The SDK couldn't represent the merchant's business rules without growing options for every case.
 - **Bundled verify+settle.** The hook didn't expose a hook point between the two steps. Audit logging, fraud checks, reward pre-allocation between verify and settle weren't expressible without forking the SDK.
 
-The new design removes the flow entirely. The SDK ships **stateless helpers** the agent composes inside `run()` — every step is its own function, callable in any order, with any user logic inserted in between.
+The new design removes the framework-installed flow entirely. The `@a2x/sdk/x402` entry exposes separate mechanics the agent can compose inside `run()` — every step is callable in order with user logic inserted between them — plus an explicit `MerchantGate` composition helper that returns outcomes instead of scheduling events.
 
 ## What changed
 

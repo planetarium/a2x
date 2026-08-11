@@ -4,7 +4,7 @@ Charge per call with on-chain cryptocurrency payments. A2X implements the x402 A
 
 The flow: the merchant agent responds to an unpaid request with `input-required` + `x402.payment.required`. The client signs a `PaymentPayload` with its wallet and resubmits the same task. The merchant validates the payload, verifies it via an x402 **facilitator**, settles on-chain, and attaches the settlement receipt to the completed task. This flow is identical across versions — only the JSON envelope shapes differ (see [Protocol versions](#protocol-versions-v1--v2)).
 
-> **What changed in this release.** The SDK no longer ships a payment *flow* — only stateless helpers. The agent owns when to request payment, what was offered, how to validate the submission, whether to retry, and what to do between `verify` and `settle`. The previous `x402PaymentHook` / `inputRoundTripHooks` API is removed; see [Migrating from X402PaymentExecutor / x402PaymentHook](./migration-x402-v2.md) for the migration steps.
+> **Flow ownership.** The `@a2x/sdk/x402` entry exposes each protocol mechanic separately and an explicit host-neutral `MerchantGate` composition described below. Nothing installs or schedules a payment flow automatically. The merchant still supplies paid/free selection, rates, settlement timing, missing-usage behavior, and event rendering. The previous framework-owned `x402PaymentHook` / `inputRoundTripHooks` API remains removed; see [Migrating from X402PaymentExecutor / x402PaymentHook](./migration-x402-v2.md).
 
 ## Installation
 
@@ -432,6 +432,130 @@ Metering an **`exact`** requirement also throws. That scheme binds the payer's s
 
 The facilitator enforces the same bound on-chain; the SDK clamp is defence in depth, not a substitute for it.
 
+### Shared merchant-policy gate
+
+Use `MerchantGate` when more than one host needs the same payment policy but renders different event types. It consumes `X402Context` and returns plain outcomes while sharing the same optional `@a2x/sdk/x402` entry:
+
+Protocol refusals from `X402Context.requestPayment()` remain explicit outcomes. For example, a V2 server receiving the legacy V1-only activation URI returns `refuse` with `invalid_x402_version`; the gate does not replace it with a generic infrastructure failure.
+
+```ts
+import { MerchantGate, X402Context } from '@a2x/sdk/x402';
+
+const gate = new MerchantGate({
+  x402: new X402Context({ x402Version: 2 }),
+  exactTiming: 'after-work', // required: the SDK does not choose the risk allocation
+  onError: (error, { operation, taskId }) => {
+    logger.error({ error, operation, taskId }, 'x402 merchant operation failed');
+  },
+  pricing: async ({ taskId, contextId, message }) => {
+    const row = await pricingRepository.forRequest({ taskId, contextId, message });
+    if (!row) return null; // this request is free
+    return {
+      expiresInSeconds: 600,
+      accepts: [{
+        scheme: 'upto',
+        network: row.network,
+        maxAmount: row.maxAmount,
+        minAmount: row.minAmount,
+        asset: row.asset,
+        payTo: row.payTo,
+        resource: row.resource,
+        description: row.description,
+        extra: { facilitatorAddress: row.facilitatorAddress },
+        rates: {
+          inputPerMillion: row.inputPerMillion,
+          outputPerMillion: row.outputPerMillion,
+          cachedInputPerMillion: row.cachedInputPerMillion,
+        },
+        unreportedUsage: 'refuse', // also required: ceiling/floor/refuse are merchant policy
+      }],
+    };
+  },
+});
+```
+
+On the inbound turn, translate the outcome into the host's event system:
+
+```ts
+const opened = await gate.open({
+  taskId: ctx.taskId!,
+  contextId: ctx.contextId,
+  // Omitted or undefined messages are treated as an unpaid first turn.
+  message: ctx.message,
+  activatedExtensions: ctx.activatedExtensions,
+});
+
+if (opened.kind === 'request-payment') {
+  yield { type: 'request-input', message: opened.text, metadata: opened.metadata };
+  return;
+}
+if (opened.kind === 'refuse') {
+  yield x402.failedEvent(opened);
+  return;
+}
+if (opened.kind === 'handled') {
+  // A self-contained operation such as a cooperative batch refund has
+  // already settled and must bypass resource work.
+  yield { type: 'done', metadata: opened.receiptMetadata };
+  return;
+}
+
+if (!opened.obligation) {
+  const result = await runWork();
+  yield { type: 'text', role: 'agent', text: result.text };
+  yield { type: 'done' };
+  return;
+}
+
+let result;
+let settled;
+try {
+  result = await runWork();
+  settled = await gate.settle({
+    taskId: ctx.taskId!,
+    obligation: opened.obligation,
+    usage: result.usageAvailable
+      ? {
+          kind: 'detailed',
+          inputTokens: result.inputTokens,
+          outputTokens: result.outputTokens,
+          cachedInputTokens: result.cachedInputTokens,
+        }
+      : { kind: 'unreported' },
+  });
+} catch (error) {
+  await gate.abort({
+    taskId: ctx.taskId!,
+    obligation: opened.obligation,
+    reason: 'handler_threw',
+    error,
+  });
+  throw error;
+}
+if (settled.kind === 'failed') {
+  yield x402.failedEvent(settled);
+  return;
+}
+yield { type: 'text', role: 'agent', text: result.text };
+yield { type: 'done', metadata: settled.receiptMetadata };
+```
+
+The pricing callback runs only on the unpaid turn. Its complete `MerchantOffer` is frozen by the offer store and the submitted turn settles against that snapshot, not live rates. When `expiresInSeconds` is omitted, `MerchantGate` applies a 10-minute TTL to both the offer-store snapshot and the underlying x402 offering; set `expiresInSeconds` on the offer to override it. The default `InMemoryMerchantOfferStore` independently defaults to the same TTL and caps itself at 10,000 live entries. Standalone store users can override those limits with `defaultTtlSeconds` and `maxEntries`. It also grants an execution claim. Multi-replica deployments must inject a durable `MerchantOfferStore` whose `publishing`, `claim`, and `release` operations are atomic.
+
+Verification happens before the execution claim is consumed, so a transient verification failure can be retried on the same task. Once verification succeeds, only one concurrent caller receives the claim and may execute work. Exact and `upto` retain the existing one-shot behavior. A canceled `batch-settlement` obligation releases both the task claim and the official scheme's channel reservation, so the same voucher can retry after failed work. Successful exact and `upto` settlement removes both lifecycle records; batch settlement removes the frozen offer but retains the completed x402 receipt until its TTL so `extra.channelState` remains available for crash recovery. Cleanup failures do not turn a completed payment into a failure; they are reported through `onError` with `operation: 'cleanup'`.
+
+Unexpected exceptions that escape pricing, storage, or x402 operations are never copied into payer-facing refusal reasons. `open()` and `settle()` return fixed generic text and pass the original error to the optional `onError` callback for host-side logging. Structured verification and settlement failures keep their protocol reason and failure receipt.
+
+Usage is semantic rather than inferred. A trusted zero reading is `{ kind: 'total', totalTokens: 0 }` and charges zero; a runtime that uses zero counters as an “accounting unavailable” sentinel must normalize them to `{ kind: 'unreported' }`. Each `rates` object must use exactly one form: detailed input/output rates or `totalPerThousand`. Detailed rates cannot price a total-only reading, so that combination also follows the offer's required `unreportedUsage` policy. A `totalPerThousand` rate can price either usage shape.
+
+`exactTiming` is required because `before-work` protects the merchant from delivering work whose authorization later fails, while `after-work` protects the payer from being charged for work that fails. For `before-work`, `open()` returns an already-settled obligation; calling `settle()` after the work reuses its receipt and never charges twice. If the facilitator definitively refuses settlement before work, the gate clears the frozen offer and execution claim so the payer can restart the payment flow on the same task.
+
+On success, `settled.charge.requestedAtomic` is the amount the gate asked the facilitator to settle. `settled.charge.amountAtomic` is the facilitator-reported `receipt.amount` when it is a decimal amount, or the requested amount when the receipt omits it. Comparing the two surfaces settlement reconciliation mismatches without discarding the facilitator's authoritative value.
+
+Each offer must contain unique payment identities across scheme, normalized network, asset, payee, and amount. Duplicate entries fail during turn-1 validation instead of making an otherwise valid turn-2 payment ambiguous.
+
+Session-scoped metering and a standard durable offer-store implementation are not part of this initial surface.
+
 #### What the payer's payload looks like
 
 An `upto` payload carries `permit2Authorization` + `signature` instead of the `exact` scheme's EIP-3009 `authorization` — the `X402UptoEvmPayload` and `X402Permit2Authorization` types (exported from `@a2x/sdk/x402`, alongside `X402ExactEvmPayload` for the EIP-3009 shape) describe it. `classify` dispatches shape validation on the matched requirement and checks the Permit2 equivalents: the signature is present, `witness.to` matches your `payTo` (the binding that stops a signature being replayed to another payee), `permitted.token` matches your `asset`, `permitted.amount` is a positive decimal integer within the offer, and the payer `from` is present. Addresses compare case-insensitively, so a checksummed signature matches a lowercase `payTo`.
@@ -476,22 +600,19 @@ class MyContext extends X402Context {
 
 ### Batch settlement (prepaid channels)
 
-`exact` and `upto` both settle on-chain once per call. The x402 V2 [`batch-settlement` scheme](https://github.com/coinbase/x402/blob/main/specs/schemes/batch-settlement/scheme_batch_settlement.md) removes that from the per-call path: the payer opens and funds an on-chain **channel** once, then each subsequent call costs only an off-chain **cumulative voucher**. The merchant records vouchers as they arrive and redeems many of them in a single transaction, out of band.
+`exact` and `upto` both settle on-chain once per call. The x402 V2 [`batch-settlement` scheme](https://github.com/x402-foundation/x402/blob/main/specs/schemes/batch-settlement/scheme_batch_settlement.md) removes that from the per-call path: the payer opens and funds an on-chain **channel** once, then each subsequent call costs only an off-chain **cumulative voucher**. The merchant records vouchers as they arrive and redeems many of them in a single transaction, out of band.
 
 That matters when settlement latency sits in the response critical path, and when per-call gas is large relative to per-call value — metering a 1000-token prompt at ~$3/MTok prices the call at ~$0.003, which is not worth an individual on-chain transfer.
 
-#### Merchant side: inject a resource server as the facilitator
+#### Merchant side: configure the resource-server lifecycle
 
-**The SDK does not own the batch lifecycle**, deliberately. Voucher accounting is not bookkeeping that fits behind `X402Context.settle()`: it needs cap enforcement against the payer's signed ceiling, a compare-and-set on the cumulative amount, and a request reservation established during *verify* — all of which live in `@x402/evm`'s **server-side** scheme as `@x402/core` lifecycle hooks. Redemption is a separate background concern that must be a singleton across horizontally-scaled deployments, which is not something a library should start on your behalf.
-
-The seam is `facilitator`. `X402Context` accepts any `{ verify, settle }` pair, and `@x402/core`'s `x402ResourceServer` knows how to drive those hooks. Because the resource server is V2-only while the SDK facilitator type covers both x402 versions, narrow the already-V2 context at the adapter boundary:
+`MerchantGate` does not reproduce batch channel accounting. Cap enforcement, cumulative-amount compare-and-set, request reservation, cancellation, commit, and settlement-response enrichment remain in `@x402/evm`'s server scheme and its `ChannelStorage`. The gate drives that lifecycle through `X402Context({ resourceServer })`. Raw `{ verify, settle }` facilitator injection is insufficient for batch because it drops those resource-server hooks.
 
 ```ts
 import { x402ResourceServer, HTTPFacilitatorClient } from '@x402/core/server';
-import type { PaymentPayload, PaymentRequirements } from '@x402/core/types';
 import { BatchSettlementEvmScheme } from '@x402/evm/batch-settlement/server';
 import { RedisChannelStorage } from '@x402/evm/batch-settlement/server/redis-storage';
-import { X402Context } from '@a2x/sdk/x402';
+import { MerchantGate, X402Context } from '@a2x/sdk/x402';
 
 const facilitatorClient = new HTTPFacilitatorClient({ url: 'https://x402.org/facilitator' });
 
@@ -506,32 +627,36 @@ await resourceServer.initialize();
 
 const x402 = new X402Context({
   x402Version: 2,
-  facilitator: {
-    verify: (payload, requirement) => {
-      if (payload.x402Version !== 2 || !('amount' in requirement)) {
-        throw new Error('batch-settlement requires x402 V2');
-      }
-      return resourceServer.verifyPayment(
-        payload as unknown as PaymentPayload,
-        requirement as unknown as PaymentRequirements,
-      );
-    },
-    settle: (payload, requirement) => {
-      if (payload.x402Version !== 2 || !('amount' in requirement)) {
-        throw new Error('batch-settlement requires x402 V2');
-      }
-      return resourceServer.settlePayment(
-        payload as unknown as PaymentPayload,
-        requirement as unknown as PaymentRequirements,
-      );
-    },
-  },
+  resourceServer,
+});
+
+const gate = new MerchantGate({
+  x402,
+  exactTiming: 'after-work',
+  pricing: async () => ({
+    accepts: [{
+      scheme: 'batch-settlement',
+      network: 'eip155:84532',
+      maxAmount: '3000',
+      minAmount: '10',
+      rates: { totalPerThousand: '100' },
+      unreportedUsage: 'refuse',
+      asset: USDC_BASE_SEPOLIA,
+      payTo: MERCHANT,
+      resource: 'https://api.example.com/chat',
+      description: 'Metered access, settled in batches',
+    }],
+  }),
 });
 ```
 
-Your agent's `run()` is then the ordinary pipeline — `classify` → `verify` → `settle` → `completedEvent` — with no batch-specific code. `X402Context` recognizes both the opening deposit and subsequent voucher-only payload shapes; `settle` returns as soon as the voucher is recorded, so nothing waits on a block.
+The resource server enriches the published requirement with server-owned fields such as `receiverAuthorizer` and `withdrawDelay`; do not duplicate them in the pricing callback. It must be initialized, and every network/scheme in an offer must be registered. `MerchantGate` rejects a batch offer before publication if the matching resource-server scheme is absent.
 
-Redemption stays yours, on whatever cadence suits your economics:
+On a charge, `open()` verifies and reserves the channel, then returns a `batch-settlement` obligation. `settle()` meters usage, passes the actual amount as the official settlement override, and commits the reservation. If work throws, call `gate.abort()` as shown in the shared gate example; it dispatches `onVerifiedPaymentCanceled` and releases the task claim so the same voucher can retry. A cooperative refund returns `kind: 'handled'`, settles immediately, and never permits resource work to run.
+
+The completed x402 store entry is retained until its configured TTL for batch operations. Its receipt contains `extra.channelState`, allowing recovery if the process stops after commit but before the terminal A2A result is durably recorded.
+
+Redemption is still a separate background concern and should normally be a singleton across horizontally scaled deployments, on whatever cadence suits your economics:
 
 ```ts
 const manager = scheme.createChannelManager(facilitatorClient, 'eip155:84532');
@@ -539,23 +664,7 @@ setInterval(() => manager.claimAndSettle(), 60 * 60 * 1000);   // one singleton,
 setInterval(() => manager.refundIdleChannels({ idleSecs: 7 * 24 * 60 * 60 }), 24 * 60 * 60 * 1000);
 ```
 
-Your offering must advertise `extra.receiverAuthorizer` (the address authorized to countersign claims) — the payer's channel id is derived from it, and signing fails without it:
-
-```ts
-const ACCEPTS = [{
-  scheme: 'batch-settlement',
-  network: 'eip155:84532',
-  amount: '3000',
-  asset: USDC_BASE_SEPOLIA,
-  payTo: MERCHANT,
-  resource: 'https://api.example.com/chat',
-  description: 'Metered access, settled in batches',
-  extra: {
-    name: 'USDC', version: '2',              // EIP-712 domain for the deposit
-    receiverAuthorizer: RECEIVER_AUTHORIZER,
-  },
-}];
-```
+When using the lower-level `requestPayment()` API without a resource server, the caller remains responsible for every scheme-specific `extra` field. That path can advertise a batch requirement but cannot provide the reservation/cancellation lifecycle required for safe resource work; use `resourceServer` with `MerchantGate` for the complete merchant flow.
 
 `batch-settlement` is V2-only. Configuring this offering on an
 `x402Version: 1` context throws before the offering is stored or emitted.

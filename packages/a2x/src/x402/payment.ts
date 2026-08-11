@@ -389,11 +389,13 @@ export interface X402ValidationIssue {
  *    charge);
  *  - `from` (the payer) is present.
  *
- * **Batch settlement** — `batch-settlement` accepts the two payer-side shapes
- * that `@x402/evm` emits for ordinary charges:
+ * **Batch settlement** — `batch-settlement` accepts the payer-side shapes
+ * that `@x402/evm` emits for ordinary charges and cooperative refunds:
  *  - a `voucher` carrying `channelConfig` and signed voucher fields; or
  *  - a `deposit` carrying the same fields plus a positive deposit amount and
- *    nested transfer authorization.
+ *    nested transfer authorization; or
+ *  - a `refund` carrying the channel and latest signed voucher. The server
+ *    enriches it with refund authorization before settlement.
  *
  * Any other scheme falls back to the EIP-3009 checks — the SDK has no ground
  * truth for its wire shape, and failing closed is the safe default. Override
@@ -423,9 +425,12 @@ function validateBatchSettlementPayloadShape(
     { code: X402_ERROR_CODES.INVALID_PAYLOAD, reason },
   ];
   const inner = payload.payload;
-  if (!isRecord(inner) || (inner.type !== 'voucher' && inner.type !== 'deposit')) {
+  if (
+    !isRecord(inner) ||
+    (inner.type !== 'voucher' && inner.type !== 'deposit' && inner.type !== 'refund')
+  ) {
     return invalid(
-      'Batch-settlement payload must have type `voucher` or `deposit`.',
+      'Batch-settlement payload must have type `voucher`, `deposit`, or `refund`.',
     );
   }
   if (!isRecord(inner.channelConfig)) {
@@ -449,7 +454,18 @@ function validateBatchSettlementPayloadShape(
       'Batch-settlement voucher `maxClaimableAmount` must be a decimal integer string.',
     );
   }
-  if (inner.type === 'voucher') return [];
+  if (inner.type === 'voucher' || inner.type === 'refund') {
+    if (
+      inner.type === 'refund' &&
+      inner.amount !== undefined &&
+      parseAtomicAmount(inner.amount) === undefined
+    ) {
+      return invalid(
+        'Batch-settlement refund `amount` must be a decimal integer string when present.',
+      );
+    }
+    return [];
+  }
 
   if (!isRecord(inner.deposit)) {
     return invalid('Batch-settlement deposit payload is missing `deposit`.');

@@ -10,23 +10,22 @@
  * `new X402Context({ x402Version: 2 })` — and the client signs whatever it
  * receives.
  *
- * The SDK exposes spec mechanics as **stateless helpers**, never as a
- * flow: the agent owns when to request payment, what offerings it
- * advertised, how to validate the submitted payment, whether to retry
- * after failure, and what to do between `facilitator.verify` and
- * `facilitator.settle`. The SDK does not persist payment state or
- * auto-route resume turns.
+ * The low-level spec mechanics are **stateless helpers**. `MerchantGate` is
+ * an optional, host-neutral composition over those helpers: the host still
+ * owns paid/free selection, pricing lookup, settlement timing, missing-usage
+ * policy, outcome rendering, and durable storage. Nothing in this entry point
+ * auto-installs payment behavior or auto-routes resume turns.
  *
  * Minimal server setup:
  *
  * ```ts
+ * import { A2XServer, AgentExecutor, BaseAgent, StreamingMode } from '@a2x/sdk';
  * import {
- *   A2XServer, AgentExecutor, BaseAgent, StreamingMode,
  *   x402RequestPayment, parseX402PaymentSubmission, pickX402Requirement,
  *   validateX402PayloadShape, normalizeX402Accept,
  *   buildX402PaymentCompletedMetadata, buildX402PaymentFailedMetadata,
  *   mapVerifyFailureToCode, resolveFacilitator, X402_FOUNDATION_EXTENSION_URI,
- * } from '@a2x/sdk';
+ * } from '@a2x/sdk/x402';
  *
  * const ACCEPTS = [{
  *   network: 'base-sepolia',
@@ -177,6 +176,11 @@ export {
 export type {
   X402Accept,
   X402Facilitator,
+  X402ResourceServer,
+  X402ResourceVerifyResponse,
+  X402PaymentCancellation,
+  X402SkipHandlerDirective,
+  X402VerifiedPaymentCancellationReason,
   X402PaymentRequirements,
   X402PaymentRequirementsV1,
   X402PaymentRequirementsV2,
@@ -239,6 +243,46 @@ export type {
   X402EntryFailure,
   InMemoryX402StoreOptions,
 } from './store.js';
+
+// Optional merchant-policy composition. Hosts still own paid/free selection,
+// rates, settlement timing, missing-usage behavior, and outcome rendering.
+export {
+  InMemoryMerchantOfferStore,
+  MerchantGate,
+  merchantPricingToAccept,
+  meterMerchantUsage,
+  validateMerchantOffer,
+} from './merchant/index.js';
+export type {
+  InMemoryMerchantOfferStoreOptions,
+  MerchantDeferredObligation,
+  MerchantBatchSettlementPricing,
+  MerchantDetailedRates,
+  MerchantExactPricing,
+  MerchantExactTiming,
+  MerchantGateErrorContext,
+  MerchantGateAbortInput,
+  MerchantGateOpenInput,
+  MerchantGateOpenOutcome,
+  MerchantGateOptions,
+  MerchantGateSettleInput,
+  MerchantGateSettleOutcome,
+  MerchantMeterableUsage,
+  MerchantMeteredPricing,
+  MerchantMeteredCharge,
+  MerchantOffer,
+  MerchantOfferStore,
+  MerchantObligation,
+  MerchantPricing,
+  MerchantPricingResolver,
+  MerchantSettledCharge,
+  MerchantSettledObligation,
+  MerchantTotalRate,
+  MerchantTurnRef,
+  MerchantUnreportedUsagePolicy,
+  MerchantUptoPricing,
+  MerchantUsageRates,
+} from './merchant/index.js';
 
 export {
   resolveFacilitator,
