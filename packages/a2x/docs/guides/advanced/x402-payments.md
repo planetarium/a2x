@@ -436,6 +436,8 @@ The facilitator enforces the same bound on-chain; the SDK clamp is defence in de
 
 Use `MerchantGate` when more than one host needs the same payment policy but renders different event types. It consumes `X402Context` and returns plain outcomes while sharing the same optional `@a2x/sdk/x402` entry:
 
+Protocol refusals from `X402Context.requestPayment()` remain explicit outcomes. For example, a V2 server receiving the legacy V1-only activation URI returns `refuse` with `invalid_x402_version`; the gate does not replace it with a generic infrastructure failure.
+
 ```ts
 import { MerchantGate, X402Context } from '@a2x/sdk/x402';
 

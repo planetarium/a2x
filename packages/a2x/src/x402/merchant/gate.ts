@@ -1,5 +1,6 @@
 import {
   X402_ERROR_CODES,
+  X402_METADATA_KEYS,
   mapVerifyFailureToCode,
   type X402ErrorCode,
 } from '../constants.js';
@@ -46,6 +47,14 @@ export interface MerchantGateErrorContext {
 }
 
 const DEFAULT_OFFER_TTL_SECONDS = 600;
+const X402_ERROR_CODE_VALUES: ReadonlySet<string> = new Set(Object.values(X402_ERROR_CODES));
+
+function eventErrorCode(metadata: Record<string, unknown> | undefined): X402ErrorCode | undefined {
+  const code = metadata?.[X402_METADATA_KEYS.ERROR];
+  return typeof code === 'string' && X402_ERROR_CODE_VALUES.has(code)
+    ? (code as X402ErrorCode)
+    : undefined;
+}
 
 function sameIdentifier(a: string, b: string): boolean {
   return a.startsWith('0x') && b.startsWith('0x')
@@ -230,7 +239,7 @@ export class MerchantGate {
         : resolvedOffer;
     validateMerchantOffer(offer);
 
-    return this.sidecar.publishing(turn.taskId, offer, async (frozenOffer) => {
+    const published = await this.sidecar.publishing(turn.taskId, offer, async (frozenOffer) => {
       let outcome: Extract<MerchantGateOpenOutcome, { kind: 'request-payment' }> | undefined;
       for await (const event of this.options.x402.requestPayment(
         {
@@ -249,6 +258,13 @@ export class MerchantGate {
             : {}),
         },
       )) {
+        if (event.type === 'error') {
+          const code = eventErrorCode(event.metadata);
+          return refusal(
+            code ?? X402_ERROR_CODES.SETTLEMENT_FAILED,
+            code ? event.error.message : 'Payment processing is unavailable.',
+          );
+        }
         if (event.type === 'request-input') {
           outcome = {
             kind: 'request-payment',
@@ -260,6 +276,8 @@ export class MerchantGate {
       if (!outcome) throw new Error('X402Context.requestPayment yielded no request-input event.');
       return outcome;
     });
+    if (published.kind === 'refuse') await this.cleanup(turn.taskId);
+    return published;
   }
 
   private resolveUptoCharge(

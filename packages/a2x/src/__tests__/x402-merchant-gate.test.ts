@@ -10,6 +10,7 @@ import {
 } from '../x402/index.js';
 import {
   X402_ERROR_CODES,
+  X402_EXTENSION_URI,
   X402_METADATA_KEYS,
   X402_PAYMENT_STATUS,
 } from '../x402/constants.js';
@@ -141,6 +142,24 @@ describe('MerchantGate', () => {
         activatedExtensions: undefined,
       }),
     ).resolves.toMatchObject({ kind: 'request-payment' });
+  });
+
+  it('preserves a request-payment protocol-version refusal and rolls back the offer', async () => {
+    const { gate, x402 } = fixture({ accepts: [EXACT] }, 'after-work');
+
+    await expect(
+      gate.open({
+        taskId: 't-v1-only-client',
+        message: message(),
+        activatedExtensions: [X402_EXTENSION_URI],
+      }),
+    ).resolves.toMatchObject({
+      kind: 'refuse',
+      code: X402_ERROR_CODES.INVALID_X402_VERSION,
+      reason: expect.stringContaining('V1-only client'),
+    });
+    await expect(gate.sidecar.getOffer('t-v1-only-client')).resolves.toBeUndefined();
+    await expect(x402.store.get('t-v1-only-client')).resolves.toBeUndefined();
   });
 
   it('lets the host proceed when pricing returns null', async () => {
