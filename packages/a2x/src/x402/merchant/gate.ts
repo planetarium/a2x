@@ -6,13 +6,17 @@ import {
 } from '../constants.js';
 import type { BaseX402Context, X402ValidClassification } from '../context.js';
 import { buildX402PaymentCompletedMetadata } from '../payment.js';
-import { sameNetwork } from '../networks.js';
+import { sameNetwork, toCaip2 } from '../networks.js';
 import {
   requirementNetwork,
   requirementPayTo,
   requirementScheme,
 } from '../versions.js';
-import type { X402SettleResponse } from '../types.js';
+import type {
+  X402PaymentCancellation,
+  X402SettleResponse,
+  X402VerifiedPaymentCancellationReason,
+} from '../types.js';
 import { meterMerchantUsage, offerAccepts, validateMerchantOffer } from './pricing.js';
 import {
   InMemoryMerchantOfferStore,
@@ -21,10 +25,12 @@ import {
 import type {
   MerchantGateOpenInput,
   MerchantGateOpenOutcome,
+  MerchantGateAbortInput,
   MerchantGateSettleInput,
   MerchantGateSettleOutcome,
   MerchantExactTiming,
   MerchantExactPricing,
+  MerchantBatchSettlementPricing,
   MerchantOffer,
   MerchantPricing,
   MerchantPricingResolver,
@@ -43,7 +49,7 @@ export interface MerchantGateOptions {
 }
 
 export interface MerchantGateErrorContext {
-  operation: 'open' | 'settle' | 'cleanup';
+  operation: 'open' | 'settle' | 'abort' | 'cleanup';
   taskId: string;
 }
 
@@ -64,7 +70,9 @@ function sameIdentifier(a: string, b: string): boolean {
 }
 
 function pricingAmount(pricing: MerchantPricing): string {
-  return pricing.scheme === 'upto' ? pricing.maxAmount : pricing.amount;
+  return pricing.scheme === 'upto' || pricing.scheme === 'batch-settlement'
+    ? pricing.maxAmount
+    : pricing.amount;
 }
 
 function selectPricing(
@@ -147,11 +155,64 @@ export class MerchantGate {
         return refusal(mapVerifyFailureToCode(reason), reason);
       }
 
-      if (!(await this.offerStore.claim(turn.taskId))) {
+      let claimed: boolean;
+      try {
+        claimed = await this.offerStore.claim(turn.taskId);
+      } catch (error) {
+        await this.cancelVerification(
+          turn.taskId,
+          verification.cancellation,
+          'after_verify_aborted',
+        );
+        throw error;
+      }
+      if (!claimed) {
+        await this.cancelVerification(
+          turn.taskId,
+          verification.cancellation,
+          'after_verify_aborted',
+        );
         return refusal(
           X402_ERROR_CODES.DUPLICATE_NONCE,
           'This payment has already been submitted for this task.',
         );
+      }
+
+      if (verification.skipHandler) {
+        if (pricing.scheme !== 'batch-settlement') {
+          await this.cancelVerification(
+            turn.taskId,
+            verification.cancellation,
+            'after_verify_aborted',
+          );
+          await this.offerStore.release(turn.taskId);
+          return refusal(
+            X402_ERROR_CODES.SETTLEMENT_FAILED,
+            'The payment scheme requested an unsupported handler bypass.',
+          );
+        }
+        const receipt = await this.options.x402.settle(turn, classified);
+        if (!receipt.success) {
+          await this.cancelVerification(
+            turn.taskId,
+            verification.cancellation,
+            'handler_failed',
+          );
+          await this.offerStore.release(turn.taskId);
+          return refusal(
+            X402_ERROR_CODES.SETTLEMENT_FAILED,
+            receipt.errorReason ?? 'Payment settlement failed.',
+            receipt,
+          );
+        }
+        await this.cleanup(turn.taskId, { retainX402Receipt: true });
+        return {
+          kind: 'handled',
+          operation: 'batch-refund',
+          response: verification.skipHandler,
+          receipt,
+          receiptMetadata: buildX402PaymentCompletedMetadata({ receipt }),
+        };
       }
 
       if ((pricing.scheme ?? 'exact') === 'exact' && this.options.exactTiming === 'before-work') {
@@ -171,7 +232,46 @@ export class MerchantGate {
         };
       }
 
-      return { kind: 'proceed', obligation: { kind: 'deferred', classified, pricing } };
+      switch (pricing.scheme ?? 'exact') {
+        case 'exact':
+          return {
+            kind: 'proceed',
+            obligation: {
+              kind: 'deferred',
+              scheme: 'exact',
+              classified,
+              pricing: pricing as MerchantExactPricing,
+            },
+          };
+        case 'upto':
+          return {
+            kind: 'proceed',
+            obligation: {
+              kind: 'deferred',
+              scheme: 'upto',
+              classified,
+              pricing: pricing as MerchantUptoPricing,
+            },
+          };
+        case 'batch-settlement':
+          if (!verification.cancellation) {
+            await this.offerStore.release(turn.taskId);
+            return refusal(
+              X402_ERROR_CODES.SETTLEMENT_FAILED,
+              'Batch settlement requires a configured x402 resource server.',
+            );
+          }
+          return {
+            kind: 'proceed',
+            obligation: {
+              kind: 'deferred',
+              scheme: 'batch-settlement',
+              classified,
+              pricing: pricing as MerchantBatchSettlementPricing,
+              cancellation: verification.cancellation,
+            },
+          };
+      }
     } catch (error) {
       await this.reportError(error, { operation: 'open', taskId: turn.taskId });
       return refusal(X402_ERROR_CODES.SETTLEMENT_FAILED, 'Payment processing is unavailable.');
@@ -181,15 +281,61 @@ export class MerchantGate {
   async settle(input: MerchantGateSettleInput): Promise<MerchantGateSettleOutcome> {
     try {
       const outcome = await this.settleObligation(input);
-      if (outcome.kind === 'settled') await this.cleanup(input.taskId);
+      const isBatch =
+        input.obligation.kind === 'deferred' &&
+        input.obligation.scheme === 'batch-settlement';
+      if (outcome.kind === 'settled') {
+        await this.cleanup(input.taskId, { retainX402Receipt: isBatch });
+      } else if (isBatch) {
+        await this.abort({
+          taskId: input.taskId,
+          obligation: input.obligation,
+          reason: 'handler_failed',
+        });
+      }
       return outcome;
     } catch (error) {
+      if (
+        input.obligation.kind === 'deferred' &&
+        input.obligation.scheme === 'batch-settlement'
+      ) {
+        await this.abort({
+          taskId: input.taskId,
+          obligation: input.obligation,
+          reason: 'handler_threw',
+          error,
+        });
+      }
       await this.reportError(error, { operation: 'settle', taskId: input.taskId });
       return {
         kind: 'failed',
         code: X402_ERROR_CODES.SETTLEMENT_FAILED,
         reason: 'Payment settlement failed.',
       };
+    }
+  }
+
+  /** Release retryable state after verified resource work does not complete. */
+  async abort(input: MerchantGateAbortInput): Promise<void> {
+    if (input.obligation.kind !== 'deferred' || input.obligation.scheme !== 'batch-settlement') {
+      return;
+    }
+    try {
+      await input.obligation.cancellation.cancel({
+        reason: input.reason,
+        ...(input.error === undefined ? {} : { error: input.error }),
+        ...(input.responseStatus === undefined
+          ? {}
+          : { responseStatus: input.responseStatus }),
+      });
+    } catch (error) {
+      await this.reportError(error, { operation: 'abort', taskId: input.taskId });
+    } finally {
+      try {
+        await this.offerStore.release(input.taskId);
+      } catch (error) {
+        await this.reportError(error, { operation: 'abort', taskId: input.taskId });
+      }
     }
   }
 
@@ -205,21 +351,24 @@ export class MerchantGate {
       });
     }
 
-    const pricing = obligation.pricing;
-    if (pricing.scheme !== 'upto') {
+    if (obligation.scheme === 'exact') {
       const receipt = await this.options.x402.settle(
         { taskId: input.taskId },
         obligation.classified,
       );
       if (!receipt.success) return settlementFailure(receipt);
       return this.settledOutcome(receipt, {
-        requestedAtomic: pricing.amount,
-        amountAtomic: pricing.amount,
+        requestedAtomic: obligation.pricing.amount,
+        amountAtomic: obligation.pricing.amount,
         basis: 'exact',
       });
     }
 
-    const charge = this.resolveUptoCharge(pricing, obligation.classified, input.usage);
+    const charge = this.resolveMeteredCharge(
+      obligation.pricing,
+      obligation.classified,
+      input.usage,
+    );
     if (charge.kind === 'failed') return charge;
     const receipt = await this.options.x402.settle(
       { taskId: input.taskId },
@@ -240,6 +389,20 @@ export class MerchantGate {
         ? { ...resolvedOffer, expiresInSeconds: DEFAULT_OFFER_TTL_SECONDS }
         : resolvedOffer;
     validateMerchantOffer(offer);
+    for (const pricing of offer.accepts) {
+      if (
+        pricing.scheme === 'batch-settlement' &&
+        !this.options.x402.supportsResourceServerScheme(
+          toCaip2(pricing.network),
+          'batch-settlement',
+        )
+      ) {
+        throw new Error(
+          'MerchantGate: batch-settlement requires an x402 resource server with the ' +
+            `scheme registered for ${toCaip2(pricing.network)}.`,
+        );
+      }
+    }
 
     const published = await this.offerStore.publishing(turn.taskId, offer, async (frozenOffer) => {
       let outcome: Extract<MerchantGateOpenOutcome, { kind: 'request-payment' }> | undefined;
@@ -282,8 +445,8 @@ export class MerchantGate {
     return published;
   }
 
-  private resolveUptoCharge(
-    pricing: MerchantUptoPricing,
+  private resolveMeteredCharge(
+    pricing: MerchantUptoPricing | MerchantBatchSettlementPricing,
     classified: X402ValidClassification,
     usage: MerchantGateSettleInput['usage'],
   ):
@@ -291,7 +454,7 @@ export class MerchantGate {
     | Extract<MerchantGateSettleOutcome, { kind: 'failed' }> {
     const metered = meterMerchantUsage(pricing, usage);
     if (metered.kind === 'charge') {
-      const amountAtomic = this.clampUptoCharge(pricing, classified, metered.amountAtomic);
+      const amountAtomic = this.clampMeteredCharge(pricing, classified, metered.amountAtomic);
       return {
         kind: 'charge',
         charge: {
@@ -309,7 +472,7 @@ export class MerchantGate {
       };
     }
     if (pricing.unreportedUsage === 'ceiling') {
-      const amountAtomic = this.clampUptoCharge(pricing, classified, pricing.maxAmount);
+      const amountAtomic = this.clampMeteredCharge(pricing, classified, pricing.maxAmount);
       return {
         kind: 'charge',
         charge: {
@@ -319,7 +482,7 @@ export class MerchantGate {
         },
       };
     }
-    const amountAtomic = this.clampUptoCharge(
+    const amountAtomic = this.clampMeteredCharge(
       pricing,
       classified,
       pricing.minAmount ?? '0',
@@ -334,14 +497,16 @@ export class MerchantGate {
     };
   }
 
-  private clampUptoCharge(
-    pricing: MerchantUptoPricing,
+  private clampMeteredCharge(
+    pricing: MerchantUptoPricing | MerchantBatchSettlementPricing,
     classified: X402ValidClassification,
     amountAtomic: string,
   ): string {
     const bounds = [BigInt(amountAtomic), BigInt(pricing.maxAmount)];
-    const signedCap = classified.submission.permit2Authorization?.permitted.amount;
-    if (signedCap !== undefined && /^\d+$/.test(signedCap)) bounds.push(BigInt(signedCap));
+    if (pricing.scheme === 'upto') {
+      const signedCap = classified.submission.permit2Authorization?.permitted.amount;
+      if (signedCap !== undefined && /^\d+$/.test(signedCap)) bounds.push(BigInt(signedCap));
+    }
     return bounds.reduce((a, b) => (a < b ? a : b)).toString();
   }
 
@@ -361,16 +526,32 @@ export class MerchantGate {
     };
   }
 
-  private async cleanup(taskId: string): Promise<void> {
-    for (const operation of [
-      () => this.offerStore.delete(taskId),
-      () => this.options.x402.clearOffering({ taskId }),
-    ]) {
+  private async cleanup(
+    taskId: string,
+    options: { retainX402Receipt?: boolean } = {},
+  ): Promise<void> {
+    const operations = [() => this.offerStore.delete(taskId)];
+    if (!options.retainX402Receipt) {
+      operations.push(() => this.options.x402.clearOffering({ taskId }));
+    }
+    for (const operation of operations) {
       try {
         await operation();
       } catch (error) {
         await this.reportError(error, { operation: 'cleanup', taskId });
       }
+    }
+  }
+
+  private async cancelVerification(
+    taskId: string,
+    cancellation: X402PaymentCancellation | undefined,
+    reason: X402VerifiedPaymentCancellationReason,
+  ): Promise<void> {
+    try {
+      await cancellation?.cancel({ reason });
+    } catch (error) {
+      await this.reportError(error, { operation: 'abort', taskId });
     }
   }
 

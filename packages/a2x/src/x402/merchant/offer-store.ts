@@ -13,6 +13,8 @@ export interface MerchantOfferStore {
   getOffer(taskId: string): Promise<MerchantOffer | undefined>;
   /** Atomically grants one caller the right to act on the submitted payment. */
   claim(taskId: string): Promise<boolean>;
+  /** Releases a claim when a retryable scheme cancels verified resource work. */
+  release(taskId: string): Promise<void>;
   delete(taskId: string): Promise<void>;
 }
 
@@ -99,6 +101,11 @@ export class InMemoryMerchantOfferStore implements MerchantOfferStore {
     if (!entry || entry.claimed) return false;
     entry.claimed = true;
     return true;
+  }
+
+  async release(taskId: string): Promise<void> {
+    const entry = this.liveEntry(taskId);
+    if (entry) entry.claimed = false;
   }
 
   async delete(taskId: string): Promise<void> {

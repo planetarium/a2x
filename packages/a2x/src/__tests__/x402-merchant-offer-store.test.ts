@@ -46,6 +46,15 @@ describe('InMemoryMerchantOfferStore', () => {
     ]);
   });
 
+  it('can release a retryable execution claim', async () => {
+    const store = new InMemoryMerchantOfferStore();
+    await store.publishing('task-1', offer('10'), async () => undefined);
+
+    expect(await store.claim('task-1')).toBe(true);
+    await store.release('task-1');
+    expect(await store.claim('task-1')).toBe(true);
+  });
+
   it('rolls back a newly frozen offer when publishing fails', async () => {
     const store = new InMemoryMerchantOfferStore();
     await expect(

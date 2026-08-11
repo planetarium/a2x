@@ -3,6 +3,7 @@ import {
   merchantPricingToAccept,
   meterMerchantUsage,
   validateMerchantOffer,
+  type MerchantBatchSettlementPricing,
   type MerchantUptoPricing,
 } from '../x402/index.js';
 
@@ -113,6 +114,30 @@ describe('x402 merchant pricing', () => {
       scheme: 'upto',
       amount: '1000000',
     });
+  });
+
+  it('uses the same metered price contract for batch settlement', () => {
+    const batch: MerchantBatchSettlementPricing = {
+      ...BASE_UPTO,
+      scheme: 'batch-settlement',
+    };
+    expect(merchantPricingToAccept(batch)).toMatchObject({
+      scheme: 'batch-settlement',
+      amount: '1000000',
+    });
+    expect(meterMerchantUsage(batch, { kind: 'total', totalTokens: 1001 })).toEqual({
+      kind: 'charge',
+      amountAtomic: '11',
+      basis: 'metered',
+    });
+  });
+
+  it('rejects unknown merchant schemes instead of treating them as exact', () => {
+    expect(() =>
+      validateMerchantOffer({
+        accepts: [{ ...BASE_UPTO, scheme: 'custom' } as never],
+      }),
+    ).toThrow(/scheme.*not supported/);
   });
 
   it('fails invalid merchant pricing before it is published', () => {

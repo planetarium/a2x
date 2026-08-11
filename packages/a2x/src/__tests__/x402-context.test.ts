@@ -86,7 +86,7 @@ function buildPlainMessage(): Message {
 }
 
 function buildBatchSubmittedMessage(
-  type: 'voucher' | 'deposit',
+  type: 'voucher' | 'deposit' | 'refund',
   overrides: { omitVoucher?: boolean } = {},
 ): Message {
   const inner: Record<string, unknown> = {
@@ -389,7 +389,7 @@ describe('X402Context.classify', () => {
     }
   });
 
-  it.each(['voucher', 'deposit'] as const)(
+  it.each(['voucher', 'deposit', 'refund'] as const)(
     'accepts a well-formed batch-settlement %s before resource-server verification',
     async (type) => {
       const ctx = new X402Context({

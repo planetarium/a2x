@@ -21,7 +21,8 @@
  *     round-trip (offered → verified → completed / failed / rejected),
  *     keyed by `taskId`. The store is updated automatically by every
  *     method below; the agent never has to call it directly.
- *  2. an `X402Facilitator` that runs the on-chain verify + settle dance;
+ *  2. an `X402Facilitator`, plus an optional scheme-aware resource server
+ *     for lifecycle hooks used by stateful V2 schemes;
  *  3. response-metadata builders that produce the right `AgentEvent`
  *     shape for each terminal lifecycle state.
  *
@@ -126,11 +127,53 @@ import {
 import type {
   X402Accept,
   X402Facilitator,
+  X402FacilitatorSettleResponse,
+  X402PaymentCancellation,
   X402PaymentPayload,
   X402PaymentRequirements,
+  X402PaymentRequirementsV2,
+  X402ResourceServer,
+  X402ResourceVerifyResponse,
   X402SettleResponse,
-  X402VerifyResponse,
 } from './types.js';
+
+interface X402ResourceServerRuntime {
+  hasRegisteredScheme(network: string, scheme: string): boolean;
+  buildPaymentRequirementsFromOptions(
+    paymentOptions: Array<{
+      scheme: string;
+      payTo: string;
+      price: { amount: string; asset: string; extra?: Record<string, unknown> };
+      network: string;
+      maxTimeoutSeconds?: number;
+      extra?: Record<string, unknown>;
+    }>,
+    context: unknown,
+  ): Promise<Array<{
+    scheme: string;
+    network: string;
+    amount: string;
+    asset: string;
+    payTo: string;
+    maxTimeoutSeconds: number;
+    extra?: Record<string, unknown>;
+  }>>;
+  verifyPayment(
+    payload: X402PaymentPayload,
+    requirements: X402PaymentRequirements,
+  ): Promise<X402ResourceVerifyResponse>;
+  settlePayment(
+    payload: X402PaymentPayload,
+    requirements: X402PaymentRequirements,
+    declaredExtensions?: Record<string, unknown>,
+    transportContext?: unknown,
+    settlementOverrides?: { amount?: string },
+  ): Promise<X402FacilitatorSettleResponse>;
+  createPaymentCancellationDispatcher(
+    payload: X402PaymentPayload,
+    requirements: X402PaymentRequirements,
+  ): X402PaymentCancellation;
+}
 
 /**
  * True for a real plain object. The facilitator's response is remote-controlled,
@@ -158,6 +201,14 @@ export interface X402ContextOptions {
    * facilitator.
    */
   facilitator?: X402Facilitator | FacilitatorUrlConfig;
+  /**
+   * Configured `@x402/core` resource server. Required for stateful schemes
+   * such as `batch-settlement`, whose lifecycle hooks reserve and commit
+   * channel state and release reservations when resource work is canceled.
+   * When present on a V2 context it handles verify and settle in place of the
+   * raw facilitator.
+   */
+  resourceServer?: X402ResourceServer;
   /**
    * The single x402 protocol version this server speaks, emitted verbatim as
    * the envelopes' `x402Version` field. Defaults to `1` — the version the
@@ -284,6 +335,8 @@ export abstract class BaseX402Context {
   abstract readonly store: BaseX402Store;
   /** Facilitator running verify + settle. Subclasses provide a concrete instance. */
   abstract readonly facilitator: X402Facilitator;
+  /** Optional scheme-aware server used for V2 resource lifecycle hooks. */
+  readonly resourceServer?: X402ResourceServer;
 
   /**
    * The single x402 protocol version this server speaks. Overridable by
@@ -334,15 +387,16 @@ export abstract class BaseX402Context {
       return;
     }
     const x402Version = this.x402Version;
+    const accepts = await this.prepareAccepts(input.accepts);
     // Encode up-front so a misconfigured offering (e.g. a CAIP-2 network with
     // no V1 bare-name mapping under a V1 offer) throws a clean configuration
     // error here — before we persist an entry that would then be unusable and
     // make the resume turn's `classify` fail too.
-    const metadata = buildX402PaymentRequiredMetadata(input, { x402Version });
+    const metadata = buildX402PaymentRequiredMetadata({ ...input, accepts }, { x402Version });
     const now = new Date();
     const entry: X402StoreEntry = {
       taskId,
-      accepts: input.accepts,
+      accepts,
       offeredX402Version: x402Version,
       status: 'offered',
       storedAt: now,
@@ -539,13 +593,26 @@ export abstract class BaseX402Context {
   async verify(
     ctx: { taskId?: string },
     classified: X402ValidClassification,
-  ): Promise<X402VerifyResponse> {
-    let result: X402VerifyResponse;
+  ): Promise<X402ResourceVerifyResponse> {
+    let result: X402ResourceVerifyResponse;
     try {
-      result = await this.facilitator.verify(
-        classified.submission.payload!,
-        classified.requirement,
-      );
+      const payload = classified.submission.payload!;
+      if (this.resourceServer && payload.x402Version === 2) {
+        const resourceServer = this.resourceServer as unknown as X402ResourceServerRuntime;
+        const requirement = classified.requirement as X402PaymentRequirementsV2;
+        result = await resourceServer.verifyPayment(payload, requirement);
+        if (result.isValid) {
+          result = {
+            ...result,
+            cancellation: resourceServer.createPaymentCancellationDispatcher(
+              payload,
+              requirement,
+            ),
+          };
+        }
+      } else {
+        result = await this.facilitator.verify(payload, classified.requirement);
+      }
     } catch (err) {
       // A genuine transport/schema error (not a structured `isValid:false`,
       // which the adapter already unwraps) still records a failure so the
@@ -597,10 +664,10 @@ export abstract class BaseX402Context {
    * omits it (`authorization.from` for `exact`, `permit2Authorization.from`
    * for `upto`).
    *
-   * Pass `opts.amountAtomic` to settle a **metered** charge — the usage-based
-   * (`upto`) flow, where the payer signed an authorization up to a maximum and
-   * the merchant charges only what was consumed. The requirement forwarded to
-   * the facilitator is a clone with its amount replaced. See
+   * Pass `opts.amountAtomic` to settle a **metered** charge under `upto` or
+   * `batch-settlement`. A raw facilitator receives a cloned requirement with
+   * its amount replaced; a resource server receives the official settlement
+   * override so its scheme hooks observe the effective charge. See
    * `meteredRequirement` for the clamp guarantee.
    *
    * Metering an `exact` requirement **throws**: `exact` binds the signature to
@@ -631,7 +698,18 @@ export abstract class BaseX402Context {
           );
     let raw: Awaited<ReturnType<X402Facilitator['settle']>>;
     try {
-      raw = await this.facilitator.settle(payload, requirement);
+      raw =
+        this.resourceServer && payload.x402Version === 2
+          ? await (this.resourceServer as unknown as X402ResourceServerRuntime).settlePayment(
+              payload,
+              classified.requirement,
+              undefined,
+              undefined,
+              opts?.amountAtomic === undefined
+                ? undefined
+                : { amount: requirementAmount(requirement) },
+            )
+          : await this.facilitator.settle(payload, requirement);
     } catch (err) {
       // A settle exception (transport/schema error, possibly after the
       // transfer was broadcast) must not leave the entry stuck at `verified`
@@ -781,7 +859,8 @@ export abstract class BaseX402Context {
       throw new Error(
         `${this.constructor.name}.settle: metered settlement requires a usage-based scheme; ` +
           `the matched requirement uses "exact", which binds the payer's signature to a ` +
-          `single amount. Offer scheme "upto" to charge a metered amount.`,
+          `single amount. Offer scheme "upto" or "batch-settlement" to charge a ` +
+          `metered amount.`,
       );
     }
     const metered = parseAtomicAmount(amountAtomic);
@@ -811,6 +890,55 @@ export abstract class BaseX402Context {
 
     const clamped = bounds.reduce((a, b) => (a < b ? a : b));
     return withRequirementAmount(requirement, clamped.toString());
+  }
+
+  /** True when a configured resource server owns this V2 scheme/network. */
+  supportsResourceServerScheme(network: string, scheme: string): boolean {
+    return (
+      (this.resourceServer as unknown as X402ResourceServerRuntime | undefined)
+        ?.hasRegisteredScheme(network, scheme) === true
+    );
+  }
+
+  private async prepareAccepts(accepts: X402Accept[]): Promise<X402Accept[]> {
+    if (!this.resourceServer || this.x402Version !== 2) return accepts;
+
+    const encoded = accepts.map(encodeRequirementV2);
+    const resourceServer = this.resourceServer as unknown as X402ResourceServerRuntime;
+    const built = await resourceServer.buildPaymentRequirementsFromOptions(
+      encoded.map((requirement) => ({
+        scheme: requirement.scheme,
+        network: requirement.network,
+        payTo: requirement.payTo,
+        price: {
+          amount: requirement.amount,
+          asset: requirement.asset,
+          ...(requirement.extra ? { extra: requirement.extra } : {}),
+        },
+        maxTimeoutSeconds: requirement.maxTimeoutSeconds,
+        ...(requirement.extra ? { extra: requirement.extra } : {}),
+      })),
+      {},
+    );
+    if (built.length !== accepts.length) {
+      throw new Error(
+        `${this.constructor.name}.requestPayment: resource server returned ${built.length} ` +
+          `requirements for ${accepts.length} payment options.`,
+      );
+    }
+    return built.map((requirement, index) => {
+      const original = accepts[index]!;
+      return {
+        ...original,
+        scheme: requirement.scheme,
+        network: requirement.network,
+        amount: requirement.amount,
+        asset: requirement.asset,
+        payTo: requirement.payTo,
+        maxTimeoutSeconds: requirement.maxTimeoutSeconds,
+        ...(requirement.extra ? { extra: requirement.extra } : {}),
+      };
+    });
   }
 
   /** Best-effort removal of the stored entry — call after task termination. */
@@ -889,10 +1017,12 @@ export abstract class BaseX402Context {
 export class X402Context extends BaseX402Context {
   readonly store: BaseX402Store;
   readonly facilitator: X402Facilitator;
+  override readonly resourceServer?: X402ResourceServer;
 
   constructor(options: X402ContextOptions = {}) {
     super();
     this.store = options.store ?? new InMemoryX402Store();
+    this.resourceServer = options.resourceServer;
     if (options.x402Version !== undefined) {
       // Fail fast on a misconfigured version (reachable from plain JS or
       // `any`): silently proceeding would encode V1 while persisting the

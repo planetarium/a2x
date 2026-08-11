@@ -21,11 +21,13 @@ export {
 } from './offer-store.js';
 export type {
   MerchantDeferredObligation,
+  MerchantBatchSettlementPricing,
   MerchantDetailedRates,
   MerchantExactPricing,
   MerchantExactTiming,
   MerchantGateOpenInput,
   MerchantGateOpenOutcome,
+  MerchantGateAbortInput,
   MerchantGateSettleInput,
   MerchantGateSettleOutcome,
   MerchantOffer,
@@ -40,5 +42,6 @@ export type {
   MerchantUptoPricing,
   MerchantUsageRates,
   MerchantMeterableUsage,
+  MerchantMeteredPricing,
   MerchantMeteredCharge,
 } from './types.js';

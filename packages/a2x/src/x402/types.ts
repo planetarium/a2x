@@ -205,6 +205,33 @@ export interface X402VerifyResponse {
   [key: string]: unknown;
 }
 
+/** Why verified resource work was abandoned before settlement. */
+export type X402VerifiedPaymentCancellationReason =
+  | 'handler_threw'
+  | 'handler_failed'
+  | 'after_verify_aborted';
+
+/** Opaque cancellation control created by an x402 resource server after verify. */
+export interface X402PaymentCancellation {
+  cancel(options: {
+    reason: X402VerifiedPaymentCancellationReason;
+    error?: unknown;
+    responseStatus?: number;
+  }): Promise<void>;
+}
+
+/** In-process response requested by a scheme that completes without resource work. */
+export interface X402SkipHandlerDirective {
+  contentType?: string;
+  body?: unknown;
+}
+
+/** Verify result after resource-server lifecycle controls have been attached. */
+export interface X402ResourceVerifyResponse extends X402VerifyResponse {
+  skipHandler?: X402SkipHandlerDirective;
+  cancellation?: X402PaymentCancellation;
+}
+
 /**
  * Raw facilitator `settle` result. a2x trims this into the wire receipt
  * (`X402SettleResponse`) attached to the task. `success`/`transaction`/
@@ -280,7 +307,7 @@ export interface X402SettleResponse {
 }
 
 /**
- * Minimal shape the SDK needs from a payment facilitator.
+ * Minimal shape the SDK needs from a raw payment facilitator.
  *
  * Matches the `verify`/`settle` methods of `@x402/core`'s
  * `HTTPFacilitatorClient` (and x402 v1's `useFacilitator()`), abstracted so
@@ -288,7 +315,9 @@ export interface X402SettleResponse {
  * custom routing proxy, a different vendor). The facilitator is handed the
  * raw wire payload and the requirement of whichever version the task
  * negotiated; both `HTTPFacilitatorClient` and the reference facilitators
- * dispatch on `x402Version` internally.
+ * dispatch on `x402Version` internally. Stateful schemes instead use
+ * `X402ResourceServer`, because their lifecycle hooks do not live on this
+ * two-method boundary.
  */
 export interface X402Facilitator {
   verify(
@@ -299,6 +328,23 @@ export interface X402Facilitator {
     payload: X402PaymentPayload,
     requirements: X402PaymentRequirements,
   ): Promise<X402FacilitatorSettleResponse>;
+}
+
+/**
+ * Structural subset of `@x402/core`'s `x402ResourceServer` used by a2x.
+ *
+ * Stateful schemes must run through this boundary rather than through the
+ * raw facilitator: their reservation, cancellation, and response-enrichment
+ * behavior lives in resource-server hooks. Method arguments stay opaque so
+ * this declaration does not make the optional `@x402/core` peer mandatory;
+ * pass a configured upstream `x402ResourceServer` instance.
+ */
+export interface X402ResourceServer {
+  hasRegisteredScheme(...args: never[]): boolean;
+  buildPaymentRequirementsFromOptions(...args: never[]): Promise<unknown>;
+  verifyPayment(...args: never[]): Promise<unknown>;
+  settlePayment(...args: never[]): Promise<unknown>;
+  createPaymentCancellationDispatcher(...args: never[]): unknown;
 }
 
 /**
@@ -360,9 +406,11 @@ export interface X402Accept {
    * `"batch-settlement"` pays out of a pre-funded on-chain channel: the payer
    * deposits once, then each call carries only an off-chain cumulative
    * voucher, and the merchant redeems many of them in one transaction out of
-   * band. Also **x402 V2 only**. Offerings must set `extra.receiverAuthorizer`
-   * (the channel id derives from it). Its voucher settlements succeed with an
-   * empty `transaction` and report channel state in the receipt's `extra`.
+   * band. Also **x402 V2 only**. A configured resource server enriches the
+   * requirement with `extra.receiverAuthorizer` / `withdrawDelay`; callers
+   * publishing low-level requirements must supply those fields themselves.
+   * Voucher settlements succeed with an empty `transaction` and report
+   * channel state in the receipt's `extra`.
    *
    * Other scheme strings pass through the pipeline untouched — payload-shape
    * validation for them is up to the caller (override

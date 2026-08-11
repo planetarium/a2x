@@ -2,10 +2,10 @@ import { sameNetwork } from '../networks.js';
 import type { X402Accept } from '../types.js';
 import type {
   MerchantDetailedRates,
+  MerchantMeteredPricing,
   MerchantOffer,
   MerchantPricing,
   MerchantTotalRate,
-  MerchantUptoPricing,
   MerchantMeterableUsage,
   MerchantMeteredCharge,
 } from './types.js';
@@ -24,11 +24,11 @@ function tokenCount(value: number): bigint | undefined {
   return BigInt(value);
 }
 
-function isDetailedRates(rates: MerchantUptoPricing['rates']): rates is MerchantDetailedRates {
+function isDetailedRates(rates: MerchantMeteredPricing['rates']): rates is MerchantDetailedRates {
   return 'inputPerMillion' in rates;
 }
 
-function isTotalRate(rates: MerchantUptoPricing['rates']): rates is MerchantTotalRate {
+function isTotalRate(rates: MerchantMeteredPricing['rates']): rates is MerchantTotalRate {
   return 'totalPerThousand' in rates;
 }
 
@@ -39,7 +39,9 @@ function sameIdentifier(a: string, b: string): boolean {
 }
 
 function pricingAmount(pricing: MerchantPricing): string {
-  return pricing.scheme === 'upto' ? pricing.maxAmount : pricing.amount;
+  return pricing.scheme === 'upto' || pricing.scheme === 'batch-settlement'
+    ? pricing.maxAmount
+    : pricing.amount;
 }
 
 function samePricingIdentity(a: MerchantPricing, b: MerchantPricing): boolean {
@@ -52,7 +54,7 @@ function samePricingIdentity(a: MerchantPricing, b: MerchantPricing): boolean {
   );
 }
 
-function applyFloor(metered: bigint, pricing: MerchantUptoPricing): MerchantMeteredCharge {
+function applyFloor(metered: bigint, pricing: MerchantMeteredPricing): MerchantMeteredCharge {
   const floor = atomic(pricing.minAmount ?? '0', 'minAmount');
   if (metered < floor) {
     return { kind: 'charge', amountAtomic: floor.toString(), basis: 'floor' };
@@ -70,7 +72,7 @@ function ceilDiv(numerator: bigint, denominator: bigint): bigint {
  * "unreported" sentinel must emit `{ kind: 'unreported' }` instead.
  */
 export function meterMerchantUsage(
-  pricing: MerchantUptoPricing,
+  pricing: MerchantMeteredPricing,
   usage: MerchantMeterableUsage | undefined,
 ): MerchantMeteredCharge {
   if (usage === undefined || usage.kind === 'unreported') return { kind: 'unpriceable' };
@@ -118,10 +120,10 @@ export function meterMerchantUsage(
 }
 
 export function merchantPricingToAccept(pricing: MerchantPricing): X402Accept {
-  if (pricing.scheme === 'upto') {
+  if (pricing.scheme === 'upto' || pricing.scheme === 'batch-settlement') {
     const { maxAmount, minAmount: _minAmount, rates: _rates, unreportedUsage: _policy, ...accept } =
       pricing;
-    return { ...accept, scheme: 'upto', amount: maxAmount };
+    return { ...accept, scheme: pricing.scheme, amount: maxAmount };
   }
   return { ...pricing, scheme: pricing.scheme ?? 'exact' };
 }
@@ -140,15 +142,23 @@ export function validateMerchantOffer(offer: MerchantOffer): void {
     throw new Error('MerchantOffer.expiresInSeconds must be greater than zero.');
   }
   for (const [index, pricing] of offer.accepts.entries()) {
+    const scheme = pricing.scheme ?? 'exact';
+    if (scheme !== 'exact' && scheme !== 'upto' && scheme !== 'batch-settlement') {
+      throw new Error(`Merchant pricing scheme ${JSON.stringify(scheme)} is not supported.`);
+    }
     if (offer.accepts.slice(0, index).some((candidate) => samePricingIdentity(candidate, pricing))) {
       throw new Error('MerchantOffer.accepts must not contain duplicate payment identities.');
     }
     const ceiling = atomic(
-      pricing.scheme === 'upto' ? pricing.maxAmount : pricing.amount,
-      pricing.scheme === 'upto' ? 'maxAmount' : 'amount',
+      pricing.scheme === 'upto' || pricing.scheme === 'batch-settlement'
+        ? pricing.maxAmount
+        : pricing.amount,
+      pricing.scheme === 'upto' || pricing.scheme === 'batch-settlement'
+        ? 'maxAmount'
+        : 'amount',
     );
     if (ceiling <= 0n) throw new Error('Merchant pricing ceiling must be greater than zero.');
-    if (pricing.scheme !== 'upto') continue;
+    if (pricing.scheme !== 'upto' && pricing.scheme !== 'batch-settlement') continue;
     if (!['ceiling', 'floor', 'refuse'].includes(pricing.unreportedUsage)) {
       throw new Error('unreportedUsage must be one of ceiling, floor, or refuse.');
     }

@@ -3,6 +3,7 @@ import type { Message } from '../types/common.js';
 import {
   MerchantGate,
   merchantPricingToAccept,
+  type MerchantBatchSettlementPricing,
   type MerchantExactPricing,
   type MerchantGateErrorContext,
   type MerchantOffer,
@@ -19,6 +20,7 @@ import type {
   X402Facilitator,
   X402PaymentPayload,
   X402PaymentRequirements,
+  X402ResourceServer,
 } from '../x402/types.js';
 import { encodeRequirementV2 } from '../x402/wire-v2.js';
 
@@ -48,6 +50,23 @@ const UPTO: MerchantUptoPricing = {
   description: 'Metered work',
   resource: 'https://example.com/work',
   extra: { facilitatorAddress: '0x4444444444444444444444444444444444444444' },
+};
+
+const BATCH: MerchantBatchSettlementPricing = {
+  scheme: 'batch-settlement',
+  network: 'eip155:84532',
+  maxAmount: '5000',
+  minAmount: '10',
+  rates: { totalPerThousand: '100' },
+  unreportedUsage: 'ceiling',
+  asset: ASSET,
+  payTo: PAY_TO,
+  description: 'Batched metered work',
+  resource: 'https://example.com/work',
+  extra: {
+    receiverAuthorizer: '0x6666666666666666666666666666666666666666',
+    withdrawDelay: 300,
+  },
 };
 
 function message(metadata?: Record<string, unknown>): Message {
@@ -99,6 +118,97 @@ function uptoPayload(cap: string = UPTO.maxAmount): X402PaymentPayload {
       },
     },
   };
+}
+
+function batchPayload(
+  type: 'voucher' | 'refund' = 'voucher',
+  accepted = merchantPricingToAccept(BATCH),
+): X402PaymentPayload {
+  return {
+    x402Version: 2,
+    accepted: encodeRequirementV2(accepted),
+    payload: {
+      type,
+      channelConfig: {
+        payer: PAYER,
+        payerAuthorizer: '0x7777777777777777777777777777777777777777',
+        receiver: PAY_TO,
+        receiverAuthorizer: '0x6666666666666666666666666666666666666666',
+        token: ASSET,
+        withdrawDelay: 300,
+        salt: '0x01',
+      },
+      voucher: {
+        channelId: '0xchannel',
+        maxClaimableAmount: '5000',
+        signature: '0xsig',
+      },
+    },
+  };
+}
+
+function batchFixture(options: {
+  pricing?: MerchantBatchSettlementPricing;
+  skipHandler?: boolean;
+  settleSuccess?: boolean;
+} = {}) {
+  const pricing = options.pricing ?? BATCH;
+  const cancel = vi.fn(async () => undefined);
+  const settlePayment = vi.fn(
+    async (
+      _payload: X402PaymentPayload,
+      requirement: X402PaymentRequirements,
+      _extensions?: Record<string, unknown>,
+      _transport?: unknown,
+      overrides?: { amount?: string },
+    ) => ({
+      success: options.settleSuccess ?? true,
+      transaction: '',
+      network: requirement.network,
+      ...((options.settleSuccess ?? true) ? {} : { errorReason: 'batch settle refused' }),
+      amount: '999999',
+      extra: {
+        chargedAmount: overrides?.amount ?? '0',
+        channelState: { channelId: '0xchannel', chargedCumulativeAmount: '5000' },
+      },
+    }),
+  );
+  const resourceServer: X402ResourceServer = {
+    hasRegisteredScheme: vi.fn(
+      (network, scheme) => network === 'eip155:84532' && scheme === 'batch-settlement',
+    ),
+    buildPaymentRequirementsFromOptions: vi.fn(async (paymentOptions) =>
+      paymentOptions.map((option) => ({
+        scheme: option.scheme,
+        network: option.network,
+        amount: option.price.amount,
+        asset: option.price.asset,
+        payTo: option.payTo,
+        maxTimeoutSeconds: option.maxTimeoutSeconds ?? 300,
+        extra: { ...option.extra, withdrawDelay: 300 },
+      })),
+    ),
+    verifyPayment: vi.fn(async () => ({
+      isValid: true,
+      ...(options.skipHandler
+        ? {
+            skipHandler: {
+              contentType: 'application/json',
+              body: { message: 'Refund acknowledged' },
+            },
+          }
+        : {}),
+    })),
+    settlePayment,
+    createPaymentCancellationDispatcher: vi.fn(() => ({ cancel })),
+  };
+  const x402 = new X402Context({ x402Version: 2, resourceServer });
+  const gate = new MerchantGate({
+    x402,
+    pricing: async () => ({ accepts: [pricing] }),
+    exactTiming: 'after-work',
+  });
+  return { gate, x402, resourceServer, cancel, settlePayment };
 }
 
 function fixture(
@@ -440,5 +550,188 @@ describe('MerchantGate', () => {
       code: X402_ERROR_CODES.SETTLEMENT_FAILED,
     });
     expect(refuseFixture.facilitator.settle).not.toHaveBeenCalled();
+  });
+
+  it('meters and commits a batch-settlement charge through the resource server', async () => {
+    const { gate, x402, resourceServer, settlePayment } = batchFixture();
+    await gate.open({ taskId: 't-batch', message: message() });
+    const storedOffer = await x402.store.get('t-batch');
+    expect(storedOffer?.accepts[0]?.extra).toMatchObject({ withdrawDelay: 300 });
+
+    const opened = await gate.open({
+      taskId: 't-batch',
+      message: submitted(batchPayload('voucher', storedOffer!.accepts[0]!)),
+    });
+    expect(opened.kind).toBe('proceed');
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+    expect(opened.obligation).toMatchObject({ kind: 'deferred', scheme: 'batch-settlement' });
+
+    const settled = await gate.settle({
+      taskId: 't-batch',
+      obligation: opened.obligation,
+      usage: { kind: 'total', totalTokens: 1_500 },
+    });
+    expect(settled).toMatchObject({
+      kind: 'settled',
+      charge: { requestedAtomic: '150', amountAtomic: '150', basis: 'metered' },
+      receipt: {
+        transaction: '',
+        amount: '150',
+        extra: { channelState: { channelId: '0xchannel' } },
+      },
+    });
+    expect(settlePayment).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      undefined,
+      undefined,
+      { amount: '150' },
+    );
+    expect(resourceServer.createPaymentCancellationDispatcher).toHaveBeenCalledOnce();
+    await expect(gate.offerStore.getOffer('t-batch')).resolves.toBeUndefined();
+    await expect(x402.store.get('t-batch')).resolves.toMatchObject({
+      status: 'completed',
+      receipt: { amount: '150', extra: { channelState: { channelId: '0xchannel' } } },
+    });
+  });
+
+  it('cancels a batch reservation and releases the task claim for retry', async () => {
+    const { gate, x402, cancel, resourceServer } = batchFixture();
+    await gate.open({ taskId: 't-batch-abort', message: message() });
+    const accepted = (await x402.store.get('t-batch-abort'))!.accepts[0]!;
+    const first = await gate.open({
+      taskId: 't-batch-abort',
+      message: submitted(batchPayload('voucher', accepted)),
+    });
+    if (first.kind !== 'proceed' || !first.obligation) throw new Error('missing obligation');
+
+    await gate.abort({
+      taskId: 't-batch-abort',
+      obligation: first.obligation,
+      reason: 'handler_threw',
+      error: new Error('work failed'),
+    });
+    expect(cancel).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'handler_threw', error: expect.any(Error) }),
+    );
+
+    await expect(
+      gate.open({
+        taskId: 't-batch-abort',
+        message: submitted(batchPayload('voucher', accepted)),
+      }),
+    ).resolves.toMatchObject({
+      kind: 'proceed',
+      obligation: { scheme: 'batch-settlement' },
+    });
+    expect(resourceServer.verifyPayment).toHaveBeenCalledTimes(2);
+  });
+
+  it('cancels batch state when usage policy refuses settlement', async () => {
+    const { gate, x402, cancel, settlePayment } = batchFixture({
+      pricing: { ...BATCH, unreportedUsage: 'refuse' },
+    });
+    await gate.open({ taskId: 't-batch-unpriced', message: message() });
+    const accepted = (await x402.store.get('t-batch-unpriced'))!.accepts[0]!;
+    const opened = await gate.open({
+      taskId: 't-batch-unpriced',
+      message: submitted(batchPayload('voucher', accepted)),
+    });
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+
+    await expect(
+      gate.settle({
+        taskId: 't-batch-unpriced',
+        obligation: opened.obligation,
+        usage: { kind: 'unreported' },
+      }),
+    ).resolves.toMatchObject({ kind: 'failed' });
+    expect(settlePayment).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledWith({ reason: 'handler_failed' });
+
+    await expect(
+      gate.open({
+        taskId: 't-batch-unpriced',
+        message: submitted(batchPayload('voucher', accepted)),
+      }),
+    ).resolves.toMatchObject({ kind: 'proceed' });
+  });
+
+  it('settles a batch refund without allowing resource work to run', async () => {
+    const { gate, x402, settlePayment, resourceServer } = batchFixture({ skipHandler: true });
+    await gate.open({ taskId: 't-batch-refund', message: message() });
+    const accepted = (await x402.store.get('t-batch-refund'))!.accepts[0]!;
+
+    await expect(
+      gate.open({
+        taskId: 't-batch-refund',
+        message: submitted(batchPayload('refund', accepted)),
+      }),
+    ).resolves.toMatchObject({
+      kind: 'handled',
+      operation: 'batch-refund',
+      response: { body: { message: 'Refund acknowledged' } },
+      receipt: { success: true },
+    });
+    expect(resourceServer.createPaymentCancellationDispatcher).toHaveBeenCalledOnce();
+    expect(settlePayment).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      undefined,
+      undefined,
+      undefined,
+    );
+    await expect(x402.store.get('t-batch-refund')).resolves.toMatchObject({
+      status: 'completed',
+    });
+  });
+
+  it('cancels a refund reservation when its immediate settlement is refused', async () => {
+    const { gate, x402, cancel } = batchFixture({
+      skipHandler: true,
+      settleSuccess: false,
+    });
+    await gate.open({ taskId: 't-batch-refund-failed', message: message() });
+    const accepted = (await x402.store.get('t-batch-refund-failed'))!.accepts[0]!;
+
+    await expect(
+      gate.open({
+        taskId: 't-batch-refund-failed',
+        message: submitted(batchPayload('refund', accepted)),
+      }),
+    ).resolves.toMatchObject({
+      kind: 'refuse',
+      reason: 'batch settle refused',
+    });
+    expect(cancel).toHaveBeenCalledWith({ reason: 'handler_failed' });
+
+    await expect(
+      gate.open({
+        taskId: 't-batch-refund-failed',
+        message: submitted(batchPayload('refund', accepted)),
+      }),
+    ).resolves.toMatchObject({ kind: 'refuse', reason: 'batch settle refused' });
+  });
+
+  it('fails closed before publishing batch terms without a registered resource server', async () => {
+    const onError = vi.fn();
+    const gate = new MerchantGate({
+      x402: new X402Context({ x402Version: 2 }),
+      pricing: async () => ({ accepts: [BATCH] }),
+      exactTiming: 'after-work',
+      onError,
+    });
+
+    await expect(
+      gate.open({ taskId: 't-batch-missing-server', message: message() }),
+    ).resolves.toEqual({
+      kind: 'refuse',
+      code: X402_ERROR_CODES.SETTLEMENT_FAILED,
+      reason: 'Payment processing is unavailable.',
+    });
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining('resource server') }),
+      { operation: 'open', taskId: 't-batch-missing-server' },
+    );
   });
 });
