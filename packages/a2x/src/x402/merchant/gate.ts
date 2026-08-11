@@ -339,6 +339,11 @@ export class MerchantGate {
     }
   }
 
+  /** Let an unused held authorization expire without attempting settlement. */
+  async lapse(taskId: string): Promise<void> {
+    await this.cleanup(taskId);
+  }
+
   private async settleObligation(
     input: MerchantGateSettleInput,
   ): Promise<MerchantGateSettleOutcome> {

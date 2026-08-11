@@ -248,13 +248,16 @@ export type {
 // rates, settlement timing, missing-usage behavior, and outcome rendering.
 export {
   InMemoryMerchantOfferStore,
+  InMemoryUptoSessionStore,
   MerchantGate,
+  UptoSessionManager,
   merchantPricingToAccept,
   meterMerchantUsage,
   validateMerchantOffer,
 } from './merchant/index.js';
 export type {
   InMemoryMerchantOfferStoreOptions,
+  InMemoryUptoSessionStoreOptions,
   MerchantDeferredObligation,
   MerchantBatchSettlementPricing,
   MerchantDetailedRates,
@@ -282,6 +285,22 @@ export type {
   MerchantUnreportedUsagePolicy,
   MerchantUptoPricing,
   MerchantUsageRates,
+  UptoSessionEndReason,
+  UptoSessionFinishTurnInput,
+  UptoSessionManagerErrorContext,
+  UptoSessionManagerOptions,
+  UptoSessionObligation,
+  UptoSessionOpenInput,
+  UptoSessionOutcome,
+  UptoSessionRecord,
+  UptoSessionRecordTurnInput,
+  UptoSessionRecovery,
+  UptoSessionSettlement,
+  UptoSessionSnapshot,
+  UptoSessionState,
+  UptoSessionStore,
+  UptoSessionTurnInput,
+  UptoSessionTurnStart,
 } from './merchant/index.js';
 
 export {
