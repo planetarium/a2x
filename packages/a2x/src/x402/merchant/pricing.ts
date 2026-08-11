@@ -12,8 +12,8 @@ import type {
 
 const DECIMAL_ATOMIC = /^\d+$/;
 
-function atomic(value: string, field: string): bigint {
-  if (!DECIMAL_ATOMIC.test(value)) {
+function atomic(value: unknown, field: string): bigint {
+  if (typeof value !== 'string' || !DECIMAL_ATOMIC.test(value)) {
     throw new Error(`${field} must be a decimal integer string, got ${JSON.stringify(value)}`);
   }
   return BigInt(value);
@@ -154,14 +154,24 @@ export function validateMerchantOffer(offer: MerchantOffer): void {
     }
     const floor = atomic(pricing.minAmount ?? '0', 'minAmount');
     if (floor > ceiling) throw new Error('minAmount must not exceed maxAmount.');
-    if (isDetailedRates(pricing.rates)) {
-      atomic(pricing.rates.inputPerMillion, 'inputPerMillion');
-      atomic(pricing.rates.outputPerMillion, 'outputPerMillion');
-      if (pricing.rates.cachedInputPerMillion !== undefined) {
-        atomic(pricing.rates.cachedInputPerMillion, 'cachedInputPerMillion');
+    const rates = pricing.rates as unknown as Record<string, unknown>;
+    const hasDetailedRates = [
+      'inputPerMillion',
+      'outputPerMillion',
+      'cachedInputPerMillion',
+    ].some((field) => field in rates);
+    const hasTotalRate = 'totalPerThousand' in rates;
+    if (hasDetailedRates === hasTotalRate) {
+      throw new Error('rates must use exactly one detailed or total rate form.');
+    }
+    if (hasDetailedRates) {
+      atomic(rates.inputPerMillion, 'inputPerMillion');
+      atomic(rates.outputPerMillion, 'outputPerMillion');
+      if (rates.cachedInputPerMillion !== undefined) {
+        atomic(rates.cachedInputPerMillion, 'cachedInputPerMillion');
       }
     } else {
-      atomic(pricing.rates.totalPerThousand, 'totalPerThousand');
+      atomic(rates.totalPerThousand, 'totalPerThousand');
     }
   }
 }

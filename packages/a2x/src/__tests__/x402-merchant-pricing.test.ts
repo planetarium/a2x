@@ -135,6 +135,27 @@ describe('x402 merchant pricing', () => {
     }
   });
 
+  it('rejects ambiguous or missing runtime rate forms', () => {
+    const bothRateForms = {
+      ...BASE_UPTO,
+      rates: {
+        inputPerMillion: '2',
+        outputPerMillion: '4',
+        totalPerThousand: '10',
+      },
+    } as unknown as MerchantUptoPricing;
+    const missingRateForm = {
+      ...BASE_UPTO,
+      rates: {},
+    } as MerchantUptoPricing;
+
+    for (const invalid of [bothRateForms, missingRateForm]) {
+      expect(() => validateMerchantOffer({ accepts: [invalid] })).toThrow(
+        /exactly one detailed or total rate form/,
+      );
+    }
+  });
+
   it('rejects duplicate payment identities before publishing', () => {
     expect(() =>
       validateMerchantOffer({
