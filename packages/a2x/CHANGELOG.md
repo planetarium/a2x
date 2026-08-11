@@ -1,5 +1,17 @@
 # @a2x/sdk
 
+## 0.20.0
+
+### Minor Changes
+
+- [#207](https://github.com/planetarium/a2x/pull/207) [`9207118`](https://github.com/planetarium/a2x/commit/920711846af8806a2bcb94d3c1242870e7854aaa) Thanks [@longfin](https://github.com/longfin)! - Add an optional host-neutral merchant-policy composition to `@a2x/sdk/x402`, with configurable exact, `upto`, and `batch-settlement` pricing, frozen offer terms, metering, retry-safe execution claims, resource-server lifecycle integration, refund bypass, and batch recovery receipts.
+
+- [#213](https://github.com/planetarium/a2x/pull/213) [`667ce37`](https://github.com/planetarium/a2x/commit/667ce370a9e767ff6496c943aaf0097b0b902054) Thanks [@longfin](https://github.com/longfin)! - Add opt-in conversation-scoped `upto` metering with CAS-backed turn leases, idle/deadline/budget settlement triggers, zero-usage lapse handling, and restart-safe reconciliation records.
+
+### Patch Changes
+
+- [#214](https://github.com/planetarium/a2x/pull/214) [`d4ad3a5`](https://github.com/planetarium/a2x/commit/d4ad3a5545efb7bf3854ec79e63ce028f3495c64) Thanks [@longfin](https://github.com/longfin)! - Make `MerchantGate` replay handling lifecycle-aware, retain completed receipts until expiry, skip verification for known claimed attempts, and keep indeterminate settlement attempts claimed for reconciliation.
+
 ## 0.19.0
 
 ### Minor Changes
