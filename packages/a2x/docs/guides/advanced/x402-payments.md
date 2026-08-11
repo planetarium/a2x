@@ -688,13 +688,15 @@ if (sessionOutcome?.settlement?.kind === 'settled') {
 
 The manager aggregates detailed readings with detailed readings and total readings with total readings. It may combine the two only when the frozen pricing uses `totalPerThousand`; a detailed rate cannot safely price a total-only turn, so that session becomes `unreported`. The frozen offer's `ceiling`, `floor`, or `refuse` policy is then applied by `MerchantGate` exactly as it is for one call. A trusted all-zero session lapses through `gate.lapse()` without consuming the authorization or applying the non-zero floor.
 
+`open()` writes the first turn's usage and turn count in the same atomic `create` operation as the held authorization. A durable store must preserve the whole record so a crash cannot leave a verified first turn without its trusted usage.
+
 The signed Permit2 cap is intersected with the frozen offer ceiling. Reaching that budget settles inline. Idle and configured maximum-duration timers are process-local optimizations; the signed deadline minus `deadlineGuardSeconds` is the hard backstop. If a turn is still in flight at the guard, the manager stops admitting new work and waits until it finishes, but never beyond the actual authorization deadline.
 
 #### Durability and recovery
 
 `InMemoryUptoSessionStore` is single-process only, caps itself at 10,000 records, and retains successful/lapsed records for one hour. Failed settlement records do not expire automatically because they are reconciliation evidence.
 
-Production session mode must inject a shared `UptoSessionStore`. Its `create`, revision-based `compareAndSet`, and revision-based `delete` operations must be atomic across replicas. It must persist the complete held `UptoSessionRecord`, including the signed obligation, and return every active or settling record from `listRecoverable()`. Protect that payload as payment authorization data. The x402 lifecycle store, merchant offer store, session store, task state, and any host conversation mapping form one recovery domain even when implemented as separate tables or keys.
+Production session mode must inject a shared `UptoSessionStore`. Its `create`, revision-based `compareAndSet`, and revision-based `delete` operations must be atomic across replicas. `compareAndSet` must reject records whose `contextId` differs from the lookup key. `create` may replace successful or lapsed closed records, but it must retain failed settlement evidence until an operator deletes the exact revision. The store must persist the complete held `UptoSessionRecord`, including the signed obligation, and return every active or settling record from `listRecoverable()`. Protect that payload as payment authorization data. The x402 lifecycle store, merchant offer store, session store, task state, and any host conversation mapping form one recovery domain even when implemented as separate tables or keys.
 
 Call `recover()` on startup (and from a periodic reaper in timerless/serverless deployments). It re-arms future active sessions and closes overdue active sessions through the same CAS transition. Multiple replicas may call it: only the winner of `active -> settling` invokes settlement.
 

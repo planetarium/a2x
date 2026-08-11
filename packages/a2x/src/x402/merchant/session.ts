@@ -91,10 +91,12 @@ export interface UptoSessionRecovery {
  * Persistence boundary for held `upto` authorizations.
  *
  * `create` and `compareAndSet` MUST be atomic across replicas. `create` may
- * replace a closed record, but returns false while the context is active or
- * settling. `compareAndSet` replaces the entire record only when `revision`
- * still equals `expectedRevision`. `listRecoverable` returns every active or
- * settling record needed to re-arm triggers after a restart.
+ * replace a successfully settled or lapsed closed record, but returns false
+ * while the context is active or settling and while failed settlement evidence
+ * is retained. `compareAndSet` rejects a record whose `contextId` differs from
+ * its key and replaces the entire record only when `revision` still equals
+ * `expectedRevision`. `listRecoverable` returns every active or settling record
+ * needed to re-arm triggers after a restart.
  */
 export interface UptoSessionStore {
   get(contextId: string): Promise<UptoSessionRecord | undefined>;
@@ -166,6 +168,9 @@ export class InMemoryUptoSessionStore implements UptoSessionStore {
     expectedRevision: number,
     record: UptoSessionRecord,
   ): Promise<boolean> {
+    if (record.contextId !== contextId) {
+      throw new Error('Upto session record contextId must match its store key.');
+    }
     const current = this.entries.get(contextId);
     if (!current || current.revision !== expectedRevision) return false;
     this.entries.set(contextId, cloneRecord(record));
@@ -421,13 +426,15 @@ export class UptoSessionManager {
         ? Number.POSITIVE_INFINITY
         : signedDeadline - this.deadlineGuardMs,
     );
-    const record: UptoSessionRecord = {
+    const usage = mergeUsage(input.obligation.pricing, undefined, input.usage);
+    const draft: UptoSessionRecord = {
       contextId: input.contextId,
       taskId: input.taskId,
       revision: 0,
       state: 'active',
       obligation: input.obligation,
-      turns: 0,
+      usage,
+      turns: 1,
       pendingTurnIds: [],
       completedTurnIds: [],
       authorizedMaxAtomic: authorizedMax(input.obligation).toString(),
@@ -438,16 +445,27 @@ export class UptoSessionManager {
         ? {}
         : { authorizationDeadline: new Date(signedDeadline).toISOString() }),
     };
+    const charge = projectedCharge(draft);
+    const trigger =
+      usage.kind === 'unreported'
+        ? 'usage-unreported'
+        : charge !== undefined && charge >= BigInt(draft.authorizedMaxAtomic)
+          ? 'budget-exhausted'
+          : undefined;
+    const record: UptoSessionRecord = trigger
+      ? { ...draft, closeRequestedReason: trigger }
+      : draft;
     try {
       if (!(await this.store.create(record))) {
         throw new Error(`An upto session is already live for context ${input.contextId}.`);
       }
-      const outcome = await this.recordTurn({
-        contextId: input.contextId,
-        usage: input.usage,
-      });
-      if (!outcome) throw new Error('The newly opened upto session disappeared.');
-      return outcome;
+      if (trigger) {
+        const outcome = await this.close(input.contextId, trigger);
+        if (!outcome) throw new Error('The newly opened upto session disappeared.');
+        return outcome;
+      }
+      this.arm(record);
+      return { session: this.snapshot(record) };
     } catch (error) {
       await this.reportError(error, {
         operation: 'open',

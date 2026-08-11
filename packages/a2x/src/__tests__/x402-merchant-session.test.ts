@@ -134,6 +134,33 @@ describe('UptoSessionManager', () => {
     manager.stop();
   });
 
+  it('persists the first turn usage atomically with session creation', async () => {
+    class InspectCreateStore extends InMemoryUptoSessionStore {
+      created?: UptoSessionRecord;
+
+      override async create(record: UptoSessionRecord): Promise<boolean> {
+        this.created = structuredClone(record);
+        return await super.create(record);
+      }
+    }
+
+    const store = new InspectCreateStore();
+    const { manager } = fixture({ store });
+    await manager.open({
+      contextId: 'c-atomic-open',
+      taskId: 't-atomic-open',
+      obligation: obligation(),
+      usage: { kind: 'total', totalTokens: 100 },
+    });
+
+    expect(store.created).toMatchObject({
+      state: 'active',
+      turns: 1,
+      usage: { kind: 'total', totalTokens: 100 },
+    });
+    manager.stop();
+  });
+
   it('clamps the session budget to the payer signed cap and settles inline', async () => {
     const { manager, settle } = fixture();
     const outcome = await manager.open({
@@ -685,6 +712,13 @@ describe('InMemoryUptoSessionStore', () => {
     await expect(
       store.compareAndSet('c-cas', 0, { ...record, revision: 1, turns: 1 }),
     ).resolves.toBe(true);
+    await expect(
+      store.compareAndSet('c-cas', 1, {
+        ...record,
+        contextId: 'c-other',
+        revision: 2,
+      }),
+    ).rejects.toThrow('contextId must match');
     await expect(store.get('c-cas')).resolves.toMatchObject({ revision: 1, turns: 1 });
   });
 
