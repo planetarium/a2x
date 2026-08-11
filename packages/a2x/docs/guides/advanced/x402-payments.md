@@ -478,7 +478,8 @@ On the inbound turn, translate the outcome into the host's event system:
 const opened = await gate.open({
   taskId: ctx.taskId!,
   contextId: ctx.contextId,
-  message: ctx.message!,
+  // Omitted or undefined messages are treated as an unpaid first turn.
+  message: ctx.message,
   activatedExtensions: ctx.activatedExtensions,
 });
 

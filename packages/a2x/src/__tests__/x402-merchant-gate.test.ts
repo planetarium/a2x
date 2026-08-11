@@ -130,6 +130,19 @@ function fixture(
 }
 
 describe('MerchantGate', () => {
+  it('treats an explicitly undefined message as a first-turn request', async () => {
+    const { gate } = fixture({ accepts: [EXACT] }, 'after-work');
+
+    await expect(
+      gate.open({
+        taskId: 't-no-message',
+        message: undefined,
+        contextId: undefined,
+        activatedExtensions: undefined,
+      }),
+    ).resolves.toMatchObject({ kind: 'request-payment' });
+  });
+
   it('lets the host proceed when pricing returns null', async () => {
     const gate = new MerchantGate({
       x402: new X402Context({ x402Version: 2 }),

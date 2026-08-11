@@ -1,6 +1,7 @@
 import type { BaseX402Context, X402ValidClassification } from '../context.js';
 import type { X402ErrorCode } from '../constants.js';
 import type { X402Accept, X402SettleResponse } from '../types.js';
+import type { Message } from '../../types/common.js';
 
 export type MerchantExactTiming = 'before-work' | 'after-work';
 
@@ -49,10 +50,12 @@ export interface MerchantOffer {
 
 export type MerchantTurnRef = Parameters<BaseX402Context['classify']>[0];
 
-export interface MerchantGateOpenInput extends MerchantTurnRef {
+export interface MerchantGateOpenInput extends Omit<MerchantTurnRef, 'taskId' | 'message'> {
   taskId: string;
-  contextId?: string;
-  activatedExtensions?: readonly string[];
+  /** An absent message is classified as a first-turn, unpaid request. */
+  message?: Message | undefined;
+  contextId?: string | undefined;
+  activatedExtensions?: readonly string[] | undefined;
 }
 
 export type MerchantPricingResolver = (

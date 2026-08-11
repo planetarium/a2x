@@ -107,7 +107,10 @@ export class MerchantGate {
 
   async open(turn: MerchantGateOpenInput): Promise<MerchantGateOpenOutcome> {
     try {
-      const classified = await this.options.x402.classify(turn);
+      const classified = await this.options.x402.classify({
+        taskId: turn.taskId,
+        ...(turn.message === undefined ? {} : { message: turn.message }),
+      });
       if (classified.kind === 'no-submission') return await this.requestPayment(turn);
       if (classified.kind !== 'valid') {
         return refusal(classified.code, classified.reason);
