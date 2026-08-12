@@ -623,13 +623,25 @@ for (const unresolved of recovery.unresolved) {
   for (const turnId of unresolved.pendingTurnIds) {
     const evidence = await taskRepository.lookupTurn(turnId);
     if (evidence.usage) {
-      await sessions.finishTurn({
-        contextId: unresolved.contextId,
-        turnId,
-        usage: evidence.usage,
-      });
+      if (unresolved.turns === 0 && turnId === unresolved.taskId) {
+        await sessions.commitOpen({
+          contextId: unresolved.contextId,
+          taskId: turnId,
+          usage: evidence.usage,
+        });
+      } else {
+        await sessions.finishTurn({
+          contextId: unresolved.contextId,
+          turnId,
+          usage: evidence.usage,
+        });
+      }
     } else if (evidence.provesNoBillableWork) {
-      await sessions.cancelTurn({ contextId: unresolved.contextId, turnId });
+      if (unresolved.turns === 0 && turnId === unresolved.taskId) {
+        await sessions.cancelOpen({ contextId: unresolved.contextId, taskId: turnId });
+      } else {
+        await sessions.cancelTurn({ contextId: unresolved.contextId, turnId });
+      }
     } else {
       alertReconciliationQueue(unresolved);
     }
@@ -666,17 +678,41 @@ if (opened.kind !== 'proceed') {
   return;
 }
 
+const openingObligation =
+  !leased &&
+  contextId &&
+  opened.obligation?.kind === 'deferred' &&
+  opened.obligation.scheme === 'upto'
+    ? opened.obligation
+    : undefined;
+let openingReserved = false;
+if (openingObligation) {
+  const reservation = await sessions.reserveOpen({
+    contextId,
+    taskId: ctx.taskId!,
+    obligation: openingObligation,
+  });
+  if (reservation.kind === 'duplicate') {
+    yield await replayTurnResult(ctx.taskId!, reservation.status);
+    return;
+  }
+  if (reservation.kind === 'unavailable') {
+    // The manager already lapsed this task's unused authorization.
+    yield renderOpeningUnavailable(reservation.reason);
+    return;
+  }
+  openingReserved = true;
+}
+
 let result;
 try {
   result = await runWork();
 } catch (error) {
   if (leased && contextId) {
     await sessions.cancelTurn({ contextId, turnId });
-  } else if (
-    opened.obligation?.kind === 'deferred' &&
-    opened.obligation.scheme === 'upto'
-  ) {
-    // The first turn never opened a session and delivered no work.
+  } else if (openingReserved && contextId) {
+    await sessions.cancelOpen({ contextId, taskId: ctx.taskId! });
+  } else if (openingObligation) {
     await gate.lapse(ctx.taskId!);
   } else if (opened.obligation) {
     await gate.abort({
@@ -696,16 +732,10 @@ const usage = result.usageAvailable
 let sessionOutcome;
 if (leased && contextId) {
   sessionOutcome = await sessions.finishTurn({ contextId, turnId, usage });
-} else if (
-  contextId &&
-  opened.obligation?.kind === 'deferred' &&
-  opened.obligation.scheme === 'upto'
-) {
-  // The paid first turn becomes the held authorization for this context.
-  sessionOutcome = await sessions.open({
+} else if (openingReserved && contextId) {
+  sessionOutcome = await sessions.commitOpen({
     contextId,
     taskId: ctx.taskId!,
-    obligation: opened.obligation,
     usage,
   });
 } else if (opened.obligation) {
@@ -724,27 +754,31 @@ if (sessionOutcome?.settlement?.kind === 'settled') {
 }
 ```
 
-`recordTurn({ contextId, usage })` remains available when usage is already complete and there is no asynchronous work gap. Use the `beginTurn` / `finishTurn` pair around real resource work. A start result distinguishes `inactive`, a new `started` lease, and duplicate `pending` or `completed` turn ids; duplicate turns must reuse the host's durable result and never execute again. `cancelTurn` releases a lease that produced no billable work. Once a close is requested, new leases are refused; the last finishing or canceled lease performs the single settlement.
+Use `reserveOpen` / `commitOpen` around the first turn's real resource work. The reservation performs the atomic context claim before work, so concurrent verified opening payments receive `unavailable` and are lapsed before they can spend upstream resources. Its reason distinguishes `active`, `settling`, `closed-unreconciled`, and `deadline`; a retained failed settlement requires operator reconciliation instead of an ordinary payer retry. A same-task retry returns `duplicate` with `pending` or `completed`; reuse durable host output instead of running it again. A mismatched task passed to `commitOpen` throws because it is a host logic error, not an expected race.
 
-`usage` is required by `open()`, `recordTurn()`, and `finishTurn()`. When trusted usage is unavailable, pass `{ kind: 'unreported' }` explicitly so the frozen offer's unreported-usage policy is applied intentionally.
+A reserved opener arms no idle or deadline timer until `commitOpen` records trusted usage. This prevents an automatic trigger from charging an unreported-usage floor or ceiling before work completes. If resource work throws after a successful reservation, the host **must** call `cancelOpen({ contextId, taskId })`; it atomically closes and lapses the reservation only while that opening task still owns it. Omitting the cancellation leaves an unresolved authorization for recovery. A reservation whose guarded authorization deadline has already passed returns `unavailable` without creating a session.
+
+`recordTurn({ contextId, usage })` remains available when usage is already complete and there is no asynchronous work gap. Use the `beginTurn` / `finishTurn` pair around later resource work. A start result distinguishes `inactive`, a new `started` lease, and duplicate `pending` or `completed` turn ids; duplicate turns must reuse the host's durable result and never execute again. `cancelTurn` releases a later-turn lease that produced no billable work. Once a close is requested, new leases are refused; the last finishing or canceled lease performs the single settlement. An opening reservation is not reported by `active()` and does not admit later turn leases until `commitOpen` records its first trusted usage.
+
+`usage` is required by `open()`, `commitOpen()`, `recordTurn()`, and `finishTurn()`. When trusted usage is unavailable, pass `{ kind: 'unreported' }` explicitly so the frozen offer's unreported-usage policy is applied intentionally.
 
 The manager aggregates detailed readings with detailed readings and total readings with total readings. It may combine the two only when the frozen pricing uses `totalPerThousand`; a detailed rate cannot safely price a total-only turn, so the session records `usageIncomplete: true`. Trusted readings already accumulated remain in `usage` as a durable lower bound. `ceiling` still settles the cap, `refuse` still refuses to select a charge, and `floor` settles the greater of the configured floor and the charge supported by the retained readings. A trusted all-zero session lapses through `gate.lapse()` only when usage is complete.
 
-`open()` writes the first turn's usage and turn count in the same atomic `create` operation as the held authorization. A durable store must preserve the whole record so a crash cannot leave a verified first turn without its trusted usage.
+`open()` remains a convenience for hosts that already have trusted first-turn usage and accept doing work before claiming the context. It writes the usage and turn count in the same atomic `create` operation as the held authorization. It is not implemented as two durable operations, so existing callers keep that atomic-write guarantee. Hosts with an asynchronous work gap should use `reserveOpen` / `commitOpen` instead.
 
-The signed Permit2 cap is intersected with the frozen offer ceiling. Reaching that budget settles inline. Idle and configured maximum-duration timers are process-local optimizations. `settleBy` is the earlier of the configured maximum duration and the signed deadline minus `deadlineGuardSeconds`; settlement starts at that guarded instant, never at the on-chain deadline itself. If a turn is still in flight, the manager stops admitting work, marks usage incomplete, and settles immediately under the frozen unreported-usage policy. This may omit the unfinished turn's reading, but preserves the configured transaction-submission margin for the accumulated session charge.
+The signed Permit2 cap is intersected with the frozen offer ceiling. Reaching that budget settles inline. After the opening usage is committed, idle and configured maximum-duration timers are process-local optimizations. `settleBy` is the earlier of the configured maximum duration and the signed deadline minus `deadlineGuardSeconds`; settlement starts at that guarded instant, never at the on-chain deadline itself. If a later turn is still in flight, the manager stops admitting work, marks usage incomplete, and settles immediately under the frozen unreported-usage policy. This may omit the unfinished turn's reading, but preserves the configured transaction-submission margin for the accumulated session charge. An uncommitted opener instead remains unresolved without an automatic timer until the host commits or cancels it from durable work evidence.
 
 #### Durability and recovery
 
 `InMemoryUptoSessionStore` is single-process only, caps itself at 10,000 records, and retains successful/lapsed records for one hour. Failed settlement records do not expire automatically because they are reconciliation evidence.
 
-Production session mode must inject a shared `UptoSessionStore`. Its `create`, revision-based `compareAndSet`, and revision-based `delete` operations must be atomic across replicas. `compareAndSet` must reject records whose `contextId` differs from the lookup key. `create` may replace successful or lapsed closed records, but it must retain failed settlement evidence until an operator deletes the exact revision. The store must persist the complete held `UptoSessionRecord`, including the signed obligation, retained usage, `usageIncomplete`, and pending turn ids, and return every active or settling record from `listRecoverable()`. Protect that payload as payment authorization data. The x402 lifecycle store, merchant offer store, session store, task state, and any host conversation mapping form one recovery domain even when implemented as separate tables or keys.
+Production session mode must inject a shared `UptoSessionStore`. Its `create`, revision-based `compareAndSet`, and revision-based `delete` operations must be atomic across replicas. `compareAndSet` must reject records whose `contextId` differs from the lookup key. `create` may replace successful or lapsed closed records, but it must retain failed settlement evidence until an operator deletes the exact revision. The store must persist the complete held `UptoSessionRecord`, including a reserved opener with `turns: 0` and its task id in `pendingTurnIds`, the signed obligation, retained usage, `usageIncomplete`, and later pending turn ids. It must return every active or settling record from `listRecoverable()`. Protect that payload as payment authorization data. The x402 lifecycle store, merchant offer store, session store, task state, and any host conversation mapping form one recovery domain even when implemented as separate tables or keys.
 
 Call `recover()` on startup (and from a periodic reaper in timerless/serverless deployments). It re-arms future active sessions and closes overdue active sessions through the same CAS transition. Multiple replicas may call it: only the winner of `active -> settling` invokes settlement.
 
-An active record with an in-flight turn is returned in `recovery.unresolved`, including its `pendingTurnIds`. The manager deliberately arms no timer for it: before accepting traffic, restore each turn's trusted usage with `finishTurn`, or call `cancelTurn` only when durable task state proves that no billable work was delivered. Ignoring this queue can let the authorization expire without a settlement attempt. A record found in `settling` is also unresolved and is **never settled automatically again**: the payment may have escaped before the process stopped. If the facilitator returned an outcome but the terminal store write lost its CAS race, the manager best-effort attaches that settlement evidence to the still-settling record without claiming that it is closed. Reconcile it against the facilitator, then conditionally remove or repair the exact revision in the store.
+An active record with in-flight work is returned in `recovery.unresolved`, including its `pendingTurnIds`. The manager deliberately arms no timer for it. A record with `turns: 0` whose pending id equals `taskId` is an uncommitted opener: restore it with `commitOpen`, or call `cancelOpen` only when durable task state proves that no billable work was delivered. Restore later turns with `finishTurn`, or use `cancelTurn` under the same proof requirement. Ignoring this queue can let the authorization expire without a settlement attempt. A record found in `settling` is also unresolved and is **never settled automatically again**: the payment may have escaped before the process stopped. If the facilitator returned an outcome but the terminal store write lost its CAS race, the manager best-effort attaches that settlement evidence to the still-settling record without claiming that it is closed. Reconcile it against the facilitator, then conditionally remove or repair the exact revision in the store.
 
-Serialize the first paid turn per `contextId` across replicas. Two first turns can both finish resource work before either has created the held session; the atomic `create` selects one winner, lapses the losing task's unused authorization, and rejects the losing `open()`. Host serialization avoids making the payer retry work that already ran.
+`reserveOpen` removes the need for a host-only first-turn mutex. Two verified first turns may race the atomic `create`, but only the winner receives `reserved`; every different-task loser receives `unavailable` and has its unused authorization lapsed before resource work. The existing `open()` convenience still runs after usage is known, so callers that choose it must serialize first paid turns themselves.
 
 Failed settlement closes the session but retains the gate's x402 evidence and blocks a replacement authorization for that context. After manual reconciliation, `forgetClosed(contextId)` conditionally removes that exact closed revision. Never call it merely to make a retry pass.
 
