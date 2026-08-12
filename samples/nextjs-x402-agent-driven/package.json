@@ -11,22 +11,22 @@
   },
   "dependencies": {
     "@a2x/sdk": "workspace:*",
-    "@anthropic-ai/sdk": "^0.91.1",
+    "@anthropic-ai/sdk": "^0.116.0",
     "@x402/core": "~2.21.0",
     "@x402/evm": "~2.21.0",
     "next": "16.2.4",
     "react": "19.2.5",
     "react-dom": "19.2.5",
-    "viem": "^2.21.26"
+    "viem": "^2.55.13"
   },
   "devDependencies": {
-    "@tailwindcss/postcss": "^4",
+    "@tailwindcss/postcss": "^4.3.3",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
-    "eslint": "^9",
+    "eslint": "^9.39.5",
     "eslint-config-next": "16.2.4",
-    "tailwindcss": "^4",
-    "typescript": "^5"
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3"
   }
 }
