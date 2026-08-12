@@ -590,7 +590,7 @@ export class UptoSessionManager {
           }
         }
 
-        if (now >= Date.parse(record.settleBy)) {
+        if (Date.now() >= Date.parse(record.settleBy)) {
           await this.options.gate.lapse(input.taskId);
           return { kind: 'unavailable', reason: 'deadline' };
         }

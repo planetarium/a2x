@@ -472,6 +472,39 @@ describe('UptoSessionManager', () => {
     await expect(manager.lookup('c-reserve-expired')).resolves.toBeUndefined();
   });
 
+  it('rechecks the guarded deadline after losing the opening create race', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-11T00:00:00Z'));
+
+    class DeadlineRaceStore extends InMemoryUptoSessionStore {
+      createCalls = 0;
+
+      override async create(record: UptoSessionRecord): Promise<boolean> {
+        this.createCalls += 1;
+        if (this.createCalls === 1) {
+          vi.setSystemTime(new Date(record.settleBy));
+          return false;
+        }
+        return await super.create(record);
+      }
+    }
+
+    const store = new DeadlineRaceStore();
+    const deadlineSeconds = Math.floor(Date.now() / 1_000) + 31;
+    const { lapse, manager } = fixture({ store, deadlineGuardSeconds: 30 });
+
+    await expect(
+      manager.reserveOpen({
+        contextId: 'c-reserve-deadline-race',
+        taskId: 't-reserve-deadline-race',
+        obligation: obligation({ deadlineSeconds }),
+      }),
+    ).resolves.toEqual({ kind: 'unavailable', reason: 'deadline' });
+    expect(store.createCalls).toBe(1);
+    expect(lapse).toHaveBeenCalledWith('t-reserve-deadline-race');
+    await expect(manager.lookup('c-reserve-deadline-race')).resolves.toBeUndefined();
+  });
+
   it('arms no automatic trigger until the reserved opening usage is committed', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-08-11T00:00:00Z'));
