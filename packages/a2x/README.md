@@ -447,7 +447,7 @@ a2xServerV03.getAgentCard(); // v0.3 card
 
 ## Requirements
 
-- Node.js >= 20
+- Node.js >= 22.11
 - TypeScript >= 5.6 (recommended)
 
 ## Links

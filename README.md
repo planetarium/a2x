@@ -263,7 +263,7 @@ a2x handles the structural differences between A2A v0.3 and v1.0 transparently:
 ## Tech Stack
 
 - **Language**: TypeScript 5.x
-- **Runtime**: Node.js 20+
+- **Runtime**: Node.js 22.11+
 - **Module**: ESM (tree-shakeable)
 - **Build**: tsup (ESM + CJS dual emit)
 - **Package manager**: pnpm (workspace)

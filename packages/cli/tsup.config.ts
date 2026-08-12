@@ -13,7 +13,7 @@ export default defineConfig([
     entry: ['src/index.ts'],
     outDir: 'dist',
     format: ['esm'],
-    target: 'node20',
+    target: 'node22',
     clean: true,
     sourcemap: true,
     banner: {
@@ -26,7 +26,7 @@ export default defineConfig([
     entry: { a2x: 'src/index.ts' },
     outDir: 'bin-bundle',
     format: ['cjs'],
-    target: 'node20',
+    target: 'node22',
     clean: true,
     sourcemap: false,
     noExternal: [/.*/],
