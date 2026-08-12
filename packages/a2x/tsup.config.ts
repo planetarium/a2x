@@ -9,7 +9,7 @@ export default defineConfig([
     dts: true,
     sourcemap: true,
     clean: true,
-    target: 'node20',
+    target: 'node22',
     outDir: 'dist',
   },
   {
@@ -25,7 +25,7 @@ export default defineConfig([
     dts: true,
     sourcemap: true,
     clean: false,
-    target: 'node20',
+    target: 'node22',
     outDir: 'dist',
   },
 ]);

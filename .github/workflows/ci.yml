@@ -27,7 +27,7 @@ jobs:
       fail-fast: false
       matrix:
         # Full Node matrix on main; PRs run a single version to cut CI minutes.
-        node-version: ${{ github.event_name == 'pull_request' && fromJSON('[20]') || fromJSON('[20, 22]') }}
+        node-version: ${{ github.event_name == 'pull_request' && fromJSON('[22]') || fromJSON('[22, 24]') }}
     name: ci (node ${{ matrix.node-version }})
     steps:
       - uses: actions/checkout@v6

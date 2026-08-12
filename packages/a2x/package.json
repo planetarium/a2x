@@ -101,7 +101,7 @@
     "viem": "^2.48.2"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.11.0"
   },
   "repository": {
     "type": "git",
