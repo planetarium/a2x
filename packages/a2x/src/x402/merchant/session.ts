@@ -229,7 +229,15 @@ export class InMemoryUptoSessionStore implements UptoSessionStore {
 }
 
 export interface UptoSessionManagerErrorContext {
-  operation: 'open' | 'record' | 'close' | 'recover' | 'timer';
+  operation:
+    | 'open'
+    | 'reserve-open'
+    | 'commit-open'
+    | 'cancel-open'
+    | 'record'
+    | 'close'
+    | 'recover'
+    | 'timer';
   contextId?: string;
   taskId?: string;
 }
@@ -249,11 +257,25 @@ export interface UptoSessionManagerOptions {
   ) => void | Promise<void>;
 }
 
-export interface UptoSessionOpenInput {
+export interface UptoSessionReserveOpenInput {
   contextId: string;
   taskId: string;
   obligation: UptoSessionObligation;
+}
+
+export interface UptoSessionOpenInput extends UptoSessionReserveOpenInput {
   usage: MerchantMeterableUsage;
+}
+
+export interface UptoSessionCommitOpenInput {
+  contextId: string;
+  taskId: string;
+  usage: MerchantMeterableUsage;
+}
+
+export interface UptoSessionCancelOpenInput {
+  contextId: string;
+  taskId: string;
 }
 
 export interface UptoSessionRecordTurnInput {
@@ -275,6 +297,19 @@ export type UptoSessionTurnStart =
   | { kind: 'started' }
   | { kind: 'inactive' }
   | { kind: 'duplicate'; status: 'pending' | 'completed' };
+
+export type UptoSessionOpenReservation =
+  | { kind: 'reserved'; session: UptoSessionSnapshot }
+  | {
+      kind: 'unavailable';
+      reason: 'active' | 'settling' | 'closed-unreconciled' | 'deadline';
+      session?: UptoSessionSnapshot;
+    }
+  | {
+      kind: 'duplicate';
+      status: 'pending' | 'completed';
+      session: UptoSessionSnapshot;
+    };
 
 const MAX_CAS_ATTEMPTS = 100;
 
@@ -367,7 +402,19 @@ function authorizedMax(obligation: UptoSessionObligation): bigint {
   return signed === undefined || offered < signed ? offered : signed;
 }
 
+function hasPendingOpen(record: UptoSessionRecord): boolean {
+  return (
+    record.state === 'active' &&
+    record.turns === 0 &&
+    record.pendingTurnIds.includes(record.taskId) &&
+    !record.completedTurnIds.includes(record.taskId)
+  );
+}
+
 function projectedCharge(record: UptoSessionRecord): bigint | undefined {
+  if (record.turns === 0 && record.usage === undefined && !record.usageIncomplete) {
+    return 0n;
+  }
   const metered = meterMerchantUsage(record.obligation.pricing, record.usage);
   const cap = BigInt(record.authorizedMaxAtomic);
   if (record.usageIncomplete) {
@@ -452,6 +499,37 @@ export class UptoSessionManager {
     this.deadlineGuardMs = deadlineGuardSeconds * 1_000;
   }
 
+  private draftOpenRecord(
+    input: UptoSessionReserveOpenInput,
+    now: number,
+    pendingOpen: boolean,
+  ): UptoSessionRecord {
+    const signedDeadline = signedDeadlineMs(input.obligation);
+    const settleBy = Math.min(
+      now + this.maxDurationMs,
+      signedDeadline === undefined
+        ? Number.POSITIVE_INFINITY
+        : signedDeadline - this.deadlineGuardMs,
+    );
+    return {
+      contextId: input.contextId,
+      taskId: input.taskId,
+      revision: 0,
+      state: 'active',
+      obligation: input.obligation,
+      turns: 0,
+      pendingTurnIds: pendingOpen ? [input.taskId] : [],
+      completedTurnIds: [],
+      authorizedMaxAtomic: authorizedMax(input.obligation).toString(),
+      openedAt: new Date(now).toISOString(),
+      lastTurnAt: new Date(now).toISOString(),
+      settleBy: new Date(settleBy).toISOString(),
+      ...(signedDeadline === undefined
+        ? {}
+        : { authorizationDeadline: new Date(signedDeadline).toISOString() }),
+    };
+  }
+
   async lookup(contextId: string): Promise<UptoSessionSnapshot | undefined> {
     const record = await this.store.get(contextId);
     return record ? this.snapshot(record) : undefined;
@@ -461,6 +539,7 @@ export class UptoSessionManager {
     const record = await this.store.get(contextId);
     return (
       record?.state === 'active' &&
+      !hasPendingOpen(record) &&
       record.closeRequestedReason === undefined &&
       Date.now() < Date.parse(record.settleBy)
     );
@@ -473,34 +552,123 @@ export class UptoSessionManager {
     return await this.store.delete(contextId, record.revision);
   }
 
+  /** Reserve a context before the opening turn performs resource work. */
+  async reserveOpen(
+    input: UptoSessionReserveOpenInput,
+  ): Promise<UptoSessionOpenReservation> {
+    try {
+      const now = Date.now();
+      const record = this.draftOpenRecord(input, now, true);
+
+      for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt += 1) {
+        const current = await this.store.get(input.contextId);
+        if (current) {
+          if (current.taskId === input.taskId) {
+            const status =
+              current.turns > 0 ||
+              current.completedTurnIds.includes(input.taskId) ||
+              current.state === 'closed'
+                ? 'completed'
+                : 'pending';
+            return { kind: 'duplicate', status, session: this.snapshot(current) };
+          }
+          const unavailableReason =
+            current.state === 'active'
+              ? 'active'
+              : current.state === 'settling'
+                ? 'settling'
+                : current.settlement?.kind === 'failed'
+                  ? 'closed-unreconciled'
+                  : undefined;
+          if (unavailableReason) {
+            await this.options.gate.lapse(input.taskId);
+            return {
+              kind: 'unavailable',
+              reason: unavailableReason,
+              session: this.snapshot(current),
+            };
+          }
+        }
+
+        if (Date.now() >= Date.parse(record.settleBy)) {
+          await this.options.gate.lapse(input.taskId);
+          return { kind: 'unavailable', reason: 'deadline' };
+        }
+        if (await this.store.create(record)) {
+          return { kind: 'reserved', session: this.snapshot(record) };
+        }
+      }
+      throw new Error('Upto session opening reservation could not win its create race.');
+    } catch (error) {
+      await this.reportError(error, {
+        operation: 'reserve-open',
+        contextId: input.contextId,
+        taskId: input.taskId,
+      });
+      throw error;
+    }
+  }
+
+  /** Commit the opening turn's trusted usage exactly once. */
+  async commitOpen(
+    input: UptoSessionCommitOpenInput,
+  ): Promise<UptoSessionOutcome | undefined> {
+    return await this.applyUsage(
+      input.contextId,
+      input.usage,
+      input.taskId,
+      input.taskId,
+      'commit-open',
+    );
+  }
+
+  /** Cancel a reserved opening turn that produced no billable work. */
+  async cancelOpen(
+    input: UptoSessionCancelOpenInput,
+  ): Promise<UptoSessionOutcome | undefined> {
+    try {
+      for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt += 1) {
+        const current = await this.store.get(input.contextId);
+        if (!current || current.taskId !== input.taskId) return undefined;
+        if (!hasPendingOpen(current)) return this.outcome(current);
+
+        const settlement: UptoSessionSettlement = { kind: 'lapsed' };
+        const closed: UptoSessionRecord = {
+          ...current,
+          revision: current.revision + 1,
+          state: 'closed',
+          pendingTurnIds: [],
+          closeRequestedReason: undefined,
+          endReason: 'manual',
+          settlement,
+          closedAt: new Date().toISOString(),
+        };
+        if (!(await this.store.compareAndSet(input.contextId, current.revision, closed))) {
+          continue;
+        }
+        this.disarm(input.contextId);
+        await this.options.gate.lapse(input.taskId);
+        return { session: this.snapshot(closed), settlement };
+      }
+      throw new Error('Upto session opening cancellation lost its compare-and-set race.');
+    } catch (error) {
+      await this.reportError(error, {
+        operation: 'cancel-open',
+        contextId: input.contextId,
+        taskId: input.taskId,
+      });
+      throw error;
+    }
+  }
+
   async open(input: UptoSessionOpenInput): Promise<UptoSessionOutcome> {
     const now = Date.now();
-    const signedDeadline = signedDeadlineMs(input.obligation);
-    const settleBy = Math.min(
-      now + this.maxDurationMs,
-      signedDeadline === undefined
-        ? Number.POSITIVE_INFINITY
-        : signedDeadline - this.deadlineGuardMs,
-    );
     const merged = mergeUsage(input.obligation.pricing, undefined, false, input.usage);
     const draft: UptoSessionRecord = {
-      contextId: input.contextId,
-      taskId: input.taskId,
-      revision: 0,
-      state: 'active',
-      obligation: input.obligation,
+      ...this.draftOpenRecord(input, now, false),
       usage: merged.usage,
       usageIncomplete: merged.incomplete,
       turns: 1,
-      pendingTurnIds: [],
-      completedTurnIds: [],
-      authorizedMaxAtomic: authorizedMax(input.obligation).toString(),
-      openedAt: new Date(now).toISOString(),
-      lastTurnAt: new Date(now).toISOString(),
-      settleBy: new Date(settleBy).toISOString(),
-      ...(signedDeadline === undefined
-        ? {}
-        : { authorizationDeadline: new Date(signedDeadline).toISOString() }),
     };
     const charge = projectedCharge(draft);
     const trigger =
@@ -508,7 +676,7 @@ export class UptoSessionManager {
         ? 'usage-unreported'
         : charge !== undefined && charge >= BigInt(draft.authorizedMaxAtomic)
           ? 'budget-exhausted'
-          : now >= settleBy
+          : now >= Date.parse(draft.settleBy)
             ? 'deadline'
             : undefined;
     const record: UptoSessionRecord = trigger
@@ -552,6 +720,7 @@ export class UptoSessionManager {
         if (
           !current ||
           current.state !== 'active' ||
+          hasPendingOpen(current) ||
           current.closeRequestedReason !== undefined ||
           Date.now() >= Date.parse(current.settleBy)
         ) {
@@ -790,6 +959,7 @@ export class UptoSessionManager {
 
   private arm(record: UptoSessionRecord): void {
     this.disarm(record.contextId);
+    if (hasPendingOpen(record)) return;
     const now = Date.now();
     if (record.closeRequestedReason) {
       const settleBy = Date.parse(record.settleBy);
@@ -867,6 +1037,13 @@ export class UptoSessionManager {
     };
   }
 
+  private outcome(record: UptoSessionRecord): UptoSessionOutcome {
+    return {
+      session: this.snapshot(record),
+      ...(record.settlement ? { settlement: record.settlement } : {}),
+    };
+  }
+
   private async reportError(
     error: unknown,
     context: UptoSessionManagerErrorContext,
@@ -882,13 +1059,24 @@ export class UptoSessionManager {
     contextId: string,
     usageInput: MerchantMeterableUsage,
     pendingTurnId?: string,
+    expectedTaskId?: string,
+    operation: 'record' | 'commit-open' = 'record',
   ): Promise<UptoSessionOutcome | undefined> {
     try {
       for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt += 1) {
         const current = await this.store.get(contextId);
-        if (!current || current.state !== 'active') return undefined;
+        if (!current) return undefined;
+        if (expectedTaskId && current.taskId !== expectedTaskId) {
+          throw new Error(
+            `Upto session opening task ${expectedTaskId} does not match ${current.taskId}.`,
+          );
+        }
         if (pendingTurnId && current.completedTurnIds.includes(pendingTurnId)) {
-          return { session: this.snapshot(current) };
+          return this.outcome(current);
+        }
+        if (current.state !== 'active') return undefined;
+        if (hasPendingOpen(current) && expectedTaskId !== current.taskId) {
+          return undefined;
         }
         if (pendingTurnId && !current.pendingTurnIds.includes(pendingTurnId)) {
           return undefined;
@@ -938,7 +1126,7 @@ export class UptoSessionManager {
       }
       throw new Error('Upto session update could not win its compare-and-set race.');
     } catch (error) {
-      await this.reportError(error, { operation: 'record', contextId });
+      await this.reportError(error, { operation, contextId, taskId: expectedTaskId });
       throw error;
     }
   }
