@@ -1,5 +1,13 @@
 # @a2x/sdk
 
+## 0.21.0
+
+### Minor Changes
+
+- [#223](https://github.com/planetarium/a2x/pull/223) [`d36ac4d`](https://github.com/planetarium/a2x/commit/d36ac4d7f0fc868939a9f2eef618207e09bbda06) Thanks [@longfin](https://github.com/longfin)! - Require Node.js 22.11 or newer for the SDK and align CI, release jobs, build targets, CLI binaries, and samples with supported Node.js LTS releases.
+
+- [#216](https://github.com/planetarium/a2x/pull/216) [`240ca6d`](https://github.com/planetarium/a2x/commit/240ca6dac3775edd373cbdc92a487055b99ee18b) Thanks [@longfin](https://github.com/longfin)! - Add a reserve, commit, and cancel lifecycle for conversation-scoped `upto` opening turns so competing sessions are refused before resource work begins.
+
 ## 0.20.0
 
 ### Minor Changes
