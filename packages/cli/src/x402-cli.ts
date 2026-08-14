@@ -48,18 +48,21 @@ export class X402BudgetExceededError extends Error {
 }
 
 /**
- * Thrown by our onPaymentRequired callback when the only affordable offers
- * use the `upto` scheme and the user did not pass --allow-upto. Signing an
- * `upto` offer authorizes the merchant to draw anything up to `amount`
- * (metered billing), a broader consent than an exact payment — the SDK
- * deliberately refuses to auto-select it, and without this error the CLI
- * would surface only the generic "no supported requirement" message with no
- * hint at the flag that fixes it.
+ * Thrown by our onPaymentRequired callback when no affordable `exact` offer
+ * exists but an affordable `upto` one does, and the user did not pass
+ * --allow-upto. `exact` and `upto` are the only schemes the CLI can sign, so
+ * this is precisely the situation where consent alone unblocks the payment
+ * (other schemes may also be on offer; the CLI cannot sign those either
+ * way). Signing an `upto` offer authorizes the merchant to draw anything up
+ * to `amount` (metered billing), a broader consent than an exact payment —
+ * the SDK deliberately refuses to auto-select it, and without this error the
+ * CLI would surface only the generic "no supported requirement" message with
+ * no hint at the flag that fixes it.
  */
 export class X402UptoConsentRequiredError extends Error {
   constructor(public readonly maxAuthorized: bigint, public readonly asset: string) {
     super(
-      `The agent only offers 'upto' (metered) billing, which authorizes it to draw anything up to ${maxAuthorized.toString()} atomic units. Re-run with --allow-upto to consent.`,
+      `The agent's affordable offers require the 'upto' (metered) scheme, which authorizes it to draw anything up to ${maxAuthorized.toString()} atomic units. Re-run with --allow-upto to consent.`,
     );
     this.name = 'X402UptoConsentRequiredError';
   }
@@ -134,6 +137,10 @@ export function buildBudgetedX402ClientSettings(args: {
           cheapest?.asset ?? 'unknown',
         );
       }
+      // With no affordable `exact` offer, an affordable `upto` one is the
+      // only offer the CLI could still sign (it supports no other scheme),
+      // so missing consent is the actual blocker — name it. Any remaining
+      // schemes fall through to the SDK's generic error as before.
       if (!allowUpto && affordable.every((a) => a.scheme !== 'exact')) {
         const upto = affordable.find((a) => a.scheme === 'upto');
         if (upto) {
@@ -235,10 +242,10 @@ export function printX402Error(err: unknown): number | null {
       chalk.bold.red("x402 payment refused ('upto' consent required)"),
     );
     console.error(
-      `  The agent only offers metered ('upto') billing: it may draw anything`,
+      `  The agent's affordable offers use metered ('upto') billing: it may draw`,
     );
     console.error(
-      `  up to ${err.maxAuthorized.toString()} atomic of ${err.asset}, charging only actual usage.`,
+      `  anything up to ${err.maxAuthorized.toString()} atomic of ${err.asset}, charging only actual usage.`,
     );
     console.error(
       chalk.yellow(

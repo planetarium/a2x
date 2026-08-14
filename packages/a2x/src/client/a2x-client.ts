@@ -832,8 +832,11 @@ export class A2XClient {
       ...(configured.batchSettlement !== undefined
         ? { batchSettlement: { ...configured.batchSettlement } }
         : {}),
+      // Deep-cloned (unlike batchSettlement, whose storage must stay the
+      // caller's live object): the per-chain-id shape nests `{ rpcUrl }`
+      // records a shallow copy would still share with the caller.
       ...(configured.upto !== undefined
-        ? { upto: { ...configured.upto } }
+        ? { upto: structuredClone(configured.upto) }
         : {}),
     };
     const userSelect = x402.selectRequirement;
