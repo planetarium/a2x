@@ -29,7 +29,7 @@ import {
   X402PaymentRequiredError,
 } from './errors.js';
 import { detectX402Version } from './versions.js';
-import { isEvmNetwork } from './networks.js';
+import { isCaip2EvmNetwork, isEvmNetwork } from './networks.js';
 import { importX402Peer } from './peer.js';
 import type {
   X402PaymentPayload,
@@ -81,9 +81,6 @@ type X402EvmBatchSettlementClientModule = {
 
 /** CAIP-2 wildcard `@x402/evm` registers its V2 schemes under. */
 const EVM_CAIP2_WILDCARD = 'eip155:*';
-
-/** A concrete CAIP-2 EVM network id — the only form a V2-only scheme can use. */
-const CAIP2_EVM_NETWORK = /^eip155:\d+$/;
 
 const BATCH_SETTLEMENT_CLIENT_PEER = ['@x402', 'evm/batch-settlement/client'].join(
   '/',
@@ -886,7 +883,7 @@ export function defaultSelect(
   const upto =
     options?.allowUpto &&
     requirements.find(
-      (r) => r.scheme === 'upto' && CAIP2_EVM_NETWORK.test(r.network),
+      (r) => r.scheme === 'upto' && isCaip2EvmNetwork(r.network),
     );
   if (upto) return upto;
   // Last, deliberately: paying out of a prepaid channel is the widest consent
@@ -894,7 +891,7 @@ export function defaultSelect(
   if (!options?.allowBatchSettlement) return undefined;
   return requirements.find(
     (r) =>
-      r.scheme === BATCH_SETTLEMENT_SCHEME && CAIP2_EVM_NETWORK.test(r.network),
+      r.scheme === BATCH_SETTLEMENT_SCHEME && isCaip2EvmNetwork(r.network),
   );
 }
 

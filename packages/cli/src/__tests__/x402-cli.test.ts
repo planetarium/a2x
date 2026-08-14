@@ -134,6 +134,39 @@ describe('buildBudgetedX402ClientSettings', () => {
     ).not.toThrow();
   });
 
+  it('demands consent when the only exact offer is on a rail the signer cannot fulfil', () => {
+    // A Solana exact offer is never signable by the EVM signer, so it must
+    // not suppress the consent hint for a payable upto offer.
+    const settings = buildBudgetedX402ClientSettings({
+      signer: SIGNER,
+      maxAmount: 10_000n,
+    });
+    expect(() =>
+      settings.onPaymentRequired!(
+        requiredEnvelope([
+          { ...EXACT_ACCEPT, network: 'solana:mainnet' },
+          UPTO_ACCEPT,
+        ]) as never,
+      ),
+    ).toThrow(X402UptoConsentRequiredError);
+  });
+
+  it('does not promise consent would help for an unsignable (bare-name) upto offer', () => {
+    // `upto` is V2-only: a bare-name network can never be signed, so the
+    // consent error would mislead — the SDK's generic error is the truth.
+    const settings = buildBudgetedX402ClientSettings({
+      signer: SIGNER,
+      maxAmount: 10_000n,
+    });
+    expect(() =>
+      settings.onPaymentRequired!(
+        requiredEnvelope([
+          { ...UPTO_ACCEPT, network: 'base-sepolia' },
+        ]) as never,
+      ),
+    ).not.toThrow();
+  });
+
   it('accepts an upto-only offer under --allow-upto', () => {
     const settings = buildBudgetedX402ClientSettings({
       signer: SIGNER,

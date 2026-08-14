@@ -12,6 +12,8 @@ import chalk from 'chalk';
 import type { A2XClientX402Options } from '@a2x/sdk';
 import {
   X402PaymentFailedError,
+  isCaip2EvmNetwork,
+  isEvmNetwork,
   requirementAmount,
   type SignX402PaymentOptions,
   type X402PaymentRequiredResponse,
@@ -142,12 +144,21 @@ export function buildBudgetedX402ClientSettings(args: {
           cheapest?.asset ?? 'unknown',
         );
       }
-      // With no affordable `exact` offer, an affordable `upto` one is the
-      // only offer the CLI could still sign (it supports no other scheme),
-      // so missing consent is the actual blocker — name it. Any remaining
-      // schemes fall through to the SDK's generic error as before.
-      if (!allowUpto && affordable.every((a) => a.scheme !== 'exact')) {
-        const upto = affordable.find((a) => a.scheme === 'upto');
+      // With no affordable `exact` offer the SDK could sign, an affordable
+      // signable `upto` one is the only offer the CLI could still pay (it
+      // supports no other scheme), so missing consent is the actual blocker
+      // — name it. Both checks mirror the SDK's default-selector criteria
+      // (`exact` needs an EVM network, `upto` a CAIP-2 `eip155:<id>` one):
+      // an exact offer on a rail the signer can't fulfil must not suppress
+      // the hint, and an unsignable upto offer must not promise that consent
+      // would help. Everything else falls through to the SDK's generic error.
+      const signableExact = affordable.some(
+        (a) => a.scheme === 'exact' && isEvmNetwork(a.network),
+      );
+      if (!allowUpto && !signableExact) {
+        const upto = affordable.find(
+          (a) => a.scheme === 'upto' && isCaip2EvmNetwork(a.network),
+        );
         if (upto) {
           throw new X402UptoConsentRequiredError(
             safeBigInt(requirementAmount(upto)),

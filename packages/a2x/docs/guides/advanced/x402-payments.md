@@ -1376,6 +1376,8 @@ Signing `exact` authorizes one amount and nothing else. Signing `upto` authorize
 
 The fallback additionally requires a **CAIP-2** network (`eip155:<chainId>`). `upto` is V2-only, so a bare-name V1 offer is never eligible however it is advertised.
 
+Both network-eligibility tests are exported so pre-flight UX can classify offers exactly the way the selector will: `isEvmNetwork(network)` is what an `exact` offer must satisfy (a known bare EVM name or a CAIP-2 `eip155:<chainId>` id), and `isCaip2EvmNetwork(network)` is what `upto` (and `batch-settlement`) must satisfy. The `a2x` CLI uses them to decide when a payment is blocked purely on missing `--allow-upto` consent.
+
 Two ways to pay one:
 
 ```ts
