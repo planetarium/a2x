@@ -97,6 +97,19 @@ describe('buildBudgetedX402ClientSettings', () => {
     expect(settings.upto).toEqual({ rpcUrl: 'https://rpc.example' });
   });
 
+  it('drops the RPC config without --allow-upto consent', () => {
+    // A globally configured A2X_RPC_URL must not leak into consent-less
+    // invocations: without allowUpto no upto offer can be selected, and the
+    // config's mere presence would make the SDK bypass its per-signer
+    // runtime cache on every signing attempt.
+    const settings = buildBudgetedX402ClientSettings({
+      signer: SIGNER,
+      maxAmount: 10_000n,
+      rpcUrl: 'https://rpc.example',
+    });
+    expect('upto' in settings).toBe(false);
+  });
+
   it('throws X402UptoConsentRequiredError for an affordable upto-only offer without --allow-upto', () => {
     const settings = buildBudgetedX402ClientSettings({
       signer: SIGNER,

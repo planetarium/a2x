@@ -107,7 +107,9 @@ export function safeBigInt(raw: string): bigint {
  * `rpcUrl` (from --rpc-url / A2X_RPC_URL / config) feeds the `upto` payer's
  * on-chain reads so it can produce the gas-sponsored Permit2 approval a
  * merchant may require; without it such merchants reject with
- * `permit2_allowance_required`.
+ * `permit2_allowance_required`. It is only forwarded together with
+ * `allowUpto` — without consent no upto offer can be selected, so the
+ * config could never be consumed.
  */
 export function buildBudgetedX402ClientSettings(args: {
   signer: SignX402PaymentOptions['signer'];
@@ -120,7 +122,10 @@ export function buildBudgetedX402ClientSettings(args: {
     signer,
     maxAmount,
     ...(allowUpto ? { allowUpto: true } : {}),
-    ...(rpcUrl ? { upto: { rpcUrl } } : {}),
+    // Without --allow-upto the CLI can never select an upto offer, so the
+    // RPC config would be dead weight — and its mere presence makes the SDK
+    // bypass its per-signer runtime cache for every signing attempt.
+    ...(allowUpto && rpcUrl ? { upto: { rpcUrl } } : {}),
     onPaymentRequired: (required) => {
       printPaymentRequirement(required, maxAmount);
       const accepts = required.accepts as X402PaymentRequirements[];
