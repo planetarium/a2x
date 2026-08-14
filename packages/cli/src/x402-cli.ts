@@ -62,7 +62,7 @@ export class X402BudgetExceededError extends Error {
 export class X402UptoConsentRequiredError extends Error {
   constructor(public readonly maxAuthorized: bigint, public readonly asset: string) {
     super(
-      `The agent's affordable offers require the 'upto' (metered) scheme, which authorizes it to draw anything up to ${maxAuthorized.toString()} atomic units. Re-run with --allow-upto to consent.`,
+      `The agent's affordable offers require the 'upto' (metered) scheme, which authorizes it to draw anything up to ${maxAuthorized.toString()} atomic units of ${asset}. Re-run with --allow-upto to consent.`,
     );
     this.name = 'X402UptoConsentRequiredError';
   }
