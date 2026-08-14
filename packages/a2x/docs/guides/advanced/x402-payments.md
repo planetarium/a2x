@@ -1311,7 +1311,7 @@ const task = await client.sendMessage({
 });
 ```
 
-If the merchant's terminal task records a payment failure (the latest receipt is unsuccessful), the call throws `X402PaymentFailedError` with the on-chain reason. The option surface:
+If the merchant's terminal task records a payment failure (the latest receipt is unsuccessful), the call throws `X402PaymentFailedError` with the on-chain reason. The option surface is as follows:
 
 | Field | Default | Purpose |
 |---|---|---|
