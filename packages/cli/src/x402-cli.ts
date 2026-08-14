@@ -101,8 +101,8 @@ export function safeBigInt(raw: string): bigint {
  * `X402BudgetExceededError` up-front when nothing fits — that gives a
  * better CLI message than letting the SDK fall through to the generic
  * "no supported requirement" error. The same hook throws
- * `X402UptoConsentRequiredError` when the agent's only affordable offers
- * need the --allow-upto consent the user didn't give.
+ * `X402UptoConsentRequiredError` when signing the agent's affordable offers
+ * needs the --allow-upto consent the user didn't give.
  *
  * `rpcUrl` (from --rpc-url / A2X_RPC_URL / config) feeds the `upto` payer's
  * on-chain reads so it can produce the gas-sponsored Permit2 approval a
