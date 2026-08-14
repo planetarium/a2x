@@ -332,6 +332,121 @@ describe('signX402Payment', () => {
     expect(signed.payload).toHaveProperty('x402Version', 2);
   });
 
+  it('backfills the eip2612 gas-sponsoring payload via the configured upto RPC endpoint', async () => {
+    // A plain LocalAccount cannot read the chain, so without `upto.rpcUrl`
+    // the merchant-advertised gas-sponsoring extensions are silently skipped
+    // and a merchant that requires a Permit2 allowance rejects with
+    // `permit2_allowance_required` (issue #225). The stub RPC answers every
+    // eth_call with 32 zero bytes — a zero Permit2 allowance (the
+    // "no pre-existing allowance" case) and EIP-2612 permit nonce 0. All
+    // signing stays local; the endpoint only serves reads.
+    const { createServer } = await import('node:http');
+    const zeroWord = `0x${'0'.repeat(64)}`;
+    const server = createServer((req, res) => {
+      let body = '';
+      req.on('data', (chunk: Buffer) => {
+        body += chunk.toString();
+      });
+      req.on('end', () => {
+        const parsed = JSON.parse(body) as
+          | { id: number }
+          | { id: number }[];
+        const respond = (r: { id: number }) => ({
+          jsonrpc: '2.0',
+          id: r.id,
+          result: zeroWord,
+        });
+        res.setHeader('content-type', 'application/json');
+        res.end(
+          JSON.stringify(
+            Array.isArray(parsed) ? parsed.map(respond) : respond(parsed),
+          ),
+        );
+      });
+    });
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const { port } = server.address() as { port: number };
+
+    try {
+      const uptoAccept = {
+        scheme: 'upto',
+        network: 'eip155:84532',
+        asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+        amount: '100000',
+        payTo: PAY_TO,
+        maxTimeoutSeconds: 300,
+        extra: {
+          name: 'USDC',
+          version: '2',
+          facilitatorAddress: '0x4444444444444444444444444444444444444444',
+        },
+      };
+      const task: Task = {
+        id: 't1',
+        contextId: 'c1',
+        status: {
+          state: TaskState.INPUT_REQUIRED,
+          timestamp: new Date().toISOString(),
+          message: {
+            messageId: 'msg-upto-sponsored',
+            role: 'agent',
+            parts: [{ text: 'pay up, gas on us' }],
+            metadata: {
+              [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.REQUIRED,
+              [X402_METADATA_KEYS.REQUIRED]: {
+                x402Version: 2,
+                resource: { url: 'https://example.com/protected' },
+                accepts: [uptoAccept],
+                extensions: { eip2612GasSponsoring: {} },
+              },
+            },
+          },
+        },
+      };
+
+      const signed = await signX402Payment(task, {
+        signer: TEST_ACCOUNT,
+        allowUpto: true,
+        upto: { rpcUrl: `http://127.0.0.1:${port}` },
+      });
+
+      const info = (
+        signed.payload as unknown as {
+          extensions?: {
+            eip2612GasSponsoring?: { info?: Record<string, string> };
+          };
+        }
+      ).extensions?.eip2612GasSponsoring?.info;
+      expect(info).toBeDefined();
+      expect(info!.from.toLowerCase()).toBe(TEST_ACCOUNT.address.toLowerCase());
+      expect(info!.asset.toLowerCase()).toBe(uptoAccept.asset.toLowerCase());
+      expect(info!.amount).toBe('100000');
+      expect(info!.nonce).toBe('0');
+      // A real secp256k1 permit signature over the approval, not a stub.
+      expect(info!.signature).toMatch(/^0x[0-9a-f]{130}$/i);
+
+      // Without the RPC config the same offer still signs, but the extension
+      // payload the merchant asked for cannot be produced — the pre-#225
+      // behavior this test exists to prevent regressing into silently.
+      const unsponsored = await signX402Payment(task, {
+        signer: TEST_ACCOUNT,
+        allowUpto: true,
+      });
+      const bare = (
+        unsponsored.payload as unknown as {
+          extensions?: { eip2612GasSponsoring?: { info?: unknown } };
+        }
+      ).extensions?.eip2612GasSponsoring?.info;
+      expect(bare).toBeUndefined();
+    } finally {
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      });
+    }
+  });
+
   it('binds the exact channel snapshot used by the real batch signer', async () => {
     // The peer reads storage to choose the voucher base. A later read is not
     // evidence of what was signed: another process may have changed the

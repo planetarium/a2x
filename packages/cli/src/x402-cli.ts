@@ -47,6 +47,24 @@ export class X402BudgetExceededError extends Error {
   }
 }
 
+/**
+ * Thrown by our onPaymentRequired callback when the only affordable offers
+ * use the `upto` scheme and the user did not pass --allow-upto. Signing an
+ * `upto` offer authorizes the merchant to draw anything up to `amount`
+ * (metered billing), a broader consent than an exact payment — the SDK
+ * deliberately refuses to auto-select it, and without this error the CLI
+ * would surface only the generic "no supported requirement" message with no
+ * hint at the flag that fixes it.
+ */
+export class X402UptoConsentRequiredError extends Error {
+  constructor(public readonly maxAuthorized: bigint, public readonly asset: string) {
+    super(
+      `The agent only offers 'upto' (metered) billing, which authorizes it to draw anything up to ${maxAuthorized.toString()} atomic units. Re-run with --allow-upto to consent.`,
+    );
+    this.name = 'X402UptoConsentRequiredError';
+  }
+}
+
 /** Parse the --max-amount CLI value; fall back to the default. */
 export function parseMaxAmount(raw: string | undefined): bigint {
   if (raw === undefined) return DEFAULT_MAX_AMOUNT_ATOMIC;
@@ -79,16 +97,27 @@ export function safeBigInt(raw: string): bigint {
  * our `onPaymentRequired` hook, which prints the requirements and throws
  * `X402BudgetExceededError` up-front when nothing fits — that gives a
  * better CLI message than letting the SDK fall through to the generic
- * "no supported requirement" error.
+ * "no supported requirement" error. The same hook throws
+ * `X402UptoConsentRequiredError` when the agent's only affordable offers
+ * need the --allow-upto consent the user didn't give.
+ *
+ * `rpcUrl` (from --rpc-url / A2X_RPC_URL / config) feeds the `upto` payer's
+ * on-chain reads so it can produce the gas-sponsored Permit2 approval a
+ * merchant may require; without it such merchants reject with
+ * `permit2_allowance_required`.
  */
 export function buildBudgetedX402ClientSettings(args: {
   signer: SignX402PaymentOptions['signer'];
   maxAmount: bigint;
+  allowUpto?: boolean;
+  rpcUrl?: string;
 }): A2XClientX402Options {
-  const { signer, maxAmount } = args;
+  const { signer, maxAmount, allowUpto, rpcUrl } = args;
   return {
     signer,
     maxAmount,
+    ...(allowUpto ? { allowUpto: true } : {}),
+    ...(rpcUrl ? { upto: { rpcUrl } } : {}),
     onPaymentRequired: (required) => {
       printPaymentRequirement(required, maxAmount);
       const accepts = required.accepts as X402PaymentRequirements[];
@@ -104,6 +133,15 @@ export function buildBudgetedX402ClientSettings(args: {
           maxAmount,
           cheapest?.asset ?? 'unknown',
         );
+      }
+      if (!allowUpto && affordable.every((a) => a.scheme !== 'exact')) {
+        const upto = affordable.find((a) => a.scheme === 'upto');
+        if (upto) {
+          throw new X402UptoConsentRequiredError(
+            safeBigInt(requirementAmount(upto)),
+            upto.asset,
+          );
+        }
       }
     },
   };
@@ -148,9 +186,28 @@ function printAccept(accept: X402PaymentRequirements, budget: bigint): void {
 // ─── Error handling ─────────────────────────────────────────────────
 
 /**
- * Centralised pretty-printer for the three x402 error classes the
- * CLI can surface. Returns the exit code the caller should use, or
- * `null` if the error wasn't an x402 one (caller handles it).
+ * Match the SDK's `X402PaymentFailedError` across bundle boundaries.
+ *
+ * `@a2x/sdk`'s entry points are bundled independently, so the class that
+ * `A2XClient` (imported from `@a2x/sdk`) throws is a different object from
+ * the one this module imports from `@a2x/sdk/x402` — a plain `instanceof`
+ * never matches and every payment failure would fall through to the generic
+ * connection-error path. The `name` field is the stable discriminator.
+ */
+function asX402PaymentFailedError(
+  err: unknown,
+): X402PaymentFailedError | null {
+  if (err instanceof X402PaymentFailedError) return err;
+  if (err instanceof Error && err.name === 'X402PaymentFailedError') {
+    return err as X402PaymentFailedError;
+  }
+  return null;
+}
+
+/**
+ * Centralised pretty-printer for the x402 error classes the CLI can
+ * surface. Returns the exit code the caller should use, or `null` if
+ * the error wasn't an x402 one (caller handles it).
  */
 export function printX402Error(err: unknown): number | null {
   if (err instanceof X402BudgetExceededError) {
@@ -171,16 +228,48 @@ export function printX402Error(err: unknown): number | null {
     return 2;
   }
 
-  if (err instanceof X402PaymentFailedError) {
+  if (err instanceof X402UptoConsentRequiredError) {
+    console.error();
+    console.error(
+      chalk.red('✗'),
+      chalk.bold.red("x402 payment refused ('upto' consent required)"),
+    );
+    console.error(
+      `  The agent only offers metered ('upto') billing: it may draw anything`,
+    );
+    console.error(
+      `  up to ${err.maxAuthorized.toString()} atomic of ${err.asset}, charging only actual usage.`,
+    );
+    console.error(
+      chalk.yellow(
+        '\n  Re-run with `--allow-upto` to authorize it (still capped by --max-amount).',
+      ),
+    );
+    return 2;
+  }
+
+  const paymentFailed = asX402PaymentFailedError(err);
+  if (paymentFailed) {
     console.error();
     console.error(
       chalk.red('✗'),
       chalk.bold.red('x402 payment failed'),
-      chalk.gray(`(${err.code})`),
+      chalk.gray(`(${paymentFailed.code})`),
     );
-    console.error(`  ${err.message}`);
-    if (err.transaction) {
-      console.error(`  tx: ${err.transaction} (${err.network ?? 'unknown'})`);
+    console.error(`  ${paymentFailed.message}`);
+    if (paymentFailed.transaction) {
+      console.error(
+        `  tx: ${paymentFailed.transaction} (${paymentFailed.network ?? 'unknown'})`,
+      );
+    }
+    if (paymentFailed.code === 'permit2_allowance_required') {
+      console.error(
+        chalk.yellow(
+          '\n  The merchant needs a Permit2 allowance for your wallet. Pass `--rpc-url <url>`\n' +
+            '  (or set A2X_RPC_URL) so the CLI can attach a gas-sponsored approval, or\n' +
+            '  approve Permit2 for the asset on-chain yourself first.',
+        ),
+      );
     }
     return 2;
   }

@@ -30,9 +30,11 @@ const captured: {
   envelope?: unknown;
   registered: [string, string][];
   batchOptions: Record<string, unknown>[];
+  uptoOptions: unknown[];
 } = {
   registered: [],
   batchOptions: [],
+  uptoOptions: [],
 };
 
 /** Channel id the mocked batch-settlement runtime signs vouchers against. */
@@ -80,6 +82,9 @@ vi.mock('../x402/peer.js', () => ({
       return {
         UptoEvmScheme: class {
           readonly scheme = 'upto';
+          constructor(_signer: unknown, options?: unknown) {
+            captured.uptoOptions.push(options);
+          }
         },
       };
     }
@@ -273,6 +278,82 @@ describe('signX402Payment upto selection policy', () => {
     );
     expect(signed.requirement).toEqual(V2_UPTO_ACCEPT);
     expect(signed.payload.scheme).toBe('upto');
+  });
+});
+
+describe('signX402Payment upto payer configuration', () => {
+  it('forwards the upto RPC config to the UptoEvmScheme constructor', async () => {
+    captured.uptoOptions = [];
+    await signX402Payment(v2RequiredTask([V2_UPTO_ACCEPT]), {
+      signer: freshSigner(0x21),
+      allowUpto: true,
+      upto: { rpcUrl: 'https://rpc.example' },
+    });
+    expect(captured.uptoOptions).toEqual([{ rpcUrl: 'https://rpc.example' }]);
+  });
+
+  it('passes no options when the caller configured none', async () => {
+    captured.uptoOptions = [];
+    await signX402Payment(v2RequiredTask([V2_UPTO_ACCEPT]), {
+      signer: freshSigner(0x22),
+      allowUpto: true,
+    });
+    expect(captured.uptoOptions).toEqual([undefined]);
+  });
+
+  it('supports the per-chain-id config shape', async () => {
+    captured.uptoOptions = [];
+    await signX402Payment(v2RequiredTask([V2_UPTO_ACCEPT]), {
+      signer: freshSigner(0x23),
+      allowUpto: true,
+      upto: { 84532: { rpcUrl: 'https://rpc.example/84532' } },
+    });
+    expect(captured.uptoOptions).toEqual([
+      { 84532: { rpcUrl: 'https://rpc.example/84532' } },
+    ]);
+  });
+
+  it('never serves a runtime built with a different upto config from the cache', async () => {
+    // The per-signer cache memoizes only the configless runtime. A signer
+    // that signed without upto config, then with one, then with another must
+    // get a runtime constructed with each configuration it asked for.
+    const signer = freshSigner(0x24);
+    captured.uptoOptions = [];
+    await signX402Payment(v2RequiredTask([V2_UPTO_ACCEPT]), {
+      signer,
+      allowUpto: true,
+    });
+    await signX402Payment(v2RequiredTask([V2_UPTO_ACCEPT]), {
+      signer,
+      allowUpto: true,
+      upto: { rpcUrl: 'https://rpc.example/a' },
+    });
+    await signX402Payment(v2RequiredTask([V2_UPTO_ACCEPT]), {
+      signer,
+      allowUpto: true,
+      upto: { rpcUrl: 'https://rpc.example/b' },
+    });
+    expect(captured.uptoOptions).toEqual([
+      undefined,
+      { rpcUrl: 'https://rpc.example/a' },
+      { rpcUrl: 'https://rpc.example/b' },
+    ]);
+  });
+
+  it('rides along when a batch-settlement requirement builds the runtime', async () => {
+    // Selecting batch-settlement builds the runtime through its own branch
+    // (the signing-read recorder path); the upto config must reach the
+    // scheme constructor there too.
+    captured.uptoOptions = [];
+    await signX402Payment(v2RequiredTask([V2_BATCH_ACCEPT]), {
+      signer: freshSigner(0x25),
+      upto: { rpcUrl: 'https://rpc.example/with-batch' },
+      batchSettlement: { storage: memoryChannelStorage() },
+      allowBatchSettlement: true,
+    });
+    expect(captured.uptoOptions).toEqual([
+      { rpcUrl: 'https://rpc.example/with-batch' },
+    ]);
   });
 });
 

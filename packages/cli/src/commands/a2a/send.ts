@@ -5,6 +5,7 @@ import type { SendMessageParams, Task } from '@a2x/sdk';
 import { getX402PaymentRequirements, getX402Receipts } from '@a2x/sdk/x402';
 import { printTask, printConnectionError, createClient } from '../../format.js';
 import { activeWalletAccount } from '../../wallet-store.js';
+import { getRpcUrl } from '../../config.js';
 import {
   DEFAULT_MAX_AMOUNT_ATOMIC,
   buildBudgetedX402ClientSettings,
@@ -25,6 +26,17 @@ export const sendCommand = new Command('send')
     'Maximum amount (in asset\'s atomic units) to auto-sign for an x402 payment. ' +
       `Defaults to ${DEFAULT_MAX_AMOUNT_ATOMIC.toString()}.`,
   )
+  .option(
+    '--allow-upto',
+    "Consent to 'upto' (metered) x402 offers, authorizing the agent to draw " +
+      'anything up to the advertised amount (still capped by --max-amount)',
+  )
+  .option(
+    '--rpc-url <url>',
+    "EVM RPC endpoint for 'upto' payments to read on-chain state (Permit2 " +
+      'allowance) and produce a gas-sponsored approval. Falls back to ' +
+      'A2X_RPC_URL, then rpcUrl in ~/.a2x/config.json.',
+  )
   .action(
     async (
       url: string,
@@ -35,6 +47,8 @@ export const sendCommand = new Command('send')
         json?: boolean;
         x402?: boolean;
         maxAmount?: string;
+        allowUpto?: boolean;
+        rpcUrl?: string;
       },
     ) => {
       const maxAmount = parseMaxAmount(opts.maxAmount);
@@ -44,7 +58,12 @@ export const sendCommand = new Command('send')
       try {
         const client = createClient(url, opts, {
           x402: signer
-            ? buildBudgetedX402ClientSettings({ signer, maxAmount })
+            ? buildBudgetedX402ClientSettings({
+                signer,
+                maxAmount,
+                allowUpto: opts.allowUpto,
+                rpcUrl: getRpcUrl(opts.rpcUrl),
+              })
             : undefined,
         });
 

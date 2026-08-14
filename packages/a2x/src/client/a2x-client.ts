@@ -59,6 +59,7 @@ import {
   getX402Receipts,
   type SignedX402Payment,
   type X402BatchSettlementOptions,
+  type X402UptoOptions,
 } from '../x402/client.js';
 import {
   acquireBatchAttemptLock,
@@ -131,6 +132,18 @@ export interface A2XClientX402Options {
    * Ignored when `selectRequirement` is supplied.
    */
   allowUpto?: boolean;
+  /**
+   * RPC configuration for the `upto` payer — one config for every EVM
+   * network, or keyed by numeric chain id. Only consulted when an `upto`
+   * offer is actually signed, and only needed when the merchant advertises
+   * gas-sponsored Permit2 approval (`eip2612GasSponsoring` /
+   * `erc20ApprovalGasSponsoring`): those extensions must read the signer's
+   * on-chain Permit2 allowance, which a plain `LocalAccount` cannot do.
+   * Without it the extension payloads are skipped and a merchant that
+   * requires an allowance rejects with `permit2_allowance_required`. The SDK
+   * never defaults this — supplying an RPC endpoint is the caller's call.
+   */
+  upto?: X402UptoOptions;
   /**
    * Channel storage and deposit policy for the `batch-settlement` scheme,
    * which pays out of a pre-funded on-chain channel instead of settling each
@@ -819,6 +832,9 @@ export class A2XClient {
       ...(configured.batchSettlement !== undefined
         ? { batchSettlement: { ...configured.batchSettlement } }
         : {}),
+      ...(configured.upto !== undefined
+        ? { upto: { ...configured.upto } }
+        : {}),
     };
     const userSelect = x402.selectRequirement;
     const select = (
@@ -859,6 +875,7 @@ export class A2XClient {
         // Selection already ran before the batch lease was acquired. Reusing
         // that exact result avoids invoking a stateful caller predicate twice.
         selectRequirement: () => selected,
+        ...(x402.upto !== undefined ? { upto: x402.upto } : {}),
         ...(batchSettlement !== undefined
           ? { batchSettlement: this._cappedBatchSettlement(x402) }
           : {}),

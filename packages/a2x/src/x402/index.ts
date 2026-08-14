@@ -327,6 +327,8 @@ export {
 export type {
   SignX402PaymentOptions,
   SignedX402Payment,
+  X402UptoOptions,
+  X402UptoSchemeConfig,
   X402BatchSettlementOptions,
   X402BatchSettlementDepositPolicy,
   X402BatchSettlementDepositStrategy,

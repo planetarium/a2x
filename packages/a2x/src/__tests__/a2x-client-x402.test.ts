@@ -396,6 +396,90 @@ describe('A2XClient.sendMessage — native x402 dance', () => {
     );
   });
 
+  it('threads the upto RPC config through to gas-sponsored approval (issue #225)', async () => {
+    // The end-to-end client half of the issue-#225 scenario: a V2 upto-only
+    // offer whose merchant sponsors the Permit2 approval gas. The payer must
+    // read its (zero) allowance and permit nonce over the configured RPC
+    // endpoint and attach a signed EIP-2612 permit to the resubmission —
+    // without `upto.rpcUrl` that payload is skipped and such merchants
+    // reject with `permit2_allowance_required`.
+    const { createServer } = await import('node:http');
+    const server = createServer((req, res) => {
+      let body = '';
+      req.on('data', (chunk: Buffer) => {
+        body += chunk.toString();
+      });
+      req.on('end', () => {
+        const parsed = JSON.parse(body) as { id: number } | { id: number }[];
+        const respond = (r: { id: number }) => ({
+          jsonrpc: '2.0',
+          id: r.id,
+          result: `0x${'0'.repeat(64)}`,
+        });
+        res.setHeader('content-type', 'application/json');
+        res.end(
+          JSON.stringify(
+            Array.isArray(parsed) ? parsed.map(respond) : respond(parsed),
+          ),
+        );
+      });
+    });
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const { port } = server.address() as { port: number };
+
+    try {
+      const required = uptoRequiredTask() as {
+        status: {
+          message: { metadata: Record<string, Record<string, unknown>> };
+        };
+      };
+      const envelope =
+        required.status.message.metadata[X402_METADATA_KEYS.REQUIRED]!;
+      envelope.extensions = { eip2612GasSponsoring: {} };
+      const accept = (envelope.accepts as { extra: Record<string, string> }[])[0]!;
+      accept.extra.name = 'USDC';
+      accept.extra.version = '2';
+
+      const { fetch, rpcRequests } = scriptedFetch([
+        () => jsonRpcOk(required),
+        () => jsonRpcOk(completedTaskWithReceipt()),
+      ]);
+      const client = new A2XClient(AGENT_URL, {
+        fetch,
+        x402: {
+          signer: TEST_ACCOUNT,
+          allowUpto: true,
+          upto: { rpcUrl: `http://127.0.0.1:${port}` },
+        },
+      });
+      const task = await client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      });
+
+      expect(task.status.state).toBe('completed');
+      const followup = rpcRequests[1]!.body as {
+        params: { message: { metadata: Record<string, unknown> } };
+      };
+      const payload = followup.params.message.metadata[
+        X402_METADATA_KEYS.PAYLOAD
+      ] as {
+        extensions?: {
+          eip2612GasSponsoring?: { info?: Record<string, string> };
+        };
+      };
+      const info = payload.extensions?.eip2612GasSponsoring?.info;
+      expect(info).toBeDefined();
+      expect(info!.from.toLowerCase()).toBe(TEST_ACCOUNT.address.toLowerCase());
+      expect(info!.signature).toMatch(/^0x[0-9a-f]{130}$/i);
+    } finally {
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      });
+    }
+  });
+
   it('honours a caller-supplied selectRequirement', async () => {
     const { fetch, rpcRequests } = scriptedFetch([
       () => jsonRpcOk(paymentRequiredTask()),

@@ -15,6 +15,7 @@ const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 /** Persistent CLI configuration stored at ~/.a2x/config.json. */
 export interface A2xConfig {
   registryUrl?: string;
+  rpcUrl?: string;
   [key: string]: unknown;
 }
 
@@ -62,4 +63,22 @@ export function getRegistryUrl(override?: string): string {
   const config = readConfig();
   if (config.registryUrl) return config.registryUrl;
   return DEFAULT_REGISTRY_URL;
+}
+
+/**
+ * Resolve the EVM RPC endpoint used by x402 `upto` payments to read on-chain
+ * state for gas-sponsored Permit2 approval. Priority chain:
+ *   1. override parameter (from --rpc-url CLI option)
+ *   2. A2X_RPC_URL environment variable
+ *   3. rpcUrl field in ~/.a2x/config.json
+ * No built-in default — the CLI never hard-codes a network's RPC endpoint.
+ *
+ * @param override - Value from the --rpc-url CLI option, if provided.
+ */
+export function getRpcUrl(override?: string): string | undefined {
+  if (override) return override;
+  if (process.env.A2X_RPC_URL) return process.env.A2X_RPC_URL;
+  const config = readConfig();
+  if (config.rpcUrl) return config.rpcUrl;
+  return undefined;
 }

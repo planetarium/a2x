@@ -1311,7 +1311,7 @@ const task = await client.sendMessage({
 });
 ```
 
-If the merchant's terminal task records a payment failure (the latest receipt is unsuccessful), the call throws `X402PaymentFailedError` with the on-chain reason. The full option surface is unchanged from prior releases:
+If the merchant's terminal task records a payment failure (the latest receipt is unsuccessful), the call throws `X402PaymentFailedError` with the on-chain reason. The option surface:
 
 | Field | Default | Purpose |
 |---|---|---|
@@ -1319,6 +1319,7 @@ If the merchant's terminal task records a payment failure (the latest receipt is
 | `maxAmount` | no cap | Atomic-unit ceiling. Filters `accepts[]` before the selector runs. |
 | `selectRequirement` | first EVM `scheme === 'exact'` | Predicate over the (already filtered) requirements. Return `undefined` to abort. |
 | `allowUpto` | `false` | Let the default selector fall back to an EVM `upto` offer when no `exact` one fits. See [Paying an `upto` offer](#paying-an-upto-offer). |
+| `upto` | none | RPC configuration for the `upto` payer — `{ rpcUrl }`, or keyed by numeric chain id. Needed only when the merchant offers [gas-sponsored Permit2 approval](#gas-sponsored-permit2-approval). |
 | `onPaymentRequired` | none | Hook between `payment-required` and signing. Return `false` to send `payment-rejected` cleanly; throw to abort *locally* without telling the merchant. |
 | `maxRetries` | `0` | Additional sign+resubmit attempts when the merchant re-issues a complete `payment-required` envelope on the same task. A reconciled batch attempt is never paid again. |
 
@@ -1394,6 +1395,39 @@ const signed = await signX402Payment(task, {
 ```
 
 Either way the payer's receipt carries `amount` — what they were actually charged, which can be less than what they authorized.
+
+#### Gas-sponsored Permit2 approval
+
+An `upto` payment settles through Permit2, which requires the payer to have approved Permit2 on the token — an on-chain transaction the payer's wallet may never have made (and, for a fresh wallet with no gas token, *cannot* make). Merchants bridge that gap by advertising the gas-sponsoring facilitator extensions on the V2 envelope: `eip2612GasSponsoring` (the payer signs an EIP-2612 permit; the facilitator submits it and pays the gas) and `erc20ApprovalGasSponsoring` (the payer signs a raw approval transaction for the facilitator to fund and broadcast).
+
+Producing either payload requires reading the chain — the signer's current Permit2 allowance, and for EIP-2612 the permit nonce. A plain `LocalAccount` cannot do that, so the payer needs an RPC endpoint:
+
+```ts
+const client = new A2XClient(url, {
+  x402: {
+    signer,
+    maxAmount: 1_000_000n,
+    allowUpto: true,
+    // One endpoint for everything, or keyed by chain id:
+    // upto: { 84532: { rpcUrl: 'https://sepolia.base.org' } }
+    upto: { rpcUrl: 'https://sepolia.base.org' },
+  },
+});
+```
+
+The endpoint is used **only for reads** — signing never leaves the process, and nothing is broadcast through it. Without it the extension payloads are silently skipped (there is nothing to skip when the merchant advertises no gas sponsoring), and a merchant that requires an allowance the payer doesn't have rejects the payment with `permit2_allowance_required`. The SDK never defaults the endpoint: choosing which RPC provider to trust is the caller's decision.
+
+The same option exists on `signX402Payment` for manually driven flows:
+
+```ts
+const signed = await signX402Payment(task, {
+  signer,
+  allowUpto: true,
+  upto: { rpcUrl: 'https://sepolia.base.org' },
+});
+```
+
+The `a2x` CLI exposes both halves of this as `a2x a2a send <url> <message> --allow-upto --rpc-url <url>` (with `A2X_RPC_URL` or a `rpcUrl` entry in `~/.a2x/config.json` as fallbacks for the endpoint).
 
 ### Reading advertised extensions
 
