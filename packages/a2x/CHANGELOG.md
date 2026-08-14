@@ -1,5 +1,13 @@
 # @a2x/sdk
 
+## 0.22.0
+
+### Minor Changes
+
+- [#226](https://github.com/planetarium/a2x/pull/226) [`c8bdec4`](https://github.com/planetarium/a2x/commit/c8bdec40ccc22564f78e15095b0522de2faf23c4) Thanks [@longfin](https://github.com/longfin)! - Export the `isEvmNetwork` and `isCaip2EvmNetwork` network-eligibility predicates from `@a2x/sdk/x402`. These are the tests the default requirement selector applies to `exact` and to the V2-only schemes (`upto`, `batch-settlement`) respectively, exported so pre-flight UX — such as the CLI's `--allow-upto` consent hint — can classify a merchant's offers exactly the way the selector will instead of re-deriving the criteria.
+
+- [#226](https://github.com/planetarium/a2x/pull/226) [`c8bdec4`](https://github.com/planetarium/a2x/commit/c8bdec40ccc22564f78e15095b0522de2faf23c4) Thanks [@longfin](https://github.com/longfin)! - Add `upto` payer RPC configuration to `A2XClientX402Options` and `SignX402PaymentOptions`. Passing `upto: { rpcUrl }` (or a per-chain-id map) lets the `upto` scheme read the signer's Permit2 allowance and EIP-2612 permit nonce, so it can produce the gas-sponsored approval payloads (`eip2612GasSponsoring` / `erc20ApprovalGasSponsoring`) a merchant may advertise. Previously the `UptoEvmScheme` was constructed without any RPC configuration, so those extension payloads were always skipped and merchants requiring a Permit2 allowance rejected the payment with `permit2_allowance_required` ([#225](https://github.com/planetarium/a2x/issues/225)).
+
 ## 0.21.0
 
 ### Minor Changes
