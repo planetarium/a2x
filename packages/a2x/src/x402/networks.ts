@@ -67,6 +67,17 @@ export function isEvmNetwork(network: string): boolean {
 }
 
 /**
+ * True for a concrete CAIP-2 EVM id (`eip155:<chainId>`) — the only network
+ * form the V2-only schemes (`upto`, `batch-settlement`) can use. The default
+ * selector's fallbacks require it; a bare-name (V1) offer of those schemes
+ * is never signable, so pre-flight UX (like the CLI's consent hint) should
+ * apply the same test rather than looking at the scheme alone.
+ */
+export function isCaip2EvmNetwork(network: string): boolean {
+  return /^eip155:\d+$/.test(network);
+}
+
+/**
  * Normalize a network id to CAIP-2. Bare EVM names map through the chain-id
  * table to `eip155:<chainId>`. Values that are already CAIP-2 are returned
  * unchanged. Unknown bare names are returned as-is (best effort — the

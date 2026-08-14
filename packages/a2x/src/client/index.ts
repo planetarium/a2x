@@ -9,9 +9,11 @@ export type {
 } from './a2x-client.js';
 
 // Type-only, so this does not pull the x402 runtime peers into this entry.
-// Re-exported because `A2XClientX402Options.batchSettlement` is otherwise
-// unnameable from `@a2x/sdk/client`.
+// Re-exported because `A2XClientX402Options.batchSettlement` and `.upto` are
+// otherwise unnameable from `@a2x/sdk/client`.
 export type {
+  X402UptoOptions,
+  X402UptoSchemeConfig,
   X402BatchSettlementOptions,
   X402BatchSettlementDepositPolicy,
   X402BatchSettlementDepositStrategy,

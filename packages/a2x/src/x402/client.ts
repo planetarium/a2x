@@ -29,7 +29,7 @@ import {
   X402PaymentRequiredError,
 } from './errors.js';
 import { detectX402Version } from './versions.js';
-import { isEvmNetwork } from './networks.js';
+import { isCaip2EvmNetwork, isEvmNetwork } from './networks.js';
 import { importX402Peer } from './peer.js';
 import type {
   X402PaymentPayload,
@@ -64,7 +64,10 @@ type X402EvmExactClientModule = {
 // 2.19) — only the scheme class — so a2x registers it on the CAIP-2 EVM
 // wildcard itself. `upto` is a V2-only scheme, so there is no `registerV1`.
 type X402EvmUptoClientModule = {
-  UptoEvmScheme: new (signer: LocalAccount) => unknown;
+  UptoEvmScheme: new (
+    signer: LocalAccount,
+    options?: X402UptoOptions,
+  ) => unknown;
 };
 // Same story for `batch-settlement`: a scheme class, no register helper. Unlike
 // the other two it is *stateful*, so the class takes the caller's channel
@@ -78,9 +81,6 @@ type X402EvmBatchSettlementClientModule = {
 
 /** CAIP-2 wildcard `@x402/evm` registers its V2 schemes under. */
 const EVM_CAIP2_WILDCARD = 'eip155:*';
-
-/** A concrete CAIP-2 EVM network id — the only form a V2-only scheme can use. */
-const CAIP2_EVM_NETWORK = /^eip155:\d+$/;
 
 const BATCH_SETTLEMENT_CLIENT_PEER = ['@x402', 'evm/batch-settlement/client'].join(
   '/',
@@ -298,6 +298,34 @@ export interface X402BatchSettlementOptions {
   voucherSigner?: LocalAccount;
 }
 
+/** Per-network RPC configuration for the `upto` payer. */
+export interface X402UptoSchemeConfig {
+  /**
+   * RPC endpoint the payer uses **only** to read on-chain state the gas
+   * sponsoring extensions need (the signer's Permit2 allowance and EIP-2612
+   * permit nonce). Signing itself is entirely local, so omitting it costs
+   * nothing — until the merchant advertises `eip2612GasSponsoring` /
+   * `erc20ApprovalGasSponsoring`: without an RPC endpoint (and with a plain
+   * `LocalAccount`, which cannot read the chain) those extension payloads are
+   * silently skipped, and a merchant that requires a Permit2 allowance
+   * rejects the payment with `permit2_allowance_required`.
+   */
+  rpcUrl?: string;
+}
+
+/**
+ * Configuration for the `upto` payer, either one config for every EVM
+ * network or keyed by numeric chain id (e.g. `{ 84532: { rpcUrl } }`) for
+ * multi-network wallets. Structurally `@x402/evm`'s `UptoEvmSchemeOptions`.
+ *
+ * Purely additive: supplying it does not register anything new (the `upto`
+ * scheme is always registered) and does not affect selection — see
+ * `allowUpto` for the consent flag.
+ */
+export type X402UptoOptions =
+  | X402UptoSchemeConfig
+  | Record<number, X402UptoSchemeConfig>;
+
 // Stateless schemes are safe to cache per signer. Batch-settlement is not:
 // its scheme closes over caller-owned storage and policy objects, which can be
 // mutated between calls. Rebuilding that runtime keeps signing and later
@@ -311,6 +339,7 @@ const _runtimeBySigner = new WeakMap<LocalAccount, RuntimeCacheEntry>();
 function _buildRuntime(
   signer: LocalAccount,
   batchSettlement?: X402BatchSettlementOptions,
+  upto?: X402UptoOptions,
 ): Promise<X402ClientRuntime> {
   return (async () => {
     const [core, evmExact, evmUpto, evmBatch] = await Promise.all([
@@ -332,7 +361,7 @@ function _buildRuntime(
     // Registering `upto` here does not make the client *choose* it — see
     // `defaultSelect`'s safety policy. It only means an explicitly selected
     // upto requirement can actually be signed.
-    client.register(EVM_CAIP2_WILDCARD, new UptoEvmScheme(signer));
+    client.register(EVM_CAIP2_WILDCARD, new UptoEvmScheme(signer, upto));
     if (batchSettlement && evmBatch) {
       const { BatchSettlementEvmScheme } =
         evmBatch as unknown as X402EvmBatchSettlementClientModule;
@@ -389,13 +418,23 @@ export function assertUsableChannelStorage(
 function _loadRuntime(
   signer: LocalAccount,
   batchSettlement?: X402BatchSettlementOptions,
+  upto?: X402UptoOptions,
 ): Promise<X402ClientRuntime> {
   if (batchSettlement !== undefined) {
     assertUsableChannelStorage(
       (batchSettlement as { storage?: unknown }).storage,
     );
 
-    return _buildRuntime(signer, batchSettlement);
+    return _buildRuntime(signer, batchSettlement, upto);
+  }
+
+  // An upto payer configuration is caller-owned data that can differ between
+  // calls (or be mutated in place), so a runtime built with one must not be
+  // served from the per-signer cache — same policy as batch-settlement above.
+  // Rebuilding is cheap: the peer imports are module-cached and the schemes
+  // themselves are stateless.
+  if (upto !== undefined) {
+    return _buildRuntime(signer, undefined, upto);
   }
 
   let entry = _runtimeBySigner.get(signer);
@@ -449,6 +488,13 @@ export interface SignX402PaymentOptions {
    * already made the decision.
    */
   allowUpto?: boolean;
+  /**
+   * RPC configuration for the `upto` payer. Only needed when the merchant
+   * offers gas-sponsored Permit2 approval (`eip2612GasSponsoring` /
+   * `erc20ApprovalGasSponsoring`) — see `X402UptoSchemeConfig.rpcUrl`.
+   * Never defaulted: the SDK does not hard-code any network's RPC endpoint.
+   */
+  upto?: X402UptoOptions;
   /**
    * Channel storage and deposit policy for the `batch-settlement` scheme.
    * Supplying it registers the scheme so a `batch-settlement` requirement can
@@ -626,6 +672,7 @@ export async function signX402Payment(
     recorder !== undefined
       ? { ...options.batchSettlement!, storage: recorder.storage }
       : undefined,
+    options.upto,
   );
 
   // Hand the client the received `payment-required` envelope with `accepts`
@@ -836,7 +883,7 @@ export function defaultSelect(
   const upto =
     options?.allowUpto &&
     requirements.find(
-      (r) => r.scheme === 'upto' && CAIP2_EVM_NETWORK.test(r.network),
+      (r) => r.scheme === 'upto' && isCaip2EvmNetwork(r.network),
     );
   if (upto) return upto;
   // Last, deliberately: paying out of a prepaid channel is the widest consent
@@ -844,7 +891,7 @@ export function defaultSelect(
   if (!options?.allowBatchSettlement) return undefined;
   return requirements.find(
     (r) =>
-      r.scheme === BATCH_SETTLEMENT_SCHEME && CAIP2_EVM_NETWORK.test(r.network),
+      r.scheme === BATCH_SETTLEMENT_SCHEME && isCaip2EvmNetwork(r.network),
   );
 }
 

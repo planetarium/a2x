@@ -173,6 +173,11 @@ export {
   type X402Version,
 } from './versions.js';
 
+// Network-eligibility predicates the default requirement selector applies —
+// exported so pre-flight UX (e.g. the CLI's --allow-upto consent hint) can
+// test offers against the same criteria instead of re-deriving them.
+export { isEvmNetwork, isCaip2EvmNetwork } from './networks.js';
+
 export type {
   X402Accept,
   X402Facilitator,
@@ -327,6 +332,8 @@ export {
 export type {
   SignX402PaymentOptions,
   SignedX402Payment,
+  X402UptoOptions,
+  X402UptoSchemeConfig,
   X402BatchSettlementOptions,
   X402BatchSettlementDepositPolicy,
   X402BatchSettlementDepositStrategy,
