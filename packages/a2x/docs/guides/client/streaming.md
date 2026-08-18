@@ -60,11 +60,11 @@ for await (const event of stream) {
 
 If you want the agent itself to stop doing work (not just your client to stop listening), call `client.cancelTask(taskId)` using the `id` from the first `task` event.
 
-As of A2X **0.5.0**, breaking out of the loop is enough on its own: when the underlying HTTP connection closes the server aborts the in-flight agent execution. You don't need to call `cancelTask` just to save tokens on abandoned streams.
+Breaking out of the loop is enough on its own: when the underlying HTTP connection closes the server aborts the in-flight agent execution and records the task as `canceled`. You don't need to call `cancelTask` just to save tokens on abandoned streams.
 
 ## Resuming a dropped stream
 
-If the connection drops but you still want the results — flaky network, mobile tab restore, proxy idle timeout — re-attach to the same task with the A2A `tasks/resubscribe` method. The server keeps publishing events to any live subscriber, so a resubscriber catches the tail of the original execution.
+Use the A2A `tasks/resubscribe` method to attach another consumer while the original task stream is still active. If the original HTTP reader has already been canceled, the server aborts that execution and resubscribe returns its persisted `canceled` state rather than restarting it.
 
 `A2XClient` doesn't yet expose a convenience helper, so issue the call at the JSON-RPC level. The response is an SSE stream with the same event shape as `message/stream`:
 
@@ -92,8 +92,9 @@ async function resubscribe(url: string, taskId: string) {
 
 Behavior to know:
 
-- **Forward-only.** Events that fired before the resubscribe call are not replayed — you see what the server publishes from that point on.
-- **Terminal replay.** If the task already completed, you receive a single `status-update` event with the final state, then the stream ends.
+- **Forward-only while active.** Events that fired before a live resubscribe call are not replayed — you see what the server publishes from that point on.
+- **Interaction-ending replay.** If the interaction already ended, you receive one `status-update`, then the stream ends. This includes terminal states plus `input-required` and `auth-required`.
+- **Disconnected primary streams are canceled.** After the original reader closes, resubscribe returns `canceled`; it cannot resume the aborted agent invocation.
 - **Unknown task.** The server emits a single JSON-RPC error envelope (`{ jsonrpc: "2.0", id: <request id>, error: { code: -32001, ... } }`) on the same SSE stream and closes — same shape as a non-streaming error response, just delivered over `data:` SSE chunks.
 
 ### SSE wire shape

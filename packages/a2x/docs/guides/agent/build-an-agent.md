@@ -99,8 +99,8 @@ Custom agents that extend `BaseAgent` directly express their output by yielding 
 | `data` | A structured non-text payload (`mediaType` indicates the shape). One artifact per event. |
 | `toolCall` / `toolResult` | LLM-style tool turns (consumed by `LlmAgent` plumbing; surface only when you're modeling the round-trip yourself). |
 | `request-input` | Halt the agent and ask the client for input — most often a payment (via `x402RequestPayment`) or an approval. The executor sets the task to `input-required` and merges the agent-supplied metadata onto the status message. The SDK keeps **no** cross-turn bookkeeping — on the resume turn the agent re-derives what it asked for from `context.message` (and any state it persisted itself, keyed by `taskId`). See [Protocol Extensions](../advanced/extensions.md) and [x402 Payments](../advanced/x402-payments.md). |
-| `done` | Mark the run finished. Required at the end of every successful run. |
-| `error` | Mark the task failed with the given `Error`. |
+| `done` | Mark the run finished. Recommended at the end of every successful run; if the generator returns without it, the executor synthesizes a completed status. |
+| `error` | Mark the task failed with the given `Error`. Text, file, and data artifacts emitted before the error remain attached to the failed task. |
 
 ## Next
 

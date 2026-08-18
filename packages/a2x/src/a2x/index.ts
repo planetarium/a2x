@@ -18,7 +18,11 @@ export { ResponseMapperFactory } from './response-mapper.js';
 export type { ResponseMapper } from './response-mapper.js';
 export { V03ResponseMapper } from './v03-response-mapper.js';
 export { V10ResponseMapper } from './v10-response-mapper.js';
-export { InMemoryTaskStore } from './task-store.js';
+export {
+  InMemoryTaskStore,
+  applyArtifactUpdate,
+  cloneTask,
+} from './task-store.js';
 export type {
   TaskStore,
   CreateTaskParams,

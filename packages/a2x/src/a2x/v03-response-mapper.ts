@@ -57,12 +57,11 @@ export class V03ResponseMapper implements ResponseMapper {
       taskId: event.taskId,
       contextId: event.contextId,
       status: this._mapStatus(event.status),
+      // Required by v0.3. Internal/custom events may omit it because v1.0
+      // has no equivalent; such events are non-final unless stated otherwise.
+      final: event.final ?? false,
     };
 
-    // Spec a2a-v0.3 §TaskStatusUpdateEvent.final
-    if (event.final !== undefined) {
-      mapped.final = event.final;
-    }
     if (event.metadata !== undefined) {
       mapped.metadata = event.metadata;
     }

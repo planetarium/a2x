@@ -14,7 +14,7 @@ Characteristics:
 
 - All state lives in the process's memory.
 - Lost on restart. Not shared across replicas.
-- Has a TTL and max-size cap so it doesn't leak (default values are sane; tune via constructor options).
+- Supports a TTL and a max-size cap so it doesn't leak. **Both default to unlimited** — pass `ttlMs` / `maxSize` to the constructor to bound it.
 
 Good for: local development, stateless serverless functions where each invocation owns its own tasks, demos.
 
@@ -31,35 +31,108 @@ Not good for: multi-replica deployments where one worker might submit a task and
 `TaskStore` is a narrow interface. The methods you implement:
 
 ```ts
+interface CreateTaskParams {
+  contextId?: string;
+  metadata?: Record<string, unknown>;
+}
+
+interface TaskUpdate {
+  status?: TaskStatus;
+  artifacts?: Artifact[];
+  history?: Message[];
+  metadata?: Record<string, unknown>;
+}
+
 interface TaskStore {
-  save(task: Task): Promise<void>;
-  get(id: string): Promise<Task | null>;
-  delete(id: string): Promise<void>;
+  createTask(params: CreateTaskParams): Promise<Task>;
+  getTask(taskId: string): Promise<Task | null>;
+  updateTask(taskId: string, update: TaskUpdate): Promise<Task>;
+  deleteTask(taskId: string): Promise<void>;
 }
 ```
+
+Contract notes:
+
+- `createTask()` mints the task id and `contextId` (fall back to a fresh UUID when the caller didn't supply one) and starts the task in `submitted`.
+- `updateTask()` applies only the fields present on the update — an absent field means "leave as is", not "clear". `metadata` merges; `artifacts` and `history` replace.
+- `updateTask()` should reject a status change on a task that is already terminal (`completed` / `failed` / `canceled` / `rejected`). `InMemoryTaskStore` throws.
+- `updateTask()` must apply its read, terminal guard, patch, and write atomically against the latest record. A plain `GET` followed by `SET` can let cancellation, completion, and artifact writes overwrite one another.
 
 A Redis-backed version in its entirety:
 
 ```ts
-import type { Task, TaskStore } from '@a2x/sdk';
+import type { Task, TaskStore, CreateTaskParams, TaskUpdate } from '@a2x/sdk';
+import { TaskState } from '@a2x/sdk';
+import { randomUUID } from 'node:crypto';
 import { Redis } from 'ioredis';
 
 const KEY = (id: string) => `a2x:task:${id}`;
 
+const UPDATE_TASK = `
+local raw = redis.call('GET', KEYS[1])
+if not raw then return redis.error_reply('Task not found: ' .. KEYS[1]) end
+
+local current = cjson.decode(raw)
+local update = cjson.decode(ARGV[1])
+local terminal = {
+  completed = true,
+  failed = true,
+  canceled = true,
+  rejected = true
+}
+if update.status and terminal[current.status.state] then
+  return redis.error_reply('Cannot update task in terminal state: ' .. KEYS[1])
+end
+
+if update.status then current.status = update.status end
+if update.artifacts then current.artifacts = update.artifacts end
+if update.history then current.history = update.history end
+if update.metadata then
+  current.metadata = current.metadata or {}
+  for key, value in pairs(update.metadata) do current.metadata[key] = value end
+end
+
+local next = cjson.encode(current)
+redis.call('SET', KEYS[1], next, 'EX', ARGV[2])
+return next
+`;
+
 export class RedisTaskStore implements TaskStore {
   constructor(private redis: Redis, private ttlSeconds = 3600) {}
 
-  async save(task: Task): Promise<void> {
-    await this.redis.set(KEY(task.id), JSON.stringify(task), 'EX', this.ttlSeconds);
+  async createTask(params: CreateTaskParams): Promise<Task> {
+    const task: Task = {
+      id: randomUUID(),
+      contextId: params.contextId ?? randomUUID(),
+      status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
+      ...(params.metadata ? { metadata: params.metadata } : {}),
+    };
+    await this._write(task);
+    return task;
   }
 
-  async get(id: string): Promise<Task | null> {
+  async getTask(id: string): Promise<Task | null> {
     const raw = await this.redis.get(KEY(id));
     return raw ? (JSON.parse(raw) as Task) : null;
   }
 
-  async delete(id: string): Promise<void> {
+  async updateTask(id: string, update: TaskUpdate): Promise<Task> {
+    const raw = await this.redis.eval(
+      UPDATE_TASK,
+      1,
+      KEY(id),
+      JSON.stringify(update),
+      this.ttlSeconds,
+    );
+    return JSON.parse(raw as string) as Task;
+  }
+
+  async deleteTask(id: string): Promise<void> {
     await this.redis.del(KEY(id));
+  }
+
+  private async _write(task: Task): Promise<void> {
+    await this.redis.set(KEY(task.id), JSON.stringify(task), 'EX', this.ttlSeconds);
   }
 }
 ```
@@ -69,6 +142,35 @@ Wire it in:
 ```ts
 const taskStore = new RedisTaskStore(new Redis(process.env.REDIS_URL!));
 const a2xServer = new A2XServer({ taskStore, executor });
+```
+
+## Tasks handed out are snapshots
+
+Every `Task` a store returns is a **snapshot**. Mutating its standard task, message, artifact, part, or metadata containers changes nothing on the store side — a serializing store parsed it out of JSON, and `InMemoryTaskStore` deliberately returns defensive copies so that in-memory development behaves the same way as production. If metadata contains a value that cannot be structured-cloned, such as a function, `cloneTask()` retains that exotic leaf while still isolating every standard container around it. Cloneable class instances may be normalized to plain objects by `structuredClone()`.
+
+Two consequences:
+
+- **Custom stores must not return their live record.** Return a copy (`structuredClone`, or the value you just deserialized). `cloneTask(task)` is exported for this.
+- **Custom handlers or executors must write every transition back** with `updateTask()`. Setting `task.status = ...` on a task you were handed persists nothing.
+
+The SDK's `DefaultRequestHandler` does exactly that: it writes the `working` transition, the result of `message/send`, each `message/stream` artifact before delivering it, each streaming status transition, and `tasks/cancel` through `updateTask()`, so the response a caller receives always matches a subsequent `tasks/get`.
+
+Two details worth knowing when you write a store:
+
+- **Streamed artifacts are write-ahead.** The handler persists an artifact update before delivering it, then carries the complete artifact set in status writes. A cancellation can therefore never make the durable task lag behind content the client already received, even when the store rejects every update to a terminal task.
+- **Artifacts survive across turns.** `updateTask` replaces the artifact list, but a continuation turn (`input-required` → resume) starts the agent's list from scratch, so the handler folds the new artifacts onto the ones the task already carried. Same `artifactId` supersedes — and `AgentExecutor` allocates ids against what the task already holds, so a later turn does not collide with an earlier one.
+
+If you fold streamed artifact chunks yourself, `applyArtifactUpdate(artifacts, event)` implements the spec's `append` semantics (append to the artifact with the same `artifactId`, otherwise replace):
+
+```ts
+import { applyArtifactUpdate, type Artifact } from '@a2x/sdk';
+
+let artifacts: Artifact[] = [];
+for await (const event of stream) {
+  if ('artifact' in event) {
+    artifacts = applyArtifactUpdate(artifacts, event);
+  }
+}
 ```
 
 ## Choosing a TTL
@@ -85,4 +187,5 @@ For most deployments, 1 hour is fine. Lengthen it for human-in-the-loop workflow
 
 - **Don't share a single Redis key prefix across agents** if they have overlapping task-id spaces. Namespace per agent (`a2x:support:task:*` vs `a2x:billing:task:*`).
 - **Serialize carefully.** `Task` objects contain nested message parts and artifacts. `JSON.stringify` works but be aware that binary file parts (as base64 strings) can grow large; consider offloading to object storage and storing just a URI.
+- **Don't return the record you keep.** A store that hands back its own mutable object hides persistence bugs: code that mutates a task in place appears to work, then loses every transition the moment the store is swapped for a real database.
 - **Monitor cardinality.** A task store that grows unboundedly is a memory/disk leak waiting to happen. Always use a TTL or periodic cleanup.

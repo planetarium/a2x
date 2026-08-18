@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { InMemoryTaskStore } from '../a2x/task-store.js';
+import { applyArtifactUpdate, InMemoryTaskStore } from '../a2x/task-store.js';
 import { TaskState } from '../types/task.js';
+import type { Artifact } from '../types/common.js';
 
 describe('Layer 3: TaskStore', () => {
   afterEach(() => {
@@ -255,6 +256,158 @@ describe('Layer 3: TaskStore', () => {
       expect(store.size).toBe(1);
       expect(await store.getTask(t1.id)).toBeNull();
       expect(await store.getTask(t2.id)).toBeNull();
+    });
+  });
+
+  describe('InMemoryTaskStore snapshot isolation', () => {
+    it('should hand out snapshots, not the stored task (issue #233)', async () => {
+      const store = new InMemoryTaskStore();
+      const created = await store.createTask({ metadata: { a: 1 } });
+
+      // Mutating a returned task must not reach the store — otherwise a
+      // handler can "persist" a transition by accident in memory and
+      // silently lose it against a durable store.
+      created.status = {
+        state: TaskState.COMPLETED,
+        timestamp: new Date().toISOString(),
+      };
+      created.artifacts = [{ artifactId: 'a-1', parts: [{ text: 'leaked' }] }];
+      (created.metadata as Record<string, unknown>).a = 2;
+
+      const stored = await store.getTask(created.id);
+      expect(stored!.status.state).toBe(TaskState.SUBMITTED);
+      expect(stored!.artifacts).toBeUndefined();
+      expect(stored!.metadata).toEqual({ a: 1 });
+    });
+
+    it('should snapshot the task returned by getTask', async () => {
+      const store = new InMemoryTaskStore();
+      const created = await store.createTask({});
+      await store.updateTask(created.id, {
+        artifacts: [{ artifactId: 'a-1', parts: [{ text: 'hi' }] }],
+      });
+
+      const first = await store.getTask(created.id);
+      first!.status = {
+        state: TaskState.FAILED,
+        timestamp: new Date().toISOString(),
+      };
+      first!.artifacts![0]!.parts.push({ text: 'leaked' });
+
+      const second = await store.getTask(created.id);
+      expect(second!.status.state).toBe(TaskState.SUBMITTED);
+      expect(second!.artifacts![0]!.parts).toHaveLength(1);
+    });
+
+    it('should snapshot the task returned by updateTask', async () => {
+      const store = new InMemoryTaskStore();
+      const created = await store.createTask({});
+
+      const updated = await store.updateTask(created.id, {
+        status: { state: TaskState.WORKING, timestamp: new Date().toISOString() },
+        artifacts: [{ artifactId: 'a-1', parts: [{ text: 'hi' }] }],
+      });
+      updated.artifacts![0]!.parts.push({ text: 'leaked' });
+
+      const stored = await store.getTask(created.id);
+      expect(stored!.artifacts![0]!.parts).toHaveLength(1);
+    });
+
+    it('should keep tasks usable when metadata cannot be structured-cloned', async () => {
+      const store = new InMemoryTaskStore();
+      const created = await store.createTask({
+        metadata: {
+          onDone: () => 'not cloneable',
+          nested: { value: 'stored' },
+        },
+      });
+      const updated = await store.updateTask(created.id, {
+        status: {
+          state: TaskState.WORKING,
+          timestamp: new Date().toISOString(),
+          message: {
+            messageId: 'status-1',
+            role: 'agent',
+            parts: [{ text: 'working' }],
+            metadata: { nested: { value: 'stored' } },
+          },
+        },
+        artifacts: [
+          {
+            artifactId: 'a-1',
+            parts: [{ data: { nested: { value: 'stored' } } }],
+          },
+        ],
+      });
+
+      (updated.metadata!.nested as { value: string }).value = 'leaked';
+      const artifactPart = updated.artifacts![0]!.parts[0] as {
+        data: { nested: { value: string } };
+      };
+      artifactPart.data.nested.value = 'leaked';
+      const messageMetadata = updated.status.message!.metadata!.nested as {
+        value: string;
+      };
+      messageMetadata.value = 'leaked';
+
+      const first = await store.getTask(created.id);
+      expect(typeof first!.metadata!.onDone).toBe('function');
+      expect(first!.metadata!.nested).toEqual({ value: 'stored' });
+      expect(first!.artifacts![0]!.parts[0]).toEqual({
+        data: { nested: { value: 'stored' } },
+      });
+      expect(first!.status.message!.metadata!.nested).toEqual({
+        value: 'stored',
+      });
+
+      (first!.artifacts![0]!.parts[0] as { data: { nested: { value: string } } })
+        .data.nested.value = 'leaked-again';
+      const second = await store.getTask(created.id);
+      expect(second!.artifacts![0]!.parts[0]).toEqual({
+        data: { nested: { value: 'stored' } },
+      });
+    });
+  });
+
+  describe('applyArtifactUpdate', () => {
+    const chunk = (text: string): Artifact => ({
+      artifactId: 'a-text',
+      parts: [{ text }],
+    });
+
+    it('appends parts to the artifact carrying the same id', () => {
+      const result = applyArtifactUpdate([chunk('hello ')], {
+        artifact: chunk('world'),
+        append: true,
+      });
+
+      expect(result).toHaveLength(1);
+      expect(result[0]!.parts).toEqual([{ text: 'hello ' }, { text: 'world' }]);
+    });
+
+    it('replaces the artifact when append is not set', () => {
+      const result = applyArtifactUpdate([chunk('partial')], {
+        artifact: chunk('final'),
+      });
+
+      expect(result).toHaveLength(1);
+      expect(result[0]!.parts).toEqual([{ text: 'final' }]);
+    });
+
+    it('adds unknown artifact ids, including appends with no predecessor', () => {
+      const result = applyArtifactUpdate([chunk('text')], {
+        artifact: { artifactId: 'a-data', parts: [{ data: { ok: true } }] },
+        append: true,
+      });
+
+      expect(result.map((a) => a.artifactId)).toEqual(['a-text', 'a-data']);
+    });
+
+    it('does not mutate the input list', () => {
+      const artifacts = [chunk('hello ')];
+      applyArtifactUpdate(artifacts, { artifact: chunk('world'), append: true });
+
+      expect(artifacts[0]!.parts).toEqual([{ text: 'hello ' }]);
     });
   });
 });

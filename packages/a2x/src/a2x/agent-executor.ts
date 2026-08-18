@@ -50,7 +50,7 @@ export interface AgentExecutorOptions {
 export class AgentExecutor {
   readonly runner: Runner;
   readonly runConfig: RunConfig;
-  private readonly _abortControllers = new Map<string, AbortController>();
+  private readonly _abortControllers = new Map<string, Set<AbortController>>();
 
   constructor(options: AgentExecutorOptions) {
     this.runner = options.runner;
@@ -68,9 +68,8 @@ export class AgentExecutor {
   ): Promise<Task> {
     const contextId = task.contextId ?? task.id;
 
-    const session = await this.runner.createSession();
     const abortController = new AbortController();
-    this._abortControllers.set(task.id, abortController);
+    this._registerAbortController(task.id, abortController);
 
     // Update task status to working
     task.status = {
@@ -80,11 +79,13 @@ export class AgentExecutor {
 
     const artifacts: Artifact[] = [];
     const textParts: string[] = [];
-    let nonTextSeq = 0;
+    const artifactIds = new ArtifactIdAllocator(task.id, task.artifacts);
     let completedNormally = false;
     let inputRequested = false;
 
     try {
+      const session = await this.runner.createSession();
+      if (abortController.signal.aborted) return task;
       for await (const event of this.runner.runAsync(session, message, abortController.signal, {
         taskId: task.id,
         contextId,
@@ -98,13 +99,13 @@ export class AgentExecutor {
             break;
           case 'file':
             artifacts.push({
-              artifactId: `artifact-${task.id}-file-${++nonTextSeq}`,
+              artifactId: artifactIds.next('file'),
               parts: [{ ...event.file }],
             });
             break;
           case 'data':
             artifacts.push({
-              artifactId: `artifact-${task.id}-data-${++nonTextSeq}`,
+              artifactId: artifactIds.next('data'),
               parts: [
                 {
                   data: event.data,
@@ -115,6 +116,10 @@ export class AgentExecutor {
             break;
           case 'request-input': {
             inputRequested = true;
+            // Content produced before the halt is part of the task
+            // document. `executeStream` emits it as artifact events, so
+            // dropping it here would lose it on `message/send` only.
+            attachArtifacts(task, artifacts, textParts, artifactIds);
             applyInputRequired(task, event.metadata, event.message);
             // Halt the agent's generator without raising — the for-await
             // unwinds via the explicit return below, and the finally
@@ -123,13 +128,7 @@ export class AgentExecutor {
             return task;
           }
           case 'done':
-            // Collect accumulated text into an artifact (if any).
-            if (textParts.length > 0) {
-              artifacts.push({
-                artifactId: `artifact-${task.id}-text`,
-                parts: [{ text: textParts.join('') }],
-              });
-            }
+            attachArtifacts(task, artifacts, textParts, artifactIds);
             task.status = {
               state: TaskState.COMPLETED,
               timestamp: new Date().toISOString(),
@@ -144,12 +143,10 @@ export class AgentExecutor {
                   }
                 : {}),
             };
-            if (artifacts.length > 0) {
-              task.artifacts = artifacts;
-            }
             completedNormally = true;
             return task;
           case 'error':
+            attachArtifacts(task, artifacts, textParts, artifactIds);
             task.status = {
               state: TaskState.FAILED,
               message: {
@@ -174,16 +171,16 @@ export class AgentExecutor {
       // completed status. This matches the legacy behavior for agents that
       // simply return from run() after emitting text.
       if (!abortController.signal.aborted) {
+        attachArtifacts(task, artifacts, textParts, artifactIds);
         task.status = {
           state: TaskState.COMPLETED,
           timestamp: new Date().toISOString(),
         };
-        if (artifacts.length > 0) {
-          task.artifacts = artifacts;
-        }
       }
       completedNormally = true;
     } catch (error) {
+      if (abortController.signal.aborted) return task;
+      attachArtifacts(task, artifacts, textParts, artifactIds);
       task.status = {
         state: TaskState.FAILED,
         message: {
@@ -208,7 +205,7 @@ export class AgentExecutor {
       if (!completedNormally && !abortController.signal.aborted) {
         abortController.abort();
       }
-      this._abortControllers.delete(task.id);
+      this._unregisterAbortController(task.id, abortController);
     }
 
     return task;
@@ -224,28 +221,32 @@ export class AgentExecutor {
   ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
     const contextId = task.contextId ?? task.id;
 
-    const session = await this.runner.createSession();
     const abortController = new AbortController();
-    this._abortControllers.set(task.id, abortController);
+    this._registerAbortController(task.id, abortController);
 
-    // Emit working status
-    task.status = {
-      state: TaskState.WORKING,
-      timestamp: new Date().toISOString(),
-    };
-    yield {
-      taskId: task.id,
-      contextId,
-      status: task.status,
-    };
-
+    const artifactIds = new ArtifactIdAllocator(task.id, task.artifacts);
     let completedNormally = false;
     let inputRequested = false;
+    const textParts: string[] = [];
+    const nonTextArtifacts: Artifact[] = [];
 
     try {
-      const textParts: string[] = [];
-      const nonTextArtifacts: Artifact[] = [];
-      let nonTextSeq = 0;
+      const session = await this.runner.createSession();
+      if (abortController.signal.aborted) return;
+
+      // Emit working status only after session creation succeeds. A session
+      // setup failure is reported as FAILED below instead of stranding a
+      // durably persisted task in WORKING.
+      task.status = {
+        state: TaskState.WORKING,
+        timestamp: new Date().toISOString(),
+      };
+      yield {
+        taskId: task.id,
+        contextId,
+        status: task.status,
+        final: false,
+      } satisfies TaskStatusUpdateEvent;
 
       for await (const event of this.runner.runAsync(session, message, abortController.signal, {
         taskId: task.id,
@@ -255,23 +256,25 @@ export class AgentExecutor {
           : {}),
       })) {
         switch (event.type) {
-          case 'text':
+          case 'text': {
+            const append = textParts.length > 0;
             textParts.push(event.text);
             yield {
               taskId: task.id,
               contextId,
               artifact: {
-                artifactId: `artifact-${task.id}-text`,
+                artifactId: artifactIds.text(),
                 parts: [{ text: event.text }],
               },
-              append: true,
+              append,
               lastChunk: false,
             } satisfies TaskArtifactUpdateEvent;
             break;
+          }
 
           case 'file': {
             const artifact: Artifact = {
-              artifactId: `artifact-${task.id}-file-${++nonTextSeq}`,
+              artifactId: artifactIds.next('file'),
               parts: [{ ...event.file }],
             };
             nonTextArtifacts.push(artifact);
@@ -287,7 +290,7 @@ export class AgentExecutor {
 
           case 'data': {
             const artifact: Artifact = {
-              artifactId: `artifact-${task.id}-data-${++nonTextSeq}`,
+              artifactId: artifactIds.next('data'),
               parts: [
                 {
                   data: event.data,
@@ -308,11 +311,13 @@ export class AgentExecutor {
 
           case 'request-input': {
             inputRequested = true;
+            attachArtifacts(task, nonTextArtifacts, textParts, artifactIds);
             applyInputRequired(task, event.metadata, event.message);
             yield {
               taskId: task.id,
               contextId,
               status: task.status,
+              final: true,
             } satisfies TaskStatusUpdateEvent;
             completedNormally = true;
             return;
@@ -323,7 +328,7 @@ export class AgentExecutor {
 
             if (textParts.length > 0) {
               const artifact: Artifact = {
-                artifactId: `artifact-${task.id}-text`,
+                artifactId: artifactIds.text(),
                 parts: [{ text: textParts.join('') }],
               };
               finalArtifacts.push(artifact);
@@ -358,12 +363,14 @@ export class AgentExecutor {
               taskId: task.id,
               contextId,
               status: task.status,
+              final: true,
             } satisfies TaskStatusUpdateEvent;
             completedNormally = true;
             return;
           }
 
           case 'error':
+            attachArtifacts(task, nonTextArtifacts, textParts, artifactIds);
             task.status = {
               state: TaskState.FAILED,
               message: {
@@ -378,6 +385,7 @@ export class AgentExecutor {
               taskId: task.id,
               contextId,
               status: task.status,
+              final: true,
             } satisfies TaskStatusUpdateEvent;
             completedNormally = true;
             return;
@@ -387,8 +395,35 @@ export class AgentExecutor {
       if (inputRequested) {
         return;
       }
+
+      if (abortController.signal.aborted) return;
+
+      // Agents may finish by returning instead of yielding `done`. Finalize
+      // the same artifact set and status that the blocking path synthesizes.
+      attachArtifacts(task, nonTextArtifacts, textParts, artifactIds);
+      if (textParts.length > 0) {
+        yield {
+          taskId: task.id,
+          contextId,
+          artifact: task.artifacts!.at(-1)!,
+          append: false,
+          lastChunk: true,
+        } satisfies TaskArtifactUpdateEvent;
+      }
+      task.status = {
+        state: TaskState.COMPLETED,
+        timestamp: new Date().toISOString(),
+      };
+      yield {
+        taskId: task.id,
+        contextId,
+        status: task.status,
+        final: true,
+      } satisfies TaskStatusUpdateEvent;
       completedNormally = true;
     } catch (error) {
+      if (abortController.signal.aborted) return;
+      attachArtifacts(task, nonTextArtifacts, textParts, artifactIds);
       task.status = {
         state: TaskState.FAILED,
         message: {
@@ -409,13 +444,14 @@ export class AgentExecutor {
         taskId: task.id,
         contextId,
         status: task.status,
+        final: true,
       } satisfies TaskStatusUpdateEvent;
       completedNormally = true;
     } finally {
       if (!completedNormally && !abortController.signal.aborted) {
         abortController.abort();
       }
-      this._abortControllers.delete(task.id);
+      this._unregisterAbortController(task.id, abortController);
     }
   }
 
@@ -423,9 +459,9 @@ export class AgentExecutor {
    * Cancel a running task. Aborts in-flight agent execution if running.
    */
   async cancel(task: Task): Promise<Task> {
-    const controller = this._abortControllers.get(task.id);
-    if (controller) {
-      controller.abort();
+    const controllers = this._abortControllers.get(task.id);
+    if (controllers) {
+      for (const controller of controllers) controller.abort();
       this._abortControllers.delete(task.id);
     }
 
@@ -435,9 +471,109 @@ export class AgentExecutor {
     };
     return task;
   }
+
+  private _registerAbortController(
+    taskId: string,
+    controller: AbortController,
+  ): void {
+    let controllers = this._abortControllers.get(taskId);
+    if (!controllers) {
+      controllers = new Set();
+      this._abortControllers.set(taskId, controllers);
+    }
+    controllers.add(controller);
+  }
+
+  private _unregisterAbortController(
+    taskId: string,
+    controller: AbortController,
+  ): void {
+    const controllers = this._abortControllers.get(taskId);
+    if (!controllers) return;
+    controllers.delete(controller);
+    if (controllers.size === 0) this._abortControllers.delete(taskId);
+  }
 }
 
 // ─── Module-private helpers ───
+
+/**
+ * Allocates artifact ids that stay unique across the turns of one task.
+ *
+ * A resumed task runs a fresh executor pass, so ids derived from a
+ * per-run counter would repeat the previous turn's — and since
+ * `artifactId` is what identifies an artifact within a task (spec
+ * a2a-v0.3 §TaskArtifactUpdateEvent), a repeat silently supersedes the
+ * earlier artifact instead of adding a new one. Ids are therefore
+ * allocated against what the task already carries; a task's first turn
+ * keeps the plain `-text` / `-data-1` form.
+ */
+class ArtifactIdAllocator {
+  private readonly taskId: string;
+  private readonly taken: Set<string>;
+  private seq = 0;
+  private textId: string | undefined;
+
+  constructor(taskId: string, existing?: readonly Artifact[]) {
+    this.taskId = taskId;
+    this.taken = new Set((existing ?? []).map((a) => a.artifactId));
+  }
+
+  /** Stable within a turn — streamed chunks append to one text artifact. */
+  text(): string {
+    this.textId ??= this._claim(`artifact-${this.taskId}-text`);
+    return this.textId;
+  }
+
+  next(kind: 'data' | 'file'): string {
+    let id: string;
+    do {
+      id = `artifact-${this.taskId}-${kind}-${++this.seq}`;
+    } while (this.taken.has(id));
+    this.taken.add(id);
+    return id;
+  }
+
+  private _claim(base: string): string {
+    if (!this.taken.has(base)) {
+      this.taken.add(base);
+      return base;
+    }
+    let suffix = 2;
+    while (this.taken.has(`${base}-${suffix}`)) suffix++;
+    const id = `${base}-${suffix}`;
+    this.taken.add(id);
+    return id;
+  }
+}
+
+/**
+ * Attach what a non-streaming run collected, folding the accumulated text
+ * chunks into the single text artifact `executeStream` emits under the
+ * same id. Leaves `task.artifacts` untouched when the run produced
+ * nothing, so a resumed task keeps what it already carried.
+ */
+function attachArtifacts(
+  task: Task,
+  artifacts: Artifact[],
+  textParts: string[],
+  artifactIds: ArtifactIdAllocator,
+): void {
+  const collected =
+    textParts.length > 0
+      ? [
+          ...artifacts,
+          {
+            artifactId: artifactIds.text(),
+            parts: [{ text: textParts.join('') }],
+          },
+        ]
+      : artifacts;
+
+  if (collected.length > 0) {
+    task.artifacts = collected;
+  }
+}
 
 /**
  * Set the task to INPUT_REQUIRED, merging the agent-supplied metadata
