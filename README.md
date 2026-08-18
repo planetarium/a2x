@@ -236,6 +236,9 @@ a2x a2a agent-card <agent-url>
 
 # Check task status
 a2x a2a task <agent-url> <task-id>
+
+# Upgrade to the latest release
+a2x update
 ```
 
 Install from [GitHub Releases](https://github.com/planetarium/a2x/releases) or build from source:
@@ -246,6 +249,12 @@ cd a2x
 pnpm install && pnpm build
 pnpm cli:install
 ```
+
+`a2x update` resolves the newest `cli-v*` release, verifies the downloaded
+asset against the SHA-256 GitHub publishes for it, and then replaces the
+standalone binary in place (or reinstalls the npm tarball, depending on how
+`a2x` was installed). Use `a2x update --check` to report an available version
+without installing it.
 
 ## A2A Protocol Versions
 
