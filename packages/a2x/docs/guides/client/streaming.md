@@ -60,7 +60,7 @@ for await (const event of stream) {
 
 If you want the agent itself to stop doing work (not just your client to stop listening), call `client.cancelTask(taskId)` using the `id` from the first `task` event.
 
-As of A2X **0.5.0**, breaking out of the loop is enough on its own: when the underlying HTTP connection closes the server aborts the in-flight agent execution and records the task as `canceled`. You don't need to call `cancelTask` just to save tokens on abandoned streams.
+Breaking out of the loop is enough on its own: when the underlying HTTP connection closes the server aborts the in-flight agent execution and records the task as `canceled`. You don't need to call `cancelTask` just to save tokens on abandoned streams.
 
 ## Resuming a dropped stream
 

@@ -1575,11 +1575,13 @@ function statusEventFromTask(
   event: TaskStatusUpdateEvent,
   task: Task,
 ): TaskStatusUpdateEvent {
-  return {
+  const authoritative = {
     ...event,
     status: task.status,
-    ...(TERMINAL_STATES.has(task.status.state) ? { final: true } : {}),
   };
+  return isInteractionEndingStatus(authoritative)
+    ? { ...authoritative, final: true }
+    : authoritative;
 }
 
 function isInteractionEndingStatus(event: TaskStatusUpdateEvent): boolean {

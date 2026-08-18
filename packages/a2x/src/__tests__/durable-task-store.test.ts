@@ -354,6 +354,26 @@ class ProgressiveArtifactExecutor extends AgentExecutor {
   }
 }
 
+class NonFinalInputExecutor extends AgentExecutor {
+  override async *executeStream(
+    task: Task,
+  ): AsyncGenerator<TaskStatusUpdateEvent> {
+    const contextId = task.contextId ?? task.id;
+    yield {
+      taskId: task.id,
+      contextId,
+      status: { state: TaskState.WORKING },
+      final: false,
+    };
+    yield {
+      taskId: task.id,
+      contextId,
+      status: { state: TaskState.INPUT_REQUIRED },
+      final: false,
+    };
+  }
+}
+
 class SessionCreationFailsRunner extends InMemoryRunner {
   override async createSession(): Promise<never> {
     throw new Error('session setup failed');
@@ -1010,6 +1030,35 @@ describe('durable TaskStore persistence (issue #233)', () => {
         'canonical',
         'later',
       ]);
+    });
+
+    it('forces final on a custom interaction-ending status', async () => {
+      const store = new CloneTaskStore();
+      const agent = new CountingAgent({ name: 'counting' });
+      const runner = new InMemoryRunner({ agent, appName: 'durable-test' });
+      const server = new A2XServer({
+        taskStore: store,
+        executor: new NonFinalInputExecutor({
+          runner,
+          runConfig: { streamingMode: StreamingMode.SSE },
+        }),
+        protocolVersion: '0.3',
+      });
+      server.setDefaultUrl('https://example.com/a2a');
+      const handler = new DefaultRequestHandler(server);
+
+      const events = await drain(
+        (await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'message/stream',
+          params: { message: userMessage('hi') },
+        })) as AsyncGenerator<unknown>,
+      );
+
+      expect(events.map((event) => event.final)).toEqual([false, true]);
+      const stored = await store.getTask(store.ids[0]!);
+      expect(stored!.status.state).toBe(TaskState.INPUT_REQUIRED);
     });
 
     it('flushes artifacts when the terminal write fails transiently', async () => {
