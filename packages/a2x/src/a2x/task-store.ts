@@ -4,7 +4,7 @@
 
 import { randomUUID } from 'node:crypto';
 import type { Artifact, Message } from '../types/common.js';
-import type { Task, TaskStatus } from '../types/task.js';
+import type { Task, TaskArtifactUpdateEvent, TaskStatus } from '../types/task.js';
 import { TaskState, TERMINAL_STATES } from '../types/task.js';
 
 // ─── TaskStore Types ───
@@ -23,11 +23,89 @@ export interface TaskUpdate {
 
 // ─── TaskStore Interface ───
 
+/**
+ * Persistence contract for tasks.
+ *
+ * Implementations MUST behave as if every method crossed a process
+ * boundary: the objects handed out by `createTask()`, `getTask()` and
+ * `updateTask()` are snapshots, and mutating one must never change what a
+ * later `getTask()` returns. Callers therefore have to write every task
+ * transition back through `updateTask()`. `InMemoryTaskStore` returns
+ * defensive copies for exactly this reason — so code that accidentally
+ * relies on object identity fails in-memory too, instead of only against
+ * a durable (serializing) store.
+ */
 export interface TaskStore {
   createTask(params: CreateTaskParams): Promise<Task>;
   getTask(taskId: string): Promise<Task | null>;
   updateTask(taskId: string, update: TaskUpdate): Promise<Task>;
   deleteTask(taskId: string): Promise<void>;
+}
+
+/**
+ * Snapshot a task so callers cannot mutate stored state through the
+ * returned reference.
+ *
+ * `structuredClone` mirrors what a durable store's serialize/deserialize
+ * round trip does. Task metadata and part payloads are user-controlled
+ * though, and may hold values it refuses to clone (functions, class
+ * instances). The fallback copies every container the SDK itself
+ * assigns to, which is enough to break object identity, while leaving
+ * exotic payloads reachable.
+ */
+export function cloneTask(task: Task): Task {
+  try {
+    return structuredClone(task);
+  } catch {
+    return {
+      ...task,
+      status: {
+        ...task.status,
+        ...(task.status.message ? { message: { ...task.status.message } } : {}),
+      },
+      ...(task.artifacts
+        ? { artifacts: task.artifacts.map((a) => ({ ...a })) }
+        : {}),
+      ...(task.history ? { history: task.history.map((m) => ({ ...m })) } : {}),
+      ...(task.metadata ? { metadata: { ...task.metadata } } : {}),
+    };
+  }
+}
+
+/**
+ * Fold a streamed artifact update into an accumulating artifact list,
+ * following spec a2a-v0.3 §TaskArtifactUpdateEvent: `append: true` adds
+ * the event's parts to the artifact already carrying that `artifactId`,
+ * anything else replaces (or appends) the artifact wholesale.
+ *
+ * Returns a new array; the input list is left untouched.
+ */
+export function applyArtifactUpdate(
+  artifacts: readonly Artifact[],
+  event: Pick<TaskArtifactUpdateEvent, 'artifact' | 'append'>,
+): Artifact[] {
+  const next = [...artifacts];
+  const index = next.findIndex(
+    (a) => a.artifactId === event.artifact.artifactId,
+  );
+
+  if (event.append && index >= 0) {
+    const existing = next[index]!;
+    next[index] = {
+      ...existing,
+      ...event.artifact,
+      parts: [...existing.parts, ...event.artifact.parts],
+    };
+    return next;
+  }
+
+  if (index >= 0) {
+    next[index] = event.artifact;
+    return next;
+  }
+
+  next.push(event.artifact);
+  return next;
 }
 
 // ─── InMemoryTaskStore Options ───
@@ -76,13 +154,14 @@ export class InMemoryTaskStore implements TaskStore {
       },
       metadata: params.metadata,
     };
-    this.tasks.set(taskId, task);
-    return task;
+    this.tasks.set(taskId, cloneTask(task));
+    return cloneTask(task);
   }
 
   async getTask(taskId: string): Promise<Task | null> {
     this._evictIfExpired(taskId);
-    return this.tasks.get(taskId) ?? null;
+    const task = this.tasks.get(taskId);
+    return task ? cloneTask(task) : null;
   }
 
   async updateTask(taskId: string, update: TaskUpdate): Promise<Task> {
@@ -100,26 +179,23 @@ export class InMemoryTaskStore implements TaskStore {
       );
     }
 
-    if (update.status) {
-      task.status = update.status;
-    }
-    if (update.artifacts) {
-      task.artifacts = update.artifacts;
-    }
-    if (update.history) {
-      task.history = update.history;
-    }
-    if (update.metadata) {
-      task.metadata = { ...task.metadata, ...update.metadata };
-    }
+    const next: Task = {
+      ...task,
+      ...(update.status ? { status: update.status } : {}),
+      ...(update.artifacts ? { artifacts: update.artifacts } : {}),
+      ...(update.history ? { history: update.history } : {}),
+      ...(update.metadata
+        ? { metadata: { ...task.metadata, ...update.metadata } }
+        : {}),
+    };
 
     // Track when a task enters a terminal state for TTL eviction
     if (update.status && TERMINAL_STATES.has(update.status.state)) {
       this.terminalTimestamps.set(taskId, Date.now());
     }
 
-    this.tasks.set(taskId, task);
-    return task;
+    this.tasks.set(taskId, cloneTask(next));
+    return cloneTask(next);
   }
 
   async deleteTask(taskId: string): Promise<void> {

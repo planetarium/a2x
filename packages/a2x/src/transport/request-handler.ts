@@ -42,8 +42,10 @@ import {
   VersionNotSupportedError,
   type A2AError,
 } from '../types/errors.js';
+import type { Artifact } from '../types/common.js';
 import { V10_ROLE_TO_INTERNAL } from '../types/common.js';
 import { StreamingMode } from '../a2x/agent-executor.js';
+import { applyArtifactUpdate, type TaskUpdate } from '../a2x/task-store.js';
 import { JsonRpcRouter, type RouteContext } from './jsonrpc-router.js';
 import { isX402ExtensionUri } from '../x402/constants.js';
 import type { ResponseMapper } from '../a2x/response-mapper.js';
@@ -621,12 +623,22 @@ export class DefaultRequestHandler {
     // events can find the config when delivery is wired.
     await this._registerInlinePushConfig(task.id, params.configuration);
 
-    const completedTask = await this.a2xServer.agentExecutor.execute(
+    const executed = await this.a2xServer.agentExecutor.execute(
       task,
       params.message,
       context?.activatedExtensions
         ? { activatedExtensions: context.activatedExtensions }
         : undefined,
+    );
+
+    // `execute()` only mutates its Task argument — that object is a
+    // snapshot, so the transition has to be written back explicitly or a
+    // durable store keeps serving the pre-execution record. The response
+    // is mapped from what the store returned so it matches a subsequent
+    // `tasks/get` exactly.
+    const completedTask = await this._persistTaskState(
+      task.id,
+      taskUpdateFrom(executed),
     );
 
     const sliced = sliceHistory(
@@ -643,6 +655,33 @@ export class DefaultRequestHandler {
     }
 
     return this.responseMapper.mapTask(sliced, params.message);
+  }
+
+  /**
+   * Write a task transition through the `TaskStore`.
+   *
+   * Stores are free to hand out snapshots (`InMemoryTaskStore` does, and
+   * any serializing store does by nature), so every transition a handler
+   * observes must be persisted explicitly — otherwise the response and a
+   * later `tasks/get` disagree.
+   *
+   * The single tolerated failure is losing a race with `tasks/cancel`:
+   * the store then already holds a terminal record, and that record wins
+   * over whatever the executor produced afterwards.
+   */
+  private async _persistTaskState(
+    taskId: string,
+    update: TaskUpdate,
+  ): Promise<Task> {
+    try {
+      return await this.a2xServer.taskStore.updateTask(taskId, update);
+    } catch (error) {
+      const stored = await this.a2xServer.taskStore.getTask(taskId);
+      if (stored && TERMINAL_STATES.has(stored.status.state)) {
+        return stored;
+      }
+      throw error;
+    }
   }
 
   private async _registerInlinePushConfig(
@@ -722,21 +761,33 @@ export class DefaultRequestHandler {
 
     let reachedTerminal = false;
 
+    // The executor mutates its own Task snapshot, so the store only learns
+    // about the stream through these writes. Artifact chunks are folded
+    // into `artifacts` and flushed with the next status write (statuses
+    // are rare, text chunks are not) — the terminal write therefore
+    // carries the complete artifact set.
+    let artifacts: Artifact[] = [];
+    let unflushedArtifacts = false;
+
     // finally closes the bus so resubscribers see the stream end regardless
     // of how the primary stream terminates (normal, error, cancel via return).
     try {
       for await (const event of eventStream) {
-        // Update task in store for non-terminal status events.
-        // Terminal states are already applied by AgentExecutor (same object
-        // reference), so calling updateTask would hit the guard.
         if ('status' in event) {
           if (TERMINAL_STATES.has(event.status.state)) {
             reachedTerminal = true;
-          } else {
-            await this.a2xServer.taskStore.updateTask(task.id, {
-              status: event.status,
-            });
           }
+          await this._persistTaskState(task.id, {
+            status: event.status,
+            ...(unflushedArtifacts ? { artifacts } : {}),
+          });
+          unflushedArtifacts = false;
+        } else {
+          artifacts = applyArtifactUpdate(
+            artifacts,
+            event as TaskArtifactUpdateEvent,
+          );
+          unflushedArtifacts = true;
         }
         bus.publish(task.id, event);
         if ('status' in event) {
@@ -747,6 +798,16 @@ export class DefaultRequestHandler {
       }
     } finally {
       bus.close(task.id);
+      // Artifacts emitted after the last status event (abort, client
+      // disconnect) still belong in the store. Best-effort: the stream is
+      // already unwinding, possibly because of an error we must not mask.
+      if (unflushedArtifacts) {
+        try {
+          await this._persistTaskState(task.id, { artifacts });
+        } catch {
+          // Nothing left to report the failure on.
+        }
+      }
       if (reachedTerminal) {
         // Re-fetch the task so the webhook body reflects the final
         // store state (artifacts accumulated during streaming, etc).
@@ -807,9 +868,13 @@ export class DefaultRequestHandler {
       );
     }
 
-    const canceledTask = await this.a2xServer.agentExecutor.cancel(task);
+    const canceled = await this.a2xServer.agentExecutor.cancel(task);
+    const persisted = await this._persistTaskState(
+      params.id,
+      taskUpdateFrom(canceled),
+    );
 
-    return this.responseMapper.mapTask(canceledTask);
+    return this.responseMapper.mapTask(persisted);
   }
 
   private async _handleDeletePushNotificationConfig(
@@ -1324,6 +1389,19 @@ export class DefaultRequestHandler {
       metadata: p.metadata as Record<string, unknown> | undefined,
     };
   }
+}
+
+/**
+ * Project a Task snapshot onto the `TaskUpdate` shape so every field the
+ * executor may have touched is written back to the store in one call.
+ */
+function taskUpdateFrom(task: Task): TaskUpdate {
+  return {
+    status: task.status,
+    ...(task.artifacts ? { artifacts: task.artifacts } : {}),
+    ...(task.history ? { history: task.history } : {}),
+    ...(task.metadata ? { metadata: task.metadata } : {}),
+  };
 }
 
 /**
