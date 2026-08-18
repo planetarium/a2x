@@ -56,6 +56,7 @@ jobs:
           - os: ubuntu-latest
             script: binaries:non-macos
             artifact: binaries-non-macos
+            smoke_binary: packages/cli/binaries/a2x-linux-x64
           # macOS runner builds Mach-O binaries so @yao-pkg/pkg can apply an
           # ad-hoc codesign (`codesign -s -`) as its post-build step. Apple
           # Silicon rejects unsigned Mach-O at exec time (SIGKILL / EBADEXEC),
@@ -63,6 +64,7 @@ jobs:
           - os: macos-14
             script: binaries:macos
             artifact: binaries-macos
+            smoke_binary: packages/cli/binaries/a2x-macos-arm64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -92,6 +94,9 @@ jobs:
               exit 1
             fi
           done
+
+      - name: Verify standalone x402 signing
+        run: node packages/cli/scripts/smoke-x402-binary.mjs ${{ matrix.smoke_binary }}
 
       - uses: actions/upload-artifact@v7
         with:

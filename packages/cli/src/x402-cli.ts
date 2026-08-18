@@ -8,6 +8,8 @@
  * message instead of the generic "no supported requirement" error.
  */
 
+import './x402-peer-loaders.js';
+
 import chalk from 'chalk';
 import type { A2XClientX402Options } from '@a2x/sdk';
 import {

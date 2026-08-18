@@ -12,6 +12,20 @@
 
 import { X402PeerMissingError } from './errors.js';
 
+type X402PeerModule = Record<string, unknown>;
+type X402PeerLoader = () => Promise<X402PeerModule>;
+
+const X402_PEER_LOADERS = Symbol.for('@a2x/sdk/x402-peer-loaders');
+
+function registeredPeerLoader(specifier: string): X402PeerLoader | undefined {
+  const registry = (globalThis as unknown as Record<PropertyKey, unknown>)[
+    X402_PEER_LOADERS
+  ];
+  if (!registry || typeof registry !== 'object') return undefined;
+  const loader = (registry as Record<string, unknown>)[specifier];
+  return typeof loader === 'function' ? (loader as X402PeerLoader) : undefined;
+}
+
 /** Resolution failures that mean "the package isn't installed / reachable". */
 const MODULE_NOT_FOUND_CODES = new Set([
   'ERR_MODULE_NOT_FOUND',
@@ -51,10 +65,14 @@ export function isMissingPeer(err: unknown, packageName: string): boolean {
  */
 export async function importX402Peer(
   specifier: string,
-): Promise<Record<string, unknown>> {
+): Promise<X402PeerModule> {
   try {
+    const load = registeredPeerLoader(specifier);
+    if (load) return await load();
     // Keep the specifier opaque to bundlers that statically inspect dynamic
-    // imports, so the peer is not required unless this path executes.
+    // imports, so the peer is not required unless this path executes. A host
+    // producing a closed-world bundle can register statically discoverable
+    // loaders above; the standalone CLI does this for @yao-pkg/pkg.
     return await import(/* @vite-ignore */ specifier);
   } catch (err) {
     const packageName = packageNameOf(specifier);
