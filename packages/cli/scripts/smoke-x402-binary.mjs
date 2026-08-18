@@ -13,8 +13,32 @@ const binary = isAbsolute(binaryArg) ? binaryArg : resolve(binaryArg);
 const privateKey = `0x${'11'.repeat(32)}`;
 const extension = 'https://github.com/google-a2a/a2a-x402/v0.1';
 const network = 'eip155:84532';
+const amount = '1000';
+const asset = '0x036CbD53842c5426634e7929541eC2318f3dCF7e';
+const payTo = '0x2222222222222222222222222222222222222222';
+const signerAddress = '0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A';
 const taskRoot = await mkdtemp(join(tmpdir(), 'a2x-x402-smoke-'));
 let paymentSubmitted = false;
+
+function isSignedExactPayment(metadata) {
+  if (metadata['x402.payment.status'] !== 'payment-submitted') return false;
+  const envelope = metadata['x402.payment.payload'];
+  const accepted = envelope?.accepted;
+  const authorization = envelope?.payload?.authorization;
+  const signature = envelope?.payload?.signature;
+  return (
+    envelope?.x402Version === 2 &&
+    accepted?.scheme === 'exact' &&
+    accepted?.network === network &&
+    accepted?.amount === amount &&
+    accepted?.asset?.toLowerCase() === asset.toLowerCase() &&
+    accepted?.payTo?.toLowerCase() === payTo.toLowerCase() &&
+    authorization?.from?.toLowerCase() === signerAddress.toLowerCase() &&
+    authorization?.to?.toLowerCase() === payTo.toLowerCase() &&
+    authorization?.value === amount &&
+    /^0x[0-9a-f]{130}$/i.test(signature)
+  );
+}
 
 function run(args, env) {
   return new Promise((resolveRun, reject) => {
@@ -61,7 +85,7 @@ const server = createServer((request, response) => {
   request.on('end', () => {
     const rpc = JSON.parse(body);
     const metadata = rpc.params?.message?.metadata ?? {};
-    paymentSubmitted = metadata['x402.payment.status'] === 'payment-submitted';
+    paymentSubmitted = isSignedExactPayment(metadata);
     const timestamp = new Date().toISOString();
     const status = paymentSubmitted
       ? {
@@ -99,9 +123,9 @@ const server = createServer((request, response) => {
                   {
                     scheme: 'exact',
                     network,
-                    amount: '1000',
-                    asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
-                    payTo: '0x2222222222222222222222222222222222222222',
+                    amount,
+                    asset,
+                    payTo,
                     maxTimeoutSeconds: 300,
                     extra: { name: 'USDC', version: '2' },
                   },

@@ -50,3 +50,38 @@ jobs:
       - run: pnpm build
       - run: pnpm typecheck
       - run: pnpm test
+
+  standalone-x402:
+    if: github.event_name == 'pull_request'
+    name: standalone x402 (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x64
+            target: node22-linux-x64
+          - os: macos-14
+            label: macos-arm64
+            target: node22-macos-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v4.4.0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @a2x/sdk build
+      - run: pnpm --filter @a2x/cli build
+
+      - name: Build host standalone binary
+        run: pnpm --filter @a2x/cli exec pkg bin-bundle/a2x.cjs --targets ${{ matrix.target }} --output binaries/a2x-smoke --compress Brotli --public
+
+      - name: Verify standalone x402 signing
+        run: node packages/cli/scripts/smoke-x402-binary.mjs packages/cli/binaries/a2x-smoke
