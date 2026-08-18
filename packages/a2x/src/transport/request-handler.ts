@@ -840,7 +840,9 @@ export class DefaultRequestHandler {
             status: event.status,
             ...(artifacts.length > 0 ? { artifacts } : {}),
           };
-          pendingStatusWrite = { event, update };
+          pendingStatusWrite = isInteractionEndingStatus(event)
+            ? { event, update }
+            : undefined;
           const persisted = await this._persistTaskState(task.id, update);
           pendingStatusWrite = undefined;
 

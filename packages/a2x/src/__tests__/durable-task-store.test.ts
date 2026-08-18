@@ -172,6 +172,19 @@ class TerminalWriteFailsOnceStore extends CloneTaskStore {
   }
 }
 
+/** Simulates a transient outage on the initial WORKING write. */
+class WorkingWriteFailsOnceStore extends CloneTaskStore {
+  private failed = false;
+
+  override async updateTask(taskId: string, update: TaskUpdate): Promise<Task> {
+    if (!this.failed && update.status?.state === TaskState.WORKING) {
+      this.failed = true;
+      throw new Error('transient working write failure');
+    }
+    return super.updateTask(taskId, update);
+  }
+}
+
 /** Simulates a persistent storage outage after task creation. */
 class UpdateFailsStore extends CloneTaskStore {
   override async updateTask(): Promise<Task> {
@@ -1039,6 +1052,27 @@ describe('durable TaskStore persistence (issue #233)', () => {
 
       const stored = await store.getTask(store.ids[0]!);
       expect(stored!.status.state).toBe(TaskState.SUBMITTED);
+    });
+
+    it('does not retry a failed WORKING write into a zombie state', async () => {
+      const store = new WorkingWriteFailsOnceStore();
+      const { handler } = createServerWithStore(
+        new EchoAgent({ name: 'echo' }),
+        store,
+      );
+      const stream = (await handler.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/stream',
+        params: { message: userMessage('hi') },
+      })) as AsyncGenerator<unknown>;
+
+      const envelope = (await stream.next()).value as JSONRPCResponse;
+      expect('error' in envelope).toBe(true);
+
+      const stored = await store.getTask(store.ids[0]!);
+      expect(stored!.status.state).toBe(TaskState.SUBMITTED);
+      expect(store.writes).toHaveLength(0);
     });
   });
 
