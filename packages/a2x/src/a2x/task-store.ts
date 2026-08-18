@@ -35,8 +35,10 @@ export interface TaskUpdate {
  * accidentally relies on object identity fails in-memory too, instead of
  * only against a durable (serializing) store. An update must be applied
  * atomically against the latest stored task so concurrent artifact, status,
- * and cancellation writes cannot overwrite one another. Non-serializable
- * exotic leaf values in user metadata may retain identity.
+ * and cancellation writes cannot overwrite one another. Implementations
+ * MUST reject any `update.status` after the stored task reaches a terminal
+ * state so a stale writer cannot replace the winning terminal transition.
+ * Non-serializable exotic leaf values in user metadata may retain identity.
  */
 export interface TaskStore {
   createTask(params: CreateTaskParams): Promise<Task>;

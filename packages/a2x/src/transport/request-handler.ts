@@ -792,6 +792,7 @@ export class DefaultRequestHandler {
 
     let reachedTerminal = false;
     let interactionEnded = false;
+    let streamFailed = false;
     let pendingStatusWrite:
       | { event: TaskStatusUpdateEvent; update: TaskUpdate }
       | undefined;
@@ -909,6 +910,9 @@ export class DefaultRequestHandler {
         bus.publish(task.id, canceled);
         yield this.responseMapper.mapStatusUpdateEvent(canceled);
       }
+    } catch (error) {
+      streamFailed = true;
+      throw error;
     } finally {
       // Retry an interaction-ending status once after a transient store
       // failure. The original stream still reports the write error, but a
@@ -934,7 +938,7 @@ export class DefaultRequestHandler {
       // Returning the primary generator aborts the executor. If no final
       // interaction status was persisted, record that local cancellation
       // so tasks/get and a later resubscribe cannot hang on a WORKING zombie.
-      if (!interactionEnded) {
+      if (!interactionEnded && !streamFailed) {
         try {
           const persisted = await this._persistTaskState(task.id, {
             status: {

@@ -172,6 +172,13 @@ class TerminalWriteFailsOnceStore extends CloneTaskStore {
   }
 }
 
+/** Simulates a persistent storage outage after task creation. */
+class UpdateFailsStore extends CloneTaskStore {
+  override async updateTask(): Promise<Task> {
+    throw new Error('persistent update failure');
+  }
+}
+
 /** Yields one text chunk, one data artifact, then completes. */
 class EchoAgent extends BaseAgent {
   async *run(context: InvocationContext): AsyncGenerator<AgentEvent> {
@@ -1012,6 +1019,26 @@ describe('durable TaskStore persistence (issue #233)', () => {
       const stored = await store.getTask(store.ids[0]!);
       expect(stored!.status.state).toBe(TaskState.COMPLETED);
       expect(stored!.artifacts).toHaveLength(2);
+    });
+
+    it('does not record canceled when the stream fails server-side', async () => {
+      const store = new UpdateFailsStore();
+      const { handler } = createServerWithStore(
+        new EchoAgent({ name: 'echo' }),
+        store,
+      );
+      const stream = (await handler.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/stream',
+        params: { message: userMessage('hi') },
+      })) as AsyncGenerator<unknown>;
+
+      const envelope = (await stream.next()).value as JSONRPCResponse;
+      expect('error' in envelope).toBe(true);
+
+      const stored = await store.getTask(store.ids[0]!);
+      expect(stored!.status.state).toBe(TaskState.SUBMITTED);
     });
   });
 
