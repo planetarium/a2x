@@ -1,5 +1,43 @@
 # @a2x/sdk
 
+## 0.23.0
+
+### Minor Changes
+
+- [#234](https://github.com/planetarium/a2x/pull/234) [`a65ca3d`](https://github.com/planetarium/a2x/commit/a65ca3dad61debd1d843c692efeddaa3680e6640) Thanks [@longfin](https://github.com/longfin)! - Make `TaskStore` values true snapshots across in-memory and durable implementations.
+  
+  `InMemoryTaskStore` now returns defensive copies from every method, matching stores that serialize tasks through Redis or a database. Mutating a returned task no longer changes stored state; custom handlers and executors must persist every transition with `updateTask()`.
+  
+  This is a breaking correction for custom code that relied on `InMemoryTaskStore` handing out its live object reference. That code must call `updateTask()` explicitly.
+  
+  Two helpers are exported for custom implementations: `cloneTask()` for snapshotting, and `applyArtifactUpdate()` for folding streamed artifact chunks according to `append` semantics. When `structuredClone()` cannot copy user metadata, `cloneTask()` recursively isolates standard task, message, artifact, part, map, and set containers while retaining only non-cloneable exotic leaves.
+
+### Patch Changes
+
+- [#234](https://github.com/planetarium/a2x/pull/234) [`c917f18`](https://github.com/planetarium/a2x/commit/c917f181236afdc2642c74cd264fe36e1b082532) Thanks [@longfin](https://github.com/longfin)! - Preserve artifacts across every `AgentExecutor` terminal path.
+  
+  Blocking and streaming execution now retain text, file, and data artifacts produced before an error. An agent generator that returns without yielding `done` is finalized as completed on both transports, including a terminal streaming status, instead of leaving a durable streaming task stuck in `working`. Session-creation failures likewise become persisted failed tasks rather than stranding the last pre-execution state.
+
+- [#234](https://github.com/planetarium/a2x/pull/234) [`da03fa5`](https://github.com/planetarium/a2x/commit/da03fa51f690538cb989241d1e4a685a779bfde1) Thanks [@longfin](https://github.com/longfin)! - Preserve artifacts across input-required continuation turns.
+  
+  Blocking input requests now retain artifacts just like streaming requests, later turns merge rather than erase earlier artifacts, and artifact ids are allocated against the task's existing ids so resumed output cannot silently replace prior output.
+
+- [#234](https://github.com/planetarium/a2x/pull/234) [`da03fa5`](https://github.com/planetarium/a2x/commit/da03fa51f690538cb989241d1e4a685a779bfde1) Thanks [@longfin](https://github.com/longfin)! - Persist every default-handler task transition through `TaskStore.updateTask()`.
+  
+  Blocking and streaming responses, streamed artifacts, status transitions, and cancellation now agree with a subsequent `tasks/get` when the store returns serialized snapshots. Streamed artifacts are written before delivery, status writes carry their complete artifact set, transient terminal writes are retried during cleanup, and a terminal state that wins a concurrent write is returned as the authoritative stream result.
+
+- [#234](https://github.com/planetarium/a2x/pull/234) [`da03fa5`](https://github.com/planetarium/a2x/commit/da03fa51f690538cb989241d1e4a685a779bfde1) Thanks [@longfin](https://github.com/longfin)! - Emit the first streamed text artifact chunk with `append: false`.
+  
+  Later text chunks continue with `append: true`, and the final consolidated artifact still replaces the accumulated value. This gives strict A2A clients a base artifact before any append update, including streams that end in failure or an input request.
+
+- [#234](https://github.com/planetarium/a2x/pull/234) [`da03fa5`](https://github.com/planetarium/a2x/commit/da03fa51f690538cb989241d1e4a685a779bfde1) Thanks [@longfin](https://github.com/longfin)! - Keep stream cancellation and persisted task state consistent.
+  
+  Cancellation no longer lets an aborted stream synthesize `completed`, cancellation during session creation no longer enters agent code, and every concurrent in-process execution for the task receives the abort. Disconnecting the primary stream records `canceled` instead of leaving a `working` task that cannot be resubscribed, while resubscribe immediately replays interaction-ending `input-required` and `auth-required` states. Custom cancellation implementations must return a terminal state to report success.
+
+- [#234](https://github.com/planetarium/a2x/pull/234) [`c917f18`](https://github.com/planetarium/a2x/commit/c917f181236afdc2642c74cd264fe36e1b082532) Thanks [@longfin](https://github.com/longfin)! - Emit the required `final` field on every v0.3 task status update.
+  
+  Non-final updates carry `final: false`; interaction-ending completed, failed, input-required, auth-required, and terminal resubscribe updates carry `final: true`. The v1.0 wire format remains unchanged.
+
 ## 0.22.0
 
 ### Minor Changes
