@@ -115,6 +115,10 @@ export class AgentExecutor {
             break;
           case 'request-input': {
             inputRequested = true;
+            // Content produced before the halt is part of the task
+            // document. `executeStream` emits it as artifact events, so
+            // dropping it here would lose it on `message/send` only.
+            attachArtifacts(task, artifacts, textParts);
             applyInputRequired(task, event.metadata, event.message);
             // Halt the agent's generator without raising — the for-await
             // unwinds via the explicit return below, and the finally
@@ -123,13 +127,7 @@ export class AgentExecutor {
             return task;
           }
           case 'done':
-            // Collect accumulated text into an artifact (if any).
-            if (textParts.length > 0) {
-              artifacts.push({
-                artifactId: `artifact-${task.id}-text`,
-                parts: [{ text: textParts.join('') }],
-              });
-            }
+            attachArtifacts(task, artifacts, textParts);
             task.status = {
               state: TaskState.COMPLETED,
               timestamp: new Date().toISOString(),
@@ -144,9 +142,6 @@ export class AgentExecutor {
                   }
                 : {}),
             };
-            if (artifacts.length > 0) {
-              task.artifacts = artifacts;
-            }
             completedNormally = true;
             return task;
           case 'error':
@@ -438,6 +433,33 @@ export class AgentExecutor {
 }
 
 // ─── Module-private helpers ───
+
+/**
+ * Attach what a non-streaming run collected, folding the accumulated text
+ * chunks into the single text artifact `executeStream` emits under the
+ * same id. Leaves `task.artifacts` untouched when the run produced
+ * nothing, so a resumed task keeps what it already carried.
+ */
+function attachArtifacts(
+  task: Task,
+  artifacts: Artifact[],
+  textParts: string[],
+): void {
+  const collected =
+    textParts.length > 0
+      ? [
+          ...artifacts,
+          {
+            artifactId: `artifact-${task.id}-text`,
+            parts: [{ text: textParts.join('') }],
+          },
+        ]
+      : artifacts;
+
+  if (collected.length > 0) {
+    task.artifacts = collected;
+  }
+}
 
 /**
  * Set the task to INPUT_REQUIRED, merging the agent-supplied metadata

@@ -14,7 +14,7 @@ Characteristics:
 
 - All state lives in the process's memory.
 - Lost on restart. Not shared across replicas.
-- Has a TTL and max-size cap so it doesn't leak (default values are sane; tune via constructor options).
+- Supports a TTL and a max-size cap so it doesn't leak. **Both default to unlimited** — pass `ttlMs` / `maxSize` to the constructor to bound it.
 
 Good for: local development, stateless serverless functions where each invocation owns its own tasks, demos.
 
@@ -132,14 +132,19 @@ Two consequences:
 - **Custom stores must not return their live record.** Return a copy (`structuredClone`, or the value you just deserialized). `cloneTask(task)` is exported for this.
 - **Custom handlers or executors must write every transition back** with `updateTask()`. Setting `task.status = ...` on a task you were handed persists nothing.
 
-The SDK's `DefaultRequestHandler` does exactly that: it writes the result of `message/send`, each `message/stream` status transition (with the artifacts accumulated so far), and `tasks/cancel` through `updateTask()`, so the response a caller receives always matches a subsequent `tasks/get`.
+The SDK's `DefaultRequestHandler` does exactly that: it writes the `working` transition, the result of `message/send`, each `message/stream` status transition (with the artifacts accumulated so far), and `tasks/cancel` through `updateTask()`, so the response a caller receives always matches a subsequent `tasks/get`.
+
+Two details worth knowing when you write a store:
+
+- **The terminal write carries the final artifact set.** The handler does not patch artifacts onto a task after it terminated, so a store that rejects *every* update to a terminal task (stricter than `InMemoryTaskStore`, which only rejects status changes) stays correct.
+- **Artifacts survive across turns.** `updateTask` replaces the artifact list, but a continuation turn (`input-required` → resume) starts the agent's list from scratch, so the handler folds the new artifacts onto the ones the task already carried. Same `artifactId` supersedes.
 
 If you fold streamed artifact chunks yourself, `applyArtifactUpdate(artifacts, event)` implements the spec's `append` semantics (append to the artifact with the same `artifactId`, otherwise replace):
 
 ```ts
-import { applyArtifactUpdate } from '@a2x/sdk';
+import { applyArtifactUpdate, type Artifact } from '@a2x/sdk';
 
-let artifacts = [];
+let artifacts: Artifact[] = [];
 for await (const event of stream) {
   if ('artifact' in event) {
     artifacts = applyArtifactUpdate(artifacts, event);

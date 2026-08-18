@@ -233,6 +233,33 @@ describe('Layer 3: TaskStore', () => {
       expect(await store.getTask(t2.id)).not.toBeNull();
     });
 
+    it('should combine TTL and maxSize', async () => {
+      const now = 1000000;
+      vi.spyOn(Date, 'now').mockReturnValue(now);
+
+      const store = new InMemoryTaskStore({ maxSize: 5, ttlMs: 3000 });
+
+      // Create and complete 2 tasks
+      const t1 = await store.createTask({});
+      await store.updateTask(t1.id, {
+        status: { state: TaskState.COMPLETED, timestamp: new Date().toISOString() },
+      });
+      const t2 = await store.createTask({});
+      await store.updateTask(t2.id, {
+        status: { state: TaskState.FAILED, timestamp: new Date().toISOString() },
+      });
+
+      // Advance past TTL and create new task — both expired tasks should be swept
+      vi.spyOn(Date, 'now').mockReturnValue(now + 4000);
+      await store.createTask({});
+
+      expect(store.size).toBe(1);
+      expect(await store.getTask(t1.id)).toBeNull();
+      expect(await store.getTask(t2.id)).toBeNull();
+    });
+  });
+
+  describe('InMemoryTaskStore snapshot isolation', () => {
     it('should hand out snapshots, not the stored task (issue #233)', async () => {
       const store = new InMemoryTaskStore();
       const created = await store.createTask({ metadata: { a: 1 } });
@@ -251,6 +278,25 @@ describe('Layer 3: TaskStore', () => {
       expect(stored!.status.state).toBe(TaskState.SUBMITTED);
       expect(stored!.artifacts).toBeUndefined();
       expect(stored!.metadata).toEqual({ a: 1 });
+    });
+
+    it('should snapshot the task returned by getTask', async () => {
+      const store = new InMemoryTaskStore();
+      const created = await store.createTask({});
+      await store.updateTask(created.id, {
+        artifacts: [{ artifactId: 'a-1', parts: [{ text: 'hi' }] }],
+      });
+
+      const first = await store.getTask(created.id);
+      first!.status = {
+        state: TaskState.FAILED,
+        timestamp: new Date().toISOString(),
+      };
+      first!.artifacts![0]!.parts.push({ text: 'leaked' });
+
+      const second = await store.getTask(created.id);
+      expect(second!.status.state).toBe(TaskState.SUBMITTED);
+      expect(second!.artifacts![0]!.parts).toHaveLength(1);
     });
 
     it('should snapshot the task returned by updateTask', async () => {
@@ -276,31 +322,6 @@ describe('Layer 3: TaskStore', () => {
       const stored = await store.getTask(created.id);
       expect(stored!.status.state).toBe(TaskState.SUBMITTED);
       expect(typeof stored!.metadata!.onDone).toBe('function');
-    });
-
-    it('should combine TTL and maxSize', async () => {
-      const now = 1000000;
-      vi.spyOn(Date, 'now').mockReturnValue(now);
-
-      const store = new InMemoryTaskStore({ maxSize: 5, ttlMs: 3000 });
-
-      // Create and complete 2 tasks
-      const t1 = await store.createTask({});
-      await store.updateTask(t1.id, {
-        status: { state: TaskState.COMPLETED, timestamp: new Date().toISOString() },
-      });
-      const t2 = await store.createTask({});
-      await store.updateTask(t2.id, {
-        status: { state: TaskState.FAILED, timestamp: new Date().toISOString() },
-      });
-
-      // Advance past TTL and create new task — both expired tasks should be swept
-      vi.spyOn(Date, 'now').mockReturnValue(now + 4000);
-      await store.createTask({});
-
-      expect(store.size).toBe(1);
-      expect(await store.getTask(t1.id)).toBeNull();
-      expect(await store.getTask(t2.id)).toBeNull();
     });
   });
 

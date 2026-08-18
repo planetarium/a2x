@@ -623,6 +623,18 @@ export class DefaultRequestHandler {
     // events can find the config when delivery is wired.
     await this._registerInlinePushConfig(task.id, params.configuration);
 
+    // The executor marks its own snapshot WORKING; write that first so a
+    // concurrent `tasks/get` reports `working` for the duration of a long
+    // execution instead of the pre-execution state. `message/stream`
+    // persists the same transition as its first event.
+    await this._persistTaskState(task.id, {
+      status: { state: TaskState.WORKING, timestamp: new Date().toISOString() },
+    });
+
+    // Captured before `execute()`, which overwrites `task.artifacts` with
+    // only what this turn produced.
+    const priorArtifacts = task.artifacts ?? [];
+
     const executed = await this.a2xServer.agentExecutor.execute(
       task,
       params.message,
@@ -636,10 +648,11 @@ export class DefaultRequestHandler {
     // durable store keeps serving the pre-execution record. The response
     // is mapped from what the store returned so it matches a subsequent
     // `tasks/get` exactly.
-    const completedTask = await this._persistTaskState(
-      task.id,
-      taskUpdateFrom(executed),
-    );
+    const update = taskUpdateFrom(executed);
+    if (executed.artifacts) {
+      update.artifacts = mergeArtifacts(priorArtifacts, executed.artifacts);
+    }
+    const completedTask = await this._persistTaskState(task.id, update);
 
     const sliced = sliceHistory(
       completedTask,
@@ -676,7 +689,14 @@ export class DefaultRequestHandler {
     try {
       return await this.a2xServer.taskStore.updateTask(taskId, update);
     } catch (error) {
-      const stored = await this.a2xServer.taskStore.getTask(taskId);
+      // The write failure is the root cause — a failing recovery read
+      // must not replace it in the error surfaced to the caller.
+      let stored: Task | null = null;
+      try {
+        stored = await this.a2xServer.taskStore.getTask(taskId);
+      } catch {
+        throw error;
+      }
       if (stored && TERMINAL_STATES.has(stored.status.state)) {
         return stored;
       }
@@ -766,7 +786,11 @@ export class DefaultRequestHandler {
     // into `artifacts` and flushed with the next status write (statuses
     // are rare, text chunks are not) — the terminal write therefore
     // carries the complete artifact set.
-    let artifacts: Artifact[] = [];
+    //
+    // Seeded from the task's own artifacts: a continuation turn restarts
+    // the executor's artifact list, and writes replace rather than merge,
+    // so starting empty would drop what an earlier turn already produced.
+    let artifacts: Artifact[] = [...(task.artifacts ?? [])];
     let unflushedArtifacts = false;
 
     // finally closes the bus so resubscribers see the stream end regardless
@@ -799,9 +823,11 @@ export class DefaultRequestHandler {
     } finally {
       bus.close(task.id);
       // Artifacts emitted after the last status event (abort, client
-      // disconnect) still belong in the store. Best-effort: the stream is
-      // already unwinding, possibly because of an error we must not mask.
-      if (unflushedArtifacts) {
+      // disconnect) still belong in the store. A terminal event already
+      // flushed them, and a terminal task's content must not keep
+      // changing afterwards. Best-effort: the stream is already
+      // unwinding, possibly because of an error we must not mask.
+      if (unflushedArtifacts && !reachedTerminal) {
         try {
           await this._persistTaskState(task.id, { artifacts });
         } catch {
@@ -873,6 +899,15 @@ export class DefaultRequestHandler {
       params.id,
       taskUpdateFrom(canceled),
     );
+
+    // The task can reach a different terminal state between the guard
+    // above and this write. The store's terminal record wins, and a
+    // cancel that did not take effect must not answer with success.
+    if (persisted.status.state !== TaskState.CANCELED) {
+      throw new TaskNotCancelableError(
+        `Task '${params.id}' reached terminal state '${persisted.status.state}' before it could be canceled`,
+      );
+    }
 
     return this.responseMapper.mapTask(persisted);
   }
@@ -1389,6 +1424,26 @@ export class DefaultRequestHandler {
       metadata: p.metadata as Record<string, unknown> | undefined,
     };
   }
+}
+
+/**
+ * Fold the artifacts one execution produced onto the ones the task
+ * already carried.
+ *
+ * `updateTask` replaces the artifact list, and a continuation turn
+ * (`input-required` → resume) starts the executor's list from scratch, so
+ * writing that list verbatim would drop artifacts the client was handed
+ * on an earlier turn. Same `artifactId` still supersedes, per spec
+ * a2a-v0.3 §TaskArtifactUpdateEvent.
+ */
+function mergeArtifacts(
+  prior: readonly Artifact[],
+  produced: readonly Artifact[],
+): Artifact[] {
+  return produced.reduce<Artifact[]>(
+    (accumulated, artifact) => applyArtifactUpdate(accumulated, { artifact }),
+    [...prior],
+  );
 }
 
 /**

@@ -61,15 +61,26 @@ export function cloneTask(task: Task): Task {
       ...task,
       status: {
         ...task.status,
-        ...(task.status.message ? { message: { ...task.status.message } } : {}),
+        ...(task.status.message
+          ? { message: copyMessage(task.status.message) }
+          : {}),
       },
       ...(task.artifacts
-        ? { artifacts: task.artifacts.map((a) => ({ ...a })) }
+        ? {
+            artifacts: task.artifacts.map((a) => ({
+              ...a,
+              parts: [...a.parts],
+            })),
+          }
         : {}),
-      ...(task.history ? { history: task.history.map((m) => ({ ...m })) } : {}),
+      ...(task.history ? { history: task.history.map(copyMessage) } : {}),
       ...(task.metadata ? { metadata: { ...task.metadata } } : {}),
     };
   }
+}
+
+function copyMessage(message: Message): Message {
+  return { ...message, parts: [...message.parts] };
 }
 
 /**

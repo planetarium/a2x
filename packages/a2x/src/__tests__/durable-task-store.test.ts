@@ -26,7 +26,11 @@ import type {
 } from '../a2x/task-store.js';
 import { TaskState, TERMINAL_STATES } from '../types/task.js';
 import type { Task } from '../types/task.js';
-import type { JSONRPCResponse } from '../types/jsonrpc.js';
+import type {
+  JSONRPCResponse,
+  JSONRPCErrorResponse,
+} from '../types/jsonrpc.js';
+import { A2A_ERROR_CODES } from '../types/errors.js';
 
 // Ensure mappers are registered
 import '../a2x/index.js';
@@ -39,6 +43,20 @@ import '../a2x/index.js';
  */
 class CloneTaskStore implements TaskStore {
   private readonly tasks = new Map<string, Task>();
+
+  /** Every update the handler wrote, in order, for write-shape assertions. */
+  readonly writes: TaskUpdate[] = [];
+
+  get ids(): string[] {
+    return [...this.tasks.keys()];
+  }
+
+  /**
+   * When set, the store refuses *any* write to a terminal task, not just a
+   * status change. Durable stores are commonly this strict; a handler that
+   * relies on patching a task after it terminated silently loses the data.
+   */
+  constructor(private readonly strictTerminal = false) {}
 
   async createTask(params: CreateTaskParams): Promise<Task> {
     const task: Task = {
@@ -64,7 +82,11 @@ class CloneTaskStore implements TaskStore {
     if (!current) {
       throw new Error(`Task not found: ${taskId}`);
     }
-    if (update.status && TERMINAL_STATES.has(current.status.state)) {
+    this.writes.push(structuredClone(update));
+    if (
+      (update.status || this.strictTerminal) &&
+      TERMINAL_STATES.has(current.status.state)
+    ) {
       throw new Error(
         `Cannot update task in terminal state '${current.status.state}': ${taskId}`,
       );
@@ -85,6 +107,29 @@ class CloneTaskStore implements TaskStore {
 
   async deleteTask(taskId: string): Promise<void> {
     this.tasks.delete(taskId);
+  }
+}
+
+/**
+ * Completes the task behind the handler's back between `tasks/cancel`'s
+ * guard read and its write — the race the handler's terminal fallback
+ * exists for. The guard therefore sees a stale, still-cancelable record.
+ */
+class RacingTaskStore extends CloneTaskStore {
+  completeOnNextRead: string | undefined;
+
+  override async getTask(taskId: string): Promise<Task | null> {
+    const stale = await super.getTask(taskId);
+    if (stale && this.completeOnNextRead === taskId) {
+      this.completeOnNextRead = undefined;
+      await super.updateTask(taskId, {
+        status: {
+          state: TaskState.COMPLETED,
+          timestamp: new Date().toISOString(),
+        },
+      });
+    }
+    return stale;
   }
 }
 
@@ -127,12 +172,46 @@ class TwoTurnAgent extends BaseAgent {
   }
 }
 
-function createServerWithStore(agent: BaseAgent): {
+/** Emits one data artifact per turn, so both turns of a resume produce one. */
+class TwoTurnArtifactAgent extends BaseAgent {
+  async *run(context: InvocationContext): AsyncGenerator<AgentEvent> {
+    const resumed =
+      (context.message?.metadata as { 'test.token'?: string } | undefined)
+        ?.['test.token'] === 'tok-1';
+
+    if (!resumed) {
+      yield { type: 'data', data: { turn: 1 } };
+      yield { type: 'request-input', metadata: { 'test.required': true } };
+      return;
+    }
+
+    yield { type: 'text', role: 'agent', text: 'turn-2' };
+    yield { type: 'done' };
+  }
+}
+
+/** Blocks inside `run()` until the test releases it. */
+class GatedAgent extends BaseAgent {
+  readonly started = Promise.withResolvers<void>();
+  readonly release = Promise.withResolvers<void>();
+
+  async *run(): AsyncGenerator<AgentEvent> {
+    this.started.resolve();
+    await this.release.promise;
+    yield { type: 'text', role: 'agent', text: 'late' };
+    yield { type: 'done' };
+  }
+}
+
+function createServerWithStore(
+  agent: BaseAgent,
+  store?: CloneTaskStore,
+): {
   taskStore: CloneTaskStore;
   a2xServer: A2XServer;
   handler: DefaultRequestHandler;
 } {
-  const taskStore = new CloneTaskStore();
+  const taskStore = store ?? new CloneTaskStore();
   const runner = new InMemoryRunner({ agent, appName: 'durable-test' });
   const executor = new AgentExecutor({
     runner,
@@ -207,6 +286,12 @@ async function drain(
     events.push(result);
   }
   return events;
+}
+
+function dataOf(task: WireTask): unknown[] {
+  return (task.artifacts ?? []).flatMap((a) =>
+    a.parts.filter((p) => p.data !== undefined).map((p) => p.data),
+  );
 }
 
 function textOf(task: WireTask): string[] {
@@ -367,6 +452,132 @@ describe('durable TaskStore persistence (issue #233)', () => {
     });
   });
 
+  describe('write discipline', () => {
+    it('persists the working transition before the agent runs', async () => {
+      const agent = new GatedAgent({ name: 'gated' });
+      const { handler, taskStore } = createServerWithStore(agent);
+
+      const inFlight = send(handler, { message: userMessage('hi') });
+      await agent.started.promise;
+
+      // A long blocking execution must be observable as `working` rather
+      // than looking like it was never picked up.
+      const fetched = await getTask(handler, taskStore.ids[0]!);
+      expect(fetched.status.state).toBe(TaskState.WORKING);
+
+      agent.release.resolve();
+      await inFlight;
+    });
+
+    it('carries the artifacts in the terminal write itself', async () => {
+      // Strict store: any write to a terminal task is rejected, so a
+      // terminal status write that omits artifacts loses them for good.
+      const store = new CloneTaskStore(true);
+      const { handler } = createServerWithStore(
+        new EchoAgent({ name: 'echo' }),
+        store,
+      );
+
+      const stream = (await handler.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/stream',
+        params: { message: userMessage('hi') },
+      })) as AsyncGenerator<unknown>;
+      const events = await drain(stream);
+
+      const terminalWrite = store.writes.at(-1)!;
+      expect(terminalWrite.status?.state).toBe(TaskState.COMPLETED);
+      expect(terminalWrite.artifacts).toHaveLength(2);
+
+      const fetched = await getTask(handler, events[0]!.taskId as string);
+      expect(textOf(fetched)).toEqual(['echo:hi']);
+    });
+
+    it('flushes artifacts left unwritten when the client disconnects', async () => {
+      const { handler, taskStore } = createServerWithStore(
+        new EchoAgent({ name: 'echo' }),
+      );
+
+      const stream = (await handler.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/stream',
+        params: { message: userMessage('hi') },
+      })) as AsyncGenerator<unknown>;
+
+      // Consume the `working` status and the first artifact chunk, then
+      // walk away — the chunk has not been written to the store yet.
+      const first = (await stream.next()).value as { result: WireTask };
+      await stream.next();
+      await stream.return(undefined);
+
+      const taskId = (first.result as unknown as { taskId: string }).taskId;
+      const stored = await taskStore.getTask(taskId);
+      expect(stored!.status.state).toBe(TaskState.WORKING);
+      expect(stored!.artifacts).toHaveLength(1);
+    });
+  });
+
+  describe('artifacts across turns', () => {
+    it('keeps earlier-turn artifacts when a continuation completes (blocking)', async () => {
+      const { handler } = createServerWithStore(
+        new TwoTurnArtifactAgent({ name: 'two-turn-artifacts' }),
+      );
+
+      const parked = await send(handler, { message: userMessage('buy') });
+      expect(parked.status.state).toBe(TaskState.INPUT_REQUIRED);
+
+      const settled = await send(handler, {
+        message: userMessage('paid', {
+          taskId: parked.id,
+          metadata: { 'test.token': 'tok-1' },
+        }),
+      });
+      expect(settled.status.state).toBe(TaskState.COMPLETED);
+
+      // Turn 2 must not erase what turn 1 already produced.
+      const fetched = await getTask(handler, parked.id);
+      expect(textOf(fetched)).toEqual(['turn-2']);
+      expect(dataOf(fetched)).toEqual([{ turn: 1 }]);
+    });
+
+    it('keeps earlier-turn artifacts when a continuation completes (streaming)', async () => {
+      const { handler } = createServerWithStore(
+        new TwoTurnArtifactAgent({ name: 'two-turn-artifacts' }),
+      );
+
+      const first = await drain(
+        (await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'message/stream',
+          params: { message: userMessage('buy') },
+        })) as AsyncGenerator<unknown>,
+      );
+      const taskId = first[0]!.taskId as string;
+
+      await drain(
+        (await handler.handle({
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'message/stream',
+          params: {
+            message: userMessage('paid', {
+              taskId,
+              metadata: { 'test.token': 'tok-1' },
+            }),
+          },
+        })) as AsyncGenerator<unknown>,
+      );
+
+      const fetched = await getTask(handler, taskId);
+      expect(fetched.status.state).toBe(TaskState.COMPLETED);
+      expect(textOf(fetched)).toEqual(['turn-2']);
+      expect(dataOf(fetched)).toEqual([{ turn: 1 }]);
+    });
+  });
+
   describe('tasks/cancel', () => {
     it('persists the canceled status', async () => {
       const { handler, taskStore } = createServerWithStore(
@@ -388,6 +599,33 @@ describe('durable TaskStore persistence (issue #233)', () => {
 
       const fetched = await getTask(handler, parked.id);
       expect(fetched.status.state).toBe(TaskState.CANCELED);
+    });
+
+    it('reports not-cancelable when the task terminates during the cancel', async () => {
+      const store = new RacingTaskStore();
+      const { handler } = createServerWithStore(
+        new TwoTurnAgent({ name: 'two-turn' }),
+        store,
+      );
+
+      const parked = await send(handler, { message: userMessage('buy') });
+      store.completeOnNextRead = parked.id;
+
+      const response = (await handler.handle({
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tasks/cancel',
+        params: { id: parked.id },
+      })) as JSONRPCResponse;
+
+      // A cancel that lost the race must not answer with success — and
+      // must not overwrite the terminal state that won.
+      expect('error' in response).toBe(true);
+      expect((response as JSONRPCErrorResponse).error.code).toBe(
+        A2A_ERROR_CODES.TASK_NOT_CANCELABLE,
+      );
+      const stored = await store.getTask(parked.id);
+      expect(stored!.status.state).toBe(TaskState.COMPLETED);
     });
   });
 });
