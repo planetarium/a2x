@@ -137,7 +137,7 @@ The SDK's `DefaultRequestHandler` does exactly that: it writes the `working` tra
 Two details worth knowing when you write a store:
 
 - **The terminal write carries the final artifact set.** The handler does not patch artifacts onto a task after it terminated, so a store that rejects *every* update to a terminal task (stricter than `InMemoryTaskStore`, which only rejects status changes) stays correct.
-- **Artifacts survive across turns.** `updateTask` replaces the artifact list, but a continuation turn (`input-required` → resume) starts the agent's list from scratch, so the handler folds the new artifacts onto the ones the task already carried. Same `artifactId` supersedes.
+- **Artifacts survive across turns.** `updateTask` replaces the artifact list, but a continuation turn (`input-required` → resume) starts the agent's list from scratch, so the handler folds the new artifacts onto the ones the task already carried. Same `artifactId` supersedes — and `AgentExecutor` allocates ids against what the task already holds, so a later turn does not collide with an earlier one.
 
 If you fold streamed artifact chunks yourself, `applyArtifactUpdate(artifacts, event)` implements the spec's `append` semantics (append to the artifact with the same `artifactId`, otherwise replace):
 

@@ -80,7 +80,7 @@ export class AgentExecutor {
 
     const artifacts: Artifact[] = [];
     const textParts: string[] = [];
-    let nonTextSeq = 0;
+    const artifactIds = new ArtifactIdAllocator(task.id, task.artifacts);
     let completedNormally = false;
     let inputRequested = false;
 
@@ -98,13 +98,13 @@ export class AgentExecutor {
             break;
           case 'file':
             artifacts.push({
-              artifactId: `artifact-${task.id}-file-${++nonTextSeq}`,
+              artifactId: artifactIds.next('file'),
               parts: [{ ...event.file }],
             });
             break;
           case 'data':
             artifacts.push({
-              artifactId: `artifact-${task.id}-data-${++nonTextSeq}`,
+              artifactId: artifactIds.next('data'),
               parts: [
                 {
                   data: event.data,
@@ -118,7 +118,7 @@ export class AgentExecutor {
             // Content produced before the halt is part of the task
             // document. `executeStream` emits it as artifact events, so
             // dropping it here would lose it on `message/send` only.
-            attachArtifacts(task, artifacts, textParts);
+            attachArtifacts(task, artifacts, textParts, artifactIds);
             applyInputRequired(task, event.metadata, event.message);
             // Halt the agent's generator without raising — the for-await
             // unwinds via the explicit return below, and the finally
@@ -127,7 +127,7 @@ export class AgentExecutor {
             return task;
           }
           case 'done':
-            attachArtifacts(task, artifacts, textParts);
+            attachArtifacts(task, artifacts, textParts, artifactIds);
             task.status = {
               state: TaskState.COMPLETED,
               timestamp: new Date().toISOString(),
@@ -234,13 +234,13 @@ export class AgentExecutor {
       status: task.status,
     };
 
+    const artifactIds = new ArtifactIdAllocator(task.id, task.artifacts);
     let completedNormally = false;
     let inputRequested = false;
 
     try {
       const textParts: string[] = [];
       const nonTextArtifacts: Artifact[] = [];
-      let nonTextSeq = 0;
 
       for await (const event of this.runner.runAsync(session, message, abortController.signal, {
         taskId: task.id,
@@ -256,7 +256,7 @@ export class AgentExecutor {
               taskId: task.id,
               contextId,
               artifact: {
-                artifactId: `artifact-${task.id}-text`,
+                artifactId: artifactIds.text(),
                 parts: [{ text: event.text }],
               },
               append: true,
@@ -266,7 +266,7 @@ export class AgentExecutor {
 
           case 'file': {
             const artifact: Artifact = {
-              artifactId: `artifact-${task.id}-file-${++nonTextSeq}`,
+              artifactId: artifactIds.next('file'),
               parts: [{ ...event.file }],
             };
             nonTextArtifacts.push(artifact);
@@ -282,7 +282,7 @@ export class AgentExecutor {
 
           case 'data': {
             const artifact: Artifact = {
-              artifactId: `artifact-${task.id}-data-${++nonTextSeq}`,
+              artifactId: artifactIds.next('data'),
               parts: [
                 {
                   data: event.data,
@@ -318,7 +318,7 @@ export class AgentExecutor {
 
             if (textParts.length > 0) {
               const artifact: Artifact = {
-                artifactId: `artifact-${task.id}-text`,
+                artifactId: artifactIds.text(),
                 parts: [{ text: textParts.join('') }],
               };
               finalArtifacts.push(artifact);
@@ -435,6 +435,56 @@ export class AgentExecutor {
 // ─── Module-private helpers ───
 
 /**
+ * Allocates artifact ids that stay unique across the turns of one task.
+ *
+ * A resumed task runs a fresh executor pass, so ids derived from a
+ * per-run counter would repeat the previous turn's — and since
+ * `artifactId` is what identifies an artifact within a task (spec
+ * a2a-v0.3 §TaskArtifactUpdateEvent), a repeat silently supersedes the
+ * earlier artifact instead of adding a new one. Ids are therefore
+ * allocated against what the task already carries; a task's first turn
+ * keeps the plain `-text` / `-data-1` form.
+ */
+class ArtifactIdAllocator {
+  private readonly taskId: string;
+  private readonly taken: Set<string>;
+  private seq = 0;
+  private textId: string | undefined;
+
+  constructor(taskId: string, existing?: readonly Artifact[]) {
+    this.taskId = taskId;
+    this.taken = new Set((existing ?? []).map((a) => a.artifactId));
+  }
+
+  /** Stable within a turn — streamed chunks append to one text artifact. */
+  text(): string {
+    this.textId ??= this._claim(`artifact-${this.taskId}-text`);
+    return this.textId;
+  }
+
+  next(kind: 'data' | 'file'): string {
+    let id: string;
+    do {
+      id = `artifact-${this.taskId}-${kind}-${++this.seq}`;
+    } while (this.taken.has(id));
+    this.taken.add(id);
+    return id;
+  }
+
+  private _claim(base: string): string {
+    if (!this.taken.has(base)) {
+      this.taken.add(base);
+      return base;
+    }
+    let suffix = 2;
+    while (this.taken.has(`${base}-${suffix}`)) suffix++;
+    const id = `${base}-${suffix}`;
+    this.taken.add(id);
+    return id;
+  }
+}
+
+/**
  * Attach what a non-streaming run collected, folding the accumulated text
  * chunks into the single text artifact `executeStream` emits under the
  * same id. Leaves `task.artifacts` untouched when the run produced
@@ -444,13 +494,14 @@ function attachArtifacts(
   task: Task,
   artifacts: Artifact[],
   textParts: string[],
+  artifactIds: ArtifactIdAllocator,
 ): void {
   const collected =
     textParts.length > 0
       ? [
           ...artifacts,
           {
-            artifactId: `artifact-${task.id}-text`,
+            artifactId: artifactIds.text(),
             parts: [{ text: textParts.join('') }],
           },
         ]

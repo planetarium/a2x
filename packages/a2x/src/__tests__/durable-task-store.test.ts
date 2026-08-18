@@ -172,7 +172,10 @@ class TwoTurnAgent extends BaseAgent {
   }
 }
 
-/** Emits one data artifact per turn, so both turns of a resume produce one. */
+/**
+ * Emits the same *kinds* of artifact on both turns of a resume — the case
+ * where a per-run id counter makes turn 2 collide with turn 1.
+ */
 class TwoTurnArtifactAgent extends BaseAgent {
   async *run(context: InvocationContext): AsyncGenerator<AgentEvent> {
     const resumed =
@@ -181,10 +184,12 @@ class TwoTurnArtifactAgent extends BaseAgent {
 
     if (!resumed) {
       yield { type: 'data', data: { turn: 1 } };
+      yield { type: 'text', role: 'agent', text: 'turn-1' };
       yield { type: 'request-input', metadata: { 'test.required': true } };
       return;
     }
 
+    yield { type: 'data', data: { turn: 2 } };
     yield { type: 'text', role: 'agent', text: 'turn-2' };
     yield { type: 'done' };
   }
@@ -286,6 +291,11 @@ async function drain(
     events.push(result);
   }
   return events;
+}
+
+function expectUniqueArtifactIds(task: WireTask): void {
+  const ids = (task.artifacts ?? []).map((a) => a.artifactId);
+  expect(new Set(ids).size).toBe(ids.length);
 }
 
 function dataOf(task: WireTask): unknown[] {
@@ -536,10 +546,12 @@ describe('durable TaskStore persistence (issue #233)', () => {
       });
       expect(settled.status.state).toBe(TaskState.COMPLETED);
 
-      // Turn 2 must not erase what turn 1 already produced.
+      // Turn 2 must not erase what turn 1 already produced, and must not
+      // reuse its artifact ids to do it.
       const fetched = await getTask(handler, parked.id);
-      expect(textOf(fetched)).toEqual(['turn-2']);
-      expect(dataOf(fetched)).toEqual([{ turn: 1 }]);
+      expect(dataOf(fetched)).toEqual([{ turn: 1 }, { turn: 2 }]);
+      expect(textOf(fetched)).toEqual(['turn-1', 'turn-2']);
+      expectUniqueArtifactIds(fetched);
     });
 
     it('keeps earlier-turn artifacts when a continuation completes (streaming)', async () => {
@@ -573,8 +585,56 @@ describe('durable TaskStore persistence (issue #233)', () => {
 
       const fetched = await getTask(handler, taskId);
       expect(fetched.status.state).toBe(TaskState.COMPLETED);
-      expect(textOf(fetched)).toEqual(['turn-2']);
-      expect(dataOf(fetched)).toEqual([{ turn: 1 }]);
+      expect(dataOf(fetched)).toEqual([{ turn: 1 }, { turn: 2 }]);
+      expect(textOf(fetched)).toEqual(['turn-1', 'turn-2']);
+      expectUniqueArtifactIds(fetched);
+    });
+
+    it('allocates the same ids for a resumed turn on either transport', async () => {
+      const blocking = createServerWithStore(
+        new TwoTurnArtifactAgent({ name: 'two-turn-artifacts' }),
+      );
+      const parked = await send(blocking.handler, { message: userMessage('buy') });
+      await send(blocking.handler, {
+        message: userMessage('paid', {
+          taskId: parked.id,
+          metadata: { 'test.token': 'tok-1' },
+        }),
+      });
+      const viaSend = await getTask(blocking.handler, parked.id);
+
+      const streaming = createServerWithStore(
+        new TwoTurnArtifactAgent({ name: 'two-turn-artifacts' }),
+      );
+      const first = await drain(
+        (await streaming.handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'message/stream',
+          params: { message: userMessage('buy') },
+        })) as AsyncGenerator<unknown>,
+      );
+      const streamedId = first[0]!.taskId as string;
+      await drain(
+        (await streaming.handler.handle({
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'message/stream',
+          params: {
+            message: userMessage('paid', {
+              taskId: streamedId,
+              metadata: { 'test.token': 'tok-1' },
+            }),
+          },
+        })) as AsyncGenerator<unknown>,
+      );
+      const viaStream = await getTask(streaming.handler, streamedId);
+
+      const suffixes = (task: WireTask, id: string) =>
+        (task.artifacts ?? []).map((a) => a.artifactId.replace(id, '<task>'));
+      expect(suffixes(viaStream, streamedId)).toEqual(
+        suffixes(viaSend, parked.id),
+      );
     });
   });
 
