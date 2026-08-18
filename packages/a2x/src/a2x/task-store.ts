@@ -27,13 +27,14 @@ export interface TaskUpdate {
  * Persistence contract for tasks.
  *
  * Implementations MUST behave as if every method crossed a process
- * boundary: the objects handed out by `createTask()`, `getTask()` and
- * `updateTask()` are snapshots, and mutating one must never change what a
- * later `getTask()` returns. Callers therefore have to write every task
- * transition back through `updateTask()`. `InMemoryTaskStore` returns
- * defensive copies for exactly this reason — so code that accidentally
- * relies on object identity fails in-memory too, instead of only against
- * a durable (serializing) store.
+ * boundary: the standard Task containers handed out by `createTask()`,
+ * `getTask()` and `updateTask()` are snapshots, and mutating one must not
+ * change what a later `getTask()` returns. Callers therefore have to write
+ * every task transition back through `updateTask()`. `InMemoryTaskStore`
+ * returns defensive copies for exactly this reason — so code that
+ * accidentally relies on object identity fails in-memory too, instead of
+ * only against a durable (serializing) store. Non-serializable exotic leaf
+ * values in user metadata may retain identity.
  */
 export interface TaskStore {
   createTask(params: CreateTaskParams): Promise<Task>;
@@ -49,38 +50,76 @@ export interface TaskStore {
  * `structuredClone` mirrors what a durable store's serialize/deserialize
  * round trip does. Task metadata and part payloads are user-controlled
  * though, and may hold values it refuses to clone (functions, class
- * instances). The fallback copies every container the SDK itself
- * assigns to, which is enough to break object identity, while leaving
- * exotic payloads reachable.
+ * instances). The fallback recursively copies arrays, plain objects,
+ * maps, and sets while retaining only non-cloneable exotic leaf values.
  */
 export function cloneTask(task: Task): Task {
   try {
     return structuredClone(task);
   } catch {
-    return {
-      ...task,
-      status: {
-        ...task.status,
-        ...(task.status.message
-          ? { message: copyMessage(task.status.message) }
-          : {}),
-      },
-      ...(task.artifacts
-        ? {
-            artifacts: task.artifacts.map((a) => ({
-              ...a,
-              parts: [...a.parts],
-            })),
-          }
-        : {}),
-      ...(task.history ? { history: task.history.map(copyMessage) } : {}),
-      ...(task.metadata ? { metadata: { ...task.metadata } } : {}),
-    };
+    return cloneFallbackValue(task);
   }
 }
 
-function copyMessage(message: Message): Message {
-  return { ...message, parts: [...message.parts] };
+function cloneFallbackValue<T>(
+  value: T,
+  seen = new WeakMap<object, unknown>(),
+): T {
+  if (value === null || typeof value !== 'object') return value;
+
+  const source = value as object;
+  const existing = seen.get(source);
+  if (existing !== undefined) return existing as T;
+
+  if (Array.isArray(value)) {
+    const copy: unknown[] = [];
+    seen.set(source, copy);
+    for (const item of value) copy.push(cloneFallbackValue(item, seen));
+    return copy as T;
+  }
+
+  if (value instanceof Map) {
+    const copy = new Map<unknown, unknown>();
+    seen.set(source, copy);
+    for (const [key, item] of value) {
+      copy.set(
+        cloneFallbackValue(key, seen),
+        cloneFallbackValue(item, seen),
+      );
+    }
+    return copy as T;
+  }
+
+  if (value instanceof Set) {
+    const copy = new Set<unknown>();
+    seen.set(source, copy);
+    for (const item of value) copy.add(cloneFallbackValue(item, seen));
+    return copy as T;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    try {
+      return structuredClone(value);
+    } catch {
+      // Functions and class instances can be meaningful metadata values.
+      // Preserve the leaf rather than rejecting the whole task; every
+      // standard container leading to it has already been isolated.
+      return value;
+    }
+  }
+
+  const copy = Object.create(prototype) as Record<PropertyKey, unknown>;
+  seen.set(source, copy);
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor) continue;
+    if ('value' in descriptor) {
+      descriptor.value = cloneFallbackValue(descriptor.value, seen);
+    }
+    Object.defineProperty(copy, key, descriptor);
+  }
+  return copy as T;
 }
 
 /**

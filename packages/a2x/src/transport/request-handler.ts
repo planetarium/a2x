@@ -627,16 +627,27 @@ export class DefaultRequestHandler {
     // concurrent `tasks/get` reports `working` for the duration of a long
     // execution instead of the pre-execution state. `message/stream`
     // persists the same transition as its first event.
-    await this._persistTaskState(task.id, {
+    const workingTask = await this._persistTaskState(task.id, {
       status: { state: TaskState.WORKING, timestamp: new Date().toISOString() },
     });
 
-    // Captured before `execute()`, which overwrites `task.artifacts` with
-    // only what this turn produced.
-    const priorArtifacts = task.artifacts ?? [];
+    // Cancellation can win between resolving the task and writing WORKING.
+    // `_persistTaskState` returns the terminal store record in that case;
+    // executing anyway would run agent side effects for an already-canceled
+    // task.
+    if (TERMINAL_STATES.has(workingTask.status.state)) {
+      return this.responseMapper.mapTask(
+        sliceHistory(workingTask, params.configuration?.historyLength),
+        params.message,
+      );
+    }
+
+    // Captured before `execute()`, which overwrites the snapshot's artifacts
+    // with only what this turn produced.
+    const priorArtifacts = workingTask.artifacts ?? [];
 
     const executed = await this.a2xServer.agentExecutor.execute(
-      task,
+      workingTask,
       params.message,
       context?.activatedExtensions
         ? { activatedExtensions: context.activatedExtensions }
@@ -652,7 +663,7 @@ export class DefaultRequestHandler {
     if (executed.artifacts) {
       update.artifacts = mergeArtifacts(priorArtifacts, executed.artifacts);
     }
-    const completedTask = await this._persistTaskState(task.id, update);
+    const completedTask = await this._persistTaskState(workingTask.id, update);
 
     const sliced = sliceHistory(
       completedTask,
@@ -790,7 +801,9 @@ export class DefaultRequestHandler {
     // Seeded from the task's own artifacts: a continuation turn restarts
     // the executor's artifact list, and writes replace rather than merge,
     // so starting empty would drop what an earlier turn already produced.
-    let artifacts: Artifact[] = [...(task.artifacts ?? [])];
+    const priorArtifacts = task.artifacts ?? [];
+    const initialTaskArtifacts = task.artifacts;
+    let artifacts: Artifact[] = [...priorArtifacts];
     let unflushedArtifacts = false;
 
     // finally closes the bus so resubscribers see the stream end regardless
@@ -798,13 +811,23 @@ export class DefaultRequestHandler {
     try {
       for await (const event of eventStream) {
         if ('status' in event) {
-          if (TERMINAL_STATES.has(event.status.state)) {
-            reachedTerminal = true;
+          const terminal = TERMINAL_STATES.has(event.status.state);
+          // The default executor writes a canonical current-turn artifact
+          // set onto its Task snapshot before an interaction-ending status.
+          // Prefer it when present so blocking and streaming persist the
+          // same artifact order while still retaining earlier turns.
+          if (task.artifacts && task.artifacts !== initialTaskArtifacts) {
+            artifacts = mergeArtifacts(priorArtifacts, task.artifacts);
+            unflushedArtifacts = true;
           }
           await this._persistTaskState(task.id, {
             status: event.status,
             ...(unflushedArtifacts ? { artifacts } : {}),
           });
+          // A terminal event only counts after its store write succeeds.
+          // If the write fails, `finally` must still flush artifacts and
+          // must not dispatch a non-terminal task as a terminal webhook.
+          if (terminal) reachedTerminal = true;
           unflushedArtifacts = false;
         } else {
           artifacts = applyArtifactUpdate(
@@ -858,6 +881,7 @@ export class DefaultRequestHandler {
         taskId: task.id,
         contextId: task.contextId ?? task.id,
         status: task.status,
+        final: true,
       };
       yield this.responseMapper.mapStatusUpdateEvent(terminal);
       return;
@@ -900,12 +924,13 @@ export class DefaultRequestHandler {
       taskUpdateFrom(canceled),
     );
 
-    // The task can reach a different terminal state between the guard
-    // above and this write. The store's terminal record wins, and a
-    // cancel that did not take effect must not answer with success.
-    if (persisted.status.state !== TaskState.CANCELED) {
+    // The task can reach a different state between the guard above and
+    // this write. Compare against what the executor requested rather than
+    // requiring CANCELED: custom executors may complete graceful cleanup
+    // during cancel, and that successful result must remain representable.
+    if (persisted.status.state !== canceled.status.state) {
       throw new TaskNotCancelableError(
-        `Task '${params.id}' reached terminal state '${persisted.status.state}' before it could be canceled`,
+        `Task '${params.id}' transitioned to '${persisted.status.state}' while cancellation requested '${canceled.status.state}'`,
       );
     }
 

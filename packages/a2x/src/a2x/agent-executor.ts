@@ -68,7 +68,6 @@ export class AgentExecutor {
   ): Promise<Task> {
     const contextId = task.contextId ?? task.id;
 
-    const session = await this.runner.createSession();
     const abortController = new AbortController();
     this._abortControllers.set(task.id, abortController);
 
@@ -85,6 +84,7 @@ export class AgentExecutor {
     let inputRequested = false;
 
     try {
+      const session = await this.runner.createSession();
       for await (const event of this.runner.runAsync(session, message, abortController.signal, {
         taskId: task.id,
         contextId,
@@ -145,6 +145,7 @@ export class AgentExecutor {
             completedNormally = true;
             return task;
           case 'error':
+            attachArtifacts(task, artifacts, textParts, artifactIds);
             task.status = {
               state: TaskState.FAILED,
               message: {
@@ -169,16 +170,15 @@ export class AgentExecutor {
       // completed status. This matches the legacy behavior for agents that
       // simply return from run() after emitting text.
       if (!abortController.signal.aborted) {
+        attachArtifacts(task, artifacts, textParts, artifactIds);
         task.status = {
           state: TaskState.COMPLETED,
           timestamp: new Date().toISOString(),
         };
-        if (artifacts.length > 0) {
-          task.artifacts = artifacts;
-        }
       }
       completedNormally = true;
     } catch (error) {
+      attachArtifacts(task, artifacts, textParts, artifactIds);
       task.status = {
         state: TaskState.FAILED,
         message: {
@@ -219,28 +219,31 @@ export class AgentExecutor {
   ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
     const contextId = task.contextId ?? task.id;
 
-    const session = await this.runner.createSession();
     const abortController = new AbortController();
     this._abortControllers.set(task.id, abortController);
-
-    // Emit working status
-    task.status = {
-      state: TaskState.WORKING,
-      timestamp: new Date().toISOString(),
-    };
-    yield {
-      taskId: task.id,
-      contextId,
-      status: task.status,
-    };
 
     const artifactIds = new ArtifactIdAllocator(task.id, task.artifacts);
     let completedNormally = false;
     let inputRequested = false;
+    const textParts: string[] = [];
+    const nonTextArtifacts: Artifact[] = [];
 
     try {
-      const textParts: string[] = [];
-      const nonTextArtifacts: Artifact[] = [];
+      const session = await this.runner.createSession();
+
+      // Emit working status only after session creation succeeds. A session
+      // setup failure is reported as FAILED below instead of stranding a
+      // durably persisted task in WORKING.
+      task.status = {
+        state: TaskState.WORKING,
+        timestamp: new Date().toISOString(),
+      };
+      yield {
+        taskId: task.id,
+        contextId,
+        status: task.status,
+        final: false,
+      } satisfies TaskStatusUpdateEvent;
 
       for await (const event of this.runner.runAsync(session, message, abortController.signal, {
         taskId: task.id,
@@ -303,11 +306,13 @@ export class AgentExecutor {
 
           case 'request-input': {
             inputRequested = true;
+            attachArtifacts(task, nonTextArtifacts, textParts, artifactIds);
             applyInputRequired(task, event.metadata, event.message);
             yield {
               taskId: task.id,
               contextId,
               status: task.status,
+              final: true,
             } satisfies TaskStatusUpdateEvent;
             completedNormally = true;
             return;
@@ -353,12 +358,14 @@ export class AgentExecutor {
               taskId: task.id,
               contextId,
               status: task.status,
+              final: true,
             } satisfies TaskStatusUpdateEvent;
             completedNormally = true;
             return;
           }
 
           case 'error':
+            attachArtifacts(task, nonTextArtifacts, textParts, artifactIds);
             task.status = {
               state: TaskState.FAILED,
               message: {
@@ -373,6 +380,7 @@ export class AgentExecutor {
               taskId: task.id,
               contextId,
               status: task.status,
+              final: true,
             } satisfies TaskStatusUpdateEvent;
             completedNormally = true;
             return;
@@ -382,8 +390,32 @@ export class AgentExecutor {
       if (inputRequested) {
         return;
       }
+
+      // Agents may finish by returning instead of yielding `done`. Finalize
+      // the same artifact set and status that the blocking path synthesizes.
+      attachArtifacts(task, nonTextArtifacts, textParts, artifactIds);
+      if (textParts.length > 0) {
+        yield {
+          taskId: task.id,
+          contextId,
+          artifact: task.artifacts!.at(-1)!,
+          append: false,
+          lastChunk: true,
+        } satisfies TaskArtifactUpdateEvent;
+      }
+      task.status = {
+        state: TaskState.COMPLETED,
+        timestamp: new Date().toISOString(),
+      };
+      yield {
+        taskId: task.id,
+        contextId,
+        status: task.status,
+        final: true,
+      } satisfies TaskStatusUpdateEvent;
       completedNormally = true;
     } catch (error) {
+      attachArtifacts(task, nonTextArtifacts, textParts, artifactIds);
       task.status = {
         state: TaskState.FAILED,
         message: {
@@ -404,6 +436,7 @@ export class AgentExecutor {
         taskId: task.id,
         contextId,
         status: task.status,
+        final: true,
       } satisfies TaskStatusUpdateEvent;
       completedNormally = true;
     } finally {

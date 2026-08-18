@@ -316,12 +316,56 @@ describe('Layer 3: TaskStore', () => {
     it('should keep tasks usable when metadata cannot be structured-cloned', async () => {
       const store = new InMemoryTaskStore();
       const created = await store.createTask({
-        metadata: { onDone: () => 'not cloneable' },
+        metadata: {
+          onDone: () => 'not cloneable',
+          nested: { value: 'stored' },
+        },
+      });
+      const updated = await store.updateTask(created.id, {
+        status: {
+          state: TaskState.WORKING,
+          timestamp: new Date().toISOString(),
+          message: {
+            messageId: 'status-1',
+            role: 'agent',
+            parts: [{ text: 'working' }],
+            metadata: { nested: { value: 'stored' } },
+          },
+        },
+        artifacts: [
+          {
+            artifactId: 'a-1',
+            parts: [{ data: { nested: { value: 'stored' } } }],
+          },
+        ],
       });
 
-      const stored = await store.getTask(created.id);
-      expect(stored!.status.state).toBe(TaskState.SUBMITTED);
-      expect(typeof stored!.metadata!.onDone).toBe('function');
+      (updated.metadata!.nested as { value: string }).value = 'leaked';
+      const artifactPart = updated.artifacts![0]!.parts[0] as {
+        data: { nested: { value: string } };
+      };
+      artifactPart.data.nested.value = 'leaked';
+      const messageMetadata = updated.status.message!.metadata!.nested as {
+        value: string;
+      };
+      messageMetadata.value = 'leaked';
+
+      const first = await store.getTask(created.id);
+      expect(typeof first!.metadata!.onDone).toBe('function');
+      expect(first!.metadata!.nested).toEqual({ value: 'stored' });
+      expect(first!.artifacts![0]!.parts[0]).toEqual({
+        data: { nested: { value: 'stored' } },
+      });
+      expect(first!.status.message!.metadata!.nested).toEqual({
+        value: 'stored',
+      });
+
+      (first!.artifacts![0]!.parts[0] as { data: { nested: { value: string } } })
+        .data.nested.value = 'leaked-again';
+      const second = await store.getTask(created.id);
+      expect(second!.artifacts![0]!.parts[0]).toEqual({
+        data: { nested: { value: 'stored' } },
+      });
     });
   });
 

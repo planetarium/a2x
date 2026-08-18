@@ -125,7 +125,7 @@ const a2xServer = new A2XServer({ taskStore, executor });
 
 ## Tasks handed out are snapshots
 
-Every `Task` a store returns is a **snapshot**. Mutating it changes nothing on the store side — a serializing store parsed it out of JSON, and `InMemoryTaskStore` deliberately returns defensive copies so that in-memory development behaves the same way as production.
+Every `Task` a store returns is a **snapshot**. Mutating its standard task, message, artifact, part, or metadata containers changes nothing on the store side — a serializing store parsed it out of JSON, and `InMemoryTaskStore` deliberately returns defensive copies so that in-memory development behaves the same way as production. If metadata contains a value that cannot be serialized or structured-cloned, such as a function or class instance, `cloneTask()` retains that exotic leaf while still isolating every standard container around it.
 
 Two consequences:
 

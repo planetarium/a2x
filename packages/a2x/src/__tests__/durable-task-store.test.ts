@@ -133,6 +133,41 @@ class RacingTaskStore extends CloneTaskStore {
   }
 }
 
+/** Cancels the task just before the handler's WORKING write lands. */
+class CancelBeforeWorkingStore extends CloneTaskStore {
+  private injected = false;
+
+  override async updateTask(taskId: string, update: TaskUpdate): Promise<Task> {
+    if (!this.injected && update.status?.state === TaskState.WORKING) {
+      this.injected = true;
+      await super.updateTask(taskId, {
+        status: {
+          state: TaskState.CANCELED,
+          timestamp: new Date().toISOString(),
+        },
+      });
+    }
+    return super.updateTask(taskId, update);
+  }
+}
+
+/** Simulates a recoverable outage on the first terminal write. */
+class TerminalWriteFailsOnceStore extends CloneTaskStore {
+  private failed = false;
+
+  override async updateTask(taskId: string, update: TaskUpdate): Promise<Task> {
+    if (
+      !this.failed &&
+      update.status &&
+      TERMINAL_STATES.has(update.status.state)
+    ) {
+      this.failed = true;
+      throw new Error('transient terminal write failure');
+    }
+    return super.updateTask(taskId, update);
+  }
+}
+
 /** Yields one text chunk, one data artifact, then completes. */
 class EchoAgent extends BaseAgent {
   async *run(context: InvocationContext): AsyncGenerator<AgentEvent> {
@@ -206,6 +241,65 @@ class GatedAgent extends BaseAgent {
     yield { type: 'text', role: 'agent', text: 'late' };
     yield { type: 'done' };
   }
+}
+
+class CountingAgent extends BaseAgent {
+  runs = 0;
+
+  async *run(): AsyncGenerator<AgentEvent> {
+    this.runs++;
+    yield { type: 'done' };
+  }
+}
+
+class ErrorAfterArtifactsAgent extends BaseAgent {
+  async *run(): AsyncGenerator<AgentEvent> {
+    yield { type: 'text', role: 'agent', text: 'before-error' };
+    yield { type: 'data', data: { retained: true } };
+    yield { type: 'error', error: new Error('failed intentionally') };
+  }
+}
+
+class ImplicitCompletionAgent extends BaseAgent {
+  async *run(): AsyncGenerator<AgentEvent> {
+    yield { type: 'text', role: 'agent', text: 'implicit' };
+    yield { type: 'data', data: { retained: true } };
+  }
+}
+
+class CompletingCancelExecutor extends AgentExecutor {
+  override async cancel(task: Task): Promise<Task> {
+    task.status = {
+      state: TaskState.COMPLETED,
+      timestamp: new Date().toISOString(),
+    };
+    return task;
+  }
+}
+
+class SessionCreationFailsRunner extends InMemoryRunner {
+  override async createSession(): Promise<never> {
+    throw new Error('session setup failed');
+  }
+}
+
+function createServerWithRunner(
+  runner: InMemoryRunner,
+  store = new CloneTaskStore(),
+): {
+  taskStore: CloneTaskStore;
+  handler: DefaultRequestHandler;
+} {
+  const server = new A2XServer({
+    taskStore: store,
+    executor: new AgentExecutor({
+      runner,
+      runConfig: { streamingMode: StreamingMode.SSE },
+    }),
+    protocolVersion: '0.3',
+  });
+  server.setDefaultUrl('https://example.com/a2a');
+  return { taskStore: store, handler: new DefaultRequestHandler(server) };
 }
 
 function createServerWithStore(
@@ -413,6 +507,45 @@ describe('durable TaskStore persistence (issue #233)', () => {
       expect(fetched.status.state).toBe(TaskState.COMPLETED);
       expect(textOf(fetched)).toEqual(['settled']);
     });
+
+    it('retains artifacts produced before a failed terminal result', async () => {
+      const { handler } = createServerWithStore(
+        new ErrorAfterArtifactsAgent({ name: 'error-after-artifacts' }),
+      );
+
+      const failed = await send(handler, { message: userMessage('fail') });
+      expect(failed.status.state).toBe(TaskState.FAILED);
+      expect(textOf(failed)).toEqual(['before-error']);
+      expect(dataOf(failed)).toEqual([{ retained: true }]);
+
+      const fetched = await getTask(handler, failed.id);
+      expect(fetched.artifacts).toEqual(failed.artifacts);
+    });
+
+    it('finalizes text and data when the agent returns without done', async () => {
+      const { handler } = createServerWithStore(
+        new ImplicitCompletionAgent({ name: 'implicit-completion' }),
+      );
+
+      const completed = await send(handler, { message: userMessage('finish') });
+      expect(completed.status.state).toBe(TaskState.COMPLETED);
+      expect(textOf(completed)).toEqual(['implicit']);
+      expect(dataOf(completed)).toEqual([{ retained: true }]);
+    });
+
+    it('persists failed when session creation throws', async () => {
+      const agent = new CountingAgent({ name: 'counting' });
+      const { handler } = createServerWithRunner(
+        new SessionCreationFailsRunner({ agent, appName: 'durable-test' }),
+      );
+
+      const failed = await send(handler, { message: userMessage('fail') });
+      expect(failed.status.state).toBe(TaskState.FAILED);
+      expect(agent.runs).toBe(0);
+
+      const fetched = await getTask(handler, failed.id);
+      expect(fetched.status.state).toBe(TaskState.FAILED);
+    });
   });
 
   describe('message/stream', () => {
@@ -459,6 +592,75 @@ describe('durable TaskStore persistence (issue #233)', () => {
       expect(fetched.status.message?.metadata).toMatchObject({
         'test.required': true,
       });
+      expect(events.at(-1)?.final).toBe(true);
+    });
+
+    it('retains artifacts produced before a failed terminal result', async () => {
+      const { handler } = createServerWithStore(
+        new ErrorAfterArtifactsAgent({ name: 'error-after-artifacts' }),
+      );
+
+      const events = await drain(
+        (await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'message/stream',
+          params: { message: userMessage('fail') },
+        })) as AsyncGenerator<unknown>,
+      );
+      const statusEvents = events.filter((event) => event.kind === 'status-update');
+      expect(statusEvents.map((event) => event.final)).toEqual([false, true]);
+
+      const fetched = await getTask(handler, events[0]!.taskId as string);
+      expect(fetched.status.state).toBe(TaskState.FAILED);
+      expect(textOf(fetched)).toEqual(['before-error']);
+      expect(dataOf(fetched)).toEqual([{ retained: true }]);
+    });
+
+    it('synthesizes a terminal event when the agent returns without done', async () => {
+      const { handler } = createServerWithStore(
+        new ImplicitCompletionAgent({ name: 'implicit-completion' }),
+      );
+
+      const events = await drain(
+        (await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'message/stream',
+          params: { message: userMessage('finish') },
+        })) as AsyncGenerator<unknown>,
+      );
+      const terminal = events.at(-1)!;
+      expect(terminal.status).toMatchObject({ state: TaskState.COMPLETED });
+      expect(terminal.final).toBe(true);
+
+      const fetched = await getTask(handler, events[0]!.taskId as string);
+      expect(fetched.status.state).toBe(TaskState.COMPLETED);
+      expect(textOf(fetched)).toEqual(['implicit']);
+      expect(dataOf(fetched)).toEqual([{ retained: true }]);
+    });
+
+    it('persists a final failed event when session creation throws', async () => {
+      const agent = new CountingAgent({ name: 'counting' });
+      const { handler, taskStore } = createServerWithRunner(
+        new SessionCreationFailsRunner({ agent, appName: 'durable-test' }),
+      );
+
+      const events = await drain(
+        (await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'message/stream',
+          params: { message: userMessage('fail') },
+        })) as AsyncGenerator<unknown>,
+      );
+
+      expect(events).toHaveLength(1);
+      expect(events[0]!.status).toMatchObject({ state: TaskState.FAILED });
+      expect(events[0]!.final).toBe(true);
+      expect(agent.runs).toBe(0);
+      const stored = await taskStore.getTask(taskStore.ids[0]!);
+      expect(stored!.status.state).toBe(TaskState.FAILED);
     });
   });
 
@@ -527,9 +729,67 @@ describe('durable TaskStore persistence (issue #233)', () => {
       expect(stored!.status.state).toBe(TaskState.WORKING);
       expect(stored!.artifacts).toHaveLength(1);
     });
+
+    it('does not execute after cancellation wins the WORKING write race', async () => {
+      const store = new CancelBeforeWorkingStore();
+      const agent = new CountingAgent({ name: 'counting' });
+      const { handler } = createServerWithStore(agent, store);
+
+      const result = await send(handler, { message: userMessage('hi') });
+
+      expect(result.status.state).toBe(TaskState.CANCELED);
+      expect(agent.runs).toBe(0);
+    });
+
+    it('flushes artifacts when the terminal write fails transiently', async () => {
+      const store = new TerminalWriteFailsOnceStore();
+      const { handler } = createServerWithStore(
+        new EchoAgent({ name: 'echo' }),
+        store,
+      );
+      const stream = (await handler.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/stream',
+        params: { message: userMessage('hi') },
+      })) as AsyncGenerator<unknown>;
+
+      // The handler converts the stream failure into a final JSON-RPC error
+      // envelope; draining still exercises the generator's `finally` block.
+      await drain(stream);
+
+      const stored = await store.getTask(store.ids[0]!);
+      expect(stored!.status.state).toBe(TaskState.WORKING);
+      expect(stored!.artifacts).toHaveLength(2);
+    });
   });
 
   describe('artifacts across turns', () => {
+    it('persists the same artifact order for blocking and streaming', async () => {
+      const blocking = createServerWithStore(new EchoAgent({ name: 'echo' }));
+      const sent = await send(blocking.handler, { message: userMessage('hi') });
+
+      const streaming = createServerWithStore(new EchoAgent({ name: 'echo' }));
+      const events = await drain(
+        (await streaming.handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'message/stream',
+          params: { message: userMessage('hi') },
+        })) as AsyncGenerator<unknown>,
+      );
+      const streamed = await getTask(
+        streaming.handler,
+        events[0]!.taskId as string,
+      );
+
+      const suffixes = (task: WireTask, id: string) =>
+        (task.artifacts ?? []).map((artifact) =>
+          artifact.artifactId.replace(id, '<task>'),
+        );
+      expect(suffixes(streamed, streamed.id)).toEqual(suffixes(sent, sent.id));
+    });
+
     it('keeps earlier-turn artifacts when a continuation completes (blocking)', async () => {
       const { handler } = createServerWithStore(
         new TwoTurnArtifactAgent({ name: 'two-turn-artifacts' }),
@@ -684,6 +944,34 @@ describe('durable TaskStore persistence (issue #233)', () => {
       expect((response as JSONRPCErrorResponse).error.code).toBe(
         A2A_ERROR_CODES.TASK_NOT_CANCELABLE,
       );
+      const stored = await store.getTask(parked.id);
+      expect(stored!.status.state).toBe(TaskState.COMPLETED);
+    });
+
+    it('accepts the terminal state returned by a custom cancel implementation', async () => {
+      const store = new CloneTaskStore();
+      const agent = new TwoTurnAgent({ name: 'two-turn' });
+      const runner = new InMemoryRunner({ agent, appName: 'durable-test' });
+      const server = new A2XServer({
+        taskStore: store,
+        executor: new CompletingCancelExecutor({
+          runner,
+          runConfig: { streamingMode: StreamingMode.SSE },
+        }),
+        protocolVersion: '0.3',
+      });
+      server.setDefaultUrl('https://example.com/a2a');
+      const handler = new DefaultRequestHandler(server);
+      const parked = await send(handler, { message: userMessage('buy') });
+
+      const response = (await handler.handle({
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tasks/cancel',
+        params: { id: parked.id },
+      })) as JSONRPCResponse;
+
+      expect('result' in response).toBe(true);
       const stored = await store.getTask(parked.id);
       expect(stored!.status.state).toBe(TaskState.COMPLETED);
     });
