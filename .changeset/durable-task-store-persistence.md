@@ -1,5 +1,5 @@
 ---
-"@a2x/sdk": major
+"@a2x/sdk": minor
 ---
 
 Make `TaskStore` values true snapshots across in-memory and durable implementations.
