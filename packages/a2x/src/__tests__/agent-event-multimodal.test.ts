@@ -214,17 +214,18 @@ describe('AgentExecutor.executeStream — non-text AgentEvents', () => {
 
     const artifactEvents = events.filter(isArtifactEvent);
 
-    // 2 text chunk updates (append=true) + 1 file + 1 data + 1 final text (append=false)
+    // 2 text chunks + 1 file + 1 data + 1 consolidated final text.
     expect(artifactEvents).toHaveLength(5);
 
-    const appendUpdates = artifactEvents.filter((e) => e.append === true);
-    expect(appendUpdates).toHaveLength(2);
-    expect(appendUpdates.every((e) => isTextPart(e.artifact.parts[0]))).toBe(
-      true,
+    const textUpdates = artifactEvents.filter((e) =>
+      isTextPart(e.artifact.parts[0]),
     );
+    // The first text chunk establishes the artifact; later chunks append,
+    // and `done` replaces it with the consolidated final value.
+    expect(textUpdates.map((e) => e.append)).toEqual([false, true, false]);
 
     const finalUpdates = artifactEvents.filter((e) => e.append === false);
-    expect(finalUpdates).toHaveLength(3);
+    expect(finalUpdates).toHaveLength(4);
 
     // Final artifact set on task: 1 file + 1 data + 1 text = 3 artifacts.
     expect(task.artifacts).toHaveLength(3);

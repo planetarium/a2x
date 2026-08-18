@@ -25,7 +25,11 @@ import type {
   TaskUpdate,
 } from '../a2x/task-store.js';
 import { TaskState, TERMINAL_STATES } from '../types/task.js';
-import type { Task } from '../types/task.js';
+import type {
+  Task,
+  TaskArtifactUpdateEvent,
+  TaskStatusUpdateEvent,
+} from '../types/task.js';
 import type {
   JSONRPCResponse,
   JSONRPCErrorResponse,
@@ -267,6 +271,19 @@ class ImplicitCompletionAgent extends BaseAgent {
   }
 }
 
+class AbortThenReturnAgent extends BaseAgent {
+  readonly started = Promise.withResolvers<void>();
+
+  async *run(context: InvocationContext): AsyncGenerator<AgentEvent> {
+    this.started.resolve();
+    await new Promise<void>((resolve) => {
+      if (context.signal?.aborted) resolve();
+      else context.signal?.addEventListener('abort', () => resolve(), { once: true });
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+}
+
 class CompletingCancelExecutor extends AgentExecutor {
   override async cancel(task: Task): Promise<Task> {
     task.status = {
@@ -277,9 +294,60 @@ class CompletingCancelExecutor extends AgentExecutor {
   }
 }
 
+class NonTerminalCancelExecutor extends AgentExecutor {
+  override async cancel(task: Task): Promise<Task> {
+    task.status = {
+      state: TaskState.WORKING,
+      timestamp: new Date().toISOString(),
+    };
+    return task;
+  }
+}
+
+class ProgressiveArtifactExecutor extends AgentExecutor {
+  override async *executeStream(
+    task: Task,
+  ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
+    const contextId = task.contextId ?? task.id;
+    task.artifacts = [
+      { artifactId: 'canonical', parts: [{ text: 'canonical' }] },
+    ];
+    yield {
+      taskId: task.id,
+      contextId,
+      status: { state: TaskState.WORKING },
+      final: false,
+    };
+    yield {
+      taskId: task.id,
+      contextId,
+      artifact: { artifactId: 'later', parts: [{ text: 'later' }] },
+      append: false,
+      lastChunk: true,
+    };
+    yield {
+      taskId: task.id,
+      contextId,
+      status: { state: TaskState.COMPLETED },
+      final: true,
+    };
+  }
+}
+
 class SessionCreationFailsRunner extends InMemoryRunner {
   override async createSession(): Promise<never> {
     throw new Error('session setup failed');
+  }
+}
+
+class GatedSessionRunner extends InMemoryRunner {
+  readonly started = Promise.withResolvers<void>();
+  readonly release = Promise.withResolvers<void>();
+
+  override async createSession() {
+    this.started.resolve();
+    await this.release.promise;
+    return super.createSession();
   }
 }
 
@@ -593,6 +661,20 @@ describe('durable TaskStore persistence (issue #233)', () => {
         'test.required': true,
       });
       expect(events.at(-1)?.final).toBe(true);
+
+      const replay = await drain(
+        (await handler.handle({
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'tasks/resubscribe',
+          params: { id: taskId },
+        })) as AsyncGenerator<unknown>,
+      );
+      expect(replay).toHaveLength(1);
+      expect(replay[0]!.status).toMatchObject({
+        state: TaskState.INPUT_REQUIRED,
+      });
+      expect(replay[0]!.final).toBe(true);
     });
 
     it('retains artifacts produced before a failed terminal result', async () => {
@@ -706,7 +788,7 @@ describe('durable TaskStore persistence (issue #233)', () => {
       expect(textOf(fetched)).toEqual(['echo:hi']);
     });
 
-    it('flushes artifacts left unwritten when the client disconnects', async () => {
+    it('persists delivered artifacts and cancels when the client disconnects', async () => {
       const { handler, taskStore } = createServerWithStore(
         new EchoAgent({ name: 'echo' }),
       );
@@ -719,15 +801,28 @@ describe('durable TaskStore persistence (issue #233)', () => {
       })) as AsyncGenerator<unknown>;
 
       // Consume the `working` status and the first artifact chunk, then
-      // walk away — the chunk has not been written to the store yet.
+      // walk away. The delivered chunk must already be durable, and the
+      // abandoned execution must not remain a WORKING zombie.
       const first = (await stream.next()).value as { result: WireTask };
       await stream.next();
       await stream.return(undefined);
 
       const taskId = (first.result as unknown as { taskId: string }).taskId;
       const stored = await taskStore.getTask(taskId);
-      expect(stored!.status.state).toBe(TaskState.WORKING);
+      expect(stored!.status.state).toBe(TaskState.CANCELED);
       expect(stored!.artifacts).toHaveLength(1);
+
+      const replay = await drain(
+        (await handler.handle({
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'tasks/resubscribe',
+          params: { id: taskId },
+        })) as AsyncGenerator<unknown>,
+      );
+      expect(replay).toHaveLength(1);
+      expect(replay[0]!.status).toMatchObject({ state: TaskState.CANCELED });
+      expect(replay[0]!.final).toBe(true);
     });
 
     it('does not execute after cancellation wins the WORKING write race', async () => {
@@ -739,6 +834,162 @@ describe('durable TaskStore persistence (issue #233)', () => {
 
       expect(result.status.state).toBe(TaskState.CANCELED);
       expect(agent.runs).toBe(0);
+    });
+
+    it('streams the authoritative canceled state when it wins the WORKING write race', async () => {
+      const store = new CancelBeforeWorkingStore();
+      const agent = new CountingAgent({ name: 'counting' });
+      const { handler } = createServerWithStore(agent, store);
+
+      const events = await drain(
+        (await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'message/stream',
+          params: { message: userMessage('hi') },
+        })) as AsyncGenerator<unknown>,
+      );
+
+      expect(events).toHaveLength(1);
+      expect(events[0]!.status).toMatchObject({ state: TaskState.CANCELED });
+      expect(events[0]!.final).toBe(true);
+      expect(agent.runs).toBe(0);
+    });
+
+    it('does not synthesize completed after an active stream is canceled', async () => {
+      const agent = new AbortThenReturnAgent({ name: 'abort-then-return' });
+      const { handler, taskStore } = createServerWithStore(agent);
+      const stream = (await handler.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/stream',
+        params: { message: userMessage('hi') },
+      })) as AsyncGenerator<unknown>;
+
+      const working = await stream.next();
+      expect(working.done).toBe(false);
+      const pending = stream.next();
+      await agent.started.promise;
+      const taskId = taskStore.ids[0]!;
+
+      const canceled = (await handler.handle({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/cancel',
+        params: { id: taskId },
+      })) as JSONRPCResponse;
+      expect('result' in canceled).toBe(true);
+      const terminal = await pending;
+      expect(terminal.done).toBe(false);
+      expect(
+        (terminal.value as { result: Record<string, unknown> }).result.status,
+      ).toMatchObject({ state: TaskState.CANCELED });
+      expect(
+        (terminal.value as { result: Record<string, unknown> }).result.final,
+      ).toBe(true);
+      expect(await stream.next()).toMatchObject({ done: true });
+
+      const stored = await taskStore.getTask(taskId);
+      expect(stored!.status.state).toBe(TaskState.CANCELED);
+    });
+
+    it('does not enter the agent when canceled during session creation', async () => {
+      const agent = new CountingAgent({ name: 'counting' });
+      const runner = new GatedSessionRunner({
+        agent,
+        appName: 'durable-test',
+      });
+      const { handler, taskStore } = createServerWithRunner(runner);
+      const stream = (await handler.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/stream',
+        params: { message: userMessage('hi') },
+      })) as AsyncGenerator<unknown>;
+
+      const pending = stream.next();
+      await runner.started.promise;
+      const taskId = taskStore.ids[0]!;
+      const canceled = (await handler.handle({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/cancel',
+        params: { id: taskId },
+      })) as JSONRPCResponse;
+      runner.release.resolve();
+
+      expect('result' in canceled).toBe(true);
+      const terminal = await pending;
+      expect(terminal.done).toBe(false);
+      expect(
+        (terminal.value as { result: Record<string, unknown> }).result.status,
+      ).toMatchObject({ state: TaskState.CANCELED });
+      expect(await stream.next()).toMatchObject({ done: true });
+      expect(agent.runs).toBe(0);
+    });
+
+    it('retains an artifact delivered before strict-store cancellation', async () => {
+      const store = new CloneTaskStore(true);
+      const { handler } = createServerWithStore(
+        new EchoAgent({ name: 'echo' }),
+        store,
+      );
+      const stream = (await handler.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/stream',
+        params: { message: userMessage('hi') },
+      })) as AsyncGenerator<unknown>;
+
+      await stream.next();
+      await stream.next();
+      const taskId = store.ids[0]!;
+      const beforeCancel = await store.getTask(taskId);
+      expect(beforeCancel!.artifacts).toHaveLength(1);
+
+      const canceled = (await handler.handle({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/cancel',
+        params: { id: taskId },
+      })) as JSONRPCResponse;
+      expect('result' in canceled).toBe(true);
+      await stream.return(undefined);
+
+      const stored = await store.getTask(taskId);
+      expect(stored!.status.state).toBe(TaskState.CANCELED);
+      expect(textOf(stored as unknown as WireTask)).toEqual(['echo:hi']);
+    });
+
+    it('keeps custom executor artifacts added after a canonical snapshot', async () => {
+      const store = new CloneTaskStore();
+      const agent = new CountingAgent({ name: 'counting' });
+      const runner = new InMemoryRunner({ agent, appName: 'durable-test' });
+      const server = new A2XServer({
+        taskStore: store,
+        executor: new ProgressiveArtifactExecutor({
+          runner,
+          runConfig: { streamingMode: StreamingMode.SSE },
+        }),
+        protocolVersion: '0.3',
+      });
+      server.setDefaultUrl('https://example.com/a2a');
+      const handler = new DefaultRequestHandler(server);
+
+      await drain(
+        (await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'message/stream',
+          params: { message: userMessage('hi') },
+        })) as AsyncGenerator<unknown>,
+      );
+
+      const stored = await store.getTask(store.ids[0]!);
+      expect(textOf(stored as unknown as WireTask)).toEqual([
+        'canonical',
+        'later',
+      ]);
     });
 
     it('flushes artifacts when the terminal write fails transiently', async () => {
@@ -759,7 +1010,7 @@ describe('durable TaskStore persistence (issue #233)', () => {
       await drain(stream);
 
       const stored = await store.getTask(store.ids[0]!);
-      expect(stored!.status.state).toBe(TaskState.WORKING);
+      expect(stored!.status.state).toBe(TaskState.COMPLETED);
       expect(stored!.artifacts).toHaveLength(2);
     });
   });
@@ -974,6 +1225,37 @@ describe('durable TaskStore persistence (issue #233)', () => {
       expect('result' in response).toBe(true);
       const stored = await store.getTask(parked.id);
       expect(stored!.status.state).toBe(TaskState.COMPLETED);
+    });
+
+    it('rejects a non-terminal state returned by a custom cancel implementation', async () => {
+      const store = new CloneTaskStore();
+      const agent = new TwoTurnAgent({ name: 'two-turn' });
+      const runner = new InMemoryRunner({ agent, appName: 'durable-test' });
+      const server = new A2XServer({
+        taskStore: store,
+        executor: new NonTerminalCancelExecutor({
+          runner,
+          runConfig: { streamingMode: StreamingMode.SSE },
+        }),
+        protocolVersion: '0.3',
+      });
+      server.setDefaultUrl('https://example.com/a2a');
+      const handler = new DefaultRequestHandler(server);
+      const parked = await send(handler, { message: userMessage('buy') });
+
+      const response = (await handler.handle({
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tasks/cancel',
+        params: { id: parked.id },
+      })) as JSONRPCResponse;
+
+      expect('error' in response).toBe(true);
+      expect((response as JSONRPCErrorResponse).error.code).toBe(
+        A2A_ERROR_CODES.TASK_NOT_CANCELABLE,
+      );
+      const stored = await store.getTask(parked.id);
+      expect(stored!.status.state).toBe(TaskState.WORKING);
     });
   });
 });

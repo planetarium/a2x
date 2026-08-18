@@ -50,7 +50,7 @@ export interface AgentExecutorOptions {
 export class AgentExecutor {
   readonly runner: Runner;
   readonly runConfig: RunConfig;
-  private readonly _abortControllers = new Map<string, AbortController>();
+  private readonly _abortControllers = new Map<string, Set<AbortController>>();
 
   constructor(options: AgentExecutorOptions) {
     this.runner = options.runner;
@@ -69,7 +69,7 @@ export class AgentExecutor {
     const contextId = task.contextId ?? task.id;
 
     const abortController = new AbortController();
-    this._abortControllers.set(task.id, abortController);
+    this._registerAbortController(task.id, abortController);
 
     // Update task status to working
     task.status = {
@@ -85,6 +85,7 @@ export class AgentExecutor {
 
     try {
       const session = await this.runner.createSession();
+      if (abortController.signal.aborted) return task;
       for await (const event of this.runner.runAsync(session, message, abortController.signal, {
         taskId: task.id,
         contextId,
@@ -178,6 +179,7 @@ export class AgentExecutor {
       }
       completedNormally = true;
     } catch (error) {
+      if (abortController.signal.aborted) return task;
       attachArtifacts(task, artifacts, textParts, artifactIds);
       task.status = {
         state: TaskState.FAILED,
@@ -203,7 +205,7 @@ export class AgentExecutor {
       if (!completedNormally && !abortController.signal.aborted) {
         abortController.abort();
       }
-      this._abortControllers.delete(task.id);
+      this._unregisterAbortController(task.id, abortController);
     }
 
     return task;
@@ -220,7 +222,7 @@ export class AgentExecutor {
     const contextId = task.contextId ?? task.id;
 
     const abortController = new AbortController();
-    this._abortControllers.set(task.id, abortController);
+    this._registerAbortController(task.id, abortController);
 
     const artifactIds = new ArtifactIdAllocator(task.id, task.artifacts);
     let completedNormally = false;
@@ -230,6 +232,7 @@ export class AgentExecutor {
 
     try {
       const session = await this.runner.createSession();
+      if (abortController.signal.aborted) return;
 
       // Emit working status only after session creation succeeds. A session
       // setup failure is reported as FAILED below instead of stranding a
@@ -253,7 +256,8 @@ export class AgentExecutor {
           : {}),
       })) {
         switch (event.type) {
-          case 'text':
+          case 'text': {
+            const append = textParts.length > 0;
             textParts.push(event.text);
             yield {
               taskId: task.id,
@@ -262,10 +266,11 @@ export class AgentExecutor {
                 artifactId: artifactIds.text(),
                 parts: [{ text: event.text }],
               },
-              append: true,
+              append,
               lastChunk: false,
             } satisfies TaskArtifactUpdateEvent;
             break;
+          }
 
           case 'file': {
             const artifact: Artifact = {
@@ -391,6 +396,8 @@ export class AgentExecutor {
         return;
       }
 
+      if (abortController.signal.aborted) return;
+
       // Agents may finish by returning instead of yielding `done`. Finalize
       // the same artifact set and status that the blocking path synthesizes.
       attachArtifacts(task, nonTextArtifacts, textParts, artifactIds);
@@ -415,6 +422,7 @@ export class AgentExecutor {
       } satisfies TaskStatusUpdateEvent;
       completedNormally = true;
     } catch (error) {
+      if (abortController.signal.aborted) return;
       attachArtifacts(task, nonTextArtifacts, textParts, artifactIds);
       task.status = {
         state: TaskState.FAILED,
@@ -443,7 +451,7 @@ export class AgentExecutor {
       if (!completedNormally && !abortController.signal.aborted) {
         abortController.abort();
       }
-      this._abortControllers.delete(task.id);
+      this._unregisterAbortController(task.id, abortController);
     }
   }
 
@@ -451,9 +459,9 @@ export class AgentExecutor {
    * Cancel a running task. Aborts in-flight agent execution if running.
    */
   async cancel(task: Task): Promise<Task> {
-    const controller = this._abortControllers.get(task.id);
-    if (controller) {
-      controller.abort();
+    const controllers = this._abortControllers.get(task.id);
+    if (controllers) {
+      for (const controller of controllers) controller.abort();
       this._abortControllers.delete(task.id);
     }
 
@@ -462,6 +470,28 @@ export class AgentExecutor {
       timestamp: new Date().toISOString(),
     };
     return task;
+  }
+
+  private _registerAbortController(
+    taskId: string,
+    controller: AbortController,
+  ): void {
+    let controllers = this._abortControllers.get(taskId);
+    if (!controllers) {
+      controllers = new Set();
+      this._abortControllers.set(taskId, controllers);
+    }
+    controllers.add(controller);
+  }
+
+  private _unregisterAbortController(
+    taskId: string,
+    controller: AbortController,
+  ): void {
+    const controllers = this._abortControllers.get(taskId);
+    if (!controllers) return;
+    controllers.delete(controller);
+    if (controllers.size === 0) this._abortControllers.delete(taskId);
   }
 }
 

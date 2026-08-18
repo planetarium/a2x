@@ -791,72 +791,176 @@ export class DefaultRequestHandler {
     const bus = this.a2xServer.taskEventBus;
 
     let reachedTerminal = false;
+    let interactionEnded = false;
+    let pendingStatusWrite:
+      | { event: TaskStatusUpdateEvent; update: TaskUpdate }
+      | undefined;
 
     // The executor mutates its own Task snapshot, so the store only learns
-    // about the stream through these writes. Artifact chunks are folded
-    // into `artifacts` and flushed with the next status write (statuses
-    // are rare, text chunks are not) — the terminal write therefore
-    // carries the complete artifact set.
+    // about the stream through these writes. Persist each artifact before
+    // yielding it so cancellation can never make the durable record lag
+    // behind content the client has already received. Status writes still
+    // carry the complete artifact set for strict terminal stores.
     //
     // Seeded from the task's own artifacts: a continuation turn restarts
     // the executor's artifact list, and writes replace rather than merge,
     // so starting empty would drop what an earlier turn already produced.
     const priorArtifacts = task.artifacts ?? [];
-    const initialTaskArtifacts = task.artifacts;
+    let observedTaskArtifacts = task.artifacts;
     let artifacts: Artifact[] = [...priorArtifacts];
-    let unflushedArtifacts = false;
 
     // finally closes the bus so resubscribers see the stream end regardless
     // of how the primary stream terminates (normal, error, cancel via return).
     try {
-      for await (const event of eventStream) {
-        if ('status' in event) {
-          const terminal = TERMINAL_STATES.has(event.status.state);
+      for await (const rawEvent of eventStream) {
+        if ('status' in rawEvent) {
+          const event = rawEvent as TaskStatusUpdateEvent;
           // The default executor writes a canonical current-turn artifact
           // set onto its Task snapshot before an interaction-ending status.
-          // Prefer it when present so blocking and streaming persist the
-          // same artifact order while still retaining earlier turns.
-          if (task.artifacts && task.artifacts !== initialTaskArtifacts) {
-            artifacts = mergeArtifacts(priorArtifacts, task.artifacts);
-            unflushedArtifacts = true;
+          // Fold it into the accumulated stream rather than resetting to
+          // the snapshot. A custom executor may emit more artifact events
+          // after assigning `task.artifacts`, and those must survive later
+          // status updates.
+          if (task.artifacts && task.artifacts !== observedTaskArtifacts) {
+            const canonical = mergeArtifacts(priorArtifacts, task.artifacts);
+            const canonicalIds = new Set(
+              canonical.map((artifact) => artifact.artifactId),
+            );
+            artifacts = [
+              ...canonical,
+              ...artifacts.filter(
+                (artifact) => !canonicalIds.has(artifact.artifactId),
+              ),
+            ];
+            observedTaskArtifacts = task.artifacts;
           }
-          await this._persistTaskState(task.id, {
+
+          const update: TaskUpdate = {
             status: event.status,
-            ...(unflushedArtifacts ? { artifacts } : {}),
-          });
-          // A terminal event only counts after its store write succeeds.
-          // If the write fails, `finally` must still flush artifacts and
-          // must not dispatch a non-terminal task as a terminal webhook.
-          if (terminal) reachedTerminal = true;
-          unflushedArtifacts = false;
+            ...(artifacts.length > 0 ? { artifacts } : {}),
+          };
+          pendingStatusWrite = { event, update };
+          const persisted = await this._persistTaskState(task.id, update);
+          pendingStatusWrite = undefined;
+
+          const authoritative = statusEventFromTask(event, persisted);
+          const storeTerminal = TERMINAL_STATES.has(persisted.status.state);
+          reachedTerminal ||= storeTerminal;
+          interactionEnded ||= isInteractionEndingStatus(authoritative);
+          bus.publish(task.id, authoritative);
+          yield this.responseMapper.mapStatusUpdateEvent(authoritative);
+
+          // Cancellation or another terminal transition can win a status
+          // write. Stop the executor immediately and expose the store's
+          // authoritative state instead of continuing stale work.
+          if (storeTerminal && persisted.status.state !== event.status.state) {
+            return;
+          }
         } else {
+          const event = rawEvent as TaskArtifactUpdateEvent;
           artifacts = applyArtifactUpdate(
             artifacts,
-            event as TaskArtifactUpdateEvent,
+            event,
           );
-          unflushedArtifacts = true;
+          const persisted = await this._persistTaskState(task.id, { artifacts });
+          if (TERMINAL_STATES.has(persisted.status.state)) {
+            const authoritative = statusEventFromTask(
+              {
+                taskId: task.id,
+                contextId: task.contextId ?? task.id,
+                status: persisted.status,
+                final: true,
+              },
+              persisted,
+            );
+            reachedTerminal = true;
+            interactionEnded = true;
+            bus.publish(task.id, authoritative);
+            yield this.responseMapper.mapStatusUpdateEvent(authoritative);
+            return;
+          }
+          bus.publish(task.id, event);
+          yield this.responseMapper.mapArtifactUpdateEvent(event);
         }
-        bus.publish(task.id, event);
-        if ('status' in event) {
-          yield this.responseMapper.mapStatusUpdateEvent(event as TaskStatusUpdateEvent);
-        } else {
-          yield this.responseMapper.mapArtifactUpdateEvent(event as TaskArtifactUpdateEvent);
-        }
+      }
+
+      // An executor canceled through tasks/cancel exits without producing
+      // another event. Complete the primary stream with the same durable
+      // terminal state instead of silently ending or synthesizing completed.
+      if (!interactionEnded) {
+        const persisted = await this._persistTaskState(task.id, {
+          status: {
+            state: TaskState.CANCELED,
+            timestamp: new Date().toISOString(),
+          },
+          ...(artifacts.length > 0 ? { artifacts } : {}),
+        });
+        const canceled = statusEventFromTask(
+          {
+            taskId: task.id,
+            contextId: task.contextId ?? task.id,
+            status: persisted.status,
+            final: true,
+          },
+          persisted,
+        );
+        reachedTerminal ||= TERMINAL_STATES.has(persisted.status.state);
+        interactionEnded = true;
+        bus.publish(task.id, canceled);
+        yield this.responseMapper.mapStatusUpdateEvent(canceled);
       }
     } finally {
-      bus.close(task.id);
-      // Artifacts emitted after the last status event (abort, client
-      // disconnect) still belong in the store. A terminal event already
-      // flushed them, and a terminal task's content must not keep
-      // changing afterwards. Best-effort: the stream is already
-      // unwinding, possibly because of an error we must not mask.
-      if (unflushedArtifacts && !reachedTerminal) {
+      // Retry an interaction-ending status once after a transient store
+      // failure. The original stream still reports the write error, but a
+      // recovered store must not strand completed work in WORKING.
+      if (pendingStatusWrite) {
         try {
-          await this._persistTaskState(task.id, { artifacts });
+          const persisted = await this._persistTaskState(
+            task.id,
+            pendingStatusWrite.update,
+          );
+          const authoritative = statusEventFromTask(
+            pendingStatusWrite.event,
+            persisted,
+          );
+          reachedTerminal ||= TERMINAL_STATES.has(persisted.status.state);
+          interactionEnded ||= isInteractionEndingStatus(authoritative);
+          bus.publish(task.id, authoritative);
         } catch {
-          // Nothing left to report the failure on.
+          // The original write error remains the primary stream failure.
         }
       }
+
+      // Returning the primary generator aborts the executor. If no final
+      // interaction status was persisted, record that local cancellation
+      // so tasks/get and a later resubscribe cannot hang on a WORKING zombie.
+      if (!interactionEnded) {
+        try {
+          const persisted = await this._persistTaskState(task.id, {
+            status: {
+              state: TaskState.CANCELED,
+              timestamp: new Date().toISOString(),
+            },
+            ...(artifacts.length > 0 ? { artifacts } : {}),
+          });
+          const canceled = statusEventFromTask(
+            {
+              taskId: task.id,
+              contextId: task.contextId ?? task.id,
+              status: persisted.status,
+              final: true,
+            },
+            persisted,
+          );
+          reachedTerminal ||= TERMINAL_STATES.has(persisted.status.state);
+          interactionEnded = true;
+          bus.publish(task.id, canceled);
+        } catch {
+          // The stream is already unwinding; do not mask its original error.
+        }
+      }
+
+      bus.close(task.id);
       if (reachedTerminal) {
         // Re-fetch the task so the webhook body reflects the final
         // store state (artifacts accumulated during streaming, etc).
@@ -874,9 +978,14 @@ export class DefaultRequestHandler {
       throw new TaskNotFoundError(`Task not found: ${params.id}`);
     }
 
-    // Terminal tasks replay a single status-update event so reconnecting
-    // clients learn the final state without needing a full history replay.
-    if (TERMINAL_STATES.has(task.status.state)) {
+    // Tasks whose current interaction already ended replay a single status
+    // update. INPUT_REQUIRED and AUTH_REQUIRED are not terminal task states,
+    // but their original stream is over and no live bus remains to follow.
+    if (
+      TERMINAL_STATES.has(task.status.state) ||
+      task.status.state === TaskState.INPUT_REQUIRED ||
+      task.status.state === TaskState.AUTH_REQUIRED
+    ) {
       const terminal: TaskStatusUpdateEvent = {
         taskId: task.id,
         contextId: task.contextId ?? task.id,
@@ -928,9 +1037,14 @@ export class DefaultRequestHandler {
     // this write. Compare against what the executor requested rather than
     // requiring CANCELED: custom executors may complete graceful cleanup
     // during cancel, and that successful result must remain representable.
-    if (persisted.status.state !== canceled.status.state) {
+    if (
+      persisted.status.state !== canceled.status.state ||
+      !TERMINAL_STATES.has(persisted.status.state)
+    ) {
       throw new TaskNotCancelableError(
-        `Task '${params.id}' transitioned to '${persisted.status.state}' while cancellation requested '${canceled.status.state}'`,
+        persisted.status.state !== canceled.status.state
+          ? `Task '${params.id}' transitioned to '${persisted.status.state}' while cancellation requested '${canceled.status.state}'`
+          : `Task '${params.id}' remained in non-terminal state '${persisted.status.state}' after cancellation`,
       );
     }
 
@@ -1451,9 +1565,28 @@ export class DefaultRequestHandler {
   }
 }
 
+function statusEventFromTask(
+  event: TaskStatusUpdateEvent,
+  task: Task,
+): TaskStatusUpdateEvent {
+  return {
+    ...event,
+    status: task.status,
+    ...(TERMINAL_STATES.has(task.status.state) ? { final: true } : {}),
+  };
+}
+
+function isInteractionEndingStatus(event: TaskStatusUpdateEvent): boolean {
+  return (
+    event.final === true ||
+    TERMINAL_STATES.has(event.status.state) ||
+    event.status.state === TaskState.INPUT_REQUIRED ||
+    event.status.state === TaskState.AUTH_REQUIRED
+  );
+}
+
 /**
- * Fold the artifacts one execution produced onto the ones the task
- * already carried.
+ * Fold artifacts onto the task's accumulated set.
  *
  * `updateTask` replaces the artifact list, and a continuation turn
  * (`input-required` → resume) starts the executor's list from scratch, so

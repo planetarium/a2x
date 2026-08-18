@@ -33,8 +33,10 @@ export interface TaskUpdate {
  * every task transition back through `updateTask()`. `InMemoryTaskStore`
  * returns defensive copies for exactly this reason — so code that
  * accidentally relies on object identity fails in-memory too, instead of
- * only against a durable (serializing) store. Non-serializable exotic leaf
- * values in user metadata may retain identity.
+ * only against a durable (serializing) store. An update must be applied
+ * atomically against the latest stored task so concurrent artifact, status,
+ * and cancellation writes cannot overwrite one another. Non-serializable
+ * exotic leaf values in user metadata may retain identity.
  */
 export interface TaskStore {
   createTask(params: CreateTaskParams): Promise<Task>;
@@ -49,9 +51,10 @@ export interface TaskStore {
  *
  * `structuredClone` mirrors what a durable store's serialize/deserialize
  * round trip does. Task metadata and part payloads are user-controlled
- * though, and may hold values it refuses to clone (functions, class
- * instances). The fallback recursively copies arrays, plain objects,
- * maps, and sets while retaining only non-cloneable exotic leaf values.
+ * though, and may hold values it refuses to clone (such as functions).
+ * The fallback recursively copies arrays, plain objects, maps, and sets
+ * while retaining only non-cloneable exotic leaf values. Cloneable class
+ * instances may be normalized to plain objects by `structuredClone`.
  */
 export function cloneTask(task: Task): Task {
   try {
@@ -102,9 +105,9 @@ function cloneFallbackValue<T>(
     try {
       return structuredClone(value);
     } catch {
-      // Functions and class instances can be meaningful metadata values.
-      // Preserve the leaf rather than rejecting the whole task; every
-      // standard container leading to it has already been isolated.
+      // Exotic values can be meaningful metadata. Preserve the leaf rather
+      // than rejecting the whole task; every standard container leading to
+      // it has already been isolated.
       return value;
     }
   }

@@ -56,16 +56,46 @@ Contract notes:
 - `createTask()` mints the task id and `contextId` (fall back to a fresh UUID when the caller didn't supply one) and starts the task in `submitted`.
 - `updateTask()` applies only the fields present on the update — an absent field means "leave as is", not "clear". `metadata` merges; `artifacts` and `history` replace.
 - `updateTask()` should reject a status change on a task that is already terminal (`completed` / `failed` / `canceled` / `rejected`). `InMemoryTaskStore` throws.
+- `updateTask()` must apply its read, terminal guard, patch, and write atomically against the latest record. A plain `GET` followed by `SET` can let cancellation, completion, and artifact writes overwrite one another.
 
 A Redis-backed version in its entirety:
 
 ```ts
 import type { Task, TaskStore, CreateTaskParams, TaskUpdate } from '@a2x/sdk';
-import { TaskState, TERMINAL_STATES } from '@a2x/sdk';
+import { TaskState } from '@a2x/sdk';
 import { randomUUID } from 'node:crypto';
 import { Redis } from 'ioredis';
 
 const KEY = (id: string) => `a2x:task:${id}`;
+
+const UPDATE_TASK = `
+local raw = redis.call('GET', KEYS[1])
+if not raw then return redis.error_reply('Task not found: ' .. KEYS[1]) end
+
+local current = cjson.decode(raw)
+local update = cjson.decode(ARGV[1])
+local terminal = {
+  completed = true,
+  failed = true,
+  canceled = true,
+  rejected = true
+}
+if update.status and terminal[current.status.state] then
+  return redis.error_reply('Cannot update task in terminal state: ' .. KEYS[1])
+end
+
+if update.status then current.status = update.status end
+if update.artifacts then current.artifacts = update.artifacts end
+if update.history then current.history = update.history end
+if update.metadata then
+  current.metadata = current.metadata or {}
+  for key, value in pairs(update.metadata) do current.metadata[key] = value end
+end
+
+local next = cjson.encode(current)
+redis.call('SET', KEYS[1], next, 'EX', ARGV[2])
+return next
+`;
 
 export class RedisTaskStore implements TaskStore {
   constructor(private redis: Redis, private ttlSeconds = 3600) {}
@@ -87,23 +117,14 @@ export class RedisTaskStore implements TaskStore {
   }
 
   async updateTask(id: string, update: TaskUpdate): Promise<Task> {
-    const current = await this.getTask(id);
-    if (!current) throw new Error(`Task not found: ${id}`);
-    if (update.status && TERMINAL_STATES.has(current.status.state)) {
-      throw new Error(`Cannot update task in terminal state: ${id}`);
-    }
-
-    const next: Task = {
-      ...current,
-      ...(update.status ? { status: update.status } : {}),
-      ...(update.artifacts ? { artifacts: update.artifacts } : {}),
-      ...(update.history ? { history: update.history } : {}),
-      ...(update.metadata
-        ? { metadata: { ...current.metadata, ...update.metadata } }
-        : {}),
-    };
-    await this._write(next);
-    return next;
+    const raw = await this.redis.eval(
+      UPDATE_TASK,
+      1,
+      KEY(id),
+      JSON.stringify(update),
+      this.ttlSeconds,
+    );
+    return JSON.parse(raw as string) as Task;
   }
 
   async deleteTask(id: string): Promise<void> {
@@ -125,18 +146,18 @@ const a2xServer = new A2XServer({ taskStore, executor });
 
 ## Tasks handed out are snapshots
 
-Every `Task` a store returns is a **snapshot**. Mutating its standard task, message, artifact, part, or metadata containers changes nothing on the store side — a serializing store parsed it out of JSON, and `InMemoryTaskStore` deliberately returns defensive copies so that in-memory development behaves the same way as production. If metadata contains a value that cannot be serialized or structured-cloned, such as a function or class instance, `cloneTask()` retains that exotic leaf while still isolating every standard container around it.
+Every `Task` a store returns is a **snapshot**. Mutating its standard task, message, artifact, part, or metadata containers changes nothing on the store side — a serializing store parsed it out of JSON, and `InMemoryTaskStore` deliberately returns defensive copies so that in-memory development behaves the same way as production. If metadata contains a value that cannot be structured-cloned, such as a function, `cloneTask()` retains that exotic leaf while still isolating every standard container around it. Cloneable class instances may be normalized to plain objects by `structuredClone()`.
 
 Two consequences:
 
 - **Custom stores must not return their live record.** Return a copy (`structuredClone`, or the value you just deserialized). `cloneTask(task)` is exported for this.
 - **Custom handlers or executors must write every transition back** with `updateTask()`. Setting `task.status = ...` on a task you were handed persists nothing.
 
-The SDK's `DefaultRequestHandler` does exactly that: it writes the `working` transition, the result of `message/send`, each `message/stream` status transition (with the artifacts accumulated so far), and `tasks/cancel` through `updateTask()`, so the response a caller receives always matches a subsequent `tasks/get`.
+The SDK's `DefaultRequestHandler` does exactly that: it writes the `working` transition, the result of `message/send`, each `message/stream` artifact before delivering it, each streaming status transition, and `tasks/cancel` through `updateTask()`, so the response a caller receives always matches a subsequent `tasks/get`.
 
 Two details worth knowing when you write a store:
 
-- **The terminal write carries the final artifact set.** The handler does not patch artifacts onto a task after it terminated, so a store that rejects *every* update to a terminal task (stricter than `InMemoryTaskStore`, which only rejects status changes) stays correct.
+- **Streamed artifacts are write-ahead.** The handler persists an artifact update before delivering it, then carries the complete artifact set in status writes. A cancellation can therefore never make the durable task lag behind content the client already received, even when the store rejects every update to a terminal task.
 - **Artifacts survive across turns.** `updateTask` replaces the artifact list, but a continuation turn (`input-required` → resume) starts the agent's list from scratch, so the handler folds the new artifacts onto the ones the task already carried. Same `artifactId` supersedes — and `AgentExecutor` allocates ids against what the task already holds, so a later turn does not collide with an earlier one.
 
 If you fold streamed artifact chunks yourself, `applyArtifactUpdate(artifacts, event)` implements the spec's `append` semantics (append to the artifact with the same `artifactId`, otherwise replace):

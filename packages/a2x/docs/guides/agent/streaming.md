@@ -57,7 +57,7 @@ See [Consuming Streams](../client/streaming.md) for the client-side iteration pa
 
 ## Client disconnect stops the work
 
-When an SSE client disconnects mid-stream — tab closed, network drop, process killed — A2X propagates the cancellation all the way into the agent's `AbortSignal`. In-flight LLM calls are aborted, long-running tool calls see `context.signal.aborted === true`, and the task generator exits cleanly. No runaway loops, no wasted tokens.
+When an SSE client disconnects mid-stream — tab closed, network drop, process killed — A2X propagates the cancellation all the way into the agent's `AbortSignal`. In-flight LLM calls are aborted, long-running tool calls see `context.signal.aborted === true`, and the durable task becomes `canceled` instead of remaining stuck in `working`. Artifacts already delivered to the client are persisted before delivery and remain attached to the canceled task.
 
 `toA2x()` wires this automatically. If you mount the handler into your own HTTP stack (Express, Next.js, Fastify, …), wire a `res.on('close')` → `reader.cancel()` on the SSE branch — `IncomingMessage.close` fires when the request body is consumed (too early) and misses the later TCP close, so use `res.close`:
 
@@ -109,7 +109,7 @@ How the default `AgentExecutor` maps each event to a `TaskArtifactUpdateEvent`:
 
 | Event | Mapping |
 |---|---|
-| `text` | Appended to a single text artifact (`artifact-${taskId}-text`). Emitted incrementally with `append: true`, finalized with `lastChunk: true` on `done`. |
+| `text` | Accumulated in one text artifact (`artifact-${taskId}-text`). The first chunk establishes it with `append: false`; later chunks use `append: true`; `done` replaces it with the consolidated value and `lastChunk: true`. |
 | `file` | A new artifact (`artifact-${taskId}-file-${n}`) carrying a single `FilePart`. Emitted inline with `append: false`, `lastChunk: true`. |
 | `data` | A new artifact (`artifact-${taskId}-data-${n}`) carrying a single `DataPart`. Emitted inline with `append: false`, `lastChunk: true`. |
 
@@ -140,8 +140,9 @@ If a client loses connection mid-task, it can re-attach via the A2A `tasks/resub
 
 Semantics:
 
-- **Forward-only.** Events that fired before the resubscribe call are not replayed.
-- **Terminal replay.** Resubscribing to a task that already completed yields a single status-update event with the final state, then ends.
+- **Forward-only while active.** Events that fired before a live resubscribe call are not replayed.
+- **Interaction-ending replay.** Resubscribing after the current interaction ended yields one status update, then ends. This covers terminal states plus `input-required` and `auth-required`.
+- **Disconnected primary streams are canceled.** If the original HTTP connection closed and its reader was canceled, resubscribe replays `canceled`; it does not restart the agent.
 - **Unknown task.** Returns `TaskNotFoundError` (JSON-RPC error code `-32001`).
 
 The bus is on by default. For custom storage or multi-process deployments you can inject your own implementation — see [Manual Wiring](../advanced/manual-wiring.md#task-event-bus).
