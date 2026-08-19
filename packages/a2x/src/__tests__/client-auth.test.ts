@@ -1458,4 +1458,211 @@ describe('A2XClient auth integration', () => {
     expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 
+  it('deduplicates concurrent authentication initialization for unary calls', async () => {
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const provide = vi.fn(async (requirements: AuthScheme[][]) => {
+      await gate;
+      return [requirements[0]![0]!.setCredential('shared-key')];
+    });
+    const client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      authProvider: { provide },
+    });
+
+    const first = client.sendMessage({
+      message: { role: 'user', parts: [{ text: '1' }] },
+    });
+    const second = client.sendMessage({
+      message: { role: 'user', parts: [{ text: '2' }] },
+    });
+    await vi.waitFor(() => expect(provide).toHaveBeenCalledTimes(1));
+    release();
+    await Promise.all([first, second]);
+
+    expect(provide).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch.mock.calls.map((call) => call[1].headers['x-api-key']))
+      .toEqual(['shared-key', 'shared-key']);
+  });
+
+  it('shares cold discovery and authentication between unary and stream calls', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const provide = vi.fn(async (requirements: AuthScheme[][]) => {
+      await gate;
+      return [requirements[0]![0]!.setCredential('shared-key')];
+    });
+    const mockFetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'GET') {
+        return {
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          json: () => Promise.resolve(V10_CARD_WITH_AUTH),
+          headers: new Headers({ 'content-type': 'application/json' }),
+        } as Response;
+      }
+      const headers = init?.headers as Record<string, string>;
+      if (headers.Accept === 'text/event-stream') {
+        return {
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          body: new ReadableStream({
+            start(controller) { controller.close(); },
+          }),
+          headers: new Headers({ 'content-type': 'text/event-stream' }),
+        } as Response;
+      }
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: () => Promise.resolve(createJsonRpcSuccess(TASK_RESULT)),
+        headers: new Headers({ 'content-type': 'application/json' }),
+      } as Response;
+    });
+    const client = new A2XClient(
+      'http://localhost:4000/.well-known/agent.json',
+      { fetch: mockFetch, authProvider: { provide } },
+    );
+
+    const unary = client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'unary' }] },
+    });
+    const streaming = (async () => {
+      for await (const _event of client.sendMessageStream({
+        message: { role: 'user', parts: [{ text: 'stream' }] },
+      })) { /* consume */ }
+    })();
+    await vi.waitFor(() => expect(provide).toHaveBeenCalledTimes(1));
+    release();
+    await Promise.all([unary, streaming]);
+
+    expect(provide).toHaveBeenCalledTimes(1);
+    expect(mockFetch.mock.calls.filter((call) => call[1]?.method === 'GET'))
+      .toHaveLength(1);
+    const transportCalls = mockFetch.mock.calls.filter(
+      (call) => call[1]?.method === 'POST',
+    );
+    expect(transportCalls).toHaveLength(2);
+    expect(transportCalls.map((call) =>
+      (call[1]?.headers as Record<string, string>)['x-api-key']))
+      .toEqual(['shared-key', 'shared-key']);
+  });
+
+  it('deduplicates concurrent credential refreshes', async () => {
+    const authRequiredTask = {
+      id: 'task-auth',
+      contextId: 'ctx-auth',
+      status: { state: TaskState.AUTH_REQUIRED, timestamp: new Date().toISOString() },
+    };
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(() => {
+      callCount += 1;
+      const body = callCount <= 2
+        ? createJsonRpcSuccess(authRequiredTask)
+        : createJsonRpcSuccess(TASK_RESULT);
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: () => Promise.resolve(body),
+        headers: new Headers({ 'content-type': 'application/json' }),
+      });
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const refresh = vi.fn(async (resolved: AuthScheme[]) => {
+      await gate;
+      resolved[0]!.setCredential('new-key');
+      return resolved;
+    });
+    const client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      authProvider: {
+        async provide(requirements) {
+          return [requirements[0]![0]!.setCredential('old-key')];
+        },
+        refresh,
+      },
+    });
+
+    const first = client.sendMessage({
+      message: { role: 'user', parts: [{ text: '1' }] },
+    });
+    const second = client.sendMessage({
+      message: { role: 'user', parts: [{ text: '2' }] },
+    });
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+    release();
+    await Promise.all([first, second]);
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    expect(mockFetch.mock.calls.slice(2).map((call) => call[1].headers['x-api-key']))
+      .toEqual(['new-key', 'new-key']);
+  });
+
+  it('does not refresh again for a late auth failure from an older generation', async () => {
+    const authRequiredTask = {
+      id: 'task-auth',
+      contextId: 'ctx-auth',
+      status: { state: TaskState.AUTH_REQUIRED, timestamp: new Date().toISOString() },
+    };
+    let releaseLate!: () => void;
+    const lateResponse = new Promise<void>((resolve) => { releaseLate = resolve; });
+    let releaseFirst!: () => void;
+    const firstResponse = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(async () => {
+      const thisCall = ++callCount;
+      if (thisCall === 1) await firstResponse;
+      if (thisCall === 2) {
+        releaseFirst();
+        await lateResponse;
+      }
+      const body = thisCall <= 2
+        ? createJsonRpcSuccess(authRequiredTask)
+        : createJsonRpcSuccess(TASK_RESULT);
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: () => Promise.resolve(body),
+        headers: new Headers({ 'content-type': 'application/json' }),
+      };
+    });
+    const refresh = vi.fn(async (resolved: AuthScheme[]) => {
+      resolved[0]!.setCredential('new-key');
+      releaseLate();
+      return resolved;
+    });
+    const client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      authProvider: {
+        async provide(requirements) {
+          return [requirements[0]![0]!.setCredential('old-key')];
+        },
+        refresh,
+      },
+    });
+
+    await Promise.all([
+      client.sendMessage({
+        message: { role: 'user', parts: [{ text: '1' }] },
+      }),
+      client.sendMessage({
+        message: { role: 'user', parts: [{ text: '2' }] },
+      }),
+    ]);
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    expect(mockFetch.mock.calls.slice(2).map((call) => call[1].headers['x-api-key']))
+      .toEqual(['new-key', 'new-key']);
+  });
+
 });

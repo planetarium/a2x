@@ -168,6 +168,8 @@ const task = await client.sendMessage({ message });
 
 The streaming counterpart buffers the first event: when it observes `auth-required` and `AuthProvider.refresh()` is available, it refreshes, opens a new stream, and yields that stream's events to the caller.
 
+One `A2XClient` can be shared by concurrent callers. Cold requests share a single in-flight `AuthProvider.provide()` call, and simultaneous `auth-required` responses share one `refresh()`. Each request records the credential generation it used, so a late failure from an older generation retries with the newer credentials instead of refreshing again.
+
 ## Client side: handling auth
 
 ### Credential providers

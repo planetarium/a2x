@@ -93,8 +93,7 @@ export function getAgentEndpointUrl(
     return jsonRpcInterface.url;
   }
 
-  // Fallback to first interface
-  return v10.supportedInterfaces[0].url;
+  throw new Error('v1.0 AgentCard has no JSONRPC interface');
 }
 
 // ─── AgentCard Resolution ───

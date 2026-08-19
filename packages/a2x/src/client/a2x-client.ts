@@ -404,6 +404,10 @@ export class A2XClient {
   private _parser: ResponseParser | null = null;
   private _endpointUrl: string | null = null;
   private _resolvedSchemes?: AuthScheme[];
+  private _resolutionPromise?: Promise<void>;
+  private _authInitializationPromise?: Promise<void>;
+  private _authRefreshPromise?: Promise<boolean>;
+  private _authGeneration = 0;
   private _requestId = 0;
 
   constructor(
@@ -730,16 +734,21 @@ export class A2XClient {
   ): Promise<Task> {
     await this._ensureResolved();
     await this._ensureAuthenticated();
+    let authGeneration = this._authGeneration;
     const formatted = this._formatParams(params);
     const request = this._buildJsonRpcRequest(A2A_METHODS.SEND_MESSAGE, formatted);
-    const result = await this._postJsonRpc(request, onTransport);
+    const result = await this._postJsonRpc(
+      request,
+      onTransport,
+      (generation) => { authGeneration = generation; },
+    );
     const task = this._parser!.parseTask(result);
     // Spec a2a-v0.3 §TaskState / a2a-v1.0 §TASK_STATE_AUTH_REQUIRED:
     // an auth failure surfaces as a Task in `auth-required` state.
     // Refresh credentials once and retry; the same condition on the
     // second response is propagated to the caller as-is.
     if (task.status.state !== TaskState.AUTH_REQUIRED) return task;
-    if (!(await this._refreshAuth())) return task;
+    if (!(await this._refreshAuth(authGeneration))) return task;
     const retryRequest = this._buildJsonRpcRequest(A2A_METHODS.SEND_MESSAGE, formatted);
     const retryResult = await this._postJsonRpc(retryRequest, onTransport);
     return this._parser!.parseTask(retryResult);
@@ -780,6 +789,7 @@ export class A2XClient {
         ...(this._extensions.size > 0 ? ['X-A2A-Extensions'] : []),
       ],
     );
+    const authGeneration = this._authGeneration;
 
     // Everything above ran locally; serialize the body before declaring the
     // request submitted, so a payload that cannot even be encoded never
@@ -822,7 +832,7 @@ export class A2XClient {
       !isRetry &&
       'status' in firstEvent &&
       firstEvent.status?.state === TaskState.AUTH_REQUIRED &&
-      (await this._refreshAuth())
+      (await this._refreshAuth(authGeneration))
     ) {
       yield* this._streamWithAuthRetry(params, signal, true, onTransport);
       return;
@@ -1086,6 +1096,24 @@ export class A2XClient {
     if (this._resolvedSchemes) return;
     if (!this._authProvider) return;
 
+    if (!this._authInitializationPromise) {
+      this._authInitializationPromise = this._initializeAuthentication();
+    }
+    const pending = this._authInitializationPromise;
+    try {
+      await pending;
+    } finally {
+      if (this._authInitializationPromise === pending) {
+        this._authInitializationPromise = undefined;
+      }
+    }
+  }
+
+  private async _initializeAuthentication(): Promise<void> {
+    if (this._resolvedSchemes) return;
+    const authProvider = this._authProvider;
+    if (!authProvider) return;
+
     const card = this._resolved!.card;
     const rawCard = card as unknown as Record<string, unknown>;
 
@@ -1098,7 +1126,10 @@ export class A2XClient {
       );
     }
     const rawRequirementsField = rawRequirementsValue;
-    if (rawRequirementsField.length === 0) return;
+    if (rawRequirementsField.length === 0) {
+      this._resolvedSchemes = [];
+      return;
+    }
 
     // Normalize v1.0 wrapped format { schemes: { name: { list: [...] } } }
     // to internal flat format { name: [...] }
@@ -1214,7 +1245,8 @@ export class A2XClient {
       return;
     }
 
-    this._resolvedSchemes = await this._authProvider.provide(requirements);
+    this._resolvedSchemes = await authProvider.provide(requirements);
+    this._authGeneration += 1;
   }
 
   /**
@@ -1252,8 +1284,25 @@ export class A2XClient {
   private async _ensureResolved(): Promise<void> {
     if (this._resolved) return;
 
+    if (!this._resolutionPromise) {
+      this._resolutionPromise = this._resolveOnce();
+    }
+    const pending = this._resolutionPromise;
+    try {
+      await pending;
+    } finally {
+      if (this._resolutionPromise === pending) {
+        this._resolutionPromise = undefined;
+      }
+    }
+  }
+
+  private async _resolveOnce(): Promise<void> {
+    if (this._resolved) return;
+
+    let resolved: ResolvedAgentCard;
     if (typeof this._urlOrCard === 'string') {
-      this._resolved = await resolveAgentCard(this._urlOrCard, {
+      resolved = await resolveAgentCard(this._urlOrCard, {
         fetch: this._fetchImpl,
         headers: this._headers,
       });
@@ -1265,18 +1314,20 @@ export class A2XClient {
       );
       const endpointUrl = getAgentEndpointUrl(card, version);
 
-      this._resolved = {
+      resolved = {
         card,
         version,
         baseUrl: new URL(endpointUrl).origin,
       };
     }
 
-    this._parser = getResponseParser(this._resolved!.version);
-    this._endpointUrl = getAgentEndpointUrl(
-      this._resolved!.card,
-      this._resolved.version,
-    );
+    // Validate every derived value before publishing any resolved state. A
+    // failed discovery must remain retryable on the next request.
+    const parser = getResponseParser(resolved.version);
+    const endpointUrl = getAgentEndpointUrl(resolved.card, resolved.version);
+    this._resolved = resolved;
+    this._parser = parser;
+    this._endpointUrl = endpointUrl;
     this._activateX402Extension();
   }
 
@@ -1368,6 +1419,7 @@ export class A2XClient {
   private async _postJsonRpc(
     request: JSONRPCRequest,
     onTransport?: () => void | Promise<void>,
+    onAuthApplied?: (generation: number) => void,
   ): Promise<unknown> {
     const headers = this._buildHeaders();
     const url = new URL(this._endpointUrl!);
@@ -1379,6 +1431,7 @@ export class A2XClient {
         ...(this._extensions.size > 0 ? ['X-A2A-Extensions'] : []),
       ],
     );
+    onAuthApplied?.(this._authGeneration);
 
     // Everything above ran locally; serialize the body before declaring the
     // request submitted, so a payload that cannot even be encoded never
@@ -1414,12 +1467,25 @@ export class A2XClient {
    * JSON-RPC error code. When the AuthProvider supports `refresh()`, the
    * client refreshes credentials once and retries the same call.
    */
-  private async _refreshAuth(): Promise<boolean> {
+  private async _refreshAuth(expectedGeneration: number): Promise<boolean> {
     if (!this._authProvider?.refresh || !this._resolvedSchemes) return false;
-    this._resolvedSchemes = await this._authProvider.refresh(
-      this._resolvedSchemes,
-    );
-    return true;
+    if (this._authGeneration !== expectedGeneration) return true;
+    if (!this._authRefreshPromise) {
+      const schemes = this._resolvedSchemes;
+      this._authRefreshPromise = (async () => {
+        this._resolvedSchemes = await this._authProvider!.refresh!(schemes);
+        this._authGeneration += 1;
+        return true;
+      })();
+    }
+    const pending = this._authRefreshPromise;
+    try {
+      return await pending;
+    } finally {
+      if (this._authRefreshPromise === pending) {
+        this._authRefreshPromise = undefined;
+      }
+    }
   }
 }
 
