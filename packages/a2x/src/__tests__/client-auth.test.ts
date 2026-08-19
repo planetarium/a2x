@@ -12,7 +12,7 @@ import {
 } from '../client/auth-scheme.js';
 import { normalizeScheme, normalizeRequirements } from '../client/auth-normalizer.js';
 import type { AuthProvider } from '../client/auth-provider.js';
-import type { AgentCardV10 } from '../types/agent-card.js';
+import type { AgentCardV03, AgentCardV10 } from '../types/agent-card.js';
 import type { SecuritySchemeV03, SecuritySchemeV10 } from '../types/security.js';
 import { TaskState } from '../types/task.js';
 
@@ -760,6 +760,55 @@ describe('A2XClient auth integration', () => {
       ...V10_CARD_WITH_AUTH,
       securityRequirements: [{ schemes: { deviceCode: wrapper } }],
     } as unknown as AgentCardV10;
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const provide = vi.fn();
+    const client = new A2XClient(malformedCard, {
+      fetch: mockFetch,
+      authProvider: { provide },
+    });
+
+    await expect(client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    })).rejects.toThrow('must contain an array of strings');
+    expect(provide).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects v1 requirement scheme arrays before transport', async () => {
+    const malformedCard = {
+      ...V10_CARD_WITH_AUTH,
+      securityRequirements: [{ schemes: [] }],
+    } as unknown as AgentCardV10;
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const provide = vi.fn();
+    const client = new A2XClient(malformedCard, {
+      fetch: mockFetch,
+      authProvider: { provide },
+    });
+
+    await expect(client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    })).rejects.toThrow('requirement schemes must be an object');
+    expect(provide).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects malformed v0.3 requirement scopes before transport', async () => {
+    const malformedCard = {
+      name: 'Malformed v0.3 Agent',
+      description: 'An agent with malformed auth requirements',
+      version: '1.0.0',
+      url: 'http://localhost:4000/a2a',
+      protocolVersion: '0.3.0',
+      capabilities: {},
+      securitySchemes: {
+        apiKey: { type: 'apiKey', in: 'header', name: 'x-api-key' },
+      },
+      security: [{ apiKey: 'openid' }],
+      skills: [],
+      defaultInputModes: ['text/plain'],
+      defaultOutputModes: ['text/plain'],
+    } as unknown as AgentCardV03;
     const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
     const provide = vi.fn();
     const client = new A2XClient(malformedCard, {

@@ -1047,18 +1047,36 @@ export class A2XClient {
     const rawCard = card as unknown as Record<string, unknown>;
 
     // v0.3 uses "security", v1.0 uses "securityRequirements"
-    const rawRequirementsField =
-      (rawCard.security as unknown[] | undefined) ??
-      (rawCard.securityRequirements as unknown[] | undefined) ??
-      [];
+    const rawRequirementsValue =
+      rawCard.security ?? rawCard.securityRequirements ?? [];
+    if (!Array.isArray(rawRequirementsValue)) {
+      throw new InvalidAgentResponseError(
+        'AgentCard security requirements must be an array.',
+      );
+    }
+    const rawRequirementsField = rawRequirementsValue;
     if (rawRequirementsField.length === 0) return;
 
     // Normalize v1.0 wrapped format { schemes: { name: { list: [...] } } }
     // to internal flat format { name: [...] }
     const rawRequirements = rawRequirementsField.map((req) => {
+      if (!req || typeof req !== 'object' || Array.isArray(req)) {
+        throw new InvalidAgentResponseError(
+          'Each AgentCard security requirement must be an object.',
+        );
+      }
       const r = req as Record<string, unknown>;
-      if (r.schemes && typeof r.schemes === 'object') {
+      if (this._resolved!.version === '1.0') {
         // v1.0 format
+        if (
+          !r.schemes ||
+          typeof r.schemes !== 'object' ||
+          Array.isArray(r.schemes)
+        ) {
+          throw new InvalidAgentResponseError(
+            'AgentCard security requirement schemes must be an object.',
+          );
+        }
         const flat: Record<string, string[]> = {};
         for (const [name, val] of Object.entries(r.schemes as Record<string, unknown>)) {
           if (!val || typeof val !== 'object' || Array.isArray(val)) {
@@ -1086,8 +1104,20 @@ export class A2XClient {
         }
         return flat;
       }
-      // v0.3 format (already flat)
-      return r as Record<string, string[]>;
+      // v0.3 format is already flat, but still comes from an untrusted card.
+      const flat: Record<string, string[]> = {};
+      for (const [name, scopes] of Object.entries(r)) {
+        if (
+          !Array.isArray(scopes) ||
+          !scopes.every((scope): scope is string => typeof scope === 'string')
+        ) {
+          throw new InvalidAgentResponseError(
+            `AgentCard security requirement "${name}" must contain an array of strings.`,
+          );
+        }
+        flat[name] = scopes;
+      }
+      return flat;
     });
 
     const rawSchemes =
