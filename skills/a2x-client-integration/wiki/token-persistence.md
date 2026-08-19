@@ -1,20 +1,20 @@
 # Token Persistence
 
-How to persist credentials across process restarts so users don't re-authenticate on every invocation. Reference implementation: `packages/cli/src/token-store.ts`.
+How to persist credentials across process restarts so users don't re-authenticate on every invocation. This pattern is based on `packages/cli/src/token-store.ts` and uses a collision-safe slot key instead of the CLI's legacy class-only key.
 
 ---
 
-## File-Based Store (CLI Pattern)
+## File-Based Store
 
-The CLI stores credentials in `~/.a2x/tokens.json`, keyed by agent URL:
+Store credentials in a user-local JSON file keyed by agent URL and unique requirement slot:
 
 ```json
 {
   "https://agent.example.com": [
-    { "schemeClass": "ApiKeyAuthScheme", "credential": "sk-abc123..." }
+    { "slot": "[0,0,\"ApiKeyAuthScheme\",{\"name\":\"x-api-key\",\"location\":\"header\"}]", "credential": "sk-abc123..." }
   ],
   "https://other.example.com/a2a": [
-    { "schemeClass": "HttpBearerAuthScheme", "credential": "eyJhbGci..." }
+    { "slot": "[0,0,\"HttpBearerAuthScheme\",{}]", "credential": "eyJhbGci..." }
   ]
 }
 ```
@@ -30,7 +30,7 @@ const STORE_DIR = path.join(os.homedir(), '.myapp');
 const STORE_PATH = path.join(STORE_DIR, 'tokens.json');
 
 interface StoredCredential {
-  schemeClass: string;
+  slot: string;
   credential: string;
 }
 
@@ -46,6 +46,7 @@ function readStore(): StoreData {
 
 function writeStore(data: StoreData): void {
   fs.mkdirSync(STORE_DIR, { recursive: true, mode: 0o700 });
+  fs.chmodSync(STORE_DIR, 0o700);
   fs.writeFileSync(STORE_PATH, JSON.stringify(data, null, 2), {
     encoding: 'utf-8',
     mode: 0o600,
@@ -102,8 +103,19 @@ import {
   ApiKeyAuthScheme,
 } from '@a2x/sdk/client';
 
-export function extractCredential(scheme: AuthScheme): {
-  schemeClass: string;
+export function credentialSlot(
+  groupIndex: number,
+  schemeIndex: number,
+  scheme: AuthScheme,
+): string {
+  const params = 'params' in scheme
+    ? (scheme as AuthScheme & { readonly params: unknown }).params
+    : {};
+  return JSON.stringify([groupIndex, schemeIndex, scheme.constructor.name, params]);
+}
+
+export function extractCredential(slot: string, scheme: AuthScheme): {
+  slot: string;
   credential: string;
 } {
   const ctx = {
@@ -113,8 +125,6 @@ export function extractCredential(scheme: AuthScheme): {
   scheme.applyToRequest(ctx);
 
   let credential = '';
-  const className = scheme.constructor.name;
-
   if (scheme instanceof ApiKeyAuthScheme) {
     credential = ctx.headers[scheme.params.name]
       ?? ctx.url.searchParams.get(scheme.params.name)
@@ -126,12 +136,13 @@ export function extractCredential(scheme: AuthScheme): {
     credential = spaceIdx >= 0 ? auth.slice(spaceIdx + 1) : auth;
   }
 
-  return { schemeClass: className, credential };
+  return { slot, credential };
 }
 ```
 
 Why this works:
 
+- The slot combines the requirement-group position, scheme position, subclass, and public parameters. It remains unique when one AND group contains two API-key schemes, and a card-shape change invalidates the old slot instead of silently applying it to a different scheme.
 - Every scheme has a defined `applyToRequest` that mutates the context.
 - API keys may land in `headers[name]`, `url.searchParams`, or `Cookie` — the `ApiKeyAuthScheme` branch handles header/query; cookie-placed keys would need an extra branch. The CLI does not handle cookie placement today, but the pattern extends cleanly.
 - All other schemes (Bearer, Basic, OAuth2 variants, OIDC) place credentials in `Authorization` with a `<scheme> <value>` format — strip the prefix.
@@ -158,7 +169,8 @@ if (scheme instanceof ApiKeyAuthScheme) {
 
 The CLI's `~/.a2x/tokens.json` is:
 
-- restricted to the current user on Unix (`0600`) inside a `0700` directory; the CLI reapplies `chmod(0600)` after every write.
+- restricted to the current user on Unix (`0600`); the CLI reapplies `chmod(0600)` after every write.
+- placed in a directory created as `0700` when absent. The CLI does not repair the mode of an already-existing `~/.a2x` directory.
 - **plaintext** — anyone with filesystem access can copy tokens.
 - **unencrypted** at rest.
 
@@ -171,15 +183,16 @@ The file permissions reduce accidental cross-user exposure, but plaintext creden
 | Encrypted file (libsodium / GPG) | If you must use a file; add a passphrase prompt. |
 | In-memory only | Forfeits step 1 of the fallback chain, but safest. Suitable for short-lived workers. |
 
-When switching stores, keep the same shape — `Record<agentUrl, Array<{ schemeClass, credential }>>` — and only swap the backing read/write functions. The `AuthProvider` doesn't need to know.
+When switching stores, keep the same shape — `Record<agentUrl, Array<{ slot, credential }>>` — and only swap the backing read/write functions. Migrate legacy CLI entries keyed by `schemeClass` carefully; a class name alone is ambiguous when one requirement group contains two instances of that class.
 
 ### File permissions
 
-Match the CLI's permissions when implementing a file store:
+Enforce both directory and file permissions when implementing a file store:
 
 ```typescript
 function writeStore(data: StoreData): void {
   fs.mkdirSync(STORE_DIR, { recursive: true, mode: 0o700 });
+  fs.chmodSync(STORE_DIR, 0o700);
   fs.writeFileSync(STORE_PATH, JSON.stringify(data, null, 2), {
     encoding: 'utf-8',
     mode: 0o600,
@@ -213,7 +226,7 @@ Safe: scheme class names, agent URLs, `scheme.params.name` for API keys.
 async refresh(schemes: AuthScheme[]): Promise<AuthScheme[]> {
   clearCredentials(this.agentUrl);
   for (const scheme of schemes) await resolveScheme(scheme);
-  this._save(schemes);
+  this._save(this.selectedGroupIndex, schemes);
   return schemes;
 }
 ```
@@ -234,7 +247,7 @@ async refresh(schemes: AuthScheme[]): Promise<AuthScheme[]> {
     // Fall back to re-prompt
     await resolveScheme(scheme);
   }
-  this._save(schemes);
+  this._save(this.selectedGroupIndex, schemes);
   return schemes;
 }
 ```
@@ -249,7 +262,7 @@ The CLI does not track TTLs — stored tokens live until `refresh()` clears them
 
 ```typescript
 interface StoredCredential {
-  schemeClass: string;
+  slot: string;
   credential: string;
   expiresAt?: number;    // Unix ms
 }

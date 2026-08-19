@@ -163,7 +163,8 @@ async function getCachedOrExchange(
   scheme: OAuth2ClientCredentialsAuthScheme,
   agentUrl: string,
 ): Promise<string> {
-  const key = `a2a:${agentUrl}:${scheme.constructor.name}`;
+  const scopes = Object.keys(scheme.params.scopes).sort().join(' ');
+  const key = `a2a:${agentUrl}:${scheme.params.tokenUrl}:${scopes}`;
   const cached = await redis.get(key);
   if (cached) return cached;
 
