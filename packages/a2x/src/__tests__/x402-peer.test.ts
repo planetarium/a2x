@@ -52,6 +52,22 @@ describe('importX402Peer', () => {
     expect(err.packageName).toBe(['@x402', 'definitely-not-installed'].join('/'));
     expect(err.specifier).toContain('deep/subpath');
   });
+
+  it('prefers a host-registered loader over runtime module resolution', async () => {
+    const registrySymbol = Symbol.for('@a2x/sdk/x402-peer-loaders');
+    const runtime = globalThis as unknown as Record<PropertyKey, unknown>;
+    const previous = runtime[registrySymbol];
+    const expected = { HTTPFacilitatorClient: class {} };
+    runtime[registrySymbol] = {
+      '@x402/core/http': async () => expected,
+    };
+    try {
+      await expect(importX402Peer('@x402/core/http')).resolves.toBe(expected);
+    } finally {
+      if (previous === undefined) delete runtime[registrySymbol];
+      else runtime[registrySymbol] = previous;
+    }
+  });
 });
 
 describe('isMissingPeer — does not over-claim', () => {
