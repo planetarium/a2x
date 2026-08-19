@@ -29,9 +29,11 @@ Key API:
 
 ```typescript
 export interface StoredCredential {
-  schemeClass: string;
+  slot: string;
   credential: string;
 }
+export function credentialSlot(groupIndex: number, schemeIndex: number, scheme: AuthScheme): string;
+export function extractCredential(slot: string, scheme: AuthScheme): StoredCredential;
 export function loadCredentials(agentUrl: string): StoredCredential[] | undefined;
 export function saveCredentials(agentUrl: string, credentials: StoredCredential[]): void;
 export function clearCredentials(agentUrl: string): void;
@@ -74,7 +76,13 @@ import {
   OAuth2PasswordAuthScheme,
   OpenIdConnectAuthScheme,
 } from '@a2x/sdk/client';
-import { loadCredentials, saveCredentials, clearCredentials } from './token-store.js';
+import {
+  clearCredentials,
+  credentialSlot,
+  extractCredential,
+  loadCredentials,
+  saveCredentials,
+} from './token-store.js';
 import { performDeviceCodeFlow } from './device-code.js';
 
 async function prompt(q: string): Promise<string> {
@@ -133,74 +141,80 @@ async function resolveScheme(scheme: AuthScheme): Promise<void> {
   throw new Error(`Unsupported auth scheme: ${scheme.constructor.name}`);
 }
 
-function extractCredential(scheme: AuthScheme): { schemeClass: string; credential: string } {
-  const ctx = { headers: {} as Record<string, string>, url: new URL('http://dummy') };
-  scheme.applyToRequest(ctx);
-  let credential = '';
-  if (scheme instanceof ApiKeyAuthScheme) {
-    credential = ctx.headers[scheme.params.name]
-      ?? ctx.url.searchParams.get(scheme.params.name) ?? '';
-  } else {
-    const auth = ctx.headers['Authorization'] ?? '';
-    const spaceIdx = auth.indexOf(' ');
-    credential = spaceIdx >= 0 ? auth.slice(spaceIdx + 1) : auth;
-  }
-  return { schemeClass: scheme.constructor.name, credential };
-}
-
 export class CliAuthProvider implements AuthProvider {
+  private selectedGroupIndex?: number;
+
   constructor(private readonly agentUrl: string) {}
 
   async provide(requirements: AuthScheme[][]): Promise<AuthScheme[]> {
     const stored = loadCredentials(this.agentUrl);
     if (stored?.length) {
-      for (const group of requirements) {
-        if (this._tryRestore(group, stored)) return group;
+      for (const [groupIndex, group] of requirements.entries()) {
+        if (this._tryRestore(groupIndex, group, stored)) {
+          this.selectedGroupIndex = groupIndex;
+          return group;
+        }
       }
     }
 
     console.log(chalk.magenta.bold('\nAuthentication required by this agent.'));
 
-    let group: AuthScheme[];
+    let groupIndex: number;
     if (requirements.length === 1) {
-      group = requirements[0];
-      console.log(chalk.gray(`  Scheme: ${group.map(schemeLabel).join(' + ')}`));
+      groupIndex = 0;
+      console.log(chalk.gray(`  Scheme: ${requirements[0].map(schemeLabel).join(' + ')}`));
     } else {
       console.log(chalk.gray('  Available authentication methods:'));
       requirements.forEach((g, i) =>
         console.log(chalk.gray(`    ${i + 1}. ${g.map(schemeLabel).join(' + ')}`)));
       const choice = await prompt(chalk.yellow(`  Select method (1-${requirements.length}): `));
-      const idx = parseInt(choice, 10) - 1;
-      if (isNaN(idx) || idx < 0 || idx >= requirements.length) throw new Error('Invalid selection');
-      group = requirements[idx];
+      groupIndex = parseInt(choice, 10) - 1;
+      if (isNaN(groupIndex) || groupIndex < 0 || groupIndex >= requirements.length) {
+        throw new Error('Invalid selection');
+      }
     }
 
+    const group = requirements[groupIndex];
     for (const scheme of group) await resolveScheme(scheme);
     console.log('');
-    this._save(group);
+    this.selectedGroupIndex = groupIndex;
+    this._save(groupIndex, group);
     return group;
   }
 
   async refresh(schemes: AuthScheme[]): Promise<AuthScheme[]> {
+    if (this.selectedGroupIndex === undefined) {
+      throw new Error('Cannot refresh before selecting an auth group');
+    }
     clearCredentials(this.agentUrl);
     console.log(chalk.magenta.bold('\nAuthentication expired. Please re-authenticate.'));
     for (const scheme of schemes) await resolveScheme(scheme);
     console.log('');
-    this._save(schemes);
+    this._save(this.selectedGroupIndex, schemes);
     return schemes;
   }
 
-  private _tryRestore(group: AuthScheme[], stored: { schemeClass: string; credential: string }[]) {
-    for (const scheme of group) {
-      const match = stored.find(s => s.schemeClass === scheme.constructor.name);
+  private _tryRestore(
+    groupIndex: number,
+    group: AuthScheme[],
+    stored: { slot: string; credential: string }[],
+  ) {
+    for (const [schemeIndex, scheme] of group.entries()) {
+      const slot = credentialSlot(groupIndex, schemeIndex, scheme);
+      const match = stored.find(s => s.slot === slot);
       if (!match) return false;
       scheme.setCredential(match.credential);
     }
     return true;
   }
 
-  private _save(group: AuthScheme[]) {
-    saveCredentials(this.agentUrl, group.map(extractCredential));
+  private _save(groupIndex: number, group: AuthScheme[]) {
+    saveCredentials(
+      this.agentUrl,
+      group.map((scheme, schemeIndex) =>
+        extractCredential(credentialSlot(groupIndex, schemeIndex, scheme), scheme),
+      ),
+    );
   }
 }
 ```

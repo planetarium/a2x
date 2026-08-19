@@ -61,17 +61,19 @@ Returning a group with an unset credential will cause `applyToRequest()` to emit
 
 ## Scheme Instance Identity
 
-The SDK constructs `AuthScheme` instances once per client from the agent card. The same instances are:
+After initialization completes, the SDK retains one active `AuthScheme` set derived from the agent card. Those cached instances are:
 
 - passed to `provide()`
 - returned by `provide()`
 - cached inside the client
 - re-applied on every outgoing request
-- passed to `refresh()` after an `auth-required` task or first stream event
+- passed to `refresh()` after an `auth-required` task or an `auth-required` first stream event
+
+Concurrent cold-start resolution can construct transient competing sets before one is cached; do not use object identity as a persistence key or assume construction happens exactly once.
 
 **Do not construct new `AuthScheme` instances inside `provide()`.** Mutate the ones the SDK hands you (via `setCredential`) and return them.
 
-This invariant is what lets you keep a `requirement-group → credentials` mapping keyed by `scheme.constructor.name` — the CLI reference implementation relies on it.
+Instance reuse does not make `scheme.constructor.name` a unique persistence key. A requirement group can contain two instances of the same subclass, such as API keys in different headers. Persist a slot identity derived from the requirement-group position, scheme position, class, and public parameters. The CLI reference implementation currently uses only the class name and therefore assumes at most one instance of each subclass per group.
 
 ---
 
@@ -85,9 +87,9 @@ new A2XClient(...)
         ▼
 await client.sendMessage(...)
         │
-        ├── [first call only] resolveAgentCard → card
+        ├── [first completed initialization] resolveAgentCard → card
         │
-        ├── [first call only] if card has securityRequirements:
+        ├── [first completed initialization] if card has securityRequirements:
         │       requirements = normalizeRequirements(card)
         │       schemes = await authProvider.provide(requirements)
         │       cache schemes
@@ -96,7 +98,8 @@ await client.sendMessage(...)
         │
         ├── fetch → task or stream
         │
-        ├── if the task or first stream event is auth-required and refresh exists:
+        ├── if the task, or exactly the first stream event, is an
+        │   auth-required status and refresh + resolved schemes exist:
         │       schemes = await authProvider.refresh(cachedSchemes)
         │       cache schemes (may be same instances)
         │       retry request exactly once
@@ -106,9 +109,9 @@ await client.sendMessage(...)
 
 Key properties:
 
-- `provide()` is called **at most once per client instance** under normal operation.
-- `refresh()` is called **at most once per `auth-required` task-creating request**. If the retry is also `auth-required`, the task or event is surfaced without another refresh attempt.
-- `sendMessageStream()` buffers its first event so it can refresh and retry once before yielding an `auth-required` event.
+- A completed `provide()` result is reused, but concurrent cold-start calls can invoke `provide()` more than once. Make it concurrency-safe and deduplicate interactive or expensive work in the provider.
+- `refresh()` is called **at most once per `auth-required` task-creating request**, and only when it exists and schemes were previously resolved. If refresh is unavailable or the retry is also `auth-required`, the task or event is surfaced.
+- `sendMessageStream()` buffers exactly its first event. It can refresh only when that event is an `auth-required` status event; a later status event does not trigger refresh.
 - An HTTP 401 is not refreshed automatically; both blocking and streaming calls surface it as `InternalError('HTTP 401: Unauthorized')`.
 
 ---

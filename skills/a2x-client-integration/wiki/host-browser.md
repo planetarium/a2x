@@ -68,11 +68,11 @@ The remote agent must send:
 
 ```
 Access-Control-Allow-Origin: https://your-app.example.com
-Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key
+Access-Control-Allow-Headers: Content-Type, Authorization, X-A2A-Extensions, x-api-key
 Access-Control-Allow-Methods: GET, POST, OPTIONS
 ```
 
-…and respond to `OPTIONS` preflight requests. The built-in `toA2x` listener emits `Access-Control-Allow-Origin: *` and handles `OPTIONS`, but its default `Access-Control-Allow-Headers` permits only `Content-Type`. Browser calls using `Authorization`, API-key, or extension headers therefore need a reverse proxy or host wrapper that returns the complete allow-list above.
+…and respond to `OPTIONS` preflight requests. Replace `x-api-key` with every custom API-key header name the card can select. The built-in `toA2x` listener emits `Access-Control-Allow-Origin: *` and handles `OPTIONS`, but its default `Access-Control-Allow-Headers` permits only `Content-Type`. Browser calls using authentication, custom, extension, or x402 headers therefore need a reverse proxy or host wrapper that returns the complete allow-list.
 
 Streaming (`message/stream`) triggers a preflight because the client sends `Accept: text/event-stream` and a JSON body — the preflight must succeed or the browser will never open the SSE connection.
 
@@ -80,15 +80,23 @@ Streaming (`message/stream`) triggers a preflight because the client sends `Acce
 
 ## Token Storage Options
 
-| Option | XSS-safe? | Survives reload? | Notes |
-|--------|-----------|------------------|-------|
-| `localStorage` | No | Yes | Simplest; XSS can exfiltrate |
-| `sessionStorage` | No | Only within tab | Slightly better blast radius |
-| In-memory only | Yes | No | Forces re-login on reload |
-| Cookie with `HttpOnly` | Yes | Yes | You can't read it from JS — useful only if the **agent** accepts the cookie |
-| Service worker + IndexedDB | Mostly | Yes | Complex; niche |
+| Option | Resists same-origin XSS token theft? | Survives reload? | Notes |
+|--------|---------------------------------------|------------------|-------|
+| `localStorage` | No | Yes | XSS can read and exfiltrate it |
+| `sessionStorage` | No | Only within tab | Smaller persistence window, same XSS boundary |
+| In-memory only | No | No | Shorter exposure window, but XSS can read or intercept a live token |
+| Cookie with `HttpOnly` | Yes, for token confidentiality | Yes | JavaScript cannot read it, but XSS can still issue same-origin requests; useful only if the **agent** accepts the cookie |
+| Service worker + IndexedDB | No | Yes | Same-origin script compromise can still reach or misuse the credential path |
 
 For user-pasted tokens in a dev tool, in-memory is fine. For production sessions, prefer `HttpOnly` cookies with server-side proxy.
+
+---
+
+## x402 Signer Boundary
+
+Native x402 payment requires a viem `LocalAccount`, which holds signing authority in the JavaScript process. Do not place a platform or service private key in a SPA bundle, browser storage, or remotely supplied configuration. An injected wallet account is not automatically a drop-in `LocalAccount` for this API.
+
+For direct browser payment, use only a user-owned signer with intentionally limited funds and clear per-payment consent. Otherwise proxy the payment through a backend payer with server-side policy, rate limits, and an aggregate budget in addition to the SDK's per-requirement `maxAmount`.
 
 ---
 

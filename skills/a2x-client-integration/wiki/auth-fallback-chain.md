@@ -1,6 +1,6 @@
 # Authentication Fallback Chain
 
-This is the **reference pattern** for an interactive `AuthProvider` — lifted directly from the `a2x` CLI implementation at `packages/cli/src/cli-auth-provider.ts`. Use it as the blueprint for any interactive client (CLI, TUI, dev tools) that must survive restarts and token expiry.
+This is the **reference pattern** for an interactive `AuthProvider`, based on `packages/cli/src/cli-auth-provider.ts` and hardened with collision-safe credential slots. Use it as the blueprint for any interactive client (CLI, TUI, dev tools) that must survive restarts and token expiry.
 
 ---
 
@@ -10,9 +10,9 @@ This is the **reference pattern** for an interactive `AuthProvider` — lifted d
 provide(requirements)
   │
   │   ── Step 1: Stored credentials ────────────────────────────────────────
-  │     loadCredentials(agentUrl) → Array<{ schemeClass, credential }>
-  │     for each group in requirements:
-  │       if all schemes in group have a stored match by class name:
+  │     loadCredentials(agentUrl) → Array<{ slot, credential }>
+  │     for each group and groupIndex in requirements:
+  │       if all schemes have a stored match by unique slot key:
   │         scheme.setCredential(match.credential) for each
   │         return group
   │     // otherwise fall through
@@ -27,7 +27,7 @@ provide(requirements)
   │     for each scheme in group:
   │       resolveScheme(scheme)   ← prompts / device-code / etc.
   │
-  │     saveCredentials(agentUrl, group.map(extractCredential))
+  │     save credentials with group index + scheme index + class + params
   │     return group
 
 refresh(schemes)   ← SDK calls after an auth-required task/event
@@ -38,7 +38,7 @@ refresh(schemes)   ← SDK calls after an auth-required task/event
   │     for each scheme in schemes:
   │       resolveScheme(scheme)   ← same interactive UI as Step 2
   │
-  │     saveCredentials(agentUrl, schemes.map(extractCredential))
+  │     save credentials using the selected group's slot keys
   │     return schemes
 ```
 
@@ -52,7 +52,7 @@ Each step addresses a distinct failure mode:
 |------|-------------------|
 | 1. Stored | **Second-run friction.** Without persistence, the user re-authenticates on every CLI invocation. |
 | 2. Interactive | **First-run bootstrap.** Stored credentials don't exist yet, or the user switched to a different agent. |
-| 3. Refresh | **Credential expiry.** Stored token worked last time, but the agent now returns an `auth-required` task or first stream event — stored credentials are stale. |
+| 3. Refresh | **Credential expiry.** Stored token worked last time, but the agent now returns an `auth-required` task or an `auth-required` first stream event — stored credentials are stale. |
 
 Skipping Step 1 is fine for short-lived workers that always re-prompt anyway (none, for a backend service). Skipping Step 3 leaves you vulnerable to stale tokens — any OAuth2-backed agent benefits from it.
 
@@ -60,35 +60,33 @@ Skipping Step 1 is fine for short-lived workers that always re-prompt anyway (no
 
 ## Key Implementation Details
 
-### Scheme class name as stable key
+### Use a unique credential-slot key
 
-The CLI stores credentials keyed by `scheme.constructor.name` and matches on that when restoring:
+The current CLI stores credentials keyed only by `scheme.constructor.name`. That is a compatibility format, not a generally unique identity. A valid AND group can contain two `ApiKeyAuthScheme` instances with different names or locations; class-only restoration finds the first stored entry for both and silently applies the wrong credential.
+
+For new integrations, derive a slot from the requirement-group position, scheme position, class, and public parameters:
 
 ```typescript
-// Save
-const entries = group.map(scheme => ({
-  schemeClass: scheme.constructor.name,
-  credential: extractCredential(scheme),
-}));
-
-// Restore
-for (const scheme of group) {
-  const match = stored.find(s => s.schemeClass === scheme.constructor.name);
-  if (!match) return false;           // this group can't be restored
-  scheme.setCredential(match.credential);
+function credentialSlot(
+  groupIndex: number,
+  schemeIndex: number,
+  scheme: AuthScheme,
+): string {
+  const params = 'params' in scheme
+    ? (scheme as AuthScheme & { readonly params: unknown }).params
+    : {};
+  return JSON.stringify([groupIndex, schemeIndex, scheme.constructor.name, params]);
 }
 ```
 
-This works because the SDK **always** instantiates the same `AuthScheme` subclass from the same agent-card security entry. As long as the agent card does not change, the class name is a stable identifier for the credential slot.
-
-If the agent later rotates to a different scheme type (say, API key → Bearer), stored entries won't match and the CLI falls through to the interactive step — which is the right behavior.
+Store the selected `groupIndex` on the provider so `refresh(schemes)` can recreate the same slot keys. If the card's ordering or public parameters change, old entries no longer match and the provider falls back to interactive resolution instead of binding a credential to a different slot.
 
 ### Credential extraction
 
 `AuthScheme` stores the credential in a `protected` field. The CLI doesn't cast past it — instead it invokes `applyToRequest` against a dummy context and reads the credential back out of the headers / URL:
 
 ```typescript
-function extractCredential(scheme: AuthScheme): { schemeClass: string; credential: string } {
+function extractCredential(slot: string, scheme: AuthScheme): { slot: string; credential: string } {
   const ctx = { headers: {} as Record<string, string>, url: new URL('http://dummy') };
   scheme.applyToRequest(ctx);
 
@@ -103,7 +101,7 @@ function extractCredential(scheme: AuthScheme): { schemeClass: string; credentia
     const spaceIdx = auth.indexOf(' ');
     credential = spaceIdx >= 0 ? auth.slice(spaceIdx + 1) : auth;
   }
-  return { schemeClass: scheme.constructor.name, credential };
+  return { slot, credential };
 }
 ```
 
@@ -114,8 +112,9 @@ This keeps the provider agnostic of each scheme's private state — if the SDK a
 Restoration is all-or-nothing per group:
 
 ```typescript
-for (const group of requirements) {
-  if (this._tryRestore(group, stored)) {
+for (const [groupIndex, group] of requirements.entries()) {
+  if (this._tryRestore(groupIndex, group, stored)) {
+    this.selectedGroupIndex = groupIndex;
     return group;
   }
 }
@@ -151,7 +150,13 @@ import {
   OAuth2PasswordAuthScheme,
   OpenIdConnectAuthScheme,
 } from '@a2x/sdk/client';
-import { loadCredentials, saveCredentials, clearCredentials } from './token-store.js';
+import {
+  clearCredentials,
+  credentialSlot,
+  extractCredential,
+  loadCredentials,
+  saveCredentials,
+} from './token-store.js';
 import { performDeviceCodeFlow } from './device-code.js';
 
 async function prompt(question: string): Promise<string> {
@@ -208,50 +213,63 @@ async function resolveScheme(scheme: AuthScheme): Promise<void> {
 }
 
 export class CliAuthProvider implements AuthProvider {
+  private selectedGroupIndex?: number;
+
   constructor(private readonly agentUrl: string) {}
 
   async provide(requirements: AuthScheme[][]): Promise<AuthScheme[]> {
     const stored = loadCredentials(this.agentUrl);
     if (stored?.length) {
-      for (const group of requirements) {
-        if (this._tryRestore(group, stored)) return group;
+      for (const [groupIndex, group] of requirements.entries()) {
+        if (this._tryRestore(groupIndex, group, stored)) {
+          this.selectedGroupIndex = groupIndex;
+          return group;
+        }
       }
     }
 
-    let group: AuthScheme[];
+    let groupIndex: number;
     if (requirements.length === 1) {
-      group = requirements[0];
+      groupIndex = 0;
     } else {
       // render menu, read user choice → index
-      const idx = /* parseInt from prompt */ 0;
-      group = requirements[idx];
+      groupIndex = /* parseInt from prompt */ 0;
     }
+    const group = requirements[groupIndex];
     for (const scheme of group) await resolveScheme(scheme);
-    this._save(group);
+    this.selectedGroupIndex = groupIndex;
+    this._save(groupIndex, group);
     return group;
   }
 
   async refresh(schemes: AuthScheme[]): Promise<AuthScheme[]> {
+    if (this.selectedGroupIndex === undefined) {
+      throw new Error('Cannot refresh before selecting an auth group');
+    }
     clearCredentials(this.agentUrl);
     for (const scheme of schemes) await resolveScheme(scheme);
-    this._save(schemes);
+    this._save(this.selectedGroupIndex, schemes);
     return schemes;
   }
 
   private _tryRestore(
+    groupIndex: number,
     group: AuthScheme[],
-    stored: Array<{ schemeClass: string; credential: string }>,
+    stored: Array<{ slot: string; credential: string }>,
   ): boolean {
-    for (const scheme of group) {
-      const match = stored.find(s => s.schemeClass === scheme.constructor.name);
+    for (const [schemeIndex, scheme] of group.entries()) {
+      const slot = credentialSlot(groupIndex, schemeIndex, scheme);
+      const match = stored.find(s => s.slot === slot);
       if (!match) return false;
       scheme.setCredential(match.credential);
     }
     return true;
   }
 
-  private _save(group: AuthScheme[]): void {
-    const entries = group.map(extractCredential);
+  private _save(groupIndex: number, group: AuthScheme[]): void {
+    const entries = group.map((scheme, schemeIndex) =>
+      extractCredential(credentialSlot(groupIndex, schemeIndex, scheme), scheme),
+    );
     saveCredentials(this.agentUrl, entries);
   }
 }

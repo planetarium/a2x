@@ -75,8 +75,10 @@ The stream ends (generator completes) when:
 
 ```typescript
 import { TERMINAL_STATES } from '@a2x/sdk';
-// Set<TaskState>: completed, failed, canceled, rejected (case-insensitive)
+// ReadonlySet<TaskState>: completed, failed, canceled, rejected
 ```
+
+The set contains normalized lowercase `TaskState` values and `Set.has()` is case-sensitive. Events parsed by the SDK are normalized before they reach this check.
 
 The generator does **not** automatically time out — if the server never signals termination, you will hang until the connection drops. Always use either a client-supplied abort or a wrapper with a timeout.
 
@@ -116,9 +118,11 @@ The `taskId` is available on every event's `taskId` field after the first status
 
 ## x402 Payment Streams
 
-When the client is constructed with `x402`, the same generator owns the payment round trip. It yields the initial `payment-required` status, invokes `onPaymentRequired`, signs and resubmits when approved, then continues yielding verification, work, artifact, and completion events. `allowUpto`, `allowBatchSettlement`, `maxRetries`, and receipt reconciliation follow the same options and safety rules as blocking `sendMessage`.
+When the client is constructed with `x402`, the same generator owns the payment round trip. It yields the initial `payment-required` status, invokes `onPaymentRequired`, signs and resubmits when approved, then continues yielding verification, work, artifact, and completion events. Configure batch support with durable `batchSettlement` storage and opt into default selection separately with `allowBatchSettlement`. The default selector's `allowUpto`, `allowBatchSettlement`, and `maxRetries` rules match blocking `sendMessage`; a custom `selectRequirement` bypasses the two scheme opt-in flags.
 
-Breaking out after a payment payload has been submitted can leave the result ambiguous, especially for `batch-settlement`. Use durable channel storage and handle `X402ReconciliationError` as described in the [x402 payments guide](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md).
+Unlike blocking `sendMessage`, a terminal unsuccessful payment receipt in a stream is yielded as a failed status; the stream does not convert it to `X402PaymentFailedError`. Inspect terminal status and x402 receipt metadata in the streamed events. Batch reconciliation failures still throw `X402ReconciliationError` before an unsafe terminal event can be yielded.
+
+Breaking out after a payment payload has been submitted can leave the result ambiguous, especially for `batch-settlement`. Use durable channel storage, route a channel through one process owner or a durable cross-process reservation, and handle `X402ReconciliationError` as described in the [x402 payments guide](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md).
 
 ---
 
@@ -137,8 +141,8 @@ try {
   if (err instanceof InvalidParamsError) { /* … */ }
   else throw err;
 }
-// Auth failure is not thrown — it arrives as a streamed task in the
-// `auth-required` state. Inspect `event.status.state` rather than catching.
+// Protocol-level task auth failure is not thrown — it arrives as an
+// `auth-required` status event. HTTP auth failures still throw InternalError.
 ```
 
 All error classes importable from `@a2x/sdk`. See [error-handling.md](./error-handling.md) for the full list.
@@ -159,7 +163,7 @@ Data-only JSON-RPC streams may also carry a JSON-RPC error envelope in a `data:`
 
 ### Authentication during streaming
 
-The client buffers the first stream event. If it is an `auth-required` status and the provider implements `refresh()`, the client refreshes credentials and retries the stream once before yielding anything. If the retried stream is also `auth-required`, that event is yielded normally.
+The client buffers exactly the first stream event. If that event is an `auth-required` status, the provider implements `refresh()`, and schemes were resolved, the client refreshes credentials and retries the stream once before yielding anything. An artifact or other event first means a later `auth-required` status is yielded without automatic refresh. If the retried stream is also `auth-required`, that event is yielded normally.
 
 An HTTP 401 is different: it throws `InternalError('HTTP 401: Unauthorized')` immediately and does not invoke the provider. Refresh the host credential and construct a fresh client only if the remote integration uses transport-level 401 instead of the A2A `auth-required` state.
 

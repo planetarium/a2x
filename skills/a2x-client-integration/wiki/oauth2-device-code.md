@@ -198,13 +198,13 @@ The device-code flow is typically used with **public** clients (no secret), so `
 
 ## Storing the Access Token
 
-The access token goes into the store via `saveCredentials` keyed by `scheme.constructor.name === 'OAuth2DeviceCodeAuthScheme'`. On subsequent runs, the CLI restores it with `scheme.setCredential` — no new device-code flow.
+The access token goes into the selected OAuth2 device-code credential slot via `saveCredentials`. On subsequent runs, the provider restores that slot with `scheme.setCredential` — no new device-code flow. Use the composite slot described in [token-persistence.md](./token-persistence.md), not the class name alone.
 
 If you want to also store `refresh_token` and exchange it when the agent reports `auth-required` instead of re-doing the device-code flow, extend `StoredCredential`:
 
 ```typescript
 interface StoredCredential {
-  schemeClass: string;
+  slot: string;
   credential: string;
   refreshCredential?: string;  // OAuth2 refresh_token
   expiresAt?: number;

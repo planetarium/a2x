@@ -9,7 +9,7 @@ Consume remote A2A agents from any TypeScript application using `@a2x/sdk` (via 
 
 The server side is covered by the companion [`a2x-integration`](../a2x-agent-integration/SKILL.md) skill — this skill focuses exclusively on the **caller** side: fetching the agent card, authenticating dynamically against the agent's declared security schemes, sending messages, streaming SSE events, and surviving token expiry.
 
-The reference implementation for all of this is the `a2x` CLI itself (`packages/cli/src/cli-auth-provider.ts` + `packages/cli/src/token-store.ts`). The patterns documented here are lifted directly from that implementation.
+The `a2x` CLI (`packages/cli/src/cli-auth-provider.ts` + `packages/cli/src/token-store.ts`) is the reference implementation. This skill follows it while hardening documented integration patterns where the CLI's local compatibility format has known limits, such as duplicate auth-scheme classes in one requirement group.
 
 ---
 
@@ -242,7 +242,7 @@ See [wiki/streaming.md](./wiki/streaming.md) for SSE format details, terminal-st
 
 ### Step 6 — Enable x402 Payments (Optional)
 
-`A2XClient` can run the payer-side x402 flow transparently. Install the optional payment peers, provide a viem `LocalAccount`, and always set a spending cap:
+`A2XClient` can run the payer-side x402 flow transparently. Install the optional payment peers, provide a viem `LocalAccount`, and always set a per-requirement authorization ceiling:
 
 ```bash
 npm install @a2x/sdk @x402/core @x402/evm viem
@@ -253,13 +253,15 @@ const paidClient = new A2XClient(AGENT_URL, {
   x402: {
     signer,
     maxAmount: 10_000n,
-    // Implement this prompt in the host UI or CLI.
-    onPaymentRequired: async (required) => confirmPaymentWithUser(required),
+    // This receives the complete accepts[] envelope before offer selection.
+    onPaymentRequired: async (required) => confirmEnvelopeWithUser(required),
   },
 });
 ```
 
-The default selector accepts affordable EVM `exact` offers. Enable `allowUpto` only with explicit consent because it authorizes any charge up to the advertised maximum. Enable `batch-settlement` only with durable channel storage. See the [x402 payments guide](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md) for V1/V2 negotiation, `upto`, batch settlement, receipt reconciliation, and recovery requirements.
+`maxAmount` is expressed in the asset's atomic units and applies to each selected requirement (or each new batch deposit); it is not an aggregate wallet budget across calls. The default selector chooses an affordable EVM `exact` offer. Enable `allowUpto` only with explicit consent because it authorizes a charge up to the advertised maximum. To use `batch-settlement`, provide `batchSettlement` storage and opt in with `allowBatchSettlement`; route each channel through one process owner or add a durable cross-process reservation before signing.
+
+`onPaymentRequired` sees the full envelope before affordability filtering and offer selection. Use it for envelope-level policy. Drive the [low-level manual flow](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md#low-level-signx402payment) when the user must approve the exact selected offer. A custom `selectRequirement` is itself explicit scheme consent: it bypasses `allowUpto` and `allowBatchSettlement`, although `maxAmount` still filters offers and batch selection still requires `batchSettlement`. Never embed a service private key in a browser bundle; use a user-owned restricted signer or a backend payer. See the [x402 payments guide](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md) for reconciliation and recovery requirements.
 
 ---
 
@@ -273,7 +275,7 @@ The default selector accepts affordable EVM `exact` offers. Enable `allowUpto` o
    console.log(resolved.version, resolved.card);
    ```
 3. **Send a message** — confirm the round-trip works with your `AuthProvider`.
-4. **Simulate token expiry** — make the server return an `auth-required` task or first stream event once, then confirm `refresh()` is invoked and the request is retried.
+4. **Simulate token expiry** — make the server return an `auth-required` unary task or an `auth-required` status as the first stream event, then confirm `refresh()` is invoked and the request is retried.
 5. **Try with the `a2x` CLI** for a sanity check against the same agent:
    ```bash
    a2x a2a agent-card <AGENT_URL>
@@ -289,7 +291,7 @@ The CLI in this repo implements a three-step fallback that every interactive cli
 ```
 provide(requirements)
   │
-  ├─ 1. Stored credentials?           ─ yes →  match group by className       → return group
+  ├─ 1. Stored credentials?           ─ yes →  match every credential slot    → return group
   │                                             (scheme.setCredential from cache)
   │                                   ─ no  ↓
   ├─ 2. Interactive resolution
@@ -310,7 +312,7 @@ refresh(schemes)  ← SDK calls this after an auth-required task/event
 
 Three properties are load-bearing:
 
-1. **Scheme class name is the stable identity.** The CLI stores `scheme.constructor.name` alongside the raw credential and matches on that when restoring. The SDK always instantiates the same classes from a given agent card, so the name is a safe key.
+1. **Persist a unique credential-slot key.** The reference CLI currently stores only `scheme.constructor.name`; that works only when a requirement group contains at most one instance of each subclass. A valid group can contain two API-key schemes with different names, so new integrations should key each slot by requirement-group index, scheme index, class, and public parameters.
 2. **Scheme instances are mutated, not replaced.** `AuthProvider` returns the same instances the SDK handed in — only `setCredential()` has been called. The SDK will then call `applyToRequest(ctx)` on each.
 3. **Credential extraction goes through `applyToRequest`.** The stored credential isn't exposed directly on the scheme; the CLI recovers it by running `applyToRequest` against a dummy context and reading the resulting `Authorization` / header / query value back out. This keeps the provider agnostic of each scheme's private state.
 
@@ -353,6 +355,6 @@ See [wiki/token-persistence.md](./wiki/token-persistence.md) for the `extractCre
 Remind the user to:
 
 1. Set any environment variables the `AuthProvider` needs (API keys, bearer tokens, OAuth client IDs).
-2. Audit the token storage location if they enabled persistence. The reference CLI uses a plaintext `0600` file in a `0700` directory; production applications should prefer an OS keychain or secret manager.
-3. Add a **connection error** path distinct from an **auth** path — the SDK throws `InternalError` for HTTP-level failures and typed `A2AError` subclasses (e.g. `TaskNotFoundError`) for protocol-level failures, while auth failures surface as a `Task` in the `auth-required` state (not a thrown error). See [wiki/error-handling.md](./wiki/error-handling.md).
+2. Audit the token storage location if they enabled persistence. The reference CLI writes a plaintext `0600` file and creates its directory as `0700` when absent, but it does not repair an existing directory's mode; production applications should prefer an OS keychain or secret manager.
+3. Add a **connection error** path distinct from an **auth** path — the SDK throws `InternalError` for HTTP-level failures and typed `A2AError` subclasses (e.g. `TaskNotFoundError`) for protocol-level failures, while protocol-level task authentication failures surface as `auth-required` state (not a thrown error). See [wiki/error-handling.md](./wiki/error-handling.md).
 4. Consider retry / backoff for `getTask`. Reconcile `cancelTask` after an ambiguous transport failure because the first cancellation may already have succeeded; never automatically retry `sendMessage` without an application-level idempotency strategy.
