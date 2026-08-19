@@ -27,6 +27,57 @@ import {
 /** Bound eager OAuth-flow expansion from an untrusted AgentCard. */
 const MAX_NORMALIZED_AUTH_GROUPS = 256;
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function invalidSecurityScheme(message: string): never {
+  throw new InvalidAgentResponseError(`Invalid AgentCard security scheme: ${message}`);
+}
+
+function assertOAuthFlows(
+  value: unknown,
+): asserts value is Record<string, unknown> {
+  if (!isRecord(value)) invalidSecurityScheme('OAuth2 flows must be an object.');
+}
+
+function assertOAuthFlow(
+  value: unknown,
+  name: string,
+  requiredUrls: readonly string[],
+  supportsPkce = false,
+): asserts value is Record<string, unknown> {
+  if (!isRecord(value)) {
+    invalidSecurityScheme(`OAuth2 ${name} flow must be an object.`);
+  }
+  for (const field of requiredUrls) {
+    if (typeof value[field] !== 'string' || value[field].length === 0) {
+      invalidSecurityScheme(
+        `OAuth2 ${name} flow requires a non-empty ${field} string.`,
+      );
+    }
+  }
+  if (
+    value.scopes !== undefined &&
+    (!isRecord(value.scopes) ||
+      !Object.values(value.scopes).every((entry) => typeof entry === 'string'))
+  ) {
+    invalidSecurityScheme(`OAuth2 ${name} flow scopes must be a string map.`);
+  }
+  if (value.refreshUrl !== undefined && typeof value.refreshUrl !== 'string') {
+    invalidSecurityScheme(`OAuth2 ${name} flow refreshUrl must be a string.`);
+  }
+  if (
+    supportsPkce &&
+    value.pkceRequired !== undefined &&
+    typeof value.pkceRequired !== 'boolean'
+  ) {
+    invalidSecurityScheme(
+      `OAuth2 ${name} flow pkceRequired must be a boolean.`,
+    );
+  }
+}
+
 type AuthDestination =
   | { kind: 'cookie'; name: string }
   | { kind: 'cookie-header' }
@@ -83,6 +134,11 @@ export function normalizeRequirements(
   requirements: SecurityRequirement[],
   schemes: Record<string, SecuritySchemeV03 | SecuritySchemeV10>,
 ): AuthScheme[][] {
+  if (!isRecord(schemes)) {
+    throw new InvalidAgentResponseError(
+      'AgentCard securitySchemes must be an object.',
+    );
+  }
   const result: AuthScheme[][] = [];
 
   for (const requirement of requirements) {
@@ -102,11 +158,11 @@ export function normalizeRequirements(
     let groups: AuthScheme[][] = [[]];
     let supported = true;
     for (const [schemeName, requiredScopes] of entries) {
-      const raw = schemes[schemeName];
-      if (!raw) {
+      if (!Object.hasOwn(schemes, schemeName)) {
         supported = false;
         break;
       }
+      const raw = schemes[schemeName];
 
       const classes = normalizeScheme(raw, requiredScopes);
       if (classes.length === 0) {
@@ -148,12 +204,15 @@ export function normalizeScheme(
   raw: SecuritySchemeV03 | SecuritySchemeV10,
   requiredScopes?: readonly string[],
 ): AuthScheme[] {
+  if (!isRecord(raw)) {
+    invalidSecurityScheme('each referenced scheme must be an object.');
+  }
   const requiredScopesSnapshot = requiredScopes === undefined
     ? undefined
     : Object.freeze([...requiredScopes]);
 
   // v0.3: has a `type` field directly
-  if ('type' in raw) {
+  if (Object.hasOwn(raw, 'type')) {
     return normalizeV03Scheme(raw as SecuritySchemeV03, requiredScopesSnapshot);
   }
 
@@ -166,27 +225,51 @@ function normalizeV03Scheme(
   requiredScopes?: readonly string[],
 ): AuthScheme[] {
   switch (scheme.type) {
-    case 'apiKey':
+    case 'apiKey': {
+      if (
+        !['header', 'query', 'cookie'].includes(scheme.in) ||
+        typeof scheme.name !== 'string' ||
+        scheme.name.length === 0
+      ) {
+        invalidSecurityScheme(
+          'API key requires a non-empty name and location header, query, or cookie.',
+        );
+      }
       return [
         new ApiKeyAuthScheme(
           scheme.name,
           scheme.in as 'header' | 'query' | 'cookie',
         ),
       ];
+    }
 
-    case 'http':
-      if (scheme.scheme === 'bearer') {
+    case 'http': {
+      if (typeof scheme.scheme !== 'string') {
+        invalidSecurityScheme('HTTP authentication scheme must be a string.');
+      }
+      const name = scheme.scheme.toLowerCase();
+      if (name === 'bearer') {
         return [new HttpBearerAuthScheme(scheme.bearerFormat)];
       }
-      if (scheme.scheme === 'basic') {
+      if (name === 'basic') {
         return [new HttpBasicAuthScheme()];
       }
       return [];
+    }
 
     case 'oauth2':
+      assertOAuthFlows(scheme.flows);
       return normalizeOAuth2FlowsV03(scheme.flows, requiredScopes);
 
     case 'openIdConnect':
+      if (
+        typeof scheme.openIdConnectUrl !== 'string' ||
+        scheme.openIdConnectUrl.length === 0
+      ) {
+        invalidSecurityScheme(
+          'OpenID Connect requires a non-empty openIdConnectUrl string.',
+        );
+      }
       return [
         new OpenIdConnectAuthScheme(
           scheme.openIdConnectUrl,
@@ -207,8 +290,39 @@ function normalizeV10Scheme(
   scheme: SecuritySchemeV10,
   requiredScopes?: readonly string[],
 ): AuthScheme[] {
-  if (scheme.apiKeySecurityScheme) {
-    const s = scheme.apiKeySecurityScheme;
+  const members = [
+    'apiKeySecurityScheme',
+    'httpAuthSecurityScheme',
+    'oauth2SecurityScheme',
+    'openIdConnectSecurityScheme',
+    'mtlsSecurityScheme',
+  ] as const;
+  const present = members.filter(
+    (name) => Object.hasOwn(scheme, name) && scheme[name] !== undefined,
+  );
+  if (present.length !== 1) {
+    invalidSecurityScheme(
+      'v1.0 scheme must contain exactly one recognized security scheme member.',
+    );
+  }
+
+  const memberName = present[0]!;
+  const member = scheme[memberName];
+  if (!isRecord(member)) {
+    invalidSecurityScheme(`v1.0 ${memberName} must be an object.`);
+  }
+
+  if (memberName === 'apiKeySecurityScheme') {
+    const s = member as unknown as NonNullable<SecuritySchemeV10['apiKeySecurityScheme']>;
+    if (
+      !['header', 'query', 'cookie'].includes(s.location) ||
+      typeof s.name !== 'string' ||
+      s.name.length === 0
+    ) {
+      invalidSecurityScheme(
+        'API key requires a non-empty name and location header, query, or cookie.',
+      );
+    }
     return [
       new ApiKeyAuthScheme(
         s.name,
@@ -217,39 +331,54 @@ function normalizeV10Scheme(
     ];
   }
 
-  if (scheme.httpAuthSecurityScheme) {
-    const s = scheme.httpAuthSecurityScheme;
-    if (s.scheme === 'bearer') {
+  if (memberName === 'httpAuthSecurityScheme') {
+    const s = member as unknown as NonNullable<SecuritySchemeV10['httpAuthSecurityScheme']>;
+    if (typeof s.scheme !== 'string') {
+      invalidSecurityScheme('HTTP authentication scheme must be a string.');
+    }
+    const name = s.scheme.toLowerCase();
+    if (name === 'bearer') {
       return [new HttpBearerAuthScheme(s.bearerFormat)];
     }
-    if (s.scheme === 'basic') {
+    if (name === 'basic') {
       return [new HttpBasicAuthScheme()];
     }
     return [];
   }
 
-  if (scheme.oauth2SecurityScheme) {
+  if (memberName === 'oauth2SecurityScheme') {
+    const oauth2 = member as unknown as NonNullable<SecuritySchemeV10['oauth2SecurityScheme']>;
+    assertOAuthFlows(oauth2.flows);
     return normalizeOAuth2FlowsV10(
-      scheme.oauth2SecurityScheme.flows,
+      oauth2.flows,
       requiredScopes,
     );
   }
 
-  if (scheme.openIdConnectSecurityScheme) {
+  if (memberName === 'openIdConnectSecurityScheme') {
+    const oidc = member as unknown as NonNullable<SecuritySchemeV10['openIdConnectSecurityScheme']>;
+    if (
+      typeof oidc.openIdConnectUrl !== 'string' ||
+      oidc.openIdConnectUrl.length === 0
+    ) {
+      invalidSecurityScheme(
+        'OpenID Connect requires a non-empty openIdConnectUrl string.',
+      );
+    }
     return [
       new OpenIdConnectAuthScheme(
-        scheme.openIdConnectSecurityScheme.openIdConnectUrl,
+        oidc.openIdConnectUrl,
         requiredScopes,
       ),
     ];
   }
 
-  if (scheme.mtlsSecurityScheme) {
+  if (memberName === 'mtlsSecurityScheme') {
     // Not supported at HTTP level — skip
     return [];
   }
 
-  return [];
+  return invalidSecurityScheme('v1.0 scheme member is not supported.');
 }
 
 // ─── OAuth2 Flow Normalization ───
@@ -263,6 +392,11 @@ function normalizeOAuth2FlowsV03(
   // `deviceCode` is a non-standard extension on v0.3. `@a2x/sdk` emits it
   // alongside standard flows, so consume it the same way v1.0 does.
   if (flows.deviceCode) {
+    assertOAuthFlow(
+      flows.deviceCode,
+      'deviceCode',
+      ['deviceAuthorizationUrl', 'tokenUrl'],
+    );
     result.push(
       new OAuth2DeviceCodeAuthScheme(
         flows.deviceCode.deviceAuthorizationUrl,
@@ -275,6 +409,11 @@ function normalizeOAuth2FlowsV03(
   }
 
   if (flows.authorizationCode) {
+    assertOAuthFlow(
+      flows.authorizationCode,
+      'authorizationCode',
+      ['authorizationUrl', 'tokenUrl'],
+    );
     result.push(
       new OAuth2AuthorizationCodeAuthScheme(
         flows.authorizationCode.authorizationUrl,
@@ -288,6 +427,11 @@ function normalizeOAuth2FlowsV03(
   }
 
   if (flows.clientCredentials) {
+    assertOAuthFlow(
+      flows.clientCredentials,
+      'clientCredentials',
+      ['tokenUrl'],
+    );
     result.push(
       new OAuth2ClientCredentialsAuthScheme(
         flows.clientCredentials.tokenUrl,
@@ -299,6 +443,7 @@ function normalizeOAuth2FlowsV03(
   }
 
   if (flows.implicit) {
+    assertOAuthFlow(flows.implicit, 'implicit', ['authorizationUrl']);
     result.push(
       new OAuth2ImplicitAuthScheme(
         flows.implicit.authorizationUrl,
@@ -310,6 +455,7 @@ function normalizeOAuth2FlowsV03(
   }
 
   if (flows.password) {
+    assertOAuthFlow(flows.password, 'password', ['tokenUrl']);
     result.push(
       new OAuth2PasswordAuthScheme(
         flows.password.tokenUrl,
@@ -330,6 +476,11 @@ function normalizeOAuth2FlowsV10(
   const result: AuthScheme[] = [];
 
   if (flows.deviceCode) {
+    assertOAuthFlow(
+      flows.deviceCode,
+      'deviceCode',
+      ['deviceAuthorizationUrl', 'tokenUrl'],
+    );
     result.push(
       new OAuth2DeviceCodeAuthScheme(
         flows.deviceCode.deviceAuthorizationUrl,
@@ -342,6 +493,12 @@ function normalizeOAuth2FlowsV10(
   }
 
   if (flows.authorizationCode) {
+    assertOAuthFlow(
+      flows.authorizationCode,
+      'authorizationCode',
+      ['authorizationUrl', 'tokenUrl'],
+      true,
+    );
     result.push(
       new OAuth2AuthorizationCodeAuthScheme(
         flows.authorizationCode.authorizationUrl,
@@ -355,6 +512,11 @@ function normalizeOAuth2FlowsV10(
   }
 
   if (flows.clientCredentials) {
+    assertOAuthFlow(
+      flows.clientCredentials,
+      'clientCredentials',
+      ['tokenUrl'],
+    );
     result.push(
       new OAuth2ClientCredentialsAuthScheme(
         flows.clientCredentials.tokenUrl,
@@ -366,6 +528,7 @@ function normalizeOAuth2FlowsV10(
   }
 
   if (flows.implicit) {
+    assertOAuthFlow(flows.implicit, 'implicit', ['authorizationUrl']);
     result.push(
       new OAuth2ImplicitAuthScheme(
         flows.implicit.authorizationUrl,
@@ -377,6 +540,7 @@ function normalizeOAuth2FlowsV10(
   }
 
   if (flows.password) {
+    assertOAuthFlow(flows.password, 'password', ['tokenUrl']);
     result.push(
       new OAuth2PasswordAuthScheme(
         flows.password.tokenUrl,

@@ -112,16 +112,14 @@ export class V03AgentCardMapper implements AgentCardMapper<AgentCardV03> {
       return undefined;
     }
 
-    const schemes: Record<string, SecuritySchemeV03> = {};
-
+    const entries: Array<[string, SecuritySchemeV03]> = [];
     for (const [name, scheme] of state.securitySchemes) {
       const v03Schema = scheme.toV03Schema();
-      if (v03Schema !== null) {
-        schemes[name] = v03Schema;
-      }
+      if (v03Schema !== null) entries.push([name, v03Schema]);
       // If null, the scheme has no v0.3 representation; the scheme's
       // toV03Schema() is expected to have emitted a warning.
     }
+    const schemes = Object.fromEntries(entries);
 
     return Object.keys(schemes).length > 0 ? schemes : undefined;
   }

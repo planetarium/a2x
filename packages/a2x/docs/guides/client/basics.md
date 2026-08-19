@@ -10,7 +10,7 @@ import { A2XClient } from '@a2x/sdk/client';
 const client = new A2XClient('https://agent.example.com/.well-known/agent.json');
 ```
 
-Resolved authentication schemes are applied after custom headers and replace a custom header with the same case-insensitive name. This prevents values such as `authorization` and `Authorization` from being combined by Fetch. Do not use `headers` to compete with a header owned by the selected auth scheme; put that credential in the `AuthProvider` instead.
+Resolved authentication schemes are applied after custom headers and replace a custom header with the same case-insensitive name. This prevents values such as `authorization` and `Authorization` from being combined by Fetch. Case variants of `Cookie` are instead joined with the cookie delimiter so unrelated caller cookies survive cookie-based authentication. Do not use `headers` to compete with a header owned by the selected auth scheme; put that credential in the `AuthProvider` instead. Authentication cannot replace operation-owned `Content-Type`, streaming `Accept`, or an active `X-A2A-Extensions` header; the client rejects that conflict before transport.
 
 Pass the AgentCard URL (the `.well-known` path). The client fetches and caches the card on first use and uses it to figure out how to route subsequent calls.
 

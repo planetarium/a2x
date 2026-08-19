@@ -14,7 +14,10 @@ import { normalizeScheme, normalizeRequirements } from '../client/auth-normalize
 import type { AuthProvider } from '../client/auth-provider.js';
 import type { AgentCardV03, AgentCardV10 } from '../types/agent-card.js';
 import type { SecuritySchemeV03, SecuritySchemeV10 } from '../types/security.js';
-import { InvalidAgentResponseError } from '../types/errors.js';
+import {
+  InvalidAgentResponseError,
+  UnsupportedOperationError,
+} from '../types/errors.js';
 import { TaskState } from '../types/task.js';
 
 // ─── Test Fixtures ───
@@ -76,6 +79,20 @@ const TASK_RESULT = {
   artifacts: [],
   metadata: {},
 };
+
+function cardWithHeaderApiKey(name: string): AgentCardV10 {
+  return {
+    ...V10_CARD_WITH_AUTH,
+    securitySchemes: {
+      transportHeader: {
+        apiKeySecurityScheme: { location: 'header', name },
+      },
+    },
+    securityRequirements: [{
+      schemes: { transportHeader: { list: [] } },
+    }],
+  };
+}
 
 // ═══ AuthScheme Tests ═══
 
@@ -272,6 +289,25 @@ describe('normalizeScheme', () => {
       expect(result[0]).toBeInstanceOf(HttpBasicAuthScheme);
     });
 
+    it.each([
+      ['Bearer', HttpBearerAuthScheme],
+      ['bAsIc', HttpBasicAuthScheme],
+    ])('normalizes HTTP scheme names case-insensitively: %s', (name, Expected) => {
+      const raw: SecuritySchemeV03 = { type: 'http', scheme: name };
+
+      expect(normalizeScheme(raw)[0]).toBeInstanceOf(Expected);
+    });
+
+    it('rejects an invalid API-key location', () => {
+      const raw = {
+        type: 'apiKey',
+        in: 'body',
+        name: 'api-key',
+      } as unknown as SecuritySchemeV03;
+
+      expect(() => normalizeScheme(raw)).toThrow(InvalidAgentResponseError);
+    });
+
     it('normalizes oauth2 with multiple flows into multiple schemes', () => {
       const raw: SecuritySchemeV03 = {
         type: 'oauth2',
@@ -392,6 +428,39 @@ describe('normalizeScheme', () => {
 
       expect(result).toHaveLength(1);
       expect(result[0]).toBeInstanceOf(HttpBearerAuthScheme);
+    });
+
+    it.each([
+      ['Bearer', HttpBearerAuthScheme],
+      ['BASIC', HttpBasicAuthScheme],
+    ])('normalizes v1 HTTP scheme names case-insensitively: %s', (name, Expected) => {
+      const raw: SecuritySchemeV10 = {
+        httpAuthSecurityScheme: { scheme: name },
+      };
+
+      expect(normalizeScheme(raw)[0]).toBeInstanceOf(Expected);
+    });
+
+    it('rejects an invalid v1 API-key location', () => {
+      const raw = {
+        apiKeySecurityScheme: { location: 'body', name: 'api-key' },
+      } as SecuritySchemeV10;
+
+      expect(() => normalizeScheme(raw)).toThrow(InvalidAgentResponseError);
+    });
+
+    it('rejects primitive security schemes with a structured error', () => {
+      expect(() => normalizeScheme(42 as unknown as SecuritySchemeV10))
+        .toThrow(InvalidAgentResponseError);
+    });
+
+    it('rejects v1 security schemes with multiple oneof members', () => {
+      const raw: SecuritySchemeV10 = {
+        apiKeySecurityScheme: { location: 'header', name: 'x-api-key' },
+        mtlsSecurityScheme: {},
+      };
+
+      expect(() => normalizeScheme(raw)).toThrow(InvalidAgentResponseError);
     });
 
     it('normalizes oauth2SecurityScheme with deviceCode flow', () => {
@@ -800,6 +869,28 @@ describe('A2XClient auth integration', () => {
     expect(mockFetch).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['unknown field', { typo: ['admin'] }],
+    ['both canonical and legacy fields', { list: [], values: ['admin'] }],
+  ])('rejects a StringList with %s', async (_label, wrapper) => {
+    const malformedCard = {
+      ...V10_CARD_WITH_AUTH,
+      securityRequirements: [{ schemes: { deviceCode: wrapper } }],
+    } as unknown as AgentCardV10;
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const provide = vi.fn();
+    const client = new A2XClient(malformedCard, {
+      fetch: mockFetch,
+      authProvider: { provide },
+    });
+
+    await expect(client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    })).rejects.toBeInstanceOf(InvalidAgentResponseError);
+    expect(provide).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
   it('rejects v1 requirement scheme arrays before transport', async () => {
     const malformedCard = {
       ...V10_CARD_WITH_AUTH,
@@ -848,6 +939,55 @@ describe('A2XClient auth integration', () => {
     expect(provide).not.toHaveBeenCalled();
     expect(mockFetch).not.toHaveBeenCalled();
   });
+
+  it.each(['0.3', '1.0'] as const)(
+    'preserves a __proto__ scheme name for v%s cards',
+    async (version) => {
+      const card = version === '1.0'
+        ? {
+            ...V10_CARD_WITH_AUTH,
+            securitySchemes: JSON.parse(
+              '{"__proto__":{"apiKeySecurityScheme":{"location":"header","name":"x-special-key"}}}',
+            ),
+            securityRequirements: JSON.parse(
+              '[{"schemes":{"__proto__":{"list":[]}}}]',
+            ),
+          }
+        : {
+            name: 'Special-key v0.3 Agent',
+            description: 'Uses a special object key as a scheme name',
+            version: '1.0.0',
+            url: 'http://localhost:4000/a2a',
+            protocolVersion: '0.3.0',
+            capabilities: {},
+            securitySchemes: JSON.parse(
+              '{"__proto__":{"type":"apiKey","in":"header","name":"x-special-key"}}',
+            ),
+            security: JSON.parse('[{"__proto__":[]}]'),
+            skills: [],
+            defaultInputModes: ['text/plain'],
+            defaultOutputModes: ['text/plain'],
+          };
+      const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+      const provide = vi.fn(async (requirements: AuthScheme[][]) => {
+        expect(requirements).toHaveLength(1);
+        expect(requirements[0]).toHaveLength(1);
+        return [requirements[0]![0]!.setCredential('special-secret')];
+      });
+      const client = new A2XClient(
+        card as unknown as AgentCardV03 | AgentCardV10,
+        { fetch: mockFetch, authProvider: { provide } },
+      );
+
+      await client.sendMessage({
+        message: { role: 'user', parts: [{ text: 'Hello' }] },
+      });
+
+      expect(provide).toHaveBeenCalledTimes(1);
+      expect(mockFetch.mock.calls[0]![1].headers['x-special-key'])
+        .toBe('special-secret');
+    },
+  );
 
   it('calls authProvider.provide() and applies credentials', async () => {
     const mockFetch = createMockFetch(
@@ -977,6 +1117,94 @@ describe('A2XClient auth integration', () => {
     const headers = mockFetch.mock.calls[0]![1].headers as Record<string, string>;
     expect(headers.Cookie).toBe('caller=present; session=one; tenant=two');
     expect(headers.cookie).toBeUndefined();
+  });
+
+  it('coalesces caller Cookie header variants before applying cookie auth', async () => {
+    const cookieCard: AgentCardV10 = {
+      ...V10_CARD_WITH_AUTH,
+      securitySchemes: {
+        session: {
+          apiKeySecurityScheme: { location: 'cookie', name: 'session' },
+        },
+      },
+      securityRequirements: [{
+        schemes: { session: { list: [] } },
+      }],
+    };
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const client = new A2XClient(cookieCard, {
+      fetch: mockFetch,
+      headers: {
+        Cookie: 'first=one; session=stale',
+        cookie: 'second=two',
+      },
+      authProvider: {
+        async provide(requirements) {
+          return [requirements[0]![0]!.setCredential('fresh')];
+        },
+      },
+    });
+
+    await client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    });
+
+    const headers = mockFetch.mock.calls[0]![1].headers as Record<string, string>;
+    expect(headers.Cookie).toBe('first=one; second=two; session=fresh');
+    expect(headers.cookie).toBeUndefined();
+  });
+
+  it('rejects auth that overwrites the JSON Content-Type header', async () => {
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const client = new A2XClient(cardWithHeaderApiKey('content-type'), {
+      fetch: mockFetch,
+      authProvider: {
+        async provide(requirements) {
+          return [requirements[0]![0]!.setCredential('secret')];
+        },
+      },
+    });
+
+    await expect(client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    })).rejects.toBeInstanceOf(UnsupportedOperationError);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects streaming auth that overwrites the SSE Accept header', async () => {
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const client = new A2XClient(cardWithHeaderApiKey('ACCEPT'), {
+      fetch: mockFetch,
+      authProvider: {
+        async provide(requirements) {
+          return [requirements[0]![0]!.setCredential('secret')];
+        },
+      },
+    });
+
+    const stream = client.sendMessageStream({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    });
+    await expect(stream.next()).rejects.toBeInstanceOf(UnsupportedOperationError);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects auth that overwrites extension activation', async () => {
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const client = new A2XClient(cardWithHeaderApiKey('x-a2a-extensions'), {
+      fetch: mockFetch,
+      authProvider: {
+        async provide(requirements) {
+          return [requirements[0]![0]!.setCredential('secret')];
+        },
+      },
+    });
+    client.registerExtension('https://example.com/extensions/test');
+
+    await expect(client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    })).rejects.toBeInstanceOf(UnsupportedOperationError);
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it('preserves the built request context for custom auth schemes', async () => {
