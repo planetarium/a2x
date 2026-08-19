@@ -17,9 +17,15 @@ import {
   HttpBearerAuthScheme,
 } from '@a2x/sdk/client';
 import type { AuthProvider } from '@a2x/sdk/client';
+import { getApprovedCard, noRedirectFetch } from './approved-agent-card.js';
+
+type SessionCredentials = {
+  apiKeys?: Record<string, string>; // keyed by `location:name`
+  bearerToken?: string;
+};
 
 class SessionAuthProvider implements AuthProvider {
-  constructor(private readonly session: { apiKey?: string; bearerToken?: string }) {}
+  constructor(private readonly session: SessionCredentials) {}
 
   async provide(requirements: AuthScheme[][]): Promise<AuthScheme[]> {
     for (const group of requirements) {
@@ -36,8 +42,15 @@ class SessionAuthProvider implements AuthProvider {
 
   private tryFill(group: AuthScheme[]): boolean {
     for (const scheme of group) {
-      if (scheme instanceof ApiKeyAuthScheme && this.session.apiKey) {
-        scheme.setCredential(this.session.apiKey);
+      if (scheme instanceof ApiKeyAuthScheme) {
+        const name = scheme.params.location === 'header'
+          ? scheme.params.name.toLowerCase()
+          : scheme.params.name;
+        const credential = this.session.apiKeys?.[
+          `${scheme.params.location}:${name}`
+        ];
+        if (!credential) return false;
+        scheme.setCredential(credential);
         continue;
       }
       if (scheme instanceof HttpBearerAuthScheme && this.session.bearerToken) {
@@ -50,8 +63,10 @@ class SessionAuthProvider implements AuthProvider {
   }
 }
 
-export function agentClientFor(session: { apiKey?: string; bearerToken?: string }) {
-  return new A2XClient(process.env.AGENT_URL!, {
+export async function agentClientFor(session: SessionCredentials) {
+  const resolved = await getApprovedCard(); // policy-bound cache below
+  return new A2XClient(resolved.card, {
+    fetch: noRedirectFetch,
     authProvider: new SessionAuthProvider(session),
   });
 }
@@ -64,25 +79,66 @@ export function agentClientFor(session: { apiKey?: string; bearerToken?: string 
 The agent card rarely changes — cache it at module scope and pass the resolved card to avoid per-request GETs of `/.well-known/agent.json`:
 
 ```typescript
-import { A2XClient, resolveAgentCard } from '@a2x/sdk/client';
+// src/lib/approved-agent-card.ts
+import {
+  getAgentEndpointUrl,
+  resolveAgentCard,
+} from '@a2x/sdk/client';
 import type { ResolvedAgentCard } from '@a2x/sdk/client';
 
 let cardPromise: Promise<ResolvedAgentCard> | undefined;
+export const noRedirectFetch: typeof fetch = (input, init) =>
+  fetch(input, { ...init, redirect: 'error' });
 
-function getCard() {
-  cardPromise ??= resolveAgentCard(process.env.AGENT_URL!);
-  return cardPromise;
+function exactHttpsUrl(raw: string | undefined, label: string): string {
+  if (!raw) throw new Error(`${label} is required`);
+  const url = new URL(raw);
+  if (
+    url.protocol !== 'https:' || url.username || url.password ||
+    url.search || url.hash
+  ) throw new Error(`${label} must be an exact credential-free HTTPS URL`);
+  return url.toString();
 }
 
-export async function agentClientFor(session: { /* … */ }) {
-  const resolved = await getCard();
-  return new A2XClient(resolved.card, {
-    authProvider: new SessionAuthProvider(session),
-  });
+function requireJsonRpcEndpoint(card: unknown, version: '0.3' | '1.0'): string {
+  if (version === '1.0') {
+    const interfaces = (card as {
+      supportedInterfaces?: Array<{ url: string; protocolBinding?: string }>;
+    }).supportedInterfaces ?? [];
+    const jsonRpc = interfaces.find(entry =>
+      entry.protocolBinding?.toUpperCase() === 'JSONRPC'
+    );
+    if (!jsonRpc) throw new Error('AgentCard has no JSON-RPC interface');
+    return jsonRpc.url;
+  }
+  return getAgentEndpointUrl(card as Parameters<typeof getAgentEndpointUrl>[0], version);
+}
+
+export function getApprovedCard() {
+  cardPromise ??= (async () => {
+    const cardUrl = exactHttpsUrl(process.env.AGENT_CARD_URL, 'AGENT_CARD_URL');
+    if (!new URL(cardUrl).pathname.endsWith('.json')) {
+      throw new Error('AGENT_CARD_URL must name one exact JSON card document');
+    }
+    const resolved = await resolveAgentCard(cardUrl, { fetch: noRedirectFetch });
+    const endpoint = exactHttpsUrl(
+      requireJsonRpcEndpoint(resolved.card, resolved.version),
+      'AgentCard endpoint',
+    );
+    const expected = exactHttpsUrl(
+      process.env.AGENT_ENDPOINT_URL,
+      'AGENT_ENDPOINT_URL',
+    );
+    if (endpoint !== expected) {
+      throw new Error(`AgentCard endpoint is not approved: ${endpoint}`);
+    }
+    return resolved;
+  })();
+  return cardPromise;
 }
 ```
 
-Card cache survives across requests (module-level), but invalidates on a fresh deploy. If you need to bust the cache at runtime, expose an internal endpoint that sets `cardPromise = undefined`.
+Card cache survives across requests (module-level), but invalidates on a fresh deploy. Never attach a session credential until both the exact card document and its resolved JSON-RPC endpoint match host policy. If you need to bust the cache at runtime, expose an internal endpoint that sets `cardPromise = undefined` and re-run the same checks.
 
 ---
 
@@ -236,6 +292,167 @@ export async function POST(request: Request) {
 
 **Important**: Set `runtime = 'nodejs'` — the SDK uses `fetch` and `URL`, both available in Edge, but the device-code flow, `node:crypto`, and some Node globals referenced elsewhere in your auth provider require Node.
 
+The direct bridge above is appropriate only for unpaid, non-funds-bearing streams. Do **not** use the browser connection as the owner of an x402 stream, especially with batch settlement: a disconnect can close the upstream generator after payment submission and leave the financial result ambiguous.
+
+For paid streams, enqueue a durable job before returning a subscription identifier. A worker should own and drain `sendMessageStream()` through terminal receipt, reconciliation, or quarantine; persist sanitized events; and expose a replayable SSE subscription to the browser. Browser cancellation closes only that subscription. Apply worker-owned deadlines and handle `X402ReconciliationError`—never derive the upstream abort signal from `request.signal` after payment submission.
+
+Minimal architecture skeleton (the queue and stores are application adapters). The job and an outbox row must be committed atomically under a unique owner-scoped idempotency key; an unconditional enqueue after `createOnce` can enqueue the same paid job twice:
+
+```typescript
+// POST /api/agent/jobs — authenticate session and enforce CSRF/rate/budget policy.
+const idempotencyKey = requireOwnerScopedIdempotencyKey(
+  request.headers.get('Idempotency-Key'),
+  session.userId,
+);
+const job = await jobs.createOnceWithOutbox({
+  ownerId: session.userId,
+  idempotencyKey, // unique with ownerId
+  text: boundedMessage,
+  credentialRef: session.a2aCredentialRef, // reference, never a browser token
+  outbox: {
+    topic: 'payer-jobs',
+    partitionKey: `${process.env.AGENT_ENDPOINT_URL}:${PAYER_ADDRESS}`,
+  },
+});
+return Response.json({ jobId: job.id }, { status: 202 });
+```
+
+An outbox dispatcher publishes each row with `job.id` as the queue deduplication key and marks it delivered transactionally/idempotently. Repeating the POST returns the existing job and cannot create another outbox row.
+
+```typescript
+// One active worker per partition. This high-level recovery example is only
+// for exact/upto payments: clientForWorker must omit batchSettlement and keep
+// allowBatchSettlement false. Batch recovery requires the low-level flow below.
+import {
+  TERMINAL_STATES,
+  TaskState,
+  type Task,
+} from '@a2x/sdk';
+import type { A2XClient } from '@a2x/sdk/client';
+import {
+  X402ReconciliationError,
+  getX402PaymentRequirements,
+  getX402Receipts,
+} from '@a2x/sdk/x402';
+
+async function executePaidJob(job: AgentJob): Promise<void> {
+  const client = await clientForWorker(job.credentialRef);
+  // Atomic and durable: only a never-started job can return `start`.
+  // Redelivery of an existing execution always enters recovery and must
+  // never invoke the original message again.
+  const execution = await paidExecutions.claimOrLoad(job.id);
+  if (execution.mode !== 'start') {
+    await recoverPersistedPaidExecution(job, execution, client);
+    return;
+  }
+
+  let terminalTask: Task | undefined;
+  try {
+    for await (const event of client.sendMessageStream(job.params)) {
+      await jobEvents.append(job.id, sanitizeForBrowser(event));
+      if ('status' in event) {
+        const eventTask: Task = {
+          id: event.taskId,
+          contextId: event.contextId,
+          status: event.status,
+        };
+        if (
+          event.status.state === TaskState.INPUT_REQUIRED &&
+          getX402PaymentRequirements(eventTask)
+        ) {
+          // The async generator is paused at this yield. Commit the merchant
+          // task handle before requesting the next event, which is the point
+          // at which A2XClient signs and submits payment.
+          await paidExecutions.recordPaymentBoundary(job.id, {
+            taskId: event.taskId,
+            contextId: event.contextId,
+          });
+        }
+        if (TERMINAL_STATES.has(event.status.state)) terminalTask = eventTask;
+      }
+    }
+
+    if (!terminalTask) {
+      await jobs.quarantine(job.id, new Error('paid stream ended before a terminal status'));
+      return;
+    }
+    if (terminalTask.status.state !== TaskState.COMPLETED) {
+      await jobs.fail(job.id, terminalTask.status);
+      return;
+    }
+    const receipt = getX402Receipts(terminalTask).at(-1);
+    if (!receipt?.success) {
+      await jobs.quarantine(job.id, new Error('completed paid stream omitted a successful receipt'));
+      return;
+    }
+    await jobs.complete(job.id);
+  } catch (error) {
+    if (error instanceof X402ReconciliationError) {
+      await jobs.quarantine(job.id, error);
+      return;
+    }
+    // The worker may already have submitted payment. Do not let the queue
+    // auto-retry an ambiguous paid attempt.
+    await jobs.quarantine(job.id, error);
+  }
+}
+
+async function recoverPersistedPaidExecution(
+  job: AgentJob,
+  execution: PaidExecution,
+  client: A2XClient,
+): Promise<void> {
+  if (!execution.taskId) {
+    await jobs.quarantine(
+      job.id,
+      new Error('worker stopped before persisting a recoverable A2A task'),
+    );
+    return;
+  }
+  if (Date.now() >= execution.recoveryDeadlineAt) {
+    await jobs.quarantine(
+      job.id,
+      new Error('paid task recovery deadline expired'),
+    );
+    return;
+  }
+  let task: Task;
+  try {
+    task = await client.getTask(execution.taskId);
+  } catch {
+    // A later recovery run re-checks the durable deadline before lookup.
+    await paidExecutions.scheduleRecoveryPoll(job.id);
+    return;
+  }
+  if (!TERMINAL_STATES.has(task.status.state)) {
+    await paidExecutions.scheduleRecoveryPoll(job.id); // recovery only; no resend
+    return;
+  }
+  if (task.status.state !== TaskState.COMPLETED) {
+    await jobs.fail(job.id, task.status);
+    return;
+  }
+  const receipt = getX402Receipts(task).at(-1);
+  if (!receipt?.success) {
+    await jobs.quarantine(job.id, new Error('recovered task has no successful receipt'));
+    return;
+  }
+  await jobs.complete(job.id);
+}
+```
+
+The durable execution row is separate from queue deduplication: it prevents an at-least-once delivery from starting the paid operation twice. `claimOrLoad` must persist a host-policy recovery deadline; a task that remains nonterminal past it is quarantined, not polled or resent forever. This high-level helper is restricted to non-batch exact/upto payments: it can persist the payment boundary and safely query an existing merchant task, but it cannot reconstruct every signed payload after process death. Batch settlement must use the [low-level x402 flow](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md#low-level-signx402payment), durably store the signed payload, task/context IDs, batch binding, payer-storage pending attempt, and submission state, then call `reconcileX402BatchSettlement` before completing the job or accepting another partitioned payment. Otherwise quarantine an ambiguous attempt; never call `sendMessageStream(job.params)` again.
+
+```typescript
+// GET /api/agent/jobs/:id/events — verify session ownership on every read.
+const after = request.headers.get('Last-Event-ID');
+return replayableSse(jobEvents.subscribe(job.id, { after }), {
+  onBrowserCancel: subscription => subscription.close(),
+}); // never cancels executePaidJob
+```
+
+On worker recovery, reconcile any persisted pending task/attempt before the partition accepts another paid job. See [host-backend.md](./host-backend.md#horizontal-x402-ownership) for the non-overlapping ownership contract.
+
 ---
 
 ## Pages Router — API Route
@@ -285,10 +502,12 @@ This makes the file fail to import from a client component, catching leakage at 
 
 ```env
 # .env.local
-AGENT_URL=https://agent.example.com
+AGENT_CARD_URL=https://agent.example.com/.well-known/agent.json
+AGENT_ENDPOINT_URL=https://agent.example.com/a2a
 # If your auth provider needs secrets beyond the user session:
 # AGENT_CLIENT_ID=...
 # AGENT_CLIENT_SECRET=...
 ```
 
-Only `AGENT_URL` is typically needed — user credentials come from the session, not env.
+`AGENT_CARD_URL` and `AGENT_ENDPOINT_URL` are required by the policy-bound
+examples. User credentials come from the session, not env.

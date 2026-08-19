@@ -55,6 +55,10 @@ Consequence: if the remote agent changes its card (e.g. rotates security schemes
 
 Concurrent calls on a cold client can all enter `_ensureResolved()` before any one call fills the cache because the client does not memoize an in-flight promise. Avoid relying on exactly one card fetch during cold start.
 
+This resolution/authentication race and the v1 non-JSON-RPC fallback are tracked
+in [#240](https://github.com/planetarium/a2x/issues/240). Complete one approved
+initialization before exposing a shared client to concurrent work.
+
 ### Authentication is cached after completion
 
 The `AuthScheme[]` returned by a completed `AuthProvider.provide()` is cached as `_resolvedSchemes` and re-applied to subsequent requests.

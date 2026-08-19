@@ -25,7 +25,11 @@ For these cases, [proxy through a backend](./host-nextjs.md) and let the browser
 
 ```typescript
 // src/lib/agent.ts
-import { A2XClient } from '@a2x/sdk/client';
+import {
+  A2XClient,
+  getAgentEndpointUrl,
+  resolveAgentCard,
+} from '@a2x/sdk/client';
 import type { AuthProvider } from '@a2x/sdk/client';
 import { AuthScheme, HttpBearerAuthScheme } from '@a2x/sdk/client';
 
@@ -53,8 +57,57 @@ class SessionBearerProvider implements AuthProvider {
   }
 }
 
-export function makeAgentClient(getToken: () => string | null) {
-  return new A2XClient(import.meta.env.VITE_AGENT_URL, {
+function requireJsonRpcEndpoint(card: unknown, version: '0.3' | '1.0'): string {
+  if (version === '1.0') {
+    const interfaces = (card as {
+      supportedInterfaces?: Array<{ url: string; protocolBinding?: string }>;
+    }).supportedInterfaces ?? [];
+    const jsonRpc = interfaces.find(entry =>
+      entry.protocolBinding?.toUpperCase() === 'JSONRPC'
+    );
+    if (!jsonRpc) throw new Error('AgentCard has no JSON-RPC interface');
+    return jsonRpc.url;
+  }
+  return getAgentEndpointUrl(card as Parameters<typeof getAgentEndpointUrl>[0], version);
+}
+
+export async function makeAgentClient(getToken: () => string | null) {
+  const exactBrowserUrl = (raw: string, label: string) => {
+    const url = new URL(raw);
+    if (
+      url.protocol !== 'https:' || url.username || url.password ||
+      url.search || url.hash
+    ) throw new Error(`${label} must be an exact credential-free HTTPS URL`);
+    return url.toString();
+  };
+  const cardUrl = exactBrowserUrl(
+    import.meta.env.VITE_AGENT_CARD_URL,
+    'VITE_AGENT_CARD_URL',
+  );
+  if (!new URL(cardUrl).pathname.endsWith('.json')) {
+    throw new Error('VITE_AGENT_CARD_URL must name one exact JSON document');
+  }
+  const expectedEndpoint = exactBrowserUrl(
+    import.meta.env.VITE_AGENT_ENDPOINT_URL,
+    'VITE_AGENT_ENDPOINT_URL',
+  );
+  const noRedirectFetch: typeof fetch = (input, init) =>
+    fetch(input, { ...init, redirect: 'error' });
+  const resolved = await resolveAgentCard(cardUrl, { fetch: noRedirectFetch });
+  const endpoint = exactBrowserUrl(
+    requireJsonRpcEndpoint(resolved.card, resolved.version),
+    'AgentCard endpoint',
+  );
+  if (endpoint !== expectedEndpoint) {
+    throw new Error(`AgentCard endpoint is not approved: ${endpoint}`);
+  }
+  // This production pattern is same-origin. A deliberate cross-origin
+  // deployment needs its own exact-origin policy plus the CORS rules below.
+  if (new URL(endpoint).origin !== window.location.origin) {
+    throw new Error('Agent endpoint is not same-origin');
+  }
+  return new A2XClient(resolved.card, {
+    fetch: noRedirectFetch,
     authProvider: new SessionBearerProvider(getToken),
   });
 }
@@ -146,7 +199,7 @@ export function ChatInput() {
   const onSubmit = useCallback(async (form: FormData) => {
     setBusy(true);
     setOutput('');
-    const client = makeAgentClient(() => accessToken);
+    const client = await makeAgentClient(() => accessToken);
 
     try {
       for await (const event of client.sendMessageStream({
@@ -177,11 +230,9 @@ export function ChatInput() {
 }
 ```
 
-Memoize the client if the token is stable:
-
-```typescript
-const client = useMemo(() => makeAgentClient(() => accessToken), [accessToken]);
-```
+For repeated calls, cache the validated card and endpoint policy separately,
+then construct a synchronous per-token client. Do not treat the promise returned
+by `makeAgentClient()` as an `A2XClient`.
 
 ---
 
@@ -191,17 +242,28 @@ Only `OAuth2AuthorizationCodeAuthScheme` (with PKCE) and `OAuth2ImplicitAuthSche
 
 Recommended approach: **don't run OAuth2 from a provider impl**. Use a proper OIDC library (e.g. `oidc-client-ts`) for the login flow, store the resulting access token somewhere, and provide a simple `SessionBearerProvider` that reads from there.
 
+Configure the library with an expected HTTPS issuer, exact endpoints, client identity, audience/resource, and exact requested scopes from application policy. The current SDK does not preserve selected security-requirement values on normalized schemes, so do not derive the request from `scheme.params.scopes`; use the host-configured set after verifying it against the approved raw card and advertised catalogue. Reject cross-origin redirects before sending credentials or showing a login link.
+
 Attempting to run `OAuth2DeviceCodeAuthScheme` from a browser is possible but weird — there's no terminal to display the code. Render it in the UI instead:
 
 ```tsx
 // Pseudo — you'd implement performDeviceCodeFlow with UI callbacks
 async function performDeviceCodeFlow(scheme, callbacks) {
-  const deviceData = /* POST device_authorization_url */;
+  const deviceUrl = requireConfiguredOAuthEndpoint(scheme.params.deviceAuthorizationUrl);
+  const tokenUrl = requireConfiguredOAuthEndpoint(scheme.params.tokenUrl);
+  const scopes = requireAllowedScopes(
+    HOST_REQUIRED_SCOPES,
+    scheme.params.scopes,
+  );
+  const deviceData = /* POST deviceUrl with redirect: 'error' */;
+  const verificationUri = requireConfiguredVerificationOrigin(
+    deviceData.verification_uri_complete ?? deviceData.verification_uri,
+  );
   callbacks.onPrompt({
-    verificationUri: deviceData.verification_uri_complete,
+    verificationUri: verificationUri.toString(),
     userCode: deviceData.user_code,
   });
-  // poll token_url until success
+  // poll tokenUrl with redirect: 'error' until success
 }
 ```
 

@@ -120,6 +120,11 @@ The `taskId` is available on every event's `taskId` field after the first status
 
 When the client is constructed with `x402`, the same generator owns the payment round trip. It yields the initial `payment-required` status, invokes `onPaymentRequired`, signs and resubmits when approved, then continues yielding verification, work, artifact, and completion events. Configure batch support with durable `batchSettlement` storage and opt into default selection separately with `allowBatchSettlement`. The default selector's `allowUpto`, `allowBatchSettlement`, and `maxRetries` rules match blocking `sendMessage`; a custom `selectRequirement` bypasses the two scheme opt-in flags.
 
+Treat yielded payment-required events, approval envelopes, and selector
+candidates as read-only. The current payer can reuse those live objects for
+later signing; mutation isolation is tracked in
+[#241](https://github.com/planetarium/a2x/issues/241).
+
 Unlike blocking `sendMessage`, a terminal unsuccessful payment receipt in a stream is yielded as a failed status; the stream does not convert it to `X402PaymentFailedError`. Inspect terminal status and x402 receipt metadata in the streamed events. Batch reconciliation failures still throw `X402ReconciliationError` before an unsafe terminal event can be yielded.
 
 Breaking out after a payment payload has been submitted can leave the result ambiguous, especially for `batch-settlement`. Use durable channel storage, route a channel through one process owner or a durable cross-process reservation, and handle `X402ReconciliationError` as described in the [x402 payments guide](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md).

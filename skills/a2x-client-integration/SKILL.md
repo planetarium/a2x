@@ -76,7 +76,11 @@ npm install @a2x/sdk
 Only the **client** subpath and the root types are needed on the caller side:
 
 ```typescript
-import { A2XClient } from '@a2x/sdk/client';
+import {
+  A2XClient,
+  getAgentEndpointUrl,
+  resolveAgentCard,
+} from '@a2x/sdk/client';
 import type { SendMessageParams, Task, TaskStatusUpdateEvent, TaskArtifactUpdateEvent } from '@a2x/sdk';
 ```
 
@@ -137,35 +141,49 @@ import {
   HttpBearerAuthScheme,
 } from '@a2x/sdk/client';
 
+const API_KEY_ENV_BY_SLOT: Record<string, string> = {
+  'header:x-api-key': 'AGENT_API_KEY',
+  'header:x-tenant-key': 'AGENT_TENANT_API_KEY',
+};
+
+function apiKeySlot(scheme: ApiKeyAuthScheme): string {
+  const name = scheme.params.location === 'header'
+    ? scheme.params.name.toLowerCase()
+    : scheme.params.name;
+  return `${scheme.params.location}:${name}`;
+}
+
 export class EnvAuthProvider implements AuthProvider {
   async provide(requirements: AuthScheme[][]): Promise<AuthScheme[]> {
     // Pick the first group we can satisfy from env.
     for (const group of requirements) {
-      const ok = group.every((scheme) => this.tryFill(scheme));
-      if (ok) return group;
+      const credentials = group.map((scheme) => this.readCredential(scheme));
+      if (credentials.every(
+        (value): value is string => typeof value === 'string' && value.length > 0,
+      )) {
+        group.forEach((scheme, index) => scheme.setCredential(credentials[index]!));
+        return group;
+      }
     }
     throw new Error(
       'No configured credentials match the agent security requirements',
     );
   }
 
-  private tryFill(scheme: AuthScheme): boolean {
+  private readCredential(scheme: AuthScheme): string | undefined {
     if (scheme instanceof ApiKeyAuthScheme) {
-      const key = process.env.AGENT_API_KEY;
-      if (!key) return false;
-      scheme.setCredential(key);
-      return true;
+      const envName = API_KEY_ENV_BY_SLOT[apiKeySlot(scheme)];
+      return envName ? process.env[envName] : undefined;
     }
     if (scheme instanceof HttpBearerAuthScheme) {
-      const token = process.env.AGENT_BEARER_TOKEN;
-      if (!token) return false;
-      scheme.setCredential(token);
-      return true;
+      return process.env.AGENT_BEARER_TOKEN;
     }
-    return false;
+    return undefined;
   }
 }
 ```
+
+Map every API-key location/name pair separately; one AND group may require multiple API keys. The current SDK has known requirement-normalization and credential-destination gaps ([#237](https://github.com/planetarium/a2x/issues/237)): reject partial AND groups yourself, do not combine schemes that compete for `Authorization` or the same API-key destination, and do not rely on multiple cookie API keys composing. OAuth schemes expose the flow catalogue as `params.scopes`, but selected security-requirement values are not preserved on normalized scheme instances. Configure the exact requested scopes in host policy, verify them against the raw approved card before constructing the client, and request only that configured set. Treat identity endpoints and scopes advertised by an agent card as untrusted until the exact card URL, resolved agent endpoint, HTTPS identity endpoints, client identity, audience/resource, and scopes match one host policy tuple. The backend and OAuth wiki pages show the pattern.
 
 For an interactive CLI, follow [wiki/host-cli.md](./wiki/host-cli.md) — it reproduces the full fallback chain including the OAuth2 device-code polling loop.
 
@@ -174,15 +192,65 @@ For an interactive CLI, follow [wiki/host-cli.md](./wiki/host-cli.md) — it rep
 ### Step 4 — Wire Up `A2XClient`
 
 ```typescript
-import { A2XClient } from '@a2x/sdk/client';
+import {
+  A2XClient,
+  getAgentEndpointUrl,
+  resolveAgentCard,
+} from '@a2x/sdk/client';
 import type { SendMessageParams } from '@a2x/sdk';
 import crypto from 'node:crypto';
 
-const client = new A2XClient(AGENT_URL, {
+function exactHttpsUrl(raw: string | undefined, label: string): string {
+  if (!raw) throw new Error(`${label} is required`);
+  const url = new URL(raw);
+  if (
+    url.protocol !== 'https:' || url.username || url.password ||
+    url.search || url.hash
+  ) throw new Error(`${label} must be an exact credential-free HTTPS URL`);
+  return url.toString();
+}
+function requireJsonRpcEndpoint(card: unknown, version: '0.3' | '1.0'): string {
+  if (version === '1.0') {
+    const interfaces = (card as {
+      supportedInterfaces?: Array<{ url: string; protocolBinding?: string }>;
+    }).supportedInterfaces ?? [];
+    const jsonRpc = interfaces.find(entry =>
+      entry.protocolBinding?.toUpperCase() === 'JSONRPC'
+    );
+    if (!jsonRpc) throw new Error('AgentCard has no JSON-RPC interface');
+    return jsonRpc.url;
+  }
+  return getAgentEndpointUrl(card as Parameters<typeof getAgentEndpointUrl>[0], version);
+}
+const AGENT_CARD_URL = exactHttpsUrl(
+  process.env.AGENT_CARD_URL,
+  'AGENT_CARD_URL',
+);
+if (!new URL(AGENT_CARD_URL).pathname.endsWith('.json')) {
+  throw new Error('AGENT_CARD_URL must name one exact JSON document');
+}
+const EXPECTED_AGENT_ENDPOINT = exactHttpsUrl(
+  process.env.AGENT_ENDPOINT_URL,
+  'AGENT_ENDPOINT_URL',
+);
+const noRedirectFetch: typeof fetch = (input, init) =>
+  fetch(input, { ...init, redirect: 'error' });
+const resolved = await resolveAgentCard(AGENT_CARD_URL, {
+  fetch: noRedirectFetch,
+});
+const endpoint = exactHttpsUrl(
+  requireJsonRpcEndpoint(resolved.card, resolved.version),
+  'AgentCard endpoint',
+);
+if (endpoint !== EXPECTED_AGENT_ENDPOINT) {
+  throw new Error(`AgentCard endpoint is not approved: ${endpoint}`);
+}
+
+const client = new A2XClient(resolved.card, {
   headers: { 'User-Agent': 'my-app/1.0' },
   authProvider: new EnvAuthProvider(),
   extensions: ['https://example.com/my-a2a-extension/v1'],
-  // fetch: customFetch,  // optional: inject a fetch (e.g. with proxy / retries)
+  fetch: noRedirectFetch,
 });
 
 const params: SendMessageParams = {
@@ -197,7 +265,7 @@ const task = await client.sendMessage(params);
 console.log(task.status?.state, task.artifacts);
 ```
 
-`A2XClient` transparently handles:
+`AGENT_CARD_URL` and `EXPECTED_AGENT_ENDPOINT` must be exact HTTPS deployment-policy values; validate credentials/hash/query and the exact `.json` card path as shown in [the backend preflight](./wiki/host-backend.md#client-lifetime). `A2XClient` transparently handles:
 
 - Fetching `/.well-known/agent.json` (tries `agent.json` then `agent-card.json`)
 - Detecting protocol version (v0.3 vs. v1.0) from the card structure
@@ -249,7 +317,9 @@ npm install @a2x/sdk @x402/core @x402/evm viem
 ```
 
 ```typescript
-const paidClient = new A2XClient(AGENT_URL, {
+const paidClient = new A2XClient(resolved.card, {
+  fetch: noRedirectFetch,
+  authProvider: new EnvAuthProvider(),
   x402: {
     signer,
     maxAmount: 10_000n,
@@ -259,9 +329,9 @@ const paidClient = new A2XClient(AGENT_URL, {
 });
 ```
 
-`maxAmount` is expressed in the asset's atomic units and applies to each selected requirement (or each new batch deposit); it is not an aggregate wallet budget across calls. The default selector chooses an affordable EVM `exact` offer. Enable `allowUpto` only with explicit consent because it authorizes a charge up to the advertised maximum. To use `batch-settlement`, provide `batchSettlement` storage and opt in with `allowBatchSettlement`; route each channel through one process owner or add a durable cross-process reservation before signing.
+`maxAmount` is expressed in the asset's atomic units and applies to each selected requirement (or each new batch deposit); it is not an aggregate wallet budget across calls. The default selector chooses an affordable EVM `exact` offer. Enable `allowUpto` only with explicit consent because it authorizes a charge up to the advertised maximum. To use `batch-settlement`, provide `batchSettlement` storage and opt in with `allowBatchSettlement`; route each payer through a durable single-owner queue/actor for the full sign → submit → reconcile lifecycle.
 
-`onPaymentRequired` sees the full envelope before affordability filtering and offer selection. Use it for envelope-level policy. Drive the [low-level manual flow](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md#low-level-signx402payment) when the user must approve the exact selected offer. A custom `selectRequirement` is itself explicit scheme consent: it bypasses `allowUpto` and `allowBatchSettlement`, although `maxAmount` still filters offers and batch selection still requires `batchSettlement`. Never embed a service private key in a browser bundle; use a user-owned restricted signer or a backend payer. See the [x402 payments guide](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md) for reconciliation and recovery requirements.
+`onPaymentRequired` currently receives the live envelope. Treat it as read-only: mutation can change later selection or signing. Likewise, a custom `selectRequirement` must not mutate candidates and should return one supplied entry; see the payer-isolation bug [#241](https://github.com/planetarium/a2x/issues/241). Drive the [low-level manual flow](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md#low-level-signx402payment) when the user must approve the exact selected offer. A custom selector is itself explicit scheme consent: it bypasses `allowUpto` and `allowBatchSettlement`, although `maxAmount` still filters offers and batch selection still requires `batchSettlement`. Never embed a service private key in a browser bundle; use a user-owned restricted signer or a backend payer. See the [x402 payments guide](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md) for reconciliation and recovery requirements.
 
 ---
 
@@ -270,16 +340,14 @@ const paidClient = new A2XClient(AGENT_URL, {
 1. **Build check** — Run the project's type-check (`tsc --noEmit`).
 2. **Agent card fetch** — manually or via the built-in resolver:
    ```typescript
-   import { resolveAgentCard } from '@a2x/sdk/client';
-   const resolved = await resolveAgentCard(AGENT_URL);
    console.log(resolved.version, resolved.card);
    ```
 3. **Send a message** — confirm the round-trip works with your `AuthProvider`.
 4. **Simulate token expiry** — make the server return an `auth-required` unary task or an `auth-required` status as the first stream event, then confirm `refresh()` is invoked and the request is retried.
 5. **Try with the `a2x` CLI** for a sanity check against the same agent:
    ```bash
-   a2x a2a agent-card <AGENT_URL>
-   a2x a2a send <AGENT_URL> "ping"
+   a2x a2a agent-card <AGENT_CARD_URL>
+   a2x a2a send <AGENT_CARD_URL> "ping"
    ```
 
 ---
@@ -304,7 +372,7 @@ provide(requirements)
 
 
 refresh(schemes)  ← SDK calls this after an auth-required task/event
-  • Clear stored credentials for this agent URL
+  • Clear stored credentials for this validated policy tuple
   • Re-run interactive resolution for the same schemes
   • Save the new values
   • Return the (same) scheme instances, now holding new credentials
@@ -312,7 +380,7 @@ refresh(schemes)  ← SDK calls this after an auth-required task/event
 
 Three properties are load-bearing:
 
-1. **Persist a unique credential-slot key.** The reference CLI currently stores only `scheme.constructor.name`; that works only when a requirement group contains at most one instance of each subclass. A valid group can contain two API-key schemes with different names, so new integrations should key each slot by requirement-group index, scheme index, class, and public parameters.
+1. **Persist a unique credential-slot key.** Key each slot by requirement-group index, scheme index, class, and public parameters, nested under the validated card/endpoint/identity-policy key. A valid group can contain two API-key schemes with different names.
 2. **Scheme instances are mutated, not replaced.** `AuthProvider` returns the same instances the SDK handed in — only `setCredential()` has been called. The SDK will then call `applyToRequest(ctx)` on each.
 3. **Credential extraction goes through `applyToRequest`.** The stored credential isn't exposed directly on the scheme; the CLI recovers it by running `applyToRequest` against a dummy context and reading the resulting `Authorization` / header / query value back out. This keeps the provider agnostic of each scheme's private state.
 

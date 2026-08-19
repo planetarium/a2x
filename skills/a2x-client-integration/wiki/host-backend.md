@@ -28,125 +28,319 @@ import {
   OAuth2ClientCredentialsAuthScheme,
 } from '@a2x/sdk/client';
 
+const API_KEY_ENV_BY_SLOT: Record<string, string> = {
+  'header:x-api-key': 'AGENT_API_KEY',
+  'header:x-tenant-key': 'AGENT_TENANT_API_KEY',
+};
+
+function normalizeOAuthEndpoint(raw: string): string {
+  const url = new URL(raw);
+  if (
+    url.protocol !== 'https:' ||
+    url.username ||
+    url.password ||
+    url.hash
+  ) {
+    throw new Error(`Invalid OAuth endpoint: ${url.origin}`);
+  }
+  return url.toString();
+}
+
+// One module instance represents one exact agent/identity tuple. Do not use a
+// shared pool of endpoints across agents: membership in that pool would let one
+// card select another agent's token endpoint and receive this client secret.
+export const OAUTH_POLICY = Object.freeze({
+  agentEndpoint: normalizeOAuthEndpoint(process.env.AGENT_ENDPOINT_URL!),
+  tokenEndpoint: normalizeOAuthEndpoint(process.env.OAUTH_TOKEN_ENDPOINT!),
+  clientId: process.env.OAUTH_CLIENT_ID!,
+  clientSecret: process.env.OAUTH_CLIENT_SECRET!,
+  expectedAudience: process.env.OAUTH_EXPECTED_AUDIENCE!,
+  allowedScopes: new Set(
+    (process.env.OAUTH_ALLOWED_SCOPES ?? '').split(/\s+/).filter(Boolean),
+  ),
+  requiredScopes: (process.env.OAUTH_REQUIRED_SCOPES ?? '')
+    .split(/\s+/)
+    .filter(Boolean),
+});
+
+function trustedOAuthEndpoint(raw: string, purpose: string): URL {
+  const normalized = normalizeOAuthEndpoint(raw);
+  if (normalized !== OAUTH_POLICY.tokenEndpoint) {
+    throw new Error(`Refusing untrusted OAuth ${purpose}: ${normalized}`);
+  }
+  return new URL(normalized);
+}
+
+function approvedScope(
+  advertised: Record<string, string>,
+  required: readonly string[],
+): string {
+  if (required.length === 0) {
+    throw new Error('Host OAuth policy omitted required scopes');
+  }
+  const requested = [...new Set(required)];
+  const rejected = requested.filter(scope =>
+    !(scope in advertised) || !OAUTH_POLICY.allowedScopes.has(scope)
+  );
+  if (rejected.length) {
+    throw new Error(`Refusing unapproved OAuth scopes: ${rejected.join(', ')}`);
+  }
+  return requested.join(' ');
+}
+
+function assertGrantedScope(
+  granted: string | undefined,
+  requested: readonly string[],
+): void {
+  if (!granted) return;
+  const grantedSet = new Set(granted.split(/\s+/).filter(Boolean));
+  const requestedSet = new Set(requested);
+  const unexpected = [...grantedSet].filter(scope => !requestedSet.has(scope));
+  const missing = [...requestedSet].filter(scope => !grantedSet.has(scope));
+  if (unexpected.length || missing.length) {
+    throw new Error(
+      `Token scope mismatch (unexpected: ${unexpected.join(', ') || 'none'}; ` +
+      `missing: ${missing.join(', ') || 'none'})`,
+    );
+  }
+}
+
+// Implement with trusted JWT verification or token introspection. Verify
+// issuer, audience/resource, and exact scopes; never use decode-only claims.
+declare function assertTokenPolicy(
+  token: string,
+  expectedAudience: string,
+  requestedScopes: readonly string[],
+): Promise<void>;
+
+function apiKeySlot(scheme: ApiKeyAuthScheme): string {
+  const name = scheme.params.location === 'header'
+    ? scheme.params.name.toLowerCase()
+    : scheme.params.name;
+  return `${scheme.params.location}:${name}`;
+}
+
 export class EnvAuthProvider implements AuthProvider {
   async provide(requirements: AuthScheme[][]): Promise<AuthScheme[]> {
     for (const group of requirements) {
-      if (await this.tryFill(group)) return group;
+      if (await fillGroup(group)) return group;
     }
     throw new Error(
       'No configured credentials match the agent security requirements. ' +
-      'Set AGENT_API_KEY, AGENT_BEARER_TOKEN, or OAUTH_CLIENT_* env vars.',
+      'Configure the required API-key slots, AGENT_BEARER_TOKEN, or OAUTH_CLIENT_* env vars.',
     );
   }
 
   async refresh(schemes: AuthScheme[]): Promise<AuthScheme[]> {
-    // For OAuth2 client_credentials, re-exchange.
-    // For static API key / Bearer, re-reading env is usually pointless —
-    // but if the env was rotated since startup, this picks it up.
-    for (const scheme of schemes) {
-      if (scheme instanceof OAuth2ClientCredentialsAuthScheme) {
-        await fillClientCredentials(scheme);
-      } else {
-        await fillStatic(scheme);
-      }
+    // Re-read every source so rotations are visible, and fail as a group.
+    if (!(await fillGroup(schemes))) {
+      throw new Error('Refreshed credentials are incomplete');
     }
     return schemes;
   }
-
-  private async tryFill(group: AuthScheme[]): Promise<boolean> {
-    for (const scheme of group) {
-      const ok = scheme instanceof OAuth2ClientCredentialsAuthScheme
-        ? await fillClientCredentials(scheme)
-        : fillStatic(scheme);
-      if (!ok) return false;
-    }
-    return true;
-  }
 }
 
-function fillStatic(scheme: AuthScheme): boolean {
+async function fillGroup(group: AuthScheme[]): Promise<boolean> {
+  const credentials: string[] = [];
+  for (const scheme of group) {
+    const credential = await resolveCredential(scheme);
+    if (!credential) return false;
+    credentials.push(credential);
+  }
+  group.forEach((scheme, index) => scheme.setCredential(credentials[index]!));
+  return true;
+}
+
+async function resolveCredential(
+  scheme: AuthScheme,
+): Promise<string | undefined> {
   if (scheme instanceof ApiKeyAuthScheme) {
-    const key = process.env.AGENT_API_KEY;
-    if (!key) return false;
-    scheme.setCredential(key);
-    return true;
+    const envName = API_KEY_ENV_BY_SLOT[apiKeySlot(scheme)];
+    return envName ? process.env[envName] : undefined;
   }
   if (scheme instanceof HttpBearerAuthScheme) {
-    const token = process.env.AGENT_BEARER_TOKEN;
-    if (!token) return false;
-    scheme.setCredential(token);
-    return true;
+    return process.env.AGENT_BEARER_TOKEN;
   }
   if (scheme instanceof HttpBasicAuthScheme) {
     const user = process.env.AGENT_BASIC_USER;
     const pass = process.env.AGENT_BASIC_PASS;
-    if (!user || !pass) return false;
-    scheme.setCredential(Buffer.from(`${user}:${pass}`).toString('base64'));
-    return true;
+    return user && pass
+      ? Buffer.from(`${user}:${pass}`).toString('base64')
+      : undefined;
   }
-  return false;
+  if (scheme instanceof OAuth2ClientCredentialsAuthScheme) {
+    return exchangeClientCredentials(scheme);
+  }
+  return undefined;
 }
 
-async function fillClientCredentials(
+async function exchangeClientCredentials(
   scheme: OAuth2ClientCredentialsAuthScheme,
-): Promise<boolean> {
-  const clientId = process.env.OAUTH_CLIENT_ID;
-  const clientSecret = process.env.OAUTH_CLIENT_SECRET;
-  if (!clientId || !clientSecret) return false;
+): Promise<string | undefined> {
+  const clientId = OAUTH_POLICY.clientId;
+  const clientSecret = OAUTH_POLICY.clientSecret;
+  const expectedAudience = OAUTH_POLICY.expectedAudience;
+  if (!clientId || !clientSecret || !expectedAudience) return undefined;
 
-  const res = await fetch(scheme.params.tokenUrl, {
+  // Agent-card discovery is not a trust decision. Validate before sending secrets.
+  const tokenUrl = trustedOAuthEndpoint(scheme.params.tokenUrl, 'token endpoint');
+  const scope = approvedScope(
+    scheme.params.scopes,
+    OAUTH_POLICY.requiredScopes,
+  );
+  const requestedScopes = scope.split(/\s+/).filter(Boolean);
+  const res = await fetch(tokenUrl, {
     method: 'POST',
+    redirect: 'error',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       grant_type: 'client_credentials',
       client_id: clientId,
       client_secret: clientSecret,
-      scope: Object.keys(scheme.params.scopes).join(' '),
+      ...(scope ? { scope } : {}),
     }),
   });
-  if (!res.ok) return false;
-  const data = (await res.json()) as { access_token?: string };
-  if (!data.access_token) return false;
-  scheme.setCredential(data.access_token);
-  return true;
+  if (!res.ok) return undefined;
+  const data = (await res.json()) as {
+    access_token?: string;
+    token_type?: string;
+    scope?: string;
+  };
+  if (data.scope !== undefined && typeof data.scope !== 'string') {
+    throw new Error('Token endpoint returned an invalid scope');
+  }
+  assertGrantedScope(data.scope, requestedScopes);
+  if (typeof data.access_token !== 'string' || !data.access_token) return undefined;
+  if (
+    typeof data.token_type !== 'string' ||
+    data.token_type.toLowerCase() !== 'bearer'
+  ) {
+    throw new Error('Token endpoint returned a non-Bearer token type');
+  }
+  await assertTokenPolicy(
+    data.access_token,
+    expectedAudience,
+    requestedScopes,
+  );
+  return data.access_token;
 }
 ```
+
+Configure the singular exact `OAUTH_TOKEN_ENDPOINT`, client identity, audience,
+and allowed scopes for this agent deployment; do not derive them from the card
+or combine endpoints from multiple agents into one allowlist. `params.scopes` is
+only the advertised catalogue; the current SDK drops selected requirement
+values during normalization. Configure `OAUTH_REQUIRED_SCOPES` as part of this
+exact tuple, verify those values against the approved raw card and catalogue,
+and request only that set. Verify the token audience/resource
+(cryptographically or through trusted introspection) before attaching it. Add
+an explicit development-only exception if local HTTP identity infrastructure
+is unavoidable. Redirects are rejected because an otherwise trusted endpoint
+could redirect the client secret elsewhere.
+
+API-key slots are keyed by placement and name because a valid AND group can require several distinct API keys. Add every expected slot to `API_KEY_ENV_BY_SLOT`; do not reuse one environment variable for the whole class.
 
 ---
 
 ## Client Lifetime
 
-A long-lived backend should create the client **once** at startup and reuse it:
+A long-lived backend should create the client **once** at startup, after binding discovery to the exact endpoint in host policy, and reuse it:
 
 ```typescript
 // src/agents/my-agent-client.ts
-import { A2XClient } from '@a2x/sdk/client';
-import { EnvAuthProvider } from './env-auth-provider.js';
+import {
+  A2XClient,
+  getAgentEndpointUrl,
+  resolveAgentCard,
+} from '@a2x/sdk/client';
+import { EnvAuthProvider, OAUTH_POLICY } from './env-auth-provider.js';
 
-export const myAgentClient = new A2XClient(process.env.AGENT_URL!, {
-  authProvider: new EnvAuthProvider(),
-});
+function exactHttpsUrl(raw: string | undefined, label: string): string {
+  if (!raw) throw new Error(`${label} is required`);
+  const url = new URL(raw);
+  if (
+    url.protocol !== 'https:' ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error(`${label} must be an exact credential-free HTTPS URL`);
+  }
+  return url.toString();
+}
+
+function requireJsonRpcEndpoint(card: unknown, version: '0.3' | '1.0'): string {
+  if (version === '1.0') {
+    const interfaces = (card as {
+      supportedInterfaces?: Array<{ url: string; protocolBinding?: string }>;
+    }).supportedInterfaces ?? [];
+    const jsonRpc = interfaces.find(entry =>
+      entry.protocolBinding?.toUpperCase() === 'JSONRPC'
+    );
+    if (!jsonRpc) throw new Error('AgentCard has no JSON-RPC interface');
+    return jsonRpc.url;
+  }
+  return getAgentEndpointUrl(card as Parameters<typeof getAgentEndpointUrl>[0], version);
+}
+
+const AGENT_CARD_URL = exactHttpsUrl(
+  process.env.AGENT_CARD_URL,
+  'AGENT_CARD_URL',
+);
+if (!new URL(AGENT_CARD_URL).pathname.endsWith('.json')) {
+  throw new Error('AGENT_CARD_URL must name one exact JSON card document');
+}
+const EXPECTED_AGENT_ENDPOINT = exactHttpsUrl(
+  process.env.AGENT_ENDPOINT_URL,
+  'AGENT_ENDPOINT_URL',
+);
+if (EXPECTED_AGENT_ENDPOINT !== OAUTH_POLICY.agentEndpoint) {
+  throw new Error('Agent and OAuth policy endpoints are not the same tuple');
+}
+const noRedirectFetch: typeof fetch = (input, init) =>
+  fetch(input, { ...init, redirect: 'error' });
+
+async function createMyAgentClient(): Promise<A2XClient> {
+  const resolved = await resolveAgentCard(AGENT_CARD_URL, {
+    fetch: noRedirectFetch,
+  });
+  const endpoint = exactHttpsUrl(
+    requireJsonRpcEndpoint(resolved.card, resolved.version),
+    'AgentCard endpoint',
+  );
+  if (endpoint !== EXPECTED_AGENT_ENDPOINT) {
+    throw new Error(`AgentCard endpoint is not approved: ${endpoint}`);
+  }
+
+  // EnvAuthProvider's endpoint, client ID, audience/resource, and scope
+  // allowlists are deployment policy for this exact card+endpoint tuple.
+  return new A2XClient(resolved.card, {
+    fetch: noRedirectFetch,
+    authProvider: new EnvAuthProvider(),
+  });
+}
+
+export const myAgentClientPromise = createMyAgentClient();
 ```
 
-Reuse one `A2XClient` per remote agent and credential identity. It caches the card and resolved schemes, while each request builds its own transport state. Do not share a client across users, mutate its extension set during concurrent calls, or share an x402 client without following the payment storage and reconciliation requirements.
+Await `myAgentClientPromise` during startup before accepting work. This prevents token exchange or attachment until the card URL and resolved A2A endpoint match policy; the no-redirect fetch prevents a trusted URL from silently moving either discovery or requests elsewhere. Reuse one `A2XClient` per remote agent and credential identity. It caches the card and resolved schemes, while each request builds its own transport state. Do not share a client across users, mutate its extension set during concurrent calls, or share an x402 client without following the payment storage and reconciliation requirements.
 
 ### Watch out for
 
-- **First call races.** If multiple requests arrive simultaneously and `_ensureAuthenticated` hasn't run yet, they will all enter `provide()` in parallel. For `AuthProvider`s that do expensive work (OAuth2 token exchange), add your own in-flight-promise dedupe:
-
-  ```typescript
-  private inflight?: Promise<AuthScheme[]>;
-
-  async provide(requirements: AuthScheme[][]): Promise<AuthScheme[]> {
-    this.inflight ??= this.doProvide(requirements)
-      .finally(() => { this.inflight = undefined; });
-    return this.inflight;
-  }
-  ```
-
-  Note: `A2XClient` itself does not dedupe — it relies on the provider to be idempotent-enough.
+- **First-call races.** The current `A2XClient` does not memoize in-flight card resolution, `provide()`, or `refresh()` ([#240](https://github.com/planetarium/a2x/issues/240)). Concurrent cold calls can race and invoke the provider more than once. Initialize the client before serving concurrent work, and make the provider concurrency-safe with tuple-keyed in-flight deduplication. Always mutate and return the exact `AuthScheme[]` supplied to that invocation.
 
 - **Stale token caches across restarts.** If you roll out a new deploy, the new process starts with an empty `_resolvedSchemes` and calls `provide()` again. That's fine for client_credentials (re-exchange is cheap) but could be a problem for pre-fetched secrets with rate limits.
+
+---
+
+## Horizontal x402 Ownership
+
+For paid calls, use a durable queue/actor partitioned by `(agent URL, payer identity)` with exactly one active consumer for the complete sign → submit → terminal receipt/reconciliation lifecycle. A load-balancer affinity cookie or short expiring lock is not sufficient.
+
+Do not treat `X402ClientChannelStorage` as a distributed lock: its public contract exposes only `get`, `set`, and `delete`, not compare-and-set. If ownership must move after a crash, let the coordinator assign a monotonically increasing generation without overlapping owners. The successor must load the pending task/attempt and reconcile or quarantine it before signing again. A database-backed storage adapter can reject stale generations on every method, but that alone cannot fence an already-started HTTP submission; non-overlapping queue ownership is the primary safety boundary.
+
+The worker—not an HTTP client connection—owns a paid stream after submission. It must drain the stream to a terminal state or reconcile/quarantine the payment even if the browser disconnects. Persist sanitized events and let browsers subscribe to a replayable stream.
 
 ---
 
@@ -159,33 +353,102 @@ import Redis from 'ioredis';
 
 const redis = new Redis(process.env.REDIS_URL!);
 
+// Implement with trusted JWT verification or token introspection. Verify the
+// exact issuer, audience/resource, and scopes.
+declare function assertTokenPolicy(
+  token: string,
+  expectedAudience: string,
+  requestedScopes: readonly string[],
+): Promise<void>;
+
 async function getCachedOrExchange(
   scheme: OAuth2ClientCredentialsAuthScheme,
-  agentUrl: string,
+  agentEndpoint: string,
+  clientIdentity: string,
+  expectedAudience: string,
 ): Promise<string> {
-  const scopes = Object.keys(scheme.params.scopes).sort().join(' ');
-  const key = `a2a:${agentUrl}:${scheme.params.tokenUrl}:${scopes}`;
+  const tokenUrl = trustedOAuthEndpoint(scheme.params.tokenUrl, 'token endpoint');
+  const scopes = approvedScope(
+    scheme.params.scopes,
+    OAUTH_POLICY.requiredScopes,
+  )
+    .split(' ')
+    .filter(Boolean)
+    .sort()
+    .join(' ');
+  const requestedScopes = scopes.split(/\s+/).filter(Boolean);
+  // clientIdentity is a stable public ID (client/tenant), never the secret.
+  const key = `a2a:${JSON.stringify([
+    agentEndpoint,
+    tokenUrl.toString(),
+    clientIdentity,
+    expectedAudience,
+    scopes,
+  ])}`;
   const cached = await redis.get(key);
-  if (cached) return cached;
+  if (cached) {
+    await assertTokenPolicy(cached, expectedAudience, requestedScopes);
+    return cached;
+  }
 
-  const res = await fetch(scheme.params.tokenUrl, { /* … */ });
-  const { access_token, expires_in = 3600 } = await res.json() as {
-    access_token: string;
+  const clientId = process.env.OAUTH_CLIENT_ID;
+  const clientSecret = process.env.OAUTH_CLIENT_SECRET;
+  if (!clientId || !clientSecret) throw new Error('OAuth client is incomplete');
+  const res = await fetch(tokenUrl, {
+    method: 'POST',
+    redirect: 'error',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: clientId,
+      client_secret: clientSecret,
+      ...(scopes ? { scope: scopes } : {}),
+    }),
+  });
+  if (!res.ok) throw new Error(`Token exchange failed: HTTP ${res.status}`);
+  const data = await res.json() as {
+    access_token?: string;
+    token_type?: string;
     expires_in?: number;
+    scope?: string;
   };
+  if (typeof data.access_token !== 'string' || !data.access_token) {
+    throw new Error('Token response omitted access_token');
+  }
+  if (
+    typeof data.token_type !== 'string' ||
+    data.token_type.toLowerCase() !== 'bearer'
+  ) {
+    throw new Error('Token endpoint returned a non-Bearer token type');
+  }
+  if (data.scope !== undefined && typeof data.scope !== 'string') {
+    throw new Error('Token endpoint returned an invalid scope');
+  }
+  assertGrantedScope(data.scope, requestedScopes);
+  await assertTokenPolicy(data.access_token, expectedAudience, requestedScopes);
   // Cache for 90% of the advertised lifetime to avoid edge-of-expiry races
-  await redis.set(key, access_token, 'EX', Math.floor(expires_in * 0.9));
-  return access_token;
+  const ttl = Number.isFinite(data.expires_in) && data.expires_in! > 0
+    ? Math.max(1, Math.floor(data.expires_in! * 0.9))
+    : 3600;
+  await redis.set(key, data.access_token, 'EX', ttl);
+  return data.access_token;
 }
 ```
 
-Apply inside `tryFill`:
+Use it as the OAuth branch of `resolveCredential`:
 
 ```typescript
 if (scheme instanceof OAuth2ClientCredentialsAuthScheme) {
-  const token = await getCachedOrExchange(scheme, this.agentUrl);
-  scheme.setCredential(token);
-  return true;
+  const credentialIdentity = process.env.OAUTH_CREDENTIAL_ID;
+  const agentEndpoint = process.env.AGENT_ENDPOINT_URL;
+  const audience = process.env.OAUTH_EXPECTED_AUDIENCE;
+  if (!credentialIdentity || !agentEndpoint || !audience) return undefined;
+  return getCachedOrExchange(
+    scheme,
+    agentEndpoint,
+    credentialIdentity, // stable public client+tenant label
+    audience,
+  );
 }
 ```
 
@@ -193,15 +456,16 @@ if (scheme instanceof OAuth2ClientCredentialsAuthScheme) {
 
 ## Card Preflight at Startup
 
-Consider probing the agent card at boot so discovery and routing failures surface immediately, not on the first request:
+Resolve the policy-bound client at boot so discovery and routing failures surface before the process accepts traffic:
 
 ```typescript
 // src/main.ts
-import { myAgentClient } from './agents/my-agent-client.js';
+import { myAgentClientPromise } from './agents/my-agent-client.js';
 
 (async () => {
   try {
-    await myAgentClient.getAgentCard(); // triggers card fetch only
+    const myAgentClient = await myAgentClientPromise;
+    await myAgentClient.getAgentCard(); // already fetched and endpoint-checked
   } catch (err) {
     console.error('Agent client preflight failed:', err);
     process.exit(1);
@@ -210,7 +474,7 @@ import { myAgentClient } from './agents/my-agent-client.js';
 })();
 ```
 
-`getAgentCard()` does not invoke `AuthProvider.provide()`. Test authentication separately by normalizing the card's requirements and calling the provider, or perform an authenticated operation whose effects are safe in your environment.
+`getAgentCard()` does not invoke `AuthProvider.provide()`. The factory above nevertheless validates the exact card+endpoint boundary before any provider can exchange or attach a token. Test authentication separately by normalizing the card's requirements and calling the provider, or perform an authenticated operation whose effects are safe in your environment. A cache or provider created for one tuple must never be reused after any tuple field changes.
 
 ---
 
@@ -234,9 +498,16 @@ async function getSecret(name: string): Promise<string | undefined> {
   }
 }
 
-// Inside fillStatic:
+const API_KEY_SECRET_BY_SLOT: Record<string, string | undefined> = {
+  'header:x-api-key': 'agent/api-key',
+  'header:x-tenant-key': 'agent/tenant-key',
+};
+
+// Inside a slot-aware async equivalent of fillStatic:
 if (scheme instanceof ApiKeyAuthScheme) {
-  const key = await getSecret('agent/api-key');
+  const secretName = API_KEY_SECRET_BY_SLOT[apiKeySlot(scheme)];
+  if (!secretName) return false;
+  const key = await getSecret(secretName);
   if (!key) return false;
   scheme.setCredential(key);
   return true;
@@ -285,7 +556,7 @@ async function callAgent(params: SendMessageParams) {
   try {
     const task = await myAgentClient.sendMessage(params);
     log.info({
-      agent: process.env.AGENT_URL,
+      agent: process.env.AGENT_ENDPOINT_URL,
       method: 'sendMessage',
       taskId: task.id,
       state: task.status?.state,
@@ -294,7 +565,7 @@ async function callAgent(params: SendMessageParams) {
     return task;
   } catch (err) {
     log.error({
-      agent: process.env.AGENT_URL,
+      agent: process.env.AGENT_ENDPOINT_URL,
       method: 'sendMessage',
       err: err instanceof Error ? { name: err.name, message: err.message } : err,
       durationMs: Date.now() - start,

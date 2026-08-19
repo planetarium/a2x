@@ -49,6 +49,13 @@ The `requirements` parameter mirrors the OpenAPI-style security semantics from t
 | `securityRequirements: [{ apiKey: [], bearer: [] }]` | `[ [ApiKeyAuthScheme, HttpBearerAuthScheme] ]` (AND — both) |
 | `securityRequirements: [{ oauth2: [...] }]` with 3 OAuth2 flows | `[ [DeviceCodeScheme], [AuthorizationCodeScheme], [ClientCredentialsScheme] ]` (OR per flow) |
 
+The current normalizer has known gaps in v1 requirement decoding, OAuth scope
+propagation, partial AND groups, multiple OAuth slots, and conflicting HTTP
+destinations; see [#237](https://github.com/planetarium/a2x/issues/237).
+Preflight the approved raw card and reject any normalized group that omits a
+required slot or would overwrite another credential. Treat configured host
+policy—not the normalized scheme—as the source of truth for requested scopes.
+
 Your `provide()` must:
 
 1. Pick exactly one group from the outer array (either by preference, user choice, or what credentials it has available).
