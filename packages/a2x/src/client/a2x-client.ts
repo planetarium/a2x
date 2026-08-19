@@ -1129,7 +1129,7 @@ export class A2XClient {
     );
     if (requirements.length === 0) {
       throw new UnsupportedOperationError(
-        'The AgentCard requires authentication, but none of its security requirements are supported.',
+        'The AgentCard requires authentication, but none of its security requirement alternatives can be satisfied safely.',
       );
     }
     if (requirements.some((group) => group.length === 0)) {

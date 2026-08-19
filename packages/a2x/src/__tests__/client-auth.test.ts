@@ -754,6 +754,30 @@ describe('A2XClient auth integration', () => {
       .toBe('Bearer legacy-compatible-token');
   });
 
+  it('accepts an omitted empty v1 StringList field', async () => {
+    const emptyListCard: AgentCardV10 = {
+      ...V10_CARD_WITH_AUTH,
+      securityRequirements: [{ schemes: { apiKey: {} } }],
+    };
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const provide = vi.fn(async (requirements: AuthScheme[][]) => {
+      expect(requirements[0]![0]).toBeInstanceOf(ApiKeyAuthScheme);
+      return [requirements[0]![0]!.setCredential('empty-list-key')];
+    });
+    const client = new A2XClient(emptyListCard, {
+      fetch: mockFetch,
+      authProvider: { provide },
+    });
+
+    await client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    });
+
+    expect(provide).toHaveBeenCalledTimes(1);
+    expect(mockFetch.mock.calls[0]![1].headers['x-api-key'])
+      .toBe('empty-list-key');
+  });
+
   it.each([
     ['canonical list', { list: 'agent:invoke' }],
     ['legacy values', { values: ['agent:invoke', 42] }],
@@ -1054,7 +1078,7 @@ describe('A2XClient auth integration', () => {
       client.sendMessage({
         message: { role: 'user', parts: [{ text: 'Hello' }] },
       }),
-    ).rejects.toThrow('none of its security requirements are supported');
+    ).rejects.toThrow('none of its security requirement alternatives can be satisfied safely');
     expect(provide).not.toHaveBeenCalled();
     expect(mockFetch).not.toHaveBeenCalled();
   });

@@ -8,11 +8,12 @@
 export type SecurityRequirement = Record<string, string[]>;
 
 /**
- * v1.0 wire format uses `list`. The `values` arm accepts AgentCards built
- * against a2x versions that exposed the protobuf wrapper under that name.
+ * v1.0 wire format uses `list`, which protobuf JSON may omit when empty.
+ * `values` accepts AgentCards built against a2x versions that exposed the
+ * protobuf wrapper under that name.
  */
 export interface SecurityRequirementV10 {
-  schemes: Record<string, { list: string[] } | { values: string[] }>;
+  schemes: Record<string, { list?: string[]; values?: string[] }>;
 }
 
 // ─── v0.3 SecurityScheme Types ───
