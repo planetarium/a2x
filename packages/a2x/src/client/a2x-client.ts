@@ -5,7 +5,6 @@
  * Protocol version is determined from the AgentCard structure.
  */
 
-import { AsyncLocalStorage } from 'node:async_hooks';
 import type { LocalAccount } from 'viem';
 import type { AgentCardV03, AgentCardV10 } from '../types/agent-card.js';
 import type { Task } from '../types/task.js';
@@ -44,6 +43,10 @@ import { getResponseParser } from './response-parser.js';
 import type { ResponseParser } from './response-parser.js';
 import { parseSSEStream } from './sse-parser.js';
 import type { AuthProvider } from './auth-provider.js';
+import {
+  authProviderInvocation,
+  type AuthProviderInvocation,
+} from './auth-provider-context.js';
 import type { AuthScheme, AuthRequestContext } from './auth-scheme.js';
 import { normalizeRequirements } from './auth-normalizer.js';
 import {
@@ -137,14 +140,6 @@ function getHeaderValue(
   );
   return entry?.[1];
 }
-
-interface AuthProviderInvocation {
-  client: A2XClient;
-  callback: 'provide' | 'refresh';
-  active: boolean;
-}
-
-const authProviderInvocation = new AsyncLocalStorage<AuthProviderInvocation>();
 
 function canonicalJson(value: unknown): string {
   if (value === null) return 'null';
@@ -1396,13 +1391,14 @@ export class A2XClient {
       // Async resources retained by the provider may outlive the callback.
       // They are no longer re-entry once the callback itself has settled.
       invocation.active = false;
+      authProviderInvocation.close(invocation);
     }
     this._authGeneration += 1;
   }
 
   private _assertNotAuthProviderReentry(): void {
-    const invocation = authProviderInvocation.getStore();
-    if (!invocation?.active || invocation.client !== this) return;
+    const invocation = authProviderInvocation.getStore(this);
+    if (!invocation) return;
     const purpose = invocation.callback === 'provide' ? 'acquisition' : 'refresh';
     throw new UnsupportedOperationError(
       `AuthProvider.${invocation.callback}() cannot call an authenticated operation ` +
@@ -1655,6 +1651,7 @@ export class A2XClient {
           );
         } finally {
           invocation.active = false;
+          authProviderInvocation.close(invocation);
         }
         // The provider retains the objects it received and returned. Publish a
         // second snapshot so later provider-side mutation cannot alter the
