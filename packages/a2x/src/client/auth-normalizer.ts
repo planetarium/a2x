@@ -26,30 +26,43 @@ import {
 /** Bound eager OAuth-flow expansion from an untrusted AgentCard. */
 const MAX_NORMALIZED_AUTH_GROUPS = 256;
 
-function authDestination(scheme: AuthScheme): string {
+type AuthDestination =
+  | { kind: 'cookie'; name: string }
+  | { kind: 'cookie-header' }
+  | { kind: 'slot'; key: string };
+
+function authDestination(scheme: AuthScheme): AuthDestination {
   if (scheme instanceof ApiKeyAuthScheme) {
     const name = scheme.params.location === 'header'
       ? scheme.params.name.toLowerCase()
       : scheme.params.name;
     if (scheme.params.location === 'header' && name === 'cookie') {
-      return 'cookie:*';
+      return { kind: 'cookie-header' };
     }
-    return `${scheme.params.location}:${name}`;
+    if (scheme.params.location === 'cookie') {
+      return { kind: 'cookie', name };
+    }
+    return { kind: 'slot', key: `${scheme.params.location}:${name}` };
   }
-  return 'header:authorization';
+  return { kind: 'slot', key: 'header:authorization' };
 }
 
 function hasConflictingDestinations(group: AuthScheme[]): boolean {
-  const destinations = new Set<string>();
+  const slots = new Set<string>();
+  const cookieNames = new Set<string>();
+  let ownsCookieHeader = false;
   for (const scheme of group) {
     const destination = authDestination(scheme);
-    if (
-      destination === 'cookie:*'
-        ? [...destinations].some((candidate) => candidate.startsWith('cookie:'))
-        : destination.startsWith('cookie:') && destinations.has('cookie:*')
-    ) return true;
-    if (destinations.has(destination)) return true;
-    destinations.add(destination);
+    if (destination.kind === 'cookie-header') {
+      if (ownsCookieHeader || cookieNames.size > 0) return true;
+      ownsCookieHeader = true;
+    } else if (destination.kind === 'cookie') {
+      if (ownsCookieHeader || cookieNames.has(destination.name)) return true;
+      cookieNames.add(destination.name);
+    } else {
+      if (slots.has(destination.key)) return true;
+      slots.add(destination.key);
+    }
   }
   return false;
 }

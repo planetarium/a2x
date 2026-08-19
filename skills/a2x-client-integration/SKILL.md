@@ -359,7 +359,7 @@ provide(requirements)
 
 
 refresh(schemes)  ← SDK calls this after an auth-required task/event
-  • Clear stored credentials for this agent URL
+  • Clear stored credentials for this validated policy tuple
   • Re-run interactive resolution for the same schemes
   • Save the new values
   • Return the (same) scheme instances, now holding new credentials
@@ -367,7 +367,7 @@ refresh(schemes)  ← SDK calls this after an auth-required task/event
 
 Three properties are load-bearing:
 
-1. **Persist a unique credential-slot key.** The reference CLI currently stores only `scheme.constructor.name`; that works only when a requirement group contains at most one instance of each subclass. A valid group can contain two API-key schemes with different names, so new integrations should key each slot by requirement-group index, scheme index, class, and public parameters.
+1. **Persist a unique credential-slot key.** Key each slot by requirement-group index, scheme index, class, and public parameters, nested under the validated card/endpoint/identity-policy key. A valid group can contain two API-key schemes with different names.
 2. **Scheme instances are mutated, not replaced.** `AuthProvider` returns the same instances the SDK handed in — only `setCredential()` has been called. The SDK will then call `applyToRequest(ctx)` on each.
 3. **Credential extraction goes through `applyToRequest`.** The stored credential isn't exposed directly on the scheme; the CLI recovers it by running `applyToRequest` against a dummy context and reading the resulting `Authorization` / header / query value back out. This keeps the provider agnostic of each scheme's private state.
 

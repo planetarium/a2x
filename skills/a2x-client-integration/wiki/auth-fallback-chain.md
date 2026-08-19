@@ -62,7 +62,7 @@ Skipping Step 1 is fine for short-lived workers that always re-prompt anyway (no
 
 ### Use a unique credential-slot key
 
-The current CLI stores credentials keyed only by `scheme.constructor.name`. That is a compatibility format, not a generally unique identity. A valid AND group can contain two `ApiKeyAuthScheme` instances with different names or locations; class-only restoration finds the first stored entry for both and silently applies the wrong credential.
+Do not store credentials only by `scheme.constructor.name`. A valid AND group can contain two `ApiKeyAuthScheme` instances with different names or locations; class-only restoration finds the first stored entry for both and silently applies the wrong credential.
 
 For new integrations, derive a slot from the requirement-group position, scheme position, class, and public parameters:
 

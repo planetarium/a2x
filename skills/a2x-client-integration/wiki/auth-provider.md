@@ -79,7 +79,7 @@ One client shares its in-flight initialization across concurrent cold calls, so 
 
 **Do not construct new `AuthScheme` instances inside `provide()`.** Mutate the ones the SDK hands you (via `setCredential`) and return them.
 
-Instance reuse does not make `scheme.constructor.name` a unique persistence key. A requirement group can contain two instances of the same subclass, such as API keys in different headers. Persist a slot identity derived from the requirement-group position, scheme position, class, and public parameters. The CLI reference implementation currently uses only the class name and therefore assumes at most one instance of each subclass per group.
+Instance reuse does not make `scheme.constructor.name` a unique persistence key. A requirement group can contain two instances of the same subclass, such as API keys in different headers. Persist a slot identity derived from the requirement-group position, scheme position, class, and public parameters, nested under the validated card/endpoint/identity-policy key.
 
 ---
 

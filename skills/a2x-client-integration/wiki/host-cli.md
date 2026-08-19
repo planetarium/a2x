@@ -268,6 +268,12 @@ export const sendCommand = new Command('send')
       fetch(input, { ...init, redirect: 'error' });
     const resolved = await resolveAgentCard(url, { headers, fetch: noRedirectFetch });
     const endpoint = getAgentEndpointUrl(resolved.card, resolved.version);
+    if (
+      url !== process.env.A2X_APPROVED_AGENT_CARD_URL ||
+      endpoint !== process.env.A2X_APPROVED_AGENT_ENDPOINT
+    ) {
+      throw new Error('Agent card or endpoint is outside the credential policy');
+    }
     const identityPolicyId = process.env.A2X_CREDENTIAL_POLICY_ID;
     if (!identityPolicyId) throw new Error('A2X_CREDENTIAL_POLICY_ID is required');
     const policyKey = credentialPolicyKey(url, endpoint, identityPolicyId);
@@ -289,8 +295,15 @@ export const sendCommand = new Command('send')
     const task = await client.sendMessage(params);
     // pretty-print task — see packages/cli/src/format.ts for a full implementation
     console.log(JSON.stringify(task, null, 2));
-  });
+});
 ```
+
+The credential-bearing commands intentionally refuse arbitrary URLs.
+`A2X_APPROVED_AGENT_CARD_URL` and `A2X_APPROVED_AGENT_ENDPOINT` must be exact,
+credential-free deployment-policy URLs, while `A2X_CREDENTIAL_POLICY_ID` binds
+the approved issuer/client/audience/scope policy version. If your CLI must call
+an arbitrary URL, disable automatic credential restoration and OAuth there;
+prompt for a credential explicitly scoped to the newly verified endpoint.
 
 ---
 
@@ -321,6 +334,12 @@ export const streamCommand = new Command('stream')
       fetch(input, { ...init, redirect: 'error' });
     const resolved = await resolveAgentCard(url, { headers, fetch: noRedirectFetch });
     const endpoint = getAgentEndpointUrl(resolved.card, resolved.version);
+    if (
+      url !== process.env.A2X_APPROVED_AGENT_CARD_URL ||
+      endpoint !== process.env.A2X_APPROVED_AGENT_ENDPOINT
+    ) {
+      throw new Error('Agent card or endpoint is outside the credential policy');
+    }
     const identityPolicyId = process.env.A2X_CREDENTIAL_POLICY_ID;
     if (!identityPolicyId) throw new Error('A2X_CREDENTIAL_POLICY_ID is required');
     const policyKey = credentialPolicyKey(url, endpoint, identityPolicyId);

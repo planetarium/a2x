@@ -547,6 +547,21 @@ describe('normalizeRequirements', () => {
     expect(result).toEqual([]);
   });
 
+  it('allows a cookie literally named * alongside a distinct cookie', () => {
+    const result = normalizeRequirements(
+      [{ star: [], session: [] }],
+      {
+        star: { apiKeySecurityScheme: { location: 'cookie', name: '*' } },
+        session: {
+          apiKeySecurityScheme: { location: 'cookie', name: 'session' },
+        },
+      },
+    );
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toHaveLength(2);
+  });
+
   it('rejects multi-OAuth AND groups that collide on Authorization', () => {
     const result = normalizeRequirements(
       [{ oauth: ['invoke'], secondOAuth: ['invoke'] }],

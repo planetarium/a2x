@@ -198,9 +198,16 @@ async function exchangeClientCredentials(
     }),
   });
   if (!res.ok) return undefined;
-  const data = (await res.json()) as { access_token?: string; scope?: string };
+  const data = (await res.json()) as {
+    access_token?: string;
+    token_type?: string;
+    scope?: string;
+  };
   assertGrantedScope(data.scope, requestedScopes);
   if (!data.access_token) return undefined;
+  if (data.token_type?.toLowerCase() !== 'bearer') {
+    throw new Error('Token endpoint returned a non-Bearer token type');
+  }
   await assertTokenPolicy(
     data.access_token,
     expectedAudience,

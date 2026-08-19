@@ -190,12 +190,33 @@ async function resolveClientCredentials(scheme: OAuth2ClientCredentialsAuthSchem
       ...(scope ? { scope } : {}),
     }),
   });
-  const { access_token } = await res.json() as { access_token: string };
-  scheme.setCredential(access_token);
+  if (!res.ok) throw new Error(`Token request failed: HTTP ${res.status}`);
+  const data = await res.json() as {
+    access_token?: string;
+    token_type?: string;
+    scope?: string;
+  };
+  if (!data.access_token || data.token_type?.toLowerCase() !== 'bearer') {
+    throw new Error('Token endpoint omitted a Bearer access token');
+  }
+  const requestedScopes = scope.split(/\s+/).filter(Boolean);
+  assertGrantedScope(data.scope, requestedScopes);
+  await assertTokenPolicy(
+    data.access_token,
+    process.env.OAUTH_EXPECTED_AUDIENCE!,
+    requestedScopes,
+  );
+  scheme.setCredential(data.access_token);
 }
 ```
 
-`trustedOAuthEndpoint` should require an exact configured HTTPS endpoint. `approvedScope` must request only `requiredScopes` and reject a value absent from either the advertised `scopes` catalogue or host policy keyed by card URL, resolved agent endpoint, issuer, client identity, and expected audience/resource. See [oauth2-device-code.md](./oauth2-device-code.md) for complete policy helpers.
+`trustedOAuthEndpoint` should require an exact configured HTTPS endpoint.
+`approvedScope` must request only `requiredScopes` and reject a value absent
+from either the advertised `scopes` catalogue or host policy keyed by card URL,
+resolved agent endpoint, issuer, client identity, and expected audience/resource.
+`assertGrantedScope` and `assertTokenPolicy` enforce the exact returned scope and
+cryptographically verified issuer/audience policy. See
+[oauth2-device-code.md](./oauth2-device-code.md) for complete helpers.
 
 ---
 

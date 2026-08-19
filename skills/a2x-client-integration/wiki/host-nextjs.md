@@ -397,6 +397,13 @@ async function recoverPersistedPaidExecution(
   }
   const task = await client.getTask(execution.taskId);
   if (!TERMINAL_STATES.has(task.status.state)) {
+    if (Date.now() >= execution.recoveryDeadlineAt) {
+      await jobs.quarantine(
+        job.id,
+        new Error('paid task did not reach terminal state before recovery deadline'),
+      );
+      return;
+    }
     await paidExecutions.scheduleRecoveryPoll(job.id); // recovery only; no resend
     return;
   }
@@ -413,7 +420,7 @@ async function recoverPersistedPaidExecution(
 }
 ```
 
-The durable execution row is separate from queue deduplication: it prevents an at-least-once delivery from starting the paid operation twice. This high-level helper is restricted to non-batch exact/upto payments: it can persist the payment boundary and safely query an existing merchant task, but it cannot reconstruct every signed payload after process death. Batch settlement must use the [low-level x402 flow](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md#low-level-signx402payment), durably store the signed payload, task/context IDs, batch binding, payer-storage pending attempt, and submission state, then call `reconcileX402BatchSettlement` before completing the job or accepting another partitioned payment. Otherwise quarantine an ambiguous attempt; never call `sendMessageStream(job.params)` again.
+The durable execution row is separate from queue deduplication: it prevents an at-least-once delivery from starting the paid operation twice. `claimOrLoad` must persist a host-policy recovery deadline; a task that remains nonterminal past it is quarantined, not polled or resent forever. This high-level helper is restricted to non-batch exact/upto payments: it can persist the payment boundary and safely query an existing merchant task, but it cannot reconstruct every signed payload after process death. Batch settlement must use the [low-level x402 flow](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md#low-level-signx402payment), durably store the signed payload, task/context IDs, batch binding, payer-storage pending attempt, and submission state, then call `reconcileX402BatchSettlement` before completing the job or accepting another partitioned payment. Otherwise quarantine an ambiguous attempt; never call `sendMessageStream(job.params)` again.
 
 ```typescript
 // GET /api/agent/jobs/:id/events — verify session ownership on every read.
