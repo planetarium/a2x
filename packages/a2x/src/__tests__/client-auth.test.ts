@@ -1458,4 +1458,485 @@ describe('A2XClient auth integration', () => {
     expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 
+  it('deduplicates concurrent authentication initialization for unary calls', async () => {
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const provide = vi.fn(async (requirements: AuthScheme[][]) => {
+      await gate;
+      return [requirements[0]![0]!.setCredential('shared-key')];
+    });
+    const client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      authProvider: { provide },
+    });
+
+    const first = client.sendMessage({
+      message: { role: 'user', parts: [{ text: '1' }] },
+    });
+    const second = client.sendMessage({
+      message: { role: 'user', parts: [{ text: '2' }] },
+    });
+    await vi.waitFor(() => expect(provide).toHaveBeenCalledTimes(1));
+    release();
+    await Promise.all([first, second]);
+
+    expect(provide).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch.mock.calls.map((call) => call[1].headers['x-api-key']))
+      .toEqual(['shared-key', 'shared-key']);
+  });
+
+  it('shares cold discovery and authentication between unary and stream calls', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const provide = vi.fn(async (requirements: AuthScheme[][]) => {
+      await gate;
+      return [requirements[0]![0]!.setCredential('shared-key')];
+    });
+    const mockFetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'GET') {
+        return {
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          json: () => Promise.resolve(V10_CARD_WITH_AUTH),
+          headers: new Headers({ 'content-type': 'application/json' }),
+        } as Response;
+      }
+      const headers = init?.headers as Record<string, string>;
+      if (headers.Accept === 'text/event-stream') {
+        return {
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          body: new ReadableStream({
+            start(controller) { controller.close(); },
+          }),
+          headers: new Headers({ 'content-type': 'text/event-stream' }),
+        } as Response;
+      }
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: () => Promise.resolve(createJsonRpcSuccess(TASK_RESULT)),
+        headers: new Headers({ 'content-type': 'application/json' }),
+      } as Response;
+    });
+    const client = new A2XClient(
+      'http://localhost:4000/.well-known/agent.json',
+      { fetch: mockFetch, authProvider: { provide } },
+    );
+
+    const unary = client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'unary' }] },
+    });
+    const streaming = (async () => {
+      for await (const _event of client.sendMessageStream({
+        message: { role: 'user', parts: [{ text: 'stream' }] },
+      })) { /* consume */ }
+    })();
+    await vi.waitFor(() => expect(provide).toHaveBeenCalledTimes(1));
+    release();
+    await Promise.all([unary, streaming]);
+
+    expect(provide).toHaveBeenCalledTimes(1);
+    expect(mockFetch.mock.calls.filter((call) => call[1]?.method === 'GET'))
+      .toHaveLength(1);
+    const transportCalls = mockFetch.mock.calls.filter(
+      (call) => call[1]?.method === 'POST',
+    );
+    expect(transportCalls).toHaveLength(2);
+    expect(transportCalls.map((call) =>
+      (call[1]?.headers as Record<string, string>)['x-api-key']))
+      .toEqual(['shared-key', 'shared-key']);
+  });
+
+  it('deduplicates concurrent credential refreshes', async () => {
+    const authRequiredTask = {
+      id: 'task-auth',
+      contextId: 'ctx-auth',
+      status: { state: TaskState.AUTH_REQUIRED, timestamp: new Date().toISOString() },
+    };
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(() => {
+      callCount += 1;
+      const body = callCount <= 2
+        ? createJsonRpcSuccess(authRequiredTask)
+        : createJsonRpcSuccess(TASK_RESULT);
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: () => Promise.resolve(body),
+        headers: new Headers({ 'content-type': 'application/json' }),
+      });
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const refresh = vi.fn(async (resolved: AuthScheme[]) => {
+      await gate;
+      resolved[0]!.setCredential('new-key');
+      return resolved;
+    });
+    const client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      authProvider: {
+        async provide(requirements) {
+          return [requirements[0]![0]!.setCredential('old-key')];
+        },
+        refresh,
+      },
+    });
+
+    const first = client.sendMessage({
+      message: { role: 'user', parts: [{ text: '1' }] },
+    });
+    const second = client.sendMessage({
+      message: { role: 'user', parts: [{ text: '2' }] },
+    });
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+    release();
+    await Promise.all([first, second]);
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    expect(mockFetch.mock.calls.slice(2).map((call) => call[1].headers['x-api-key']))
+      .toEqual(['new-key', 'new-key']);
+  });
+
+  it('does not refresh again for a late auth failure from an older generation', async () => {
+    const authRequiredTask = {
+      id: 'task-auth',
+      contextId: 'ctx-auth',
+      status: { state: TaskState.AUTH_REQUIRED, timestamp: new Date().toISOString() },
+    };
+    let releaseLate!: () => void;
+    const lateResponse = new Promise<void>((resolve) => { releaseLate = resolve; });
+    let releaseFirst!: () => void;
+    const firstResponse = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(async () => {
+      const thisCall = ++callCount;
+      if (thisCall === 1) await firstResponse;
+      if (thisCall === 2) {
+        releaseFirst();
+        await lateResponse;
+      }
+      const body = thisCall <= 2
+        ? createJsonRpcSuccess(authRequiredTask)
+        : createJsonRpcSuccess(TASK_RESULT);
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: () => Promise.resolve(body),
+        headers: new Headers({ 'content-type': 'application/json' }),
+      };
+    });
+    const refresh = vi.fn(async (resolved: AuthScheme[]) => {
+      resolved[0]!.setCredential('new-key');
+      releaseLate();
+      return resolved;
+    });
+    const client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      authProvider: {
+        async provide(requirements) {
+          return [requirements[0]![0]!.setCredential('old-key')];
+        },
+        refresh,
+      },
+    });
+
+    await Promise.all([
+      client.sendMessage({
+        message: { role: 'user', parts: [{ text: '1' }] },
+      }),
+      client.sendMessage({
+        message: { role: 'user', parts: [{ text: '2' }] },
+      }),
+    ]);
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    expect(mockFetch.mock.calls.slice(2).map((call) => call[1].headers['x-api-key']))
+      .toEqual(['new-key', 'new-key']);
+  });
+
+  it('publishes an in-place credential refresh only after it succeeds', async () => {
+    const authRequiredTask = {
+      id: 'task-auth',
+      contextId: 'ctx-auth',
+      status: { state: TaskState.AUTH_REQUIRED, timestamp: new Date().toISOString() },
+    };
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(() => {
+      callCount += 1;
+      const body = callCount === 1
+        ? createJsonRpcSuccess(authRequiredTask)
+        : createJsonRpcSuccess(TASK_RESULT);
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: () => Promise.resolve(body),
+        headers: new Headers({ 'content-type': 'application/json' }),
+      });
+    });
+    let releaseRefresh!: () => void;
+    const refreshGate = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+    let refreshSchemes!: AuthScheme[];
+    const refresh = vi.fn(async (schemes: AuthScheme[]) => {
+      refreshSchemes = schemes;
+      schemes[0]!.setCredential('new-key');
+      await refreshGate;
+      return schemes;
+    });
+    const client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      authProvider: {
+        async provide(requirements) {
+          return [requirements[0]![0]!.setCredential('old-key')];
+        },
+        refresh,
+      },
+    });
+
+    const refreshing = client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'refresh' }] },
+    });
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+
+    await client.getTask('concurrent-task');
+    expect(mockFetch.mock.calls[1]![1].headers['x-api-key']).toBe('old-key');
+
+    releaseRefresh();
+    await refreshing;
+    expect(mockFetch.mock.calls[2]![1].headers['x-api-key']).toBe('new-key');
+
+    // The provider still owns the objects it returned. Mutating them after
+    // resolution must not modify the generation published by the client.
+    refreshSchemes[0]!.setCredential('provider-late-mutation');
+    await client.getTask('after-refresh');
+    expect(mockFetch.mock.calls[3]![1].headers['x-api-key']).toBe('new-key');
+  });
+
+  it('keeps the published credentials when an in-place refresh rejects', async () => {
+    const authRequiredTask = {
+      id: 'task-auth',
+      contextId: 'ctx-auth',
+      status: { state: TaskState.AUTH_REQUIRED, timestamp: new Date().toISOString() },
+    };
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(() => {
+      callCount += 1;
+      const body = callCount === 1
+        ? createJsonRpcSuccess(authRequiredTask)
+        : createJsonRpcSuccess(TASK_RESULT);
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: () => Promise.resolve(body),
+        headers: new Headers({ 'content-type': 'application/json' }),
+      });
+    });
+    let releaseRefresh!: () => void;
+    const refreshGate = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+    const refresh = vi.fn(async (schemes: AuthScheme[]) => {
+      schemes[0]!.setCredential('rejected-key');
+      await refreshGate;
+      throw new Error('refresh failed');
+    });
+    const client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      authProvider: {
+        async provide(requirements) {
+          return [requirements[0]![0]!.setCredential('old-key')];
+        },
+        refresh,
+      },
+    });
+
+    const refreshing = client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'refresh' }] },
+    });
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+
+    await client.getTask('concurrent-task');
+    expect(mockFetch.mock.calls[1]![1].headers['x-api-key']).toBe('old-key');
+
+    releaseRefresh();
+    await expect(refreshing).rejects.toThrow('refresh failed');
+    await client.getTask('after-failure');
+    expect(mockFetch.mock.calls[2]![1].headers['x-api-key']).toBe('old-key');
+  });
+
+  it('waits for a newer in-flight refresh before retrying a stale stream', async () => {
+    const authRequiredTask = {
+      id: 'task-auth',
+      contextId: 'ctx-auth',
+      status: { state: TaskState.AUTH_REQUIRED, timestamp: new Date().toISOString() },
+    };
+    const encoder = new TextEncoder();
+    const authRequiredEvent =
+      'data: {"jsonrpc":"2.0","id":1,"result":{"taskId":"task-auth","contextId":"ctx-auth","status":{"state":"auth-required"},"final":true}}\n\n';
+    const completedEvent =
+      'data: {"jsonrpc":"2.0","id":1,"result":{"taskId":"task-ok","contextId":"ctx-ok","status":{"state":"completed"},"final":true}}\n\n';
+    let staleController!: ReadableStreamDefaultController<Uint8Array>;
+    const staleCancelled = vi.fn();
+    const staleBody = new ReadableStream<Uint8Array>({
+      start(controller) { staleController = controller; },
+      cancel: staleCancelled,
+    });
+    const attempts = new Map<string, number>();
+    const transportLog: Array<{ text: string; credential: string }> = [];
+    const mockFetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = init?.headers as Record<string, string>;
+      const request = JSON.parse(init?.body as string) as {
+        params: { message: { parts: Array<{ text: string }> } };
+      };
+      const text = request.params.message.parts[0]!.text;
+      const attempt = (attempts.get(text) ?? 0) + 1;
+      attempts.set(text, attempt);
+      transportLog.push({ text, credential: headers['x-api-key']! });
+
+      if (text === 'stale-stream') {
+        const body = attempt === 1
+          ? staleBody
+          : new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(encoder.encode(completedEvent));
+                controller.close();
+              },
+            });
+        return {
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          body,
+          headers: new Headers({ 'content-type': 'text/event-stream' }),
+        } as Response;
+      }
+
+      const body = attempt === 1
+        ? createJsonRpcSuccess(authRequiredTask)
+        : createJsonRpcSuccess(TASK_RESULT);
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: () => Promise.resolve(body),
+        headers: new Headers({ 'content-type': 'application/json' }),
+      } as Response;
+    });
+    let releaseSecondRefresh!: () => void;
+    const secondRefreshGate = new Promise<void>((resolve) => {
+      releaseSecondRefresh = resolve;
+    });
+    let refreshCount = 0;
+    const refresh = vi.fn(async (schemes: AuthScheme[]) => {
+      refreshCount += 1;
+      schemes[0]!.setCredential(`key-${refreshCount + 1}`);
+      if (refreshCount === 2) await secondRefreshGate;
+      return schemes;
+    });
+    const client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      authProvider: {
+        async provide(requirements) {
+          return [requirements[0]![0]!.setCredential('key-1')];
+        },
+        refresh,
+      },
+    });
+
+    const staleStream = (async () => {
+      for await (const _event of client.sendMessageStream({
+        message: { role: 'user', parts: [{ text: 'stale-stream' }] },
+      })) { /* consume */ }
+    })();
+    await vi.waitFor(() => expect(attempts.get('stale-stream')).toBe(1));
+
+    await client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'first-refresh' }] },
+    });
+    const newerUnary = client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'second-refresh' }] },
+    });
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
+
+    staleController.enqueue(encoder.encode(authRequiredEvent));
+    await vi.waitFor(() => expect(staleCancelled).toHaveBeenCalledTimes(1));
+    expect(attempts.get('stale-stream')).toBe(1);
+
+    releaseSecondRefresh();
+    await Promise.all([newerUnary, staleStream]);
+
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect(transportLog.filter(({ text }) => text === 'stale-stream'))
+      .toEqual([
+        { text: 'stale-stream', credential: 'key-1' },
+        { text: 'stale-stream', credential: 'key-3' },
+      ]);
+  });
+
+  it('cancels a rejected non-closing SSE response before auth retry', async () => {
+    const encoder = new TextEncoder();
+    const authRequiredEvent =
+      'data: {"jsonrpc":"2.0","id":1,"result":{"taskId":"task-auth","contextId":"ctx-auth","status":{"state":"auth-required"},"final":true}}\n\n';
+    const completedEvent =
+      'data: {"jsonrpc":"2.0","id":1,"result":{"taskId":"task-ok","contextId":"ctx-ok","status":{"state":"completed"},"final":true}}\n\n';
+    const order: string[] = [];
+    const firstBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(authRequiredEvent));
+      },
+      cancel() { order.push('cancel'); },
+    });
+    let callCount = 0;
+    const mockFetch = vi.fn(async () => {
+      callCount += 1;
+      if (callCount === 2) order.push('retry');
+      const body = callCount === 1
+        ? firstBody
+        : new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(encoder.encode(completedEvent));
+              controller.close();
+            },
+          });
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        body,
+        headers: new Headers({ 'content-type': 'text/event-stream' }),
+      } as Response;
+    });
+    const client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      authProvider: {
+        async provide(requirements) {
+          return [requirements[0]![0]!.setCredential('old-key')];
+        },
+        async refresh(schemes) {
+          return [schemes[0]!.setCredential('new-key')];
+        },
+      },
+    });
+
+    const events = [];
+    for await (const event of client.sendMessageStream({
+      message: { role: 'user', parts: [{ text: 'stream' }] },
+    })) {
+      events.push(event);
+    }
+
+    expect(events).toHaveLength(1);
+    expect(order).toEqual(['cancel', 'retry']);
+  });
+
 });
