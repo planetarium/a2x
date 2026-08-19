@@ -73,7 +73,9 @@ export class ApiKeyAuthScheme extends AuthScheme {
       const unrelated = existing
         .split(';')
         .map((pair) => pair.trim())
-        .filter((pair) => pair.split('=', 1)[0] !== this.name)
+        .filter(
+          (pair) => pair.length > 0 && pair.split('=', 1)[0] !== this.name,
+        )
         .join('; ');
       ctx.headers['Cookie'] = [unrelated, `${this.name}=${this.credential!}`]
         .filter(Boolean)

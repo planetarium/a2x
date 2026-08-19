@@ -1061,10 +1061,28 @@ export class A2XClient {
         // v1.0 format
         const flat: Record<string, string[]> = {};
         for (const [name, val] of Object.entries(r.schemes as Record<string, unknown>)) {
-          const v = val as { list?: string[]; values?: string[] };
+          if (!val || typeof val !== 'object' || Array.isArray(val)) {
+            throw new InvalidAgentResponseError(
+              `AgentCard security requirement "${name}" must be a StringList object.`,
+            );
+          }
+          const v = val as { list?: unknown; values?: unknown };
           // `list` is the A2A v1.0 StringList field. Accept `values` as a
           // compatibility bridge for cards emitted by older a2x releases.
-          flat[name] = v.list ?? v.values ?? [];
+          const scopes = Object.hasOwn(v, 'list')
+            ? v.list
+            : Object.hasOwn(v, 'values')
+              ? v.values
+              : [];
+          if (
+            !Array.isArray(scopes) ||
+            !scopes.every((scope): scope is string => typeof scope === 'string')
+          ) {
+            throw new InvalidAgentResponseError(
+              `AgentCard security requirement "${name}" must contain an array of strings.`,
+            );
+          }
+          flat[name] = scopes;
         }
         return flat;
       }

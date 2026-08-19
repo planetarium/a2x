@@ -129,9 +129,9 @@ describe('AuthScheme', () => {
       scheme.setCredential('fresh');
       const ctx = {
         headers: {
-          Cookie: 'session=stale; first=one',
+          Cookie: '; session=stale; first=one;',
           cookie: 'second=two',
-          COOKIE: 'session=older; third=three',
+          COOKIE: ';; session=older; third=three',
         } as Record<string, string>,
         url: new URL('http://example.com'),
       };
@@ -750,6 +750,28 @@ describe('A2XClient auth integration', () => {
     expect(provide).toHaveBeenCalledTimes(1);
     expect(mockFetch.mock.calls[0]![1].headers.Authorization)
       .toBe('Bearer legacy-compatible-token');
+  });
+
+  it.each([
+    ['canonical list', { list: 'agent:invoke' }],
+    ['legacy values', { values: ['agent:invoke', 42] }],
+  ])('rejects malformed %s requirement scopes before transport', async (_label, wrapper) => {
+    const malformedCard = {
+      ...V10_CARD_WITH_AUTH,
+      securityRequirements: [{ schemes: { deviceCode: wrapper } }],
+    } as unknown as AgentCardV10;
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const provide = vi.fn();
+    const client = new A2XClient(malformedCard, {
+      fetch: mockFetch,
+      authProvider: { provide },
+    });
+
+    await expect(client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    })).rejects.toThrow('must contain an array of strings');
+    expect(provide).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it('calls authProvider.provide() and applies credentials', async () => {
