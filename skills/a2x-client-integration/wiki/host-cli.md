@@ -349,7 +349,7 @@ program.parse();
 
 1. Run against an unauthenticated agent — no prompting should happen.
 2. Run against an agent with `{ apiKey: [] }` — first run prompts, second run reads from store.
-3. Manually break the stored credential (edit `~/.<your-cli>/tokens.json`) — the next run should hit 401 and re-prompt via `refresh()`.
+3. Manually break the stored credential (edit `~/.<your-cli>/tokens.json`) and have the test agent return `auth-required` — the next run should re-prompt via `refresh()`.
 4. Run against an agent with OAuth2 device code — confirm the verification URL and polling behavior.
 5. Run against an agent with multiple auth groups — confirm the menu works and your choice persists.
 

@@ -67,7 +67,7 @@ Both include `taskId` and `contextId`. Status updates carry a `TaskStatus` with 
 
 The stream ends (generator completes) when:
 
-1. The server sends `event: done` (a2x server format), or
+1. A legacy server sends `event: done`, or
 2. A status event with `final: true` arrives and the state is terminal (`completed`, `failed`, `canceled`, `rejected`), or
 3. The underlying HTTP response body closes cleanly.
 
@@ -114,6 +114,14 @@ The `taskId` is available on every event's `taskId` field after the first status
 
 ---
 
+## x402 Payment Streams
+
+When the client is constructed with `x402`, the same generator owns the payment round trip. It yields the initial `payment-required` status, invokes `onPaymentRequired`, signs and resubmits when approved, then continues yielding verification, work, artifact, and completion events. `allowUpto`, `allowBatchSettlement`, `maxRetries`, and receipt reconciliation follow the same options and safety rules as blocking `sendMessage`.
+
+Breaking out after a payment payload has been submitted can leave the result ambiguous, especially for `batch-settlement`. Use durable channel storage and handle `X402ReconciliationError` as described in the [x402 payments guide](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md).
+
+---
+
 ## Error Handling During a Stream
 
 The SDK distinguishes two error paths:
@@ -147,40 +155,21 @@ try {
 }
 ```
 
-Format-B servers (JSON-RPC-wrapped SSE) cannot send an `error` event — they surface errors as a non-SSE JSON-RPC error response instead.
+Data-only JSON-RPC streams may also carry a JSON-RPC error envelope in a `data:` chunk. The parser terminates the generator and throws an error containing the remote message, code, and data. A server may instead return a non-SSE JSON-RPC error response before streaming begins; that response is mapped to the exported `A2AError` subclass.
 
-### HTTP 401 during streaming
+### Authentication during streaming
 
-Unlike non-streaming requests, streaming does **not** retry via `authProvider.refresh()`. A 401 on the SSE endpoint throws an `InternalError('HTTP 401: Unauthorized')`. If you need automatic refresh for streaming, wrap your own retry around the generator:
+The client buffers the first stream event. If it is an `auth-required` status and the provider implements `refresh()`, the client refreshes credentials and retries the stream once before yielding anything. If the retried stream is also `auth-required`, that event is yielded normally.
 
-```typescript
-async function streamWithRefresh(params: SendMessageParams) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      for await (const event of client.sendMessageStream(params)) yield event;
-      return;
-    } catch (err) {
-      if (attempt === 0 && err instanceof InternalError && /401/.test(err.message)) {
-        // We know refresh is safe because this error is from fetch, not protocol
-        // Force the provider's refresh path by constructing a dummy 401:
-        // (see note below on better patterns)
-        continue;
-      }
-      throw err;
-    }
-  }
-}
-```
-
-A cleaner pattern: construct a fresh client on HTTP 401 during streaming, forcing `provide()` to run again.
+An HTTP 401 is different: it throws `InternalError('HTTP 401: Unauthorized')` immediately and does not invoke the provider. Refresh the host credential and construct a fresh client only if the remote integration uses transport-level 401 instead of the A2A `auth-required` state.
 
 ---
 
 ## SSE Wire Formats
 
-The parser handles two formats interoperably — you don't need to know which the server uses:
+The parser handles the standard format plus a temporary legacy format for upgrade compatibility:
 
-### Format A: explicit event names (a2x servers)
+### Legacy format: explicit event names
 
 ```
 event: status_update
@@ -196,7 +185,9 @@ event: error
 data: {"error":"something broke"}
 ```
 
-### Format B: data-only with JSON-RPC wrapping (ADK-style servers)
+The parser logs a one-time deprecation warning when it sees this format.
+
+### Standard format: data-only with JSON-RPC wrapping
 
 ```
 data: {"jsonrpc":"2.0","id":1,"result":{"kind":"status-update","taskId":"…","status":{"state":"working"}}}
@@ -204,11 +195,12 @@ data: {"jsonrpc":"2.0","id":1,"result":{"kind":"status-update","taskId":"…","s
 data: {"jsonrpc":"2.0","id":1,"result":{"kind":"artifact-update","artifact":{"parts":[…]}}}
 ```
 
-For Format B, the parser:
+For the standard format, the parser:
 
 1. Unwraps the JSON-RPC envelope (takes `result`).
 2. Detects event type via the `kind` discriminator or structural cues (`status` + `taskId` without `artifacts` → status-update; `artifact` → artifact-update).
-3. Stops when a status event with `final: true` and terminal state arrives.
+3. Throws when a chunk contains a JSON-RPC `error` envelope.
+4. Stops when a status event with `final: true` and terminal state arrives.
 
 ---
 

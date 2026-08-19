@@ -53,6 +53,10 @@ If both fail, the error includes both attempted paths and the last error message
 `detectProtocolVersion(card)` inspects the card:
 
 ```typescript
+if (typeof card.protocolVersion === 'string') {
+  if (card.protocolVersion.startsWith('0.3')) return '0.3';
+  if (card.protocolVersion.startsWith('1.')) return '1.0';
+}
 if (Array.isArray(card.supportedInterfaces) && card.supportedInterfaces.length > 0) {
   return '1.0';
 }
@@ -64,9 +68,11 @@ return '1.0';  // ambiguous default
 
 Notes:
 
+- The card's declared `protocolVersion` is authoritative when recognized.
 - v1.0 cards have `supportedInterfaces: [{ url, protocolBinding, … }, …]`.
 - v0.3 cards have a top-level `url` (the JSON-RPC endpoint).
-- A card that has **both** (e.g. a dual-stack server) is classified as v1.0.
+- A v0.3 card may also advertise `supportedInterfaces`; it remains v0.3 when `protocolVersion` declares `0.3.x`.
+- Shape heuristics are used only when the declaration is absent or unrecognized.
 
 ---
 
