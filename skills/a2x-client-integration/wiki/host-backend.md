@@ -218,7 +218,13 @@ import { EnvAuthProvider } from './env-auth-provider.js';
 function exactHttpsUrl(raw: string | undefined, label: string): string {
   if (!raw) throw new Error(`${label} is required`);
   const url = new URL(raw);
-  if (url.protocol !== 'https:' || url.username || url.password || url.hash) {
+  if (
+    url.protocol !== 'https:' ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  ) {
     throw new Error(`${label} must be an exact credential-free HTTPS URL`);
   }
   return url.toString();
@@ -228,6 +234,9 @@ const AGENT_CARD_URL = exactHttpsUrl(
   process.env.AGENT_CARD_URL,
   'AGENT_CARD_URL',
 );
+if (!new URL(AGENT_CARD_URL).pathname.endsWith('.json')) {
+  throw new Error('AGENT_CARD_URL must name one exact JSON card document');
+}
 const EXPECTED_AGENT_ENDPOINT = exactHttpsUrl(
   process.env.AGENT_ENDPOINT_URL,
   'AGENT_ENDPOINT_URL',
