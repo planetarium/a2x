@@ -22,6 +22,7 @@ The SDK only ever constructs this scheme when the agent card (v1.0) declares a `
 Client                                              Authorization Server
   │                                                        │
   │  POST deviceAuthorizationUrl                           │
+  │  client_id=<host-configured-client>                    │
   │  scope=<space-delimited-scopes>                        │
   │ ──────────────────────────────────────────────────────▶│
   │                                                        │
@@ -34,6 +35,7 @@ Client                                              Authorization Server
   │  POST tokenUrl                                         │
   │  grant_type=urn:ietf:params:oauth:grant-type:device_code│
   │  device_code=<code>                                    │
+  │  client_id=<host-configured-client>                    │
   │ ──────────────────────────────────────────────────────▶│
   │                                                        │
   │  either { error: 'authorization_pending' }             │
@@ -74,40 +76,96 @@ interface TokenErrorResponse {
   error_description?: string;
 }
 
-// Configure this from host/deployment policy, never from the discovered card.
-const TRUSTED_OAUTH_ORIGINS = new Set(
-  (process.env.OAUTH_ISSUER_ORIGINS ?? '')
+function normalizeOAuthEndpoint(raw: string): string {
+  const url = new URL(raw);
+  if (url.protocol !== 'https:' || url.username || url.password || url.hash) {
+    throw new Error(`Invalid OAuth endpoint: ${url.origin}`);
+  }
+  return url.toString();
+}
+
+// Configure all policy below from the host, never from the discovered card.
+const TRUSTED_OAUTH_ENDPOINTS = new Set(
+  (process.env.OAUTH_ENDPOINTS ?? '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean)
+    .map(normalizeOAuthEndpoint),
+);
+
+const TRUSTED_VERIFICATION_ORIGINS = new Set(
+  (process.env.OAUTH_VERIFICATION_ORIGINS ?? '')
     .split(',')
     .map(value => value.trim())
     .filter(Boolean)
     .map(value => new URL(value).origin),
 );
 
-function trustedOAuthUrl(raw: string, purpose: string): URL {
+const ALLOWED_OAUTH_SCOPES = new Set(
+  (process.env.OAUTH_ALLOWED_SCOPES ?? '').split(/\s+/).filter(Boolean),
+);
+
+function trustedOAuthEndpoint(raw: string, purpose: string): URL {
+  const normalized = normalizeOAuthEndpoint(raw);
+  if (!TRUSTED_OAUTH_ENDPOINTS.has(normalized)) {
+    throw new Error(`Refusing untrusted OAuth ${purpose}: ${normalized}`);
+  }
+  return new URL(normalized);
+}
+
+function trustedVerificationUrl(raw: string): URL {
   const url = new URL(raw);
-  if (url.protocol !== 'https:' || !TRUSTED_OAUTH_ORIGINS.has(url.origin)) {
-    throw new Error(`Refusing untrusted OAuth ${purpose} origin: ${url.origin}`);
+  if (
+    url.protocol !== 'https:' ||
+    url.username ||
+    url.password ||
+    !TRUSTED_VERIFICATION_ORIGINS.has(url.origin)
+  ) {
+    throw new Error(`Refusing untrusted verification URL: ${url.origin}`);
   }
   return url;
 }
 
+function approvedScope(scopes: Record<string, string>): string {
+  const requested = Object.keys(scopes);
+  const rejected = requested.filter(scope => !ALLOWED_OAUTH_SCOPES.has(scope));
+  if (rejected.length) {
+    throw new Error(`Refusing unapproved OAuth scopes: ${rejected.join(', ')}`);
+  }
+  return requested.join(' ');
+}
+
+function assertGrantedScope(granted?: string): void {
+  if (!granted) return;
+  const rejected = granted
+    .split(/\s+/)
+    .filter(Boolean)
+    .filter(scope => !ALLOWED_OAUTH_SCOPES.has(scope));
+  if (rejected.length) {
+    throw new Error(`Token granted unapproved scopes: ${rejected.join(', ')}`);
+  }
+}
+
 export async function performDeviceCodeFlow(
   scheme: OAuth2DeviceCodeAuthScheme,
-): Promise<string> {
+  clientId: string,
+): Promise<TokenResponse> {
+  if (!clientId) throw new Error('OAuth client ID is required');
   const { scopes } = scheme.params;
-  const deviceAuthorizationUrl = trustedOAuthUrl(
+  const deviceAuthorizationUrl = trustedOAuthEndpoint(
     scheme.params.deviceAuthorizationUrl,
     'device authorization endpoint',
   );
-  const tokenUrl = trustedOAuthUrl(scheme.params.tokenUrl, 'token endpoint');
+  const tokenUrl = trustedOAuthEndpoint(scheme.params.tokenUrl, 'token endpoint');
 
   // Step 1: Request a device code
-  const scopeStr = Object.keys(scopes).join(' ');
+  const scopeStr = approvedScope(scopes);
   const deviceRes = await fetch(deviceAuthorizationUrl, {
     method: 'POST',
     redirect: 'error',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
+      client_id: clientId,
       ...(scopeStr ? { scope: scopeStr } : {}),
     }),
   });
@@ -119,12 +177,22 @@ export async function performDeviceCodeFlow(
   }
 
   const deviceData = (await deviceRes.json()) as DeviceAuthResponse;
-  const pollInterval = (deviceData.interval ?? 5) * 1000;
+  if (
+    typeof deviceData.device_code !== 'string' ||
+    typeof deviceData.user_code !== 'string' ||
+    typeof deviceData.verification_uri !== 'string' ||
+    (deviceData.verification_uri_complete !== undefined &&
+      typeof deviceData.verification_uri_complete !== 'string')
+  ) {
+    throw new Error('Device authorization response is incomplete');
+  }
+  let pollInterval = Number.isFinite(deviceData.interval) && deviceData.interval! > 0
+    ? deviceData.interval! * 1000
+    : 5_000;
 
   // A compromised endpoint can return a phishing URL. Validate before displaying it.
-  const verificationUrl = trustedOAuthUrl(
+  const verificationUrl = trustedVerificationUrl(
     deviceData.verification_uri_complete ?? deviceData.verification_uri,
-    'verification page',
   );
 
   // Step 2: Display instructions to the user
@@ -138,7 +206,10 @@ export async function performDeviceCodeFlow(
   process.stdout.write('  Waiting for authorization...');
 
   // Step 3: Poll the token endpoint
-  const deadline = Date.now() + (deviceData.expires_in ?? 300) * 1000;
+  const lifetime = Number.isFinite(deviceData.expires_in) && deviceData.expires_in! > 0
+    ? deviceData.expires_in!
+    : 300;
+  const deadline = Date.now() + lifetime * 1000;
 
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, pollInterval));
@@ -150,14 +221,19 @@ export async function performDeviceCodeFlow(
       body: new URLSearchParams({
         grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
         device_code: deviceData.device_code,
+        client_id: clientId,
       }),
     });
 
     const tokenData = (await tokenRes.json()) as TokenResponse | TokenErrorResponse;
 
     if ('access_token' in tokenData) {
+      if (typeof tokenData.access_token !== 'string' || !tokenData.access_token) {
+        throw new Error('Token response omitted access_token');
+      }
+      assertGrantedScope(tokenData.scope);
       console.log(' Authorized!');
-      return tokenData.access_token;
+      return tokenData;
     }
 
     const errorData = tokenData as TokenErrorResponse;
@@ -166,7 +242,7 @@ export async function performDeviceCodeFlow(
       continue;
     }
     if (errorData.error === 'slow_down') {
-      await new Promise(r => setTimeout(r, pollInterval));  // extra back-off
+      pollInterval += 5_000;
       continue;
     }
 
@@ -181,14 +257,14 @@ export async function performDeviceCodeFlow(
 }
 ```
 
-Set `OAUTH_ISSUER_ORIGINS` from trusted host configuration, for example `https://login.example.com`. Validate the device, token, and displayed verification URLs before sending a client secret, refresh token, device code, or directing a user to a page. Reject redirects so an allowlisted endpoint cannot forward secrets to another origin. If local HTTP identity infrastructure is required, implement a narrow development-only exception rather than weakening the production rule.
+Configure exact `OAUTH_ENDPOINTS`, `OAUTH_VERIFICATION_ORIGINS`, `OAUTH_ALLOWED_SCOPES`, and the client ID from trusted host policy. In multi-agent or multi-tenant hosts, key policy by agent, issuer, client identity, and expected audience/resource. Reject redirects so an approved endpoint cannot forward secrets elsewhere. If local HTTP identity infrastructure is required, implement a narrow development-only exception rather than weakening the production rule.
 
 Use it from `resolveScheme`:
 
 ```typescript
 if (scheme instanceof OAuth2DeviceCodeAuthScheme) {
-  const token = await performDeviceCodeFlow(scheme);
-  scheme.setCredential(token);
+  const tokens = await performDeviceCodeFlow(scheme, process.env.OAUTH_CLIENT_ID!);
+  scheme.setCredential(tokens.access_token);
   return;
 }
 ```
@@ -202,7 +278,7 @@ The OAuth2 Device Authorization Grant spec ([RFC 8628 §3.5](https://datatracker
 | Error | Meaning | CLI behavior |
 |-------|---------|--------------|
 | `authorization_pending` | User hasn't approved yet. Keep polling. | Continue loop. |
-| `slow_down` | Polling too fast. Increase interval by ≥5s. | Extra sleep, continue. |
+| `slow_down` | Polling too fast. Increase all subsequent intervals by ≥5s. | Increase interval, continue. |
 | `access_denied` | User rejected the request. | Fatal, throw. |
 | `expired_token` | Device code passed its `expires_in`. | Fatal, throw. |
 | (any other) | Protocol error. | Fatal, throw. |
@@ -213,7 +289,7 @@ The CLI catches `authorization_pending` and `slow_down` and treats **every other
 
 ## Client Authentication on the Token Endpoint
 
-Some authorization servers require the client to authenticate on the token endpoint even during device-code polling (`client_id` / `client_secret`). The reference above omits them — add them if your authorization server requires them:
+RFC 8628 requires `client_id` in both the device authorization and token polling requests unless the client authenticates by another method. The reference accepts this host-configured ID explicitly. A confidential client may additionally authenticate with a secret using the method required by its authorization server:
 
 ```typescript
 body: new URLSearchParams({
@@ -224,53 +300,102 @@ body: new URLSearchParams({
 }),
 ```
 
-The device-code flow is typically used with **public** clients (no secret), so `client_id` is usually enough. Consult your agent's OAuth2 server docs.
+The device-code flow is typically used with **public** clients (no secret), so `client_id` is usually enough. Never obtain the client ID or secret from the agent card.
 
 ---
 
-## Storing the Access Token
+## Storing and Refreshing the Token Set
 
-The access token goes into the selected OAuth2 device-code credential slot via `saveCredentials`. On subsequent runs, the provider restores that slot with `scheme.setCredential` — no new device-code flow. Use the composite slot described in [token-persistence.md](./token-persistence.md), not the class name alone.
-
-If you want to also store `refresh_token` and exchange it when the agent reports `auth-required` instead of re-doing the device-code flow, extend `StoredCredential`:
+`performDeviceCodeFlow` returns the full token set so callers do not discard `refresh_token` or expiry. Extend the slot-safe store from [token-persistence.md](./token-persistence.md):
 
 ```typescript
 interface StoredCredential {
   slot: string;
   credential: string;
-  refreshCredential?: string;  // OAuth2 refresh_token
+  refreshCredential?: string;
   expiresAt?: number;
 }
 ```
 
-Then in `AuthProvider.refresh()`, try the refresh token before falling back to `performDeviceCodeFlow`:
+The provider can retain newly issued token sets until `_save` serializes the selected group:
 
 ```typescript
+private readonly tokenSets = new Map<string, TokenResponse>();
+
+private async _resolveForSlot(
+  groupIndex: number,
+  schemeIndex: number,
+  scheme: AuthScheme,
+): Promise<void> {
+  if (!(scheme instanceof OAuth2DeviceCodeAuthScheme)) {
+    await resolveScheme(scheme);
+    return;
+  }
+  const tokens = await performDeviceCodeFlow(
+    scheme,
+    process.env.OAUTH_CLIENT_ID!,
+  );
+  scheme.setCredential(tokens.access_token);
+  this.tokenSets.set(credentialSlot(groupIndex, schemeIndex, scheme), tokens);
+}
+
+private _save(groupIndex: number, group: AuthScheme[]): void {
+  const entries = group.map((scheme, schemeIndex): StoredCredential => {
+    const slot = credentialSlot(groupIndex, schemeIndex, scheme);
+    const access = extractCredential(slot, scheme);
+    const tokens = this.tokenSets.get(slot);
+    return {
+      ...access,
+      ...(tokens?.refresh_token
+        ? { refreshCredential: tokens.refresh_token }
+        : {}),
+      ...(tokens?.expires_in
+        ? { expiresAt: Date.now() + tokens.expires_in * 1000 }
+        : {}),
+    };
+  });
+  saveCredentials(this.agentUrl, entries);
+}
+
 async refresh(schemes: AuthScheme[]): Promise<AuthScheme[]> {
-  for (const scheme of schemes) {
+  const groupIndex = this.selectedGroupIndex;
+  if (groupIndex === undefined) {
+    throw new Error('Cannot refresh before selecting an auth group');
+  }
+  const stored = loadCredentials(this.agentUrl) ?? [];
+  const clientId = process.env.OAUTH_CLIENT_ID!;
+
+  for (const [schemeIndex, scheme] of schemes.entries()) {
     if (scheme instanceof OAuth2DeviceCodeAuthScheme) {
-      const rt = loadRefreshToken(this.agentUrl);
-      if (rt) {
-        const ok = await tryRefreshToken(scheme.params.tokenUrl, rt, scheme);
-        if (ok) continue;
+      const slot = credentialSlot(groupIndex, schemeIndex, scheme);
+      const previous = stored.find(entry => entry.slot === slot);
+      let tokens = previous?.refreshCredential
+        ? await tryRefreshToken(
+            scheme.params.tokenUrl,
+            previous.refreshCredential,
+            clientId,
+          )
+        : undefined;
+      if (!tokens) tokens = await performDeviceCodeFlow(scheme, clientId);
+      if (!tokens.refresh_token && previous?.refreshCredential) {
+        tokens.refresh_token = previous.refreshCredential;
       }
-      // fall back to a fresh device-code flow
-      const token = await performDeviceCodeFlow(scheme);
-      scheme.setCredential(token);
+      scheme.setCredential(tokens.access_token);
+      this.tokenSets.set(slot, tokens);
     } else {
       await resolveScheme(scheme);
     }
   }
-  this._save(schemes);
+  this._save(groupIndex, schemes);
   return schemes;
 }
 
 async function tryRefreshToken(
   tokenUrl: string,
   refreshToken: string,
-  scheme: OAuth2DeviceCodeAuthScheme,
-): Promise<boolean> {
-  const trustedTokenUrl = trustedOAuthUrl(tokenUrl, 'refresh endpoint');
+  clientId: string,
+): Promise<TokenResponse | undefined> {
+  const trustedTokenUrl = trustedOAuthEndpoint(tokenUrl, 'refresh endpoint');
   const res = await fetch(trustedTokenUrl, {
     method: 'POST',
     redirect: 'error',
@@ -278,15 +403,28 @@ async function tryRefreshToken(
     body: new URLSearchParams({
       grant_type: 'refresh_token',
       refresh_token: refreshToken,
+      client_id: clientId,
     }),
   });
-  if (!res.ok) return false;
+  if (!res.ok) return undefined;
   const data = (await res.json()) as TokenResponse | TokenErrorResponse;
-  if (!('access_token' in data)) return false;
-  scheme.setCredential(data.access_token);
-  return true;
+  if (!('access_token' in data)) return undefined;
+  if (typeof data.access_token !== 'string' || !data.access_token) return undefined;
+  assertGrantedScope(data.scope);
+  return data;
 }
 ```
+
+In `provide()`, replace the generic resolution loop for a newly selected group with the slot-aware method before saving:
+
+```typescript
+for (const [schemeIndex, scheme] of group.entries()) {
+  await this._resolveForSlot(groupIndex, schemeIndex, scheme);
+}
+this._save(groupIndex, group);
+```
+
+For confidential clients, authenticate the refresh request using the authorization server's configured method. Apply the same exact endpoint, allowed-scope, issuer, audience/resource, and client-identity policy as the initial exchange.
 
 ---
 

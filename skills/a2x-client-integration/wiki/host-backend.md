@@ -28,25 +28,62 @@ import {
   OAuth2ClientCredentialsAuthScheme,
 } from '@a2x/sdk/client';
 
-const API_KEY_ENV_BY_SLOT: Record<string, string | undefined> = {
-  'header:x-api-key': process.env.AGENT_API_KEY,
-  'header:x-tenant-key': process.env.AGENT_TENANT_API_KEY,
+const API_KEY_ENV_BY_SLOT: Record<string, string> = {
+  'header:x-api-key': 'AGENT_API_KEY',
+  'header:x-tenant-key': 'AGENT_TENANT_API_KEY',
 };
 
-const TRUSTED_OAUTH_ORIGINS = new Set(
-  (process.env.OAUTH_ISSUER_ORIGINS ?? '')
+function normalizeOAuthEndpoint(raw: string): string {
+  const url = new URL(raw);
+  if (
+    url.protocol !== 'https:' ||
+    url.username ||
+    url.password ||
+    url.hash
+  ) {
+    throw new Error(`Invalid OAuth endpoint: ${url.origin}`);
+  }
+  return url.toString();
+}
+
+const TRUSTED_OAUTH_TOKEN_ENDPOINTS = new Set(
+  (process.env.OAUTH_TOKEN_ENDPOINTS ?? '')
     .split(',')
     .map(value => value.trim())
     .filter(Boolean)
-    .map(value => new URL(value).origin),
+    .map(normalizeOAuthEndpoint),
 );
 
 function trustedOAuthEndpoint(raw: string, purpose: string): URL {
-  const url = new URL(raw);
-  if (url.protocol !== 'https:' || !TRUSTED_OAUTH_ORIGINS.has(url.origin)) {
-    throw new Error(`Refusing untrusted OAuth ${purpose} origin: ${url.origin}`);
+  const normalized = normalizeOAuthEndpoint(raw);
+  if (!TRUSTED_OAUTH_TOKEN_ENDPOINTS.has(normalized)) {
+    throw new Error(`Refusing untrusted OAuth ${purpose}: ${normalized}`);
   }
-  return url;
+  return new URL(normalized);
+}
+
+const ALLOWED_OAUTH_SCOPES = new Set(
+  (process.env.OAUTH_ALLOWED_SCOPES ?? '').split(/\s+/).filter(Boolean),
+);
+
+function approvedScope(scopes: Record<string, string>): string {
+  const requested = Object.keys(scopes);
+  const rejected = requested.filter(scope => !ALLOWED_OAUTH_SCOPES.has(scope));
+  if (rejected.length) {
+    throw new Error(`Refusing unapproved OAuth scopes: ${rejected.join(', ')}`);
+  }
+  return requested.join(' ');
+}
+
+function assertGrantedScope(granted?: string): void {
+  if (!granted) return;
+  const rejected = granted
+    .split(/\s+/)
+    .filter(Boolean)
+    .filter(scope => !ALLOWED_OAUTH_SCOPES.has(scope));
+  if (rejected.length) {
+    throw new Error(`Token granted unapproved scopes: ${rejected.join(', ')}`);
+  }
 }
 
 function apiKeySlot(scheme: ApiKeyAuthScheme): string {
@@ -59,7 +96,7 @@ function apiKeySlot(scheme: ApiKeyAuthScheme): string {
 export class EnvAuthProvider implements AuthProvider {
   async provide(requirements: AuthScheme[][]): Promise<AuthScheme[]> {
     for (const group of requirements) {
-      if (await this.tryFill(group)) return group;
+      if (await fillGroup(group)) return group;
     }
     throw new Error(
       'No configured credentials match the agent security requirements. ' +
@@ -68,62 +105,58 @@ export class EnvAuthProvider implements AuthProvider {
   }
 
   async refresh(schemes: AuthScheme[]): Promise<AuthScheme[]> {
-    // For OAuth2 client_credentials, re-exchange.
-    // For static API key / Bearer, re-reading env is usually pointless —
-    // but if the env was rotated since startup, this picks it up.
-    for (const scheme of schemes) {
-      if (scheme instanceof OAuth2ClientCredentialsAuthScheme) {
-        await fillClientCredentials(scheme);
-      } else {
-        await fillStatic(scheme);
-      }
+    // Re-read every source so rotations are visible, and fail as a group.
+    if (!(await fillGroup(schemes))) {
+      throw new Error('Refreshed credentials are incomplete');
     }
     return schemes;
   }
-
-  private async tryFill(group: AuthScheme[]): Promise<boolean> {
-    for (const scheme of group) {
-      const ok = scheme instanceof OAuth2ClientCredentialsAuthScheme
-        ? await fillClientCredentials(scheme)
-        : fillStatic(scheme);
-      if (!ok) return false;
-    }
-    return true;
-  }
 }
 
-function fillStatic(scheme: AuthScheme): boolean {
+async function fillGroup(group: AuthScheme[]): Promise<boolean> {
+  const credentials: string[] = [];
+  for (const scheme of group) {
+    const credential = await resolveCredential(scheme);
+    if (!credential) return false;
+    credentials.push(credential);
+  }
+  group.forEach((scheme, index) => scheme.setCredential(credentials[index]!));
+  return true;
+}
+
+async function resolveCredential(
+  scheme: AuthScheme,
+): Promise<string | undefined> {
   if (scheme instanceof ApiKeyAuthScheme) {
-    const key = API_KEY_ENV_BY_SLOT[apiKeySlot(scheme)];
-    if (!key) return false;
-    scheme.setCredential(key);
-    return true;
+    const envName = API_KEY_ENV_BY_SLOT[apiKeySlot(scheme)];
+    return envName ? process.env[envName] : undefined;
   }
   if (scheme instanceof HttpBearerAuthScheme) {
-    const token = process.env.AGENT_BEARER_TOKEN;
-    if (!token) return false;
-    scheme.setCredential(token);
-    return true;
+    return process.env.AGENT_BEARER_TOKEN;
   }
   if (scheme instanceof HttpBasicAuthScheme) {
     const user = process.env.AGENT_BASIC_USER;
     const pass = process.env.AGENT_BASIC_PASS;
-    if (!user || !pass) return false;
-    scheme.setCredential(Buffer.from(`${user}:${pass}`).toString('base64'));
-    return true;
+    return user && pass
+      ? Buffer.from(`${user}:${pass}`).toString('base64')
+      : undefined;
   }
-  return false;
+  if (scheme instanceof OAuth2ClientCredentialsAuthScheme) {
+    return exchangeClientCredentials(scheme);
+  }
+  return undefined;
 }
 
-async function fillClientCredentials(
+async function exchangeClientCredentials(
   scheme: OAuth2ClientCredentialsAuthScheme,
-): Promise<boolean> {
+): Promise<string | undefined> {
   const clientId = process.env.OAUTH_CLIENT_ID;
   const clientSecret = process.env.OAUTH_CLIENT_SECRET;
-  if (!clientId || !clientSecret) return false;
+  if (!clientId || !clientSecret) return undefined;
 
   // Agent-card discovery is not a trust decision. Validate before sending secrets.
   const tokenUrl = trustedOAuthEndpoint(scheme.params.tokenUrl, 'token endpoint');
+  const scope = approvedScope(scheme.params.scopes);
   const res = await fetch(tokenUrl, {
     method: 'POST',
     redirect: 'error',
@@ -132,18 +165,17 @@ async function fillClientCredentials(
       grant_type: 'client_credentials',
       client_id: clientId,
       client_secret: clientSecret,
-      scope: Object.keys(scheme.params.scopes).join(' '),
+      ...(scope ? { scope } : {}),
     }),
   });
-  if (!res.ok) return false;
-  const data = (await res.json()) as { access_token?: string };
-  if (!data.access_token) return false;
-  scheme.setCredential(data.access_token);
-  return true;
+  if (!res.ok) return undefined;
+  const data = (await res.json()) as { access_token?: string; scope?: string };
+  assertGrantedScope(data.scope);
+  return data.access_token;
 }
 ```
 
-Configure `OAUTH_ISSUER_ORIGINS` from deployment policy, for example `https://login.example.com`; do not derive it from the agent card. Add an explicit development-only exception if local HTTP identity infrastructure is unavoidable. Redirects are rejected because an otherwise trusted endpoint could redirect the client secret to another origin.
+Configure exact `OAUTH_TOKEN_ENDPOINTS` and `OAUTH_ALLOWED_SCOPES` from deployment policy; do not derive either from the agent card. In multi-agent or multi-tenant hosts, key that policy by agent, issuer, client identity, and expected audience/resource. Add an explicit development-only exception if local HTTP identity infrastructure is unavoidable. Redirects are rejected because an otherwise trusted endpoint could redirect the client secret elsewhere.
 
 API-key slots are keyed by placement and name because a valid AND group can require several distinct API keys. Add every expected slot to `API_KEY_ENV_BY_SLOT`; do not reuse one environment variable for the whole class.
 
@@ -193,9 +225,9 @@ Reuse one `A2XClient` per remote agent and credential identity. It caches the ca
 
 ## Horizontal x402 Ownership
 
-For paid calls, route each `(agent URL, payer identity, payment channel)` to one durable owner for the complete sign → submit → terminal receipt/reconciliation lifecycle. A load-balancer affinity cookie is not sufficient.
+For paid calls, use a durable queue/actor partitioned by `(agent URL, payer identity)` with exactly one active consumer for the complete sign → submit → terminal receipt/reconciliation lifecycle. A load-balancer affinity cookie or short expiring lock is not sufficient.
 
-If ownership can move between workers, store a monotonically increasing fencing token with the reservation in a transactional database. Every sign, submit, reconciliation, and quarantine write must compare-and-set that token and reject stale owners. A short expiring lock by itself can allow two workers to spend after a pause or network partition.
+Do not treat `X402ClientChannelStorage` as a distributed lock: its public contract exposes only `get`, `set`, and `delete`, not compare-and-set. If ownership must move after a crash, let the coordinator assign a monotonically increasing generation without overlapping owners. The successor must load the pending task/attempt and reconcile or quarantine it before signing again. A database-backed storage adapter can reject stale generations on every method, but that alone cannot fence an already-started HTTP submission; non-overlapping queue ownership is the primary safety boundary.
 
 The worker—not an HTTP client connection—owns a paid stream after submission. It must drain the stream to a terminal state or reconcile/quarantine the payment even if the browser disconnects. Persist sanitized events and let browsers subscribe to a replayable stream.
 
@@ -213,31 +245,67 @@ const redis = new Redis(process.env.REDIS_URL!);
 async function getCachedOrExchange(
   scheme: OAuth2ClientCredentialsAuthScheme,
   agentUrl: string,
+  clientIdentity: string,
 ): Promise<string> {
-  const scopes = Object.keys(scheme.params.scopes).sort().join(' ');
-  const key = `a2a:${agentUrl}:${scheme.params.tokenUrl}:${scopes}`;
+  const tokenUrl = trustedOAuthEndpoint(scheme.params.tokenUrl, 'token endpoint');
+  const scopes = approvedScope(scheme.params.scopes)
+    .split(' ')
+    .filter(Boolean)
+    .sort()
+    .join(' ');
+  // clientIdentity is a stable public ID (client/tenant), never the secret.
+  const key = `a2a:${JSON.stringify([
+    agentUrl,
+    tokenUrl.toString(),
+    clientIdentity,
+    scopes,
+  ])}`;
   const cached = await redis.get(key);
   if (cached) return cached;
 
-  const tokenUrl = trustedOAuthEndpoint(scheme.params.tokenUrl, 'token endpoint');
-  const res = await fetch(tokenUrl, { redirect: 'error', /* … */ });
-  const { access_token, expires_in = 3600 } = await res.json() as {
-    access_token: string;
+  const clientId = process.env.OAUTH_CLIENT_ID;
+  const clientSecret = process.env.OAUTH_CLIENT_SECRET;
+  if (!clientId || !clientSecret) throw new Error('OAuth client is incomplete');
+  const res = await fetch(tokenUrl, {
+    method: 'POST',
+    redirect: 'error',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: clientId,
+      client_secret: clientSecret,
+      ...(scopes ? { scope: scopes } : {}),
+    }),
+  });
+  if (!res.ok) throw new Error(`Token exchange failed: HTTP ${res.status}`);
+  const { access_token, expires_in = 3600, scope } = await res.json() as {
+    access_token?: string;
     expires_in?: number;
+    scope?: string;
   };
+  if (!access_token) throw new Error('Token response omitted access_token');
+  assertGrantedScope(scope);
   // Cache for 90% of the advertised lifetime to avoid edge-of-expiry races
-  await redis.set(key, access_token, 'EX', Math.floor(expires_in * 0.9));
+  const ttl = Number.isFinite(expires_in) && expires_in > 0
+    ? Math.max(1, Math.floor(expires_in * 0.9))
+    : 3600;
+  await redis.set(key, access_token, 'EX', ttl);
   return access_token;
 }
 ```
 
-Apply inside `tryFill`:
+Use it as the OAuth branch of `resolveCredential`:
 
 ```typescript
 if (scheme instanceof OAuth2ClientCredentialsAuthScheme) {
-  const token = await getCachedOrExchange(scheme, this.agentUrl);
-  scheme.setCredential(token);
-  return true;
+  const credentialIdentity = process.env.OAUTH_CREDENTIAL_ID;
+  const agentUrl = process.env.AGENT_URL;
+  if (!credentialIdentity || !agentUrl) return undefined;
+  return getCachedOrExchange(
+    scheme,
+    agentUrl,
+    credentialIdentity, // stable public client+tenant label
+  );
 }
 ```
 

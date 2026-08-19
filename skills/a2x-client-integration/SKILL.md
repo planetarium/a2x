@@ -137,9 +137,9 @@ import {
   HttpBearerAuthScheme,
 } from '@a2x/sdk/client';
 
-const API_KEY_ENV_BY_SLOT: Record<string, string | undefined> = {
-  'header:x-api-key': process.env.AGENT_API_KEY,
-  'header:x-tenant-key': process.env.AGENT_TENANT_API_KEY,
+const API_KEY_ENV_BY_SLOT: Record<string, string> = {
+  'header:x-api-key': 'AGENT_API_KEY',
+  'header:x-tenant-key': 'AGENT_TENANT_API_KEY',
 };
 
 function apiKeySlot(scheme: ApiKeyAuthScheme): string {
@@ -154,8 +154,10 @@ export class EnvAuthProvider implements AuthProvider {
     // Pick the first group we can satisfy from env.
     for (const group of requirements) {
       const credentials = group.map((scheme) => this.readCredential(scheme));
-      if (credentials.every((value): value is string => value !== undefined)) {
-        group.forEach((scheme, index) => scheme.setCredential(credentials[index]));
+      if (credentials.every(
+        (value): value is string => typeof value === 'string' && value.length > 0,
+      )) {
+        group.forEach((scheme, index) => scheme.setCredential(credentials[index]!));
         return group;
       }
     }
@@ -166,7 +168,8 @@ export class EnvAuthProvider implements AuthProvider {
 
   private readCredential(scheme: AuthScheme): string | undefined {
     if (scheme instanceof ApiKeyAuthScheme) {
-      return API_KEY_ENV_BY_SLOT[apiKeySlot(scheme)];
+      const envName = API_KEY_ENV_BY_SLOT[apiKeySlot(scheme)];
+      return envName ? process.env[envName] : undefined;
     }
     if (scheme instanceof HttpBearerAuthScheme) {
       return process.env.AGENT_BEARER_TOKEN;
@@ -176,7 +179,7 @@ export class EnvAuthProvider implements AuthProvider {
 }
 ```
 
-Map every API-key location/name pair separately; one AND group may require multiple API keys. Treat OAuth endpoints advertised by an agent card as untrusted until their HTTPS origins match a host-configured allowlist. The backend and OAuth wiki pages show both patterns.
+Map every API-key location/name pair separately; one AND group may require multiple API keys. Treat OAuth endpoints and scopes advertised by an agent card as untrusted until exact HTTPS endpoints, client identity, audience/resource, and scopes match host policy. The backend and OAuth wiki pages show both patterns.
 
 For an interactive CLI, follow [wiki/host-cli.md](./wiki/host-cli.md) — it reproduces the full fallback chain including the OAuth2 device-code polling loop.
 
@@ -270,9 +273,9 @@ const paidClient = new A2XClient(AGENT_URL, {
 });
 ```
 
-`maxAmount` is expressed in the asset's atomic units and applies to each selected requirement (or each new batch deposit); it is not an aggregate wallet budget across calls. The default selector chooses an affordable EVM `exact` offer. Enable `allowUpto` only with explicit consent because it authorizes a charge up to the advertised maximum. To use `batch-settlement`, provide `batchSettlement` storage and opt in with `allowBatchSettlement`; route each channel through one process owner or add a durable cross-process reservation before signing.
+`maxAmount` is expressed in the asset's atomic units and applies to each selected requirement (or each new batch deposit); it is not an aggregate wallet budget across calls. The default selector chooses an affordable EVM `exact` offer. Enable `allowUpto` only with explicit consent because it authorizes a charge up to the advertised maximum. To use `batch-settlement`, provide `batchSettlement` storage and opt in with `allowBatchSettlement`; route each payer through a durable single-owner queue/actor for the full sign → submit → reconcile lifecycle.
 
-`onPaymentRequired` sees the full envelope before affordability filtering and offer selection. Use it for envelope-level policy. Drive the [low-level manual flow](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md#low-level-signx402payment) when the user must approve the exact selected offer. A custom `selectRequirement` is itself explicit scheme consent: it bypasses `allowUpto` and `allowBatchSettlement`, although `maxAmount` still filters offers and batch selection still requires `batchSettlement`. Never embed a service private key in a browser bundle; use a user-owned restricted signer or a backend payer. See the [x402 payments guide](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md) for reconciliation and recovery requirements.
+`onPaymentRequired` sees a detached snapshot of the full envelope before affordability filtering and offer selection. Use it for envelope-level policy; mutations are ignored. Drive the [low-level manual flow](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md#low-level-signx402payment) when the user must approve the exact selected offer. A custom `selectRequirement` is itself explicit scheme consent: it bypasses `allowUpto` and `allowBatchSettlement`, although `maxAmount` still filters offers and batch selection still requires `batchSettlement`. Never embed a service private key in a browser bundle; use a user-owned restricted signer or a backend payer. See the [x402 payments guide](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md) for reconciliation and recovery requirements.
 
 ---
 

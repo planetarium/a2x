@@ -240,6 +240,53 @@ The direct bridge above is appropriate only for unpaid, non-funds-bearing stream
 
 For paid streams, enqueue a durable job before returning a subscription identifier. A worker should own and drain `sendMessageStream()` through terminal receipt, reconciliation, or quarantine; persist sanitized events; and expose a replayable SSE subscription to the browser. Browser cancellation closes only that subscription. Apply worker-owned deadlines and handle `X402ReconciliationError`—never derive the upstream abort signal from `request.signal` after payment submission.
 
+Minimal architecture skeleton (the queue and stores are application adapters):
+
+```typescript
+// POST /api/agent/jobs — authenticate session and enforce CSRF/rate/budget policy.
+const job = await jobs.createOnce({
+  ownerId: session.userId,
+  idempotencyKey: request.headers.get('Idempotency-Key')!,
+  text: boundedMessage,
+  credentialRef: session.a2aCredentialRef, // reference, never a browser token
+});
+await payerQueue.enqueue(job.id, {
+  partitionKey: `${AGENT_URL}:${PAYER_ADDRESS}`,
+});
+return Response.json({ jobId: job.id }, { status: 202 });
+```
+
+```typescript
+// One active worker per partition; clientForWorker injects server credentials,
+// signer policy, and durable batchSettlement storage.
+import { X402ReconciliationError } from '@a2x/sdk/x402';
+
+async function executePaidJob(job: AgentJob): Promise<void> {
+  const client = await clientForWorker(job.credentialRef);
+  try {
+    for await (const event of client.sendMessageStream(job.params)) {
+      await jobEvents.append(job.id, sanitizeForBrowser(event));
+    }
+    await jobs.complete(job.id);
+  } catch (error) {
+    if (error instanceof X402ReconciliationError) {
+      await jobs.quarantine(job.id, error);
+    }
+    throw error;
+  }
+}
+```
+
+```typescript
+// GET /api/agent/jobs/:id/events — verify session ownership on every read.
+const after = request.headers.get('Last-Event-ID');
+return replayableSse(jobEvents.subscribe(job.id, { after }), {
+  onBrowserCancel: subscription => subscription.close(),
+}); // never cancels executePaidJob
+```
+
+On worker recovery, reconcile any persisted pending task/attempt before the partition accepts another paid job. See [host-backend.md](./host-backend.md#horizontal-x402-ownership) for the non-overlapping ownership contract.
+
 ---
 
 ## Pages Router — API Route

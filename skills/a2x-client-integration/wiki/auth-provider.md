@@ -128,17 +128,19 @@ import {
   HttpBearerAuthScheme,
 } from '@a2x/sdk/client';
 
-const API_KEY_ENV_BY_SLOT: Record<string, string | undefined> = {
-  'header:x-api-key': process.env.AGENT_API_KEY,
-  'header:x-tenant-key': process.env.AGENT_TENANT_API_KEY,
+const API_KEY_ENV_BY_SLOT: Record<string, string> = {
+  'header:x-api-key': 'AGENT_API_KEY',
+  'header:x-tenant-key': 'AGENT_TENANT_API_KEY',
 };
 
 class EnvAuthProvider implements AuthProvider {
   async provide(requirements: AuthScheme[][]): Promise<AuthScheme[]> {
     for (const group of requirements) {
       const credentials = group.map(scheme => this.lookup(scheme));
-      if (credentials.every((value): value is string => value !== undefined)) {
-        group.forEach((scheme, index) => scheme.setCredential(credentials[index]));
+      if (credentials.every(
+        (value): value is string => typeof value === 'string' && value.length > 0,
+      )) {
+        group.forEach((scheme, index) => scheme.setCredential(credentials[index]!));
         return group;
       }
     }
@@ -150,7 +152,8 @@ class EnvAuthProvider implements AuthProvider {
       const name = scheme.params.location === 'header'
         ? scheme.params.name.toLowerCase()
         : scheme.params.name;
-      return API_KEY_ENV_BY_SLOT[`${scheme.params.location}:${name}`];
+      const envName = API_KEY_ENV_BY_SLOT[`${scheme.params.location}:${name}`];
+      return envName ? process.env[envName] : undefined;
     }
     if (scheme instanceof HttpBearerAuthScheme) return process.env.AGENT_BEARER_TOKEN;
     return undefined;

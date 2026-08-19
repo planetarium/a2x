@@ -171,7 +171,8 @@ Machine-to-machine flow — typically best for backend services:
 
 ```typescript
 async function resolveClientCredentials(scheme: OAuth2ClientCredentialsAuthScheme) {
-  const tokenUrl = trustedOAuthUrl(scheme.params.tokenUrl, 'token endpoint');
+  const tokenUrl = trustedOAuthEndpoint(scheme.params.tokenUrl, 'token endpoint');
+  const scope = approvedScope(scheme.params.scopes); // host-configured allowlist
   const res = await fetch(tokenUrl, {
     method: 'POST',
     redirect: 'error',
@@ -180,7 +181,7 @@ async function resolveClientCredentials(scheme: OAuth2ClientCredentialsAuthSchem
       grant_type: 'client_credentials',
       client_id: process.env.OAUTH_CLIENT_ID!,
       client_secret: process.env.OAUTH_CLIENT_SECRET!,
-      scope: Object.keys(scheme.params.scopes).join(' '),
+      ...(scope ? { scope } : {}),
     }),
   });
   const { access_token } = await res.json() as { access_token: string };
@@ -188,7 +189,7 @@ async function resolveClientCredentials(scheme: OAuth2ClientCredentialsAuthSchem
 }
 ```
 
-`trustedOAuthUrl` must compare the parsed HTTPS origin against host configuration, never against a value learned from the agent card. See [oauth2-device-code.md](./oauth2-device-code.md) for a complete helper.
+`trustedOAuthEndpoint` should require an exact configured HTTPS endpoint, and `approvedScope` must reject card-advertised scopes outside a host policy keyed by agent, issuer, client identity, and expected audience/resource. See [oauth2-device-code.md](./oauth2-device-code.md) for complete policy helpers.
 
 ---
 

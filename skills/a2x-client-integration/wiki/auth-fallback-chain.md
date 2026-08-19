@@ -204,8 +204,8 @@ async function resolveScheme(scheme: AuthScheme): Promise<void> {
     return;
   }
   if (scheme instanceof OAuth2DeviceCodeAuthScheme) {
-    const token = await performDeviceCodeFlow(scheme);
-    scheme.setCredential(token);
+    const tokens = await performDeviceCodeFlow(scheme, process.env.OAUTH_CLIENT_ID!);
+    scheme.setCredential(tokens.access_token);
     return;
   }
   if (

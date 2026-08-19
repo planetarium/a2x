@@ -116,9 +116,9 @@ export interface A2XClientX402Options {
    * EVM `scheme === 'exact'` option (see `allowUpto`).
    *
    * The callback receives detached copies and must return one of those array
-   * entries by identity. The client maps that choice back to the original
-   * affordable requirement, so returning a captured/fabricated object or
-   * mutating an entry cannot bypass `maxAmount` or alter what is signed.
+   * entries by identity. The client maps that choice to a private, pristine
+   * snapshot, so returning a captured/fabricated object, reordering the array,
+   * or mutating any live or detached entry cannot alter what is signed.
    */
   selectRequirement?: (
     requirements: X402PaymentRequirements[],
@@ -201,6 +201,8 @@ export interface A2XClientX402Options {
    * Hook invoked after the merchant publishes `payment-required` and
    * before the client signs. Useful for prompting the user to confirm,
    * declining the challenge, or recording the prompt for audit.
+   * The hook receives a detached snapshot; mutating it never changes the
+   * requirement later selected or signed.
    *
    * Return value semantics:
    *  - `void` / `undefined` / `true` — proceed: sign and resubmit (default).
@@ -411,7 +413,9 @@ export class A2XClient {
       const required = getX402PaymentRequirements(task);
       if (!required) break;
 
-      const decision = await this._x402.onPaymentRequired?.(required);
+      const decision = await this._x402.onPaymentRequired?.(
+        structuredClone(required),
+      );
 
       if (decision === false) {
         return this._sendMessageOnce(this._buildRejectFollowup(params, task));
@@ -632,7 +636,9 @@ export class A2XClient {
       const required = getX402PaymentRequirements(pendingTask);
       if (!required) return;
 
-      const decision = await this._x402.onPaymentRequired?.(required);
+      const decision = await this._x402.onPaymentRequired?.(
+        structuredClone(required),
+      );
       if (decision === false) {
         // Decline cleanly: surface the rejection follow-up's events to
         // the caller (typically a single `failed` + payment-rejected
@@ -848,22 +854,34 @@ export class A2XClient {
     const select = (
       reqs: X402PaymentRequirements[],
     ): X402PaymentRequirements | undefined => {
+      // Work from a private snapshot so no retained task/envelope reference
+      // can change an offer after affordability policy has inspected it.
+      const snapshot = structuredClone(reqs);
       // maxAmount is enforced first regardless of caller predicate, so a
       // user-provided selectRequirement only sees the affordable subset.
-      const usable = reqs.filter((r) => hasUsableBatchDepositPolicy(r, x402));
+      const usable = snapshot.filter((r) =>
+        hasUsableBatchDepositPolicy(r, x402),
+      );
       const affordable =
         x402.maxAmount === undefined
           ? usable
           : usable.filter((r) => isWithinBudget(r, x402.maxAmount!));
       if (userSelect) {
-        // Do not let trusted-but-fallible host policy accidentally escape the
-        // cap by returning a requirement captured from onPaymentRequired, or
-        // alter a requirement after it passed the affordability check.
-        const choices = structuredClone(affordable);
+        // Map by object identity rather than array index. Selectors commonly
+        // sort candidates in place, and that must not change which pristine
+        // snapshot is signed.
+        const selectedSnapshots = new Map<
+          X402PaymentRequirements,
+          X402PaymentRequirements
+        >();
+        const choices = affordable.map((requirement) => {
+          const choice = structuredClone(requirement);
+          selectedSnapshots.set(choice, requirement);
+          return choice;
+        });
         const chosen = userSelect(choices);
         if (!chosen) return undefined;
-        const index = choices.indexOf(chosen);
-        return index >= 0 ? affordable[index] : undefined;
+        return selectedSnapshots.get(chosen);
       }
       // Only auto-pick an option the EVM signer can fulfil, exact-first and
       // never `upto` / `batch-settlement` unless opted in — see defaultSelect

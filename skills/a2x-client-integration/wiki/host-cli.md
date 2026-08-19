@@ -50,7 +50,8 @@ See [oauth2-device-code.md](./oauth2-device-code.md). Exports:
 ```typescript
 export async function performDeviceCodeFlow(
   scheme: OAuth2DeviceCodeAuthScheme,
-): Promise<string>;
+  clientId: string,
+): Promise<{ access_token: string; refresh_token?: string; expires_in?: number }>;
 ```
 
 ---
@@ -127,8 +128,8 @@ async function resolveScheme(scheme: AuthScheme): Promise<void> {
     scheme.setCredential(cred); return;
   }
   if (scheme instanceof OAuth2DeviceCodeAuthScheme) {
-    const token = await performDeviceCodeFlow(scheme);
-    scheme.setCredential(token); return;
+    const tokens = await performDeviceCodeFlow(scheme, process.env.OAUTH_CLIENT_ID!);
+    scheme.setCredential(tokens.access_token); return;
   }
   if (
     scheme instanceof OAuth2AuthorizationCodeAuthScheme ||
@@ -239,7 +240,7 @@ import { A2XClient } from '@a2x/sdk/client';
 import type { SendMessageParams } from '@a2x/sdk';
 import { CliAuthProvider } from '../cli-auth-provider.js';
 
-function parseHeaders(headerArgs?: string[]): Record<string, string> | undefined {
+export function parseHeaders(headerArgs?: string[]): Record<string, string> | undefined {
   if (!headerArgs?.length) return undefined;
   const headers: Record<string, string> = {};
   for (const h of headerArgs) {
@@ -286,6 +287,7 @@ import crypto from 'node:crypto';
 import { A2XClient } from '@a2x/sdk/client';
 import type { SendMessageParams } from '@a2x/sdk';
 import { CliAuthProvider } from '../cli-auth-provider.js';
+import { parseHeaders } from './send.js';
 
 export const streamCommand = new Command('stream')
   .description('Send a message and stream the response')
@@ -355,6 +357,7 @@ program.parse();
   "bin": { "my-cli": "./dist/index.js" },
   "dependencies": {
     "@a2x/sdk": "latest",
+    "@inquirer/prompts": "latest",
     "chalk": "^5",
     "commander": "^12"
   },

@@ -31,6 +31,7 @@ import { randomUUID } from 'node:crypto';
 
 const STORE_DIR = path.join(os.homedir(), '.myapp');
 const STORE_PATH = path.join(STORE_DIR, 'tokens.json');
+const TEMP_PREFIX = `${path.basename(STORE_PATH)}.`;
 
 interface StoredCredential {
   slot: string;
@@ -39,9 +40,33 @@ interface StoredCredential {
 
 type StoreData = Record<string, StoredCredential[]>;
 
+function isStoreData(value: unknown): value is StoreData {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    && Object.values(value).every(entries =>
+      Array.isArray(entries) && entries.every(entry =>
+        typeof entry === 'object' && entry !== null
+        && typeof (entry as StoredCredential).slot === 'string'
+        && typeof (entry as StoredCredential).credential === 'string'));
+}
+
+function initializeStore(): void {
+  fs.mkdirSync(STORE_DIR, { recursive: true, mode: 0o700 });
+  fs.chmodSync(STORE_DIR, 0o700);
+  // Single-writer contract: no live writer can own one of these files.
+  for (const name of fs.readdirSync(STORE_DIR)) {
+    if (name.startsWith(TEMP_PREFIX) && name.endsWith('.tmp')) {
+      fs.unlinkSync(path.join(STORE_DIR, name));
+    }
+  }
+}
+
+initializeStore();
+
 function readStore(): StoreData {
   try {
-    return JSON.parse(fs.readFileSync(STORE_PATH, 'utf-8')) as StoreData;
+    const parsed: unknown = JSON.parse(fs.readFileSync(STORE_PATH, 'utf-8'));
+    if (!isStoreData(parsed)) throw new Error('Invalid credential store shape');
+    return parsed;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {};
     throw error;
@@ -49,8 +74,6 @@ function readStore(): StoreData {
 }
 
 function writeStore(data: StoreData): void {
-  fs.mkdirSync(STORE_DIR, { recursive: true, mode: 0o700 });
-  fs.chmodSync(STORE_DIR, 0o700);
   const tempPath = `${STORE_PATH}.${process.pid}.${randomUUID()}.tmp`;
   try {
     fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), {
@@ -58,10 +81,15 @@ function writeStore(data: StoreData): void {
       flag: 'wx',
       mode: 0o600,
     });
+    fs.chmodSync(tempPath, 0o600);
     const fd = fs.openSync(tempPath, 'r');
     try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
     fs.renameSync(tempPath, STORE_PATH);
-    fs.chmodSync(STORE_PATH, 0o600);
+    // Persist the rename itself, not just the temporary file contents.
+    if (process.platform !== 'win32') {
+      const dirFd = fs.openSync(STORE_DIR, 'r');
+      try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
+    }
   } catch (error) {
     try { fs.unlinkSync(tempPath); } catch { /* already renamed or absent */ }
     throw error;
@@ -192,7 +220,7 @@ When switching stores, keep the same shape — `Record<agentUrl, Array<{ slot, c
 
 ### File permissions
 
-The example enforces both directory and file permissions. On rewrite, `mode` only affects creation, so it also calls `chmod`. Atomic rename must use a temporary file in the same directory; cross-filesystem renames are not atomic.
+The example enforces both directory and file permissions, removes crash-orphaned temporary credential files at startup, fsyncs the temporary file, renames within the same directory, and fsyncs that directory on POSIX. Windows ignores most Unix mode bits and has different replacement/durability semantics; use the OS credential manager or a tested transactional storage library there.
 
 Windows: `mode` is largely ignored; rely on the user's home-directory ACLs.
 
