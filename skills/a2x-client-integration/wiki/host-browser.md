@@ -127,7 +127,7 @@ Access-Control-Allow-Methods: GET, POST, OPTIONS
 
 …and respond to `OPTIONS` preflight requests. Replace `x-api-key` with every custom API-key header name the card can select. The built-in `toA2x` listener emits `Access-Control-Allow-Origin: *` and handles `OPTIONS`, but its default `Access-Control-Allow-Headers` permits only `Content-Type`. Browser calls using authentication, custom, extension, or x402 headers therefore need a reverse proxy or host wrapper that returns the complete allow-list.
 
-Streaming (`message/stream`) triggers a preflight because the client sends `Accept: text/event-stream` and a JSON body — the preflight must succeed or the browser will never open the SSE connection.
+Streaming (`message/stream`) typically triggers a preflight because the POST uses a non-safelisted JSON `Content-Type`; authentication, extension, and custom API-key headers can also require it. `Accept: text/event-stream` is CORS-safelisted and does not trigger preflight by itself. The preflight must succeed or the browser will never open the SSE connection.
 
 ---
 
