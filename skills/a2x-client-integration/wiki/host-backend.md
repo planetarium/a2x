@@ -203,9 +203,15 @@ async function exchangeClientCredentials(
     token_type?: string;
     scope?: string;
   };
+  if (data.scope !== undefined && typeof data.scope !== 'string') {
+    throw new Error('Token endpoint returned an invalid scope');
+  }
   assertGrantedScope(data.scope, requestedScopes);
-  if (!data.access_token) return undefined;
-  if (data.token_type?.toLowerCase() !== 'bearer') {
+  if (typeof data.access_token !== 'string' || !data.access_token) return undefined;
+  if (
+    typeof data.token_type !== 'string' ||
+    data.token_type.toLowerCase() !== 'bearer'
+  ) {
     throw new Error('Token endpoint returned a non-Bearer token type');
   }
   await assertTokenPolicy(
@@ -382,20 +388,32 @@ async function getCachedOrExchange(
     }),
   });
   if (!res.ok) throw new Error(`Token exchange failed: HTTP ${res.status}`);
-  const { access_token, expires_in = 3600, scope } = await res.json() as {
+  const data = await res.json() as {
     access_token?: string;
+    token_type?: string;
     expires_in?: number;
     scope?: string;
   };
-  if (!access_token) throw new Error('Token response omitted access_token');
-  assertGrantedScope(scope, requestedScopes);
-  await assertTokenPolicy(access_token, expectedAudience, requestedScopes);
+  if (typeof data.access_token !== 'string' || !data.access_token) {
+    throw new Error('Token response omitted access_token');
+  }
+  if (
+    typeof data.token_type !== 'string' ||
+    data.token_type.toLowerCase() !== 'bearer'
+  ) {
+    throw new Error('Token endpoint returned a non-Bearer token type');
+  }
+  if (data.scope !== undefined && typeof data.scope !== 'string') {
+    throw new Error('Token endpoint returned an invalid scope');
+  }
+  assertGrantedScope(data.scope, requestedScopes);
+  await assertTokenPolicy(data.access_token, expectedAudience, requestedScopes);
   // Cache for 90% of the advertised lifetime to avoid edge-of-expiry races
-  const ttl = Number.isFinite(expires_in) && expires_in > 0
-    ? Math.max(1, Math.floor(expires_in * 0.9))
+  const ttl = Number.isFinite(data.expires_in) && data.expires_in! > 0
+    ? Math.max(1, Math.floor(data.expires_in! * 0.9))
     : 3600;
-  await redis.set(key, access_token, 'EX', ttl);
-  return access_token;
+  await redis.set(key, data.access_token, 'EX', ttl);
+  return data.access_token;
 }
 ```
 

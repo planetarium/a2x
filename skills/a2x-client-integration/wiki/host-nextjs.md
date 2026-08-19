@@ -395,15 +395,22 @@ async function recoverPersistedPaidExecution(
     );
     return;
   }
-  const task = await client.getTask(execution.taskId);
+  if (Date.now() >= execution.recoveryDeadlineAt) {
+    await jobs.quarantine(
+      job.id,
+      new Error('paid task recovery deadline expired'),
+    );
+    return;
+  }
+  let task: Task;
+  try {
+    task = await client.getTask(execution.taskId);
+  } catch {
+    // A later recovery run re-checks the durable deadline before lookup.
+    await paidExecutions.scheduleRecoveryPoll(job.id);
+    return;
+  }
   if (!TERMINAL_STATES.has(task.status.state)) {
-    if (Date.now() >= execution.recoveryDeadlineAt) {
-      await jobs.quarantine(
-        job.id,
-        new Error('paid task did not reach terminal state before recovery deadline'),
-      );
-      return;
-    }
     await paidExecutions.scheduleRecoveryPoll(job.id); // recovery only; no resend
     return;
   }

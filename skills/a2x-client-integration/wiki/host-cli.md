@@ -258,7 +258,7 @@ export function parseHeaders(headerArgs?: string[]): Record<string, string> | un
 
 export const sendCommand = new Command('send')
   .description('Send a message to an A2A agent (blocking)')
-  .argument('<url>', 'Agent base URL')
+  .argument('<url>', 'Approved AgentCard document URL')
   .argument('<message>', 'Message text')
   .option('--context-id <id>')
   .option('-H, --header <header...>')
@@ -324,7 +324,7 @@ import { credentialPolicyKey } from '../token-store.js';
 
 export const streamCommand = new Command('stream')
   .description('Send a message and stream the response')
-  .argument('<url>')
+  .argument('<url>', 'Approved AgentCard document URL')
   .argument('<message>')
   .option('--context-id <id>')
   .option('-H, --header <header...>')

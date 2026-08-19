@@ -196,8 +196,15 @@ async function resolveClientCredentials(scheme: OAuth2ClientCredentialsAuthSchem
     token_type?: string;
     scope?: string;
   };
-  if (!data.access_token || data.token_type?.toLowerCase() !== 'bearer') {
+  if (
+    typeof data.access_token !== 'string' || !data.access_token ||
+    typeof data.token_type !== 'string' ||
+    data.token_type.toLowerCase() !== 'bearer'
+  ) {
     throw new Error('Token endpoint omitted a Bearer access token');
+  }
+  if (data.scope !== undefined && typeof data.scope !== 'string') {
+    throw new Error('Token endpoint returned an invalid scope');
   }
   const requestedScopes = scope.split(/\s+/).filter(Boolean);
   assertGrantedScope(data.scope, requestedScopes);
