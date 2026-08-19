@@ -129,14 +129,14 @@ export class V10AgentCardMapper implements AgentCardMapper<AgentCardV10> {
   /**
    * Convert internal flat SecurityRequirement to v1.0 wrapped format.
    * Internal: { "oauth2": ["read", "write"], "apiKey": [] }
-   * v1.0:    { schemes: { "oauth2": { values: ["read", "write"] }, "apiKey": { values: [] } } }
+   * v1.0:    { schemes: { "oauth2": { list: ["read", "write"] }, "apiKey": { list: [] } } }
    */
   private mapSecurityRequirement(
     requirement: SecurityRequirement,
   ): SecurityRequirementV10 {
-    const schemes: Record<string, { values: string[] }> = {};
+    const schemes: Record<string, { list: string[] }> = {};
     for (const [name, scopes] of Object.entries(requirement)) {
-      schemes[name] = { values: scopes };
+      schemes[name] = { list: scopes };
     }
     return { schemes };
   }

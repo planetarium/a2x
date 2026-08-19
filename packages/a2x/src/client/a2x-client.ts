@@ -75,6 +75,29 @@ import type {
   X402PaymentRequiredResponse,
 } from '../x402/types.js';
 
+function normalizeHeaderBag(
+  headers: Record<string, string>,
+): Record<string, string> {
+  const result: Record<string, string> = {};
+  const casing = new Map<string, string>();
+  for (const [name, value] of Object.entries(headers)) {
+    const lower = name.toLowerCase();
+    const previous = casing.get(lower);
+    if (previous !== undefined) delete result[previous];
+    casing.set(lower, name);
+    result[name] = value;
+  }
+  return result;
+}
+
+function replaceHeaderBag(
+  target: Record<string, string>,
+  source: Record<string, string>,
+): void {
+  for (const name of Object.keys(target)) delete target[name];
+  Object.assign(target, source);
+}
+
 // ─── Types ───
 
 /**
@@ -1030,7 +1053,7 @@ export class A2XClient {
       [];
     if (rawRequirementsField.length === 0) return;
 
-    // Normalize v1.0 wrapped format { schemes: { name: { values: [...] } } }
+    // Normalize v1.0 wrapped format { schemes: { name: { list: [...] } } }
     // to internal flat format { name: [...] }
     const rawRequirements = rawRequirementsField.map((req) => {
       const r = req as Record<string, unknown>;
@@ -1038,8 +1061,10 @@ export class A2XClient {
         // v1.0 format
         const flat: Record<string, string[]> = {};
         for (const [name, val] of Object.entries(r.schemes as Record<string, unknown>)) {
-          const v = val as { values?: string[] };
-          flat[name] = v.values ?? [];
+          const v = val as { list?: string[]; values?: string[] };
+          // `list` is the A2A v1.0 StringList field. Accept `values` as a
+          // compatibility bridge for cards emitted by older a2x releases.
+          flat[name] = v.list ?? v.values ?? [];
         }
         return flat;
       }
@@ -1054,7 +1079,16 @@ export class A2XClient {
       rawRequirements,
       rawSchemes as Parameters<typeof normalizeRequirements>[1],
     );
-    if (requirements.length === 0) return;
+    if (requirements.length === 0) {
+      throw new UnsupportedOperationError(
+        'The AgentCard requires authentication, but none of its security requirements are supported.',
+      );
+    }
+    if (requirements.some((group) => group.length === 0)) {
+      // An explicit empty requirement is an anonymous OR alternative.
+      this._resolvedSchemes = [];
+      return;
+    }
 
     this._resolvedSchemes = await this._authProvider.provide(requirements);
   }
@@ -1064,8 +1098,13 @@ export class A2XClient {
    */
   private _applyAuth(ctx: AuthRequestContext): void {
     if (!this._resolvedSchemes) return;
+    replaceHeaderBag(ctx.headers, normalizeHeaderBag(ctx.headers));
     for (const scheme of this._resolvedSchemes) {
-      scheme.applyToRequest(ctx);
+      // Preserve the complete context custom schemes historically received,
+      // then collapse case variants after their reads/writes/deletes.
+      const nextHeaders = { ...ctx.headers };
+      scheme.applyToRequest({ headers: nextHeaders, url: ctx.url });
+      replaceHeaderBag(ctx.headers, normalizeHeaderBag(nextHeaders));
     }
   }
 

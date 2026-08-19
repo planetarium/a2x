@@ -46,8 +46,8 @@ const V10_CARD_WITH_AUTH: AgentCardV10 = {
     },
   },
   securityRequirements: [
-    { apiKey: [] },
-    { deviceCode: ['agent:invoke'] },
+    { schemes: { apiKey: { list: [] } } },
+    { schemes: { deviceCode: { list: ['agent:invoke'] } } },
   ],
   skills: [],
   defaultInputModes: ['text/plain'],
@@ -108,6 +108,20 @@ describe('AuthScheme', () => {
       scheme.applyToRequest(ctx);
 
       expect(ctx.headers['Cookie']).toBe('session=abc123');
+    });
+
+    it('replaces the same cookie name while preserving unrelated cookies', () => {
+      const scheme = new ApiKeyAuthScheme('session', 'cookie');
+      scheme.setCredential('fresh');
+      const ctx = {
+        headers: { cookie: 'session=stale; other=ok' } as Record<string, string>,
+        url: new URL('http://example.com'),
+      };
+
+      scheme.applyToRequest(ctx);
+
+      expect(ctx.headers.Cookie).toBe('other=ok; session=fresh');
+      expect(ctx.headers.cookie).toBeUndefined();
     });
 
     it('returns params', () => {
@@ -253,11 +267,25 @@ describe('normalizeScheme', () => {
           },
         },
       };
-      const result = normalizeScheme(raw);
+      const requiredScopes = ['read'];
+      const result = normalizeScheme(raw, requiredScopes);
 
       expect(result).toHaveLength(2);
       expect(result[0]).toBeInstanceOf(OAuth2AuthorizationCodeAuthScheme);
       expect(result[1]).toBeInstanceOf(OAuth2ClientCredentialsAuthScheme);
+      expect(
+        (result[0] as OAuth2AuthorizationCodeAuthScheme).params.requiredScopes,
+      ).toEqual(['read']);
+      expect(
+        (result[1] as OAuth2ClientCredentialsAuthScheme).params.requiredScopes,
+      ).toEqual(['read']);
+      requiredScopes.push('write');
+      expect(
+        (result[0] as OAuth2AuthorizationCodeAuthScheme).params.requiredScopes,
+      ).toEqual(['read']);
+      expect(Object.isFrozen(
+        (result[0] as OAuth2AuthorizationCodeAuthScheme).params.requiredScopes,
+      )).toBe(true);
     });
 
     it('normalizes oauth2 deviceCode flow as non-standard v0.3 extension', () => {
@@ -309,10 +337,12 @@ describe('normalizeScheme', () => {
 
     it('normalizes openIdConnect scheme', () => {
       const raw: SecuritySchemeV03 = { type: 'openIdConnect', openIdConnectUrl: 'http://auth/.well-known' };
-      const result = normalizeScheme(raw);
+      const result = normalizeScheme(raw, ['openid']);
 
       expect(result).toHaveLength(1);
       expect(result[0]).toBeInstanceOf(OpenIdConnectAuthScheme);
+      expect((result[0] as OpenIdConnectAuthScheme).params.requiredScopes)
+        .toEqual(['openid']);
     });
 
     it('returns empty for mutualTLS', () => {
@@ -361,6 +391,26 @@ describe('normalizeScheme', () => {
       expect(result).toHaveLength(1);
       expect(result[0]).toBeInstanceOf(OAuth2DeviceCodeAuthScheme);
       expect((result[0] as OAuth2DeviceCodeAuthScheme).params.deviceAuthorizationUrl).toBe('http://auth/device');
+    });
+
+    it('distinguishes an empty required scope list from an absent one', () => {
+      const raw: SecuritySchemeV10 = {
+        oauth2SecurityScheme: {
+          flows: {
+            deviceCode: {
+              deviceAuthorizationUrl: 'http://auth/device',
+              tokenUrl: 'http://auth/token',
+              scopes: { invoke: 'Invoke' },
+            },
+          },
+        },
+      };
+
+      const withEmpty = normalizeScheme(raw, [])[0] as OAuth2DeviceCodeAuthScheme;
+      const withoutRequirement = normalizeScheme(raw)[0] as OAuth2DeviceCodeAuthScheme;
+
+      expect(withEmpty.params.requiredScopes).toEqual([]);
+      expect(withoutRequirement.params.requiredScopes).toBeUndefined();
     });
 
     it('normalizes oauth2SecurityScheme with multiple flows', () => {
@@ -413,14 +463,25 @@ describe('normalizeRequirements', () => {
           deviceCode: {
             deviceAuthorizationUrl: 'http://auth/device',
             tokenUrl: 'http://auth/token',
-            scopes: {},
+            scopes: {
+              invoke: 'Invoke the agent',
+              admin: 'Administer the agent',
+            },
           },
           authorizationCode: {
             authorizationUrl: 'http://auth/authorize',
             tokenUrl: 'http://auth/token',
-            scopes: {},
+            scopes: {
+              invoke: 'Invoke the agent',
+              admin: 'Administer the agent',
+            },
           },
         },
+      },
+    },
+    oidc: {
+      openIdConnectSecurityScheme: {
+        openIdConnectUrl: 'http://auth/.well-known/openid-configuration',
       },
     },
   };
@@ -456,6 +517,12 @@ describe('normalizeRequirements', () => {
     expect(result[0][0]).toBeInstanceOf(OAuth2DeviceCodeAuthScheme);
     expect(result[1]).toHaveLength(1);
     expect(result[1][0]).toBeInstanceOf(OAuth2AuthorizationCodeAuthScheme);
+    expect(
+      (result[0][0] as OAuth2DeviceCodeAuthScheme).params.requiredScopes,
+    ).toEqual(['invoke']);
+    expect(
+      (result[1][0] as OAuth2AuthorizationCodeAuthScheme).params.requiredScopes,
+    ).toEqual(['invoke']);
   });
 
   it('combines AND schemes with OAuth2 flow expansion', () => {
@@ -472,12 +539,162 @@ describe('normalizeRequirements', () => {
     expect(result[1][1]).toBeInstanceOf(OAuth2AuthorizationCodeAuthScheme);
   });
 
-  it('skips unknown scheme names', () => {
+  it('rejects a non-empty requirement containing an unknown scheme', () => {
     const requirements = [{ unknown: [] as string[] }];
     const result = normalizeRequirements(requirements, schemes);
 
+    expect(result).toEqual([]);
+  });
+
+  it('rejects an entire AND requirement when one scheme is unsupported', () => {
+    const requirements = [{ apiKey: [] as string[], unknown: [] as string[] }];
+    const result = normalizeRequirements(requirements, schemes);
+
+    expect(result).toEqual([]);
+  });
+
+  it('preserves an explicitly empty anonymous requirement', () => {
+    const result = normalizeRequirements([{}], schemes);
+
+    expect(result).toEqual([[]]);
+  });
+
+  it('rejects an AND group whose schemes overwrite one Authorization header', () => {
+    const result = normalizeRequirements(
+      [{ bearer: [], oidc: ['openid'] }],
+      {
+        bearer: { httpAuthSecurityScheme: { scheme: 'bearer' } },
+        oidc: schemes.oidc!,
+      },
+    );
+
+    expect(result).toEqual([]);
+  });
+
+  it('rejects a Cookie header API key combined with cookie API keys', () => {
+    const result = normalizeRequirements(
+      [{ wholeCookieHeader: [], sessionCookie: [] }],
+      {
+        wholeCookieHeader: {
+          apiKeySecurityScheme: { location: 'header', name: 'Cookie' },
+        },
+        sessionCookie: {
+          apiKeySecurityScheme: { location: 'cookie', name: 'session' },
+        },
+      },
+    );
+
+    expect(result).toEqual([]);
+  });
+
+  it('rejects duplicate header destinations case-insensitively', () => {
+    const result = normalizeRequirements(
+      [{ first: [], second: [] }],
+      {
+        first: {
+          apiKeySecurityScheme: { location: 'header', name: 'X-API-Key' },
+        },
+        second: {
+          apiKeySecurityScheme: { location: 'header', name: 'x-api-key' },
+        },
+      },
+    );
+
+    expect(result).toEqual([]);
+  });
+
+  it('rejects duplicate query destinations', () => {
+    const result = normalizeRequirements(
+      [{ first: [], second: [] }],
+      {
+        first: {
+          apiKeySecurityScheme: { location: 'query', name: 'api_key' },
+        },
+        second: {
+          apiKeySecurityScheme: { location: 'query', name: 'api_key' },
+        },
+      },
+    );
+
+    expect(result).toEqual([]);
+  });
+
+  it('rejects duplicate cookie names', () => {
+    const result = normalizeRequirements(
+      [{ first: [], second: [] }],
+      {
+        first: {
+          apiKeySecurityScheme: { location: 'cookie', name: 'session' },
+        },
+        second: {
+          apiKeySecurityScheme: { location: 'cookie', name: 'session' },
+        },
+      },
+    );
+
+    expect(result).toEqual([]);
+  });
+
+  it('allows a cookie literally named * alongside a distinct cookie', () => {
+    const result = normalizeRequirements(
+      [{ star: [], session: [] }],
+      {
+        star: { apiKeySecurityScheme: { location: 'cookie', name: '*' } },
+        session: {
+          apiKeySecurityScheme: { location: 'cookie', name: 'session' },
+        },
+      },
+    );
+
     expect(result).toHaveLength(1);
-    expect(result[0]).toHaveLength(0);
+    expect(result[0]).toHaveLength(2);
+  });
+
+  it('rejects multi-OAuth AND groups that collide on Authorization', () => {
+    const result = normalizeRequirements(
+      [{ oauth: ['invoke'], secondOAuth: ['invoke'] }],
+      { ...schemes, secondOAuth: schemes.oauth! },
+    );
+
+    expect(result).toEqual([]);
+  });
+
+  it('bounds OAuth flow expansion from an untrusted AgentCard', () => {
+    const requirement: Record<string, string[]> = {};
+    const manySchemes: Record<string, SecuritySchemeV10> = {};
+    for (let index = 0; index < 9; index++) {
+      const name = `oauth${index}`;
+      requirement[name] = ['invoke'];
+      manySchemes[name] = schemes.oauth!;
+    }
+
+    expect(() => normalizeRequirements([requirement], manySchemes)).toThrow(
+      'more than 256 authentication alternatives',
+    );
+  });
+
+  it('preserves requirement-specific OpenID Connect scopes', () => {
+    const result = normalizeRequirements([{ oidc: ['openid', 'profile'] }], schemes);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]![0]).toBeInstanceOf(OpenIdConnectAuthScheme);
+    expect((result[0]![0] as OpenIdConnectAuthScheme).params.requiredScopes)
+      .toEqual(['openid', 'profile']);
+  });
+
+  it('keeps different scope sets on separate alternatives', () => {
+    const result = normalizeRequirements(
+      [{ oauth: ['invoke'] }, { oauth: ['admin'] }],
+      schemes,
+    );
+
+    expect(result).toHaveLength(4);
+    expect(result.slice(0, 2).map((group) =>
+      (group[0] as OAuth2DeviceCodeAuthScheme).params.requiredScopes,
+    )).toEqual([['invoke'], ['invoke']]);
+    expect(result.slice(2).map((group) =>
+      (group[0] as OAuth2DeviceCodeAuthScheme).params.requiredScopes,
+    )).toEqual([['admin'], ['admin']]);
   });
 
   it('returns empty for empty requirements', () => {
@@ -489,6 +706,33 @@ describe('normalizeRequirements', () => {
 // ═══ A2XClient Auth Integration Tests ═══
 
 describe('A2XClient auth integration', () => {
+  it('accepts the legacy a2x values spelling for v1.0 requirement scopes', async () => {
+    const legacyCard: AgentCardV10 = {
+      ...V10_CARD_WITH_AUTH,
+      securityRequirements: [
+        { schemes: { deviceCode: { values: ['agent:invoke'] } } },
+      ],
+    };
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const provide = vi.fn(async (requirements: AuthScheme[][]) => {
+      const scheme = requirements[0]![0] as OAuth2DeviceCodeAuthScheme;
+      expect(scheme.params.requiredScopes).toEqual(['agent:invoke']);
+      return [scheme.setCredential('legacy-compatible-token')];
+    });
+    const client = new A2XClient(legacyCard, {
+      fetch: mockFetch,
+      authProvider: { provide },
+    });
+
+    await client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    });
+
+    expect(provide).toHaveBeenCalledTimes(1);
+    expect(mockFetch.mock.calls[0]![1].headers.Authorization)
+      .toBe('Bearer legacy-compatible-token');
+  });
+
   it('calls authProvider.provide() and applies credentials', async () => {
     const mockFetch = createMockFetch(
       createJsonRpcSuccess(TASK_RESULT),
@@ -521,6 +765,138 @@ describe('A2XClient auth integration', () => {
     expect(headers['x-api-key']).toBe('my-secret-key');
   });
 
+  it('replaces case-variant custom API-key headers with the resolved credential', async () => {
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      headers: { 'X-API-KEY': 'caller-value' },
+      authProvider: {
+        async provide(requirements) {
+          const group = requirements.find(
+            (candidate) => candidate[0] instanceof ApiKeyAuthScheme,
+          )!;
+          group[0]!.setCredential('provider-value');
+          return group;
+        },
+      },
+    });
+
+    await client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    });
+
+    const headers = mockFetch.mock.calls[0]![1].headers as Record<string, string>;
+    expect(headers['x-api-key']).toBe('provider-value');
+    expect(
+      Object.keys(headers).filter((name) => name.toLowerCase() === 'x-api-key'),
+    ).toEqual(['x-api-key']);
+  });
+
+  it('replaces a lowercase authorization header with bearer auth', async () => {
+    const bearerCard: AgentCardV10 = {
+      ...V10_CARD_WITH_AUTH,
+      securitySchemes: {
+        bearer: {
+          httpAuthSecurityScheme: { scheme: 'bearer' },
+        },
+      },
+      securityRequirements: [{ schemes: { bearer: { list: [] } } }],
+    };
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const client = new A2XClient(bearerCard, {
+      fetch: mockFetch,
+      headers: { authorization: 'Bearer caller-value' },
+      authProvider: {
+        async provide(requirements) {
+          requirements[0]![0]!.setCredential('provider-value');
+          return requirements[0]!;
+        },
+      },
+    });
+
+    await client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    });
+
+    const headers = mockFetch.mock.calls[0]![1].headers as Record<string, string>;
+    expect(headers.Authorization).toBe('Bearer provider-value');
+    expect(headers.authorization).toBeUndefined();
+  });
+
+  it('composes distinct cookie API-key schemes in one AND group', async () => {
+    const cookieCard: AgentCardV10 = {
+      ...V10_CARD_WITH_AUTH,
+      securitySchemes: {
+        session: {
+          apiKeySecurityScheme: { location: 'cookie', name: 'session' },
+        },
+        tenant: {
+          apiKeySecurityScheme: { location: 'cookie', name: 'tenant' },
+        },
+      },
+      securityRequirements: [{
+        schemes: {
+          session: { list: [] },
+          tenant: { list: [] },
+        },
+      }],
+    };
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const client = new A2XClient(cookieCard, {
+      fetch: mockFetch,
+      headers: { cookie: 'caller=present' },
+      authProvider: {
+        async provide(requirements) {
+          requirements[0]![0]!.setCredential('one');
+          requirements[0]![1]!.setCredential('two');
+          return requirements[0]!;
+        },
+      },
+    });
+
+    await client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    });
+
+    const headers = mockFetch.mock.calls[0]![1].headers as Record<string, string>;
+    expect(headers.Cookie).toBe('caller=present; session=one; tenant=two');
+    expect(headers.cookie).toBeUndefined();
+  });
+
+  it('preserves the built request context for custom auth schemes', async () => {
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      headers: { Cookie: 'session=caller' },
+      authProvider: {
+        async provide(requirements) {
+          const group = requirements.find(
+            (candidate) => candidate[0] instanceof ApiKeyAuthScheme,
+          )!;
+          group[0]!.applyToRequest = (ctx) => {
+            ctx.headers['X-Context-Signature'] = [
+              ctx.headers['Content-Type'],
+              ctx.headers.Cookie,
+              ctx.url.pathname,
+            ].join('|');
+            ctx.headers.Cookie = `${ctx.headers.Cookie}; auth=provider`;
+          };
+          return group;
+        },
+      },
+    });
+
+    await client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    });
+
+    const headers = mockFetch.mock.calls[0]![1].headers as Record<string, string>;
+    expect(headers['X-Context-Signature']).toBe(
+      'application/json|session=caller|/a2a',
+    );
+    expect(headers.Cookie).toBe('session=caller; auth=provider');
+  });
+
   it('does not call authProvider when no security requirements', async () => {
     const cardWithoutAuth: AgentCardV10 = {
       ...V10_CARD_WITH_AUTH,
@@ -541,6 +917,54 @@ describe('A2XClient auth integration', () => {
     });
 
     expect(provide).not.toHaveBeenCalled();
+  });
+
+  it('does not call authProvider when anonymous access is an explicit alternative', async () => {
+    const anonymousCard: AgentCardV10 = {
+      ...V10_CARD_WITH_AUTH,
+      securityRequirements: [
+        { schemes: { apiKey: { list: [] } } },
+        { schemes: {} },
+      ],
+    };
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const provide = vi.fn();
+    const client = new A2XClient(anonymousCard, {
+      fetch: mockFetch,
+      authProvider: { provide },
+    });
+
+    await client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    });
+
+    expect(provide).not.toHaveBeenCalled();
+    const headers = mockFetch.mock.calls[0]![1].headers as Record<string, string>;
+    expect(headers['x-api-key']).toBeUndefined();
+  });
+
+  it('fails before sending when every non-empty auth requirement is unsupported', async () => {
+    const unsupportedCard: AgentCardV10 = {
+      ...V10_CARD_WITH_AUTH,
+      securitySchemes: {
+        mtls: { mtlsSecurityScheme: {} },
+      },
+      securityRequirements: [{ schemes: { mtls: { list: [] } } }],
+    };
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const provide = vi.fn();
+    const client = new A2XClient(unsupportedCard, {
+      fetch: mockFetch,
+      authProvider: { provide },
+    });
+
+    await expect(
+      client.sendMessage({
+        message: { role: 'user', parts: [{ text: 'Hello' }] },
+      }),
+    ).rejects.toThrow('none of its security requirements are supported');
+    expect(provide).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it('works without authProvider (public agents)', async () => {

@@ -10,6 +10,8 @@ import { A2XClient } from '@a2x/sdk/client';
 const client = new A2XClient('https://agent.example.com/.well-known/agent.json');
 ```
 
+Resolved authentication schemes are applied after custom headers and replace a custom header with the same case-insensitive name. This prevents values such as `authorization` and `Authorization` from being combined by Fetch. Do not use `headers` to compete with a header owned by the selected auth scheme; put that credential in the `AuthProvider` instead.
+
 Pass the AgentCard URL (the `.well-known` path). The client fetches and caches the card on first use and uses it to figure out how to route subsequent calls.
 
 You can also pass the JSON-RPC endpoint directly, but the card URL is preferred — it supports discovery, version negotiation, and auth scheme introspection.

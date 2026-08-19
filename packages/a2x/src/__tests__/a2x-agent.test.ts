@@ -247,7 +247,7 @@ describe('Layer 3: A2XServer', () => {
         httpAuthSecurityScheme: { scheme: 'bearer' },
       });
       expect(card.securityRequirements).toEqual([
-        { schemes: { bearer: { values: [] } } },
+        { schemes: { bearer: { list: [] } } },
       ]);
     });
   });
