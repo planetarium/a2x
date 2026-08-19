@@ -131,7 +131,7 @@ describe('AuthScheme', () => {
         headers: {
           Cookie: '; session=stale; first=one;',
           cookie: 'second=two',
-          COOKIE: ';; session=older; third=three',
+          COOKIE: ';; session =older; third=three',
         } as Record<string, string>,
         url: new URL('http://example.com'),
       };
