@@ -27,7 +27,14 @@ import {
   X402_PAYMENT_STATUS,
 } from '../x402/constants.js';
 import type { Task } from '../types/task.js';
-import { reconcileX402BatchSettlement } from '../x402/client.js';
+import type {
+  X402PaymentRequiredResponse,
+  X402PaymentRequirements,
+} from '../x402/types.js';
+import {
+  reconcileX402BatchSettlement,
+  type SignedX402Payment,
+} from '../x402/client.js';
 import {
   X402AttemptPendingError,
   X402NoSupportedRequirementError,
@@ -339,6 +346,34 @@ describe('A2XClient.sendMessage — native x402 dance', () => {
     expect(rpcRequests).toHaveLength(1); // never reached the followup
   });
 
+  it('ignores payment requirement mutations from onPaymentRequired', async () => {
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(paymentRequiredTask()),
+      () => jsonRpcOk(completedTaskWithReceipt()),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        maxAmount: 1000n,
+        onPaymentRequired: (required) => {
+          required.accepts[0]!.maxAmountRequired = '999999';
+        },
+      },
+    });
+
+    await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    const followup = rpcRequests[1]!.body as {
+      params: { message: { metadata: Record<string, unknown> } };
+    };
+    const signed = followup.params.message.metadata[
+      X402_METADATA_KEYS.PAYLOAD
+    ] as { payload: { authorization: { value: string } } };
+    expect(signed.payload.authorization.value).toBe('1000');
+  });
+
   it('rejects with X402NoSupportedRequirementError when every accept exceeds maxAmount', async () => {
     const { fetch } = scriptedFetch([
       () => jsonRpcOk(paymentRequiredTask()),
@@ -495,6 +530,194 @@ describe('A2XClient.sendMessage — native x402 dance', () => {
     });
     expect(selectRequirement).toHaveBeenCalledTimes(1);
     expect(rpcRequests).toHaveLength(2);
+  });
+
+  it('rejects a custom selection captured outside the affordable candidates', async () => {
+    const required = paymentRequiredTask() as {
+      status: {
+        message: { metadata: Record<string, Record<string, unknown>> };
+      };
+    };
+    const envelope = required.status.message.metadata[
+      X402_METADATA_KEYS.REQUIRED
+    ]!;
+    const captured = (envelope.accepts as X402PaymentRequirements[])[0]!;
+    const { fetch, rpcRequests } = scriptedFetch([() => jsonRpcOk(required)]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        maxAmount: 100n,
+        selectRequirement: () => captured,
+      },
+    });
+
+    await expect(
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      }),
+    ).rejects.toBeInstanceOf(X402NoSupportedRequirementError);
+    expect(rpcRequests).toHaveLength(1);
+  });
+
+  it('rejects a requirement inserted by a custom selector', async () => {
+    const required = paymentRequiredTask() as {
+      status: {
+        message: { metadata: Record<string, Record<string, unknown>> };
+      };
+    };
+    const envelope = required.status.message.metadata[
+      X402_METADATA_KEYS.REQUIRED
+    ]!;
+    const fabricated = {
+      ...(envelope.accepts as X402PaymentRequirements[])[0]!,
+      maxAmountRequired: '1',
+    };
+    const { fetch, rpcRequests } = scriptedFetch([() => jsonRpcOk(required)]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        maxAmount: 1000n,
+        selectRequirement: (requirements) => {
+          requirements.unshift(fabricated);
+          return requirements[0];
+        },
+      },
+    });
+
+    await expect(
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      }),
+    ).rejects.toBeInstanceOf(X402NoSupportedRequirementError);
+    expect(rpcRequests).toHaveLength(1);
+  });
+
+  it('signs a pristine snapshot when the selector mutates a captured original', async () => {
+    const required = paymentRequiredTask() as {
+      status: {
+        message: { metadata: Record<string, Record<string, unknown>> };
+      };
+    };
+    const envelope = required.status.message.metadata[
+      X402_METADATA_KEYS.REQUIRED
+    ]!;
+    const captured = (envelope.accepts as X402PaymentRequirements[])[0]!;
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(required),
+      () => jsonRpcOk(completedTaskWithReceipt()),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        maxAmount: 1000n,
+        selectRequirement: (requirements) => {
+          captured.maxAmountRequired = '999999';
+          return requirements[0];
+        },
+      },
+    });
+
+    await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    const followup = rpcRequests[1]!.body as {
+      params: { message: { metadata: Record<string, unknown> } };
+    };
+    const signed = followup.params.message.metadata[
+      X402_METADATA_KEYS.PAYLOAD
+    ] as { payload: { authorization: { value: string } } };
+    expect(signed.payload.authorization.value).toBe('1000');
+  });
+
+  it('preserves selection identity when the selector reorders candidates', async () => {
+    const required = paymentRequiredTask() as {
+      status: {
+        message: { metadata: Record<string, Record<string, unknown>> };
+      };
+    };
+    const envelope = required.status.message.metadata[
+      X402_METADATA_KEYS.REQUIRED
+    ]!;
+    const accepts = envelope.accepts as X402PaymentRequirements[];
+    accepts.push({ ...accepts[0]!, maxAmountRequired: '500' });
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(required),
+      () => jsonRpcOk(completedTaskWithReceipt()),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        maxAmount: 1000n,
+        selectRequirement: (requirements) => {
+          requirements.reverse();
+          return requirements[0];
+        },
+      },
+    });
+
+    await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    const followup = rpcRequests[1]!.body as {
+      params: { message: { metadata: Record<string, unknown> } };
+    };
+    const signed = followup.params.message.metadata[
+      X402_METADATA_KEYS.PAYLOAD
+    ] as { payload: { authorization: { value: string } } };
+    expect(signed.payload.authorization.value).toBe('500');
+  });
+
+  it('accepts an unchanged structural copy returned by a custom selector', async () => {
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(paymentRequiredTask()),
+      () => jsonRpcOk(completedTaskWithReceipt()),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        maxAmount: 1000n,
+        selectRequirement: (requirements) => ({ ...requirements[0]! }),
+      },
+    });
+
+    await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    expect(rpcRequests).toHaveLength(2);
+  });
+
+  it('ignores mutations a custom selector makes to an affordable candidate', async () => {
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(paymentRequiredTask()),
+      () => jsonRpcOk(completedTaskWithReceipt()),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        maxAmount: 1000n,
+        selectRequirement: (requirements) => {
+          requirements[0]!.maxAmountRequired = '999999';
+          return requirements[0];
+        },
+      },
+    });
+
+    await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    const followup = rpcRequests[1]!.body as {
+      params: { message: { metadata: Record<string, unknown> } };
+    };
+    const signed = followup.params.message.metadata[
+      X402_METADATA_KEYS.PAYLOAD
+    ] as { payload: { authorization: { value: string } } };
+    expect(signed.payload.authorization.value).toBe('1000');
   });
 
   it('does not run the dance when no x402 option is configured', async () => {
@@ -2932,27 +3155,32 @@ describe('A2XClient.sendMessageStream — native x402 dance', () => {
       ),
     ]);
 
-    let call = 0;
-    const fetch = (async (input: RequestInfo | URL): Promise<Response> => {
-      const url = typeof input === 'string' ? input : input.toString();
-      if (url.endsWith('/agent-card.json') || url.endsWith('/agent.json')) {
-        return agentCardResponse();
-      }
-      call += 1;
-      if (call === 1) return firstStream;
-      if (call === 2) return secondStream;
-      throw new Error('Unexpected RPC call');
-    }) as unknown as typeof globalThis.fetch;
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => firstStream,
+      () => secondStream,
+    ]);
 
     const client = new A2XClient(AGENT_URL, {
       fetch,
-      x402: { signer: TEST_ACCOUNT },
+      x402: {
+        signer: TEST_ACCOUNT,
+        maxAmount: 1000n,
+        onPaymentRequired: (required) => {
+          required.accepts[0]!.maxAmountRequired = '999999';
+        },
+      },
     });
 
     const events: Array<Record<string, unknown>> = [];
     for await (const ev of client.sendMessageStream({
       message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
     })) {
+      if ('status' in ev && ev.status.state === 'input-required') {
+        const required = ev.status.message?.metadata?.[
+          X402_METADATA_KEYS.REQUIRED
+        ] as X402PaymentRequiredResponse;
+        required.accepts[0]!.maxAmountRequired = '999999';
+      }
       events.push(ev as unknown as Record<string, unknown>);
     }
 
@@ -2972,7 +3200,46 @@ describe('A2XClient.sendMessageStream — native x402 dance', () => {
       { state: 'working', x402: X402_PAYMENT_STATUS.VERIFIED },
       { state: 'completed', x402: X402_PAYMENT_STATUS.COMPLETED },
     ]);
-    expect(call).toBe(2);
+    expect(rpcRequests).toHaveLength(2);
+    const followup = rpcRequests[1]!.body as {
+      params: { message: { metadata: Record<string, unknown> } };
+    };
+    const signed = followup.params.message.metadata[
+      X402_METADATA_KEYS.PAYLOAD
+    ] as SignedX402Payment;
+    expect(signed.payload.authorization.value).toBe('1000');
+  });
+
+  it('does not sign when the consumer closes at the payment-required event', async () => {
+    const required = paymentRequiredTask() as {
+      status: { message: { metadata: Record<string, unknown> } };
+    };
+    const firstStream = sseResponse([
+      statusUpdate(
+        'input-required',
+        required.status.message.metadata,
+        true,
+      ),
+    ]);
+    const { fetch, rpcRequests } = scriptedFetch([() => firstStream]);
+    const onPaymentRequired = vi.fn();
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: { signer: TEST_ACCOUNT, onPaymentRequired },
+    });
+    const events = client.sendMessageStream({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+
+    const first = await events.next();
+    expect(first.done).toBe(false);
+    expect('status' in first.value && first.value.status.state).toBe(
+      'input-required',
+    );
+    await events.return(undefined);
+
+    expect(onPaymentRequired).not.toHaveBeenCalled();
+    expect(rpcRequests).toHaveLength(1);
   });
 
   it('passes through events untouched when no x402 option is configured', async () => {
