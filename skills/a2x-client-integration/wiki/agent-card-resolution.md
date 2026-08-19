@@ -53,6 +53,10 @@ If both fail, the error includes both attempted paths and the last error message
 `detectProtocolVersion(card)` inspects the card:
 
 ```typescript
+if (typeof card.protocolVersion === 'string') {
+  if (card.protocolVersion.startsWith('0.3')) return '0.3';
+  if (card.protocolVersion.startsWith('1.')) return '1.0';
+}
 if (Array.isArray(card.supportedInterfaces) && card.supportedInterfaces.length > 0) {
   return '1.0';
 }
@@ -64,9 +68,11 @@ return '1.0';  // ambiguous default
 
 Notes:
 
+- The card's declared `protocolVersion` is authoritative when recognized.
 - v1.0 cards have `supportedInterfaces: [{ url, protocolBinding, … }, …]`.
 - v0.3 cards have a top-level `url` (the JSON-RPC endpoint).
-- A card that has **both** (e.g. a dual-stack server) is classified as v1.0.
+- A v0.3 card may also advertise `supportedInterfaces`; it remains v0.3 when `protocolVersion` declares `0.3.x`.
+- Shape heuristics are used only when the declaration is absent or unrecognized.
 
 ---
 
@@ -75,9 +81,13 @@ Notes:
 `getAgentEndpointUrl(card, version)` picks the JSON-RPC endpoint:
 
 - **v0.3** — use `card.url`. Throws if absent.
-- **v1.0** — find the interface with `protocolBinding` (case-insensitive) `JSONRPC`. If none match, falls back to the **first** interface in `supportedInterfaces`.
+- **v1.0** — find the interface with `protocolBinding` (case-insensitive) `JSONRPC`; if none matches, the current SDK falls back to the first interface.
 
-The same extraction is used internally by `A2XClient` to determine where to POST JSON-RPC requests.
+The fallback is unsafe for a JSON-RPC-only client: it can post JSON-RPC to a
+gRPC or HTTP+JSON endpoint. Before attaching credentials, inspect a v1.0 card
+yourself and reject it unless it advertises an explicit JSON-RPC interface.
+The policy-bound examples in this skill perform that preflight. The SDK fix is
+tracked in [#240](https://github.com/planetarium/a2x/issues/240).
 
 ---
 
@@ -113,14 +123,48 @@ const requirements = card.securityRequirements ?? card.security ?? [];
 If you need card caching at the application layer (e.g. to avoid repeated GETs when you create short-lived clients), call `resolveAgentCard` once, then pass the resolved card to `A2XClient`:
 
 ```typescript
+import {
+  A2XClient,
+  getAgentEndpointUrl,
+  resolveAgentCard,
+} from '@a2x/sdk/client';
+
+function requireJsonRpcEndpoint(card: unknown, version: '0.3' | '1.0'): string {
+  if (version === '1.0') {
+    const interfaces = (card as {
+      supportedInterfaces?: Array<{ url: string; protocolBinding?: string }>;
+    }).supportedInterfaces ?? [];
+    const jsonRpc = interfaces.find(entry =>
+      entry.protocolBinding?.toUpperCase() === 'JSONRPC'
+    );
+    if (!jsonRpc) throw new Error('AgentCard has no JSON-RPC interface');
+    return jsonRpc.url;
+  }
+  return getAgentEndpointUrl(card as Parameters<typeof getAgentEndpointUrl>[0], version);
+}
+
 // once, e.g. at app startup
-const resolved = await resolveAgentCard(AGENT_URL);
+const noRedirectFetch: typeof fetch = (input, init) =>
+  fetch(input, { ...init, redirect: 'error' });
+const resolved = await resolveAgentCard(AGENT_CARD_URL, {
+  fetch: noRedirectFetch,
+});
+const endpoint = requireJsonRpcEndpoint(resolved.card, resolved.version);
+if (endpoint !== EXPECTED_AGENT_ENDPOINT) {
+  throw new Error(`AgentCard endpoint is not approved: ${endpoint}`);
+}
 
 // later, per request
 function makeClient() {
-  return new A2XClient(resolved.card, { authProvider });
+  return new A2XClient(resolved.card, {
+    authProvider,
+    fetch: noRedirectFetch,
+  });
 }
 ```
+
+`AGENT_CARD_URL` and `EXPECTED_AGENT_ENDPOINT` must be exact host-policy values.
+Never restore or attach credentials until this binding succeeds.
 
 When you pass an `AgentCard` object instead of a URL, `A2XClient` skips the HTTP GET entirely. It still runs `detectProtocolVersion` and `getAgentEndpointUrl` to derive routing info.
 

@@ -7,9 +7,9 @@ description: Integrates `@a2x/sdk` **client-side** into a TypeScript application
 
 Consume remote A2A agents from any TypeScript application using `@a2x/sdk` (via the `@a2x/sdk/client` subpath).
 
-The server side is covered by the companion [`a2x-integration`](../a2x-integration/SKILL.md) skill — this skill focuses exclusively on the **caller** side: fetching the agent card, authenticating dynamically against the agent's declared security schemes, sending messages, streaming SSE events, and surviving token expiry.
+The server side is covered by the companion [`a2x-integration`](../a2x-agent-integration/SKILL.md) skill — this skill focuses exclusively on the **caller** side: fetching the agent card, authenticating dynamically against the agent's declared security schemes, sending messages, streaming SSE events, and surviving token expiry.
 
-The reference implementation for all of this is the `a2x` CLI itself (`packages/cli/src/cli-auth-provider.ts` + `packages/cli/src/token-store.ts`). The patterns documented here are lifted directly from that implementation.
+The `a2x` CLI (`packages/cli/src/cli-auth-provider.ts` + `packages/cli/src/token-store.ts`) is the reference implementation. This skill follows it while hardening documented integration patterns where the CLI's local compatibility format has known limits, such as duplicate auth-scheme classes in one requirement group.
 
 ---
 
@@ -37,7 +37,7 @@ This skill uses a wiki-style structure. Detailed reference material is in the `w
 | **Token Persistence** | [wiki/token-persistence.md](./wiki/token-persistence.md) | File-based store pattern, credential extraction, security notes |
 | **OAuth2 Device Code** | [wiki/oauth2-device-code.md](./wiki/oauth2-device-code.md) | Full device-code polling loop for headless clients |
 | **Streaming** | [wiki/streaming.md](./wiki/streaming.md) | `sendMessageStream`, SSE parsing, cancellation, terminal states |
-| **Error Handling** | [wiki/error-handling.md](./wiki/error-handling.md) | JSON-RPC error codes, 401 refresh, connection errors |
+| **Error Handling** | [wiki/error-handling.md](./wiki/error-handling.md) | JSON-RPC error codes, auth-required refresh, connection errors |
 
 ### Host-Environment Guides
 
@@ -76,7 +76,11 @@ npm install @a2x/sdk
 Only the **client** subpath and the root types are needed on the caller side:
 
 ```typescript
-import { A2XClient } from '@a2x/sdk/client';
+import {
+  A2XClient,
+  getAgentEndpointUrl,
+  resolveAgentCard,
+} from '@a2x/sdk/client';
 import type { SendMessageParams, Task, TaskStatusUpdateEvent, TaskArtifactUpdateEvent } from '@a2x/sdk';
 ```
 
@@ -117,7 +121,7 @@ The [CLI reference implementation](./wiki/auth-fallback-chain.md) composes the t
 
 1. **Stored credentials first** — try cached values; if they match a requirement group, use them.
 2. **Interactive fallback** — if none match, prompt the user for a group they can satisfy.
-3. **Refresh on 401** — on auth failure, clear the cache and re-run the interactive step.
+3. **Refresh on `auth-required`** — when a task-creating response reports the protocol-level `auth-required` state, clear the cache and re-run the interactive step.
 
 Pick the subset that makes sense for your host. Backend services typically skip step 2 entirely.
 
@@ -137,35 +141,49 @@ import {
   HttpBearerAuthScheme,
 } from '@a2x/sdk/client';
 
+const API_KEY_ENV_BY_SLOT: Record<string, string> = {
+  'header:x-api-key': 'AGENT_API_KEY',
+  'header:x-tenant-key': 'AGENT_TENANT_API_KEY',
+};
+
+function apiKeySlot(scheme: ApiKeyAuthScheme): string {
+  const name = scheme.params.location === 'header'
+    ? scheme.params.name.toLowerCase()
+    : scheme.params.name;
+  return `${scheme.params.location}:${name}`;
+}
+
 export class EnvAuthProvider implements AuthProvider {
   async provide(requirements: AuthScheme[][]): Promise<AuthScheme[]> {
     // Pick the first group we can satisfy from env.
     for (const group of requirements) {
-      const ok = group.every((scheme) => this.tryFill(scheme));
-      if (ok) return group;
+      const credentials = group.map((scheme) => this.readCredential(scheme));
+      if (credentials.every(
+        (value): value is string => typeof value === 'string' && value.length > 0,
+      )) {
+        group.forEach((scheme, index) => scheme.setCredential(credentials[index]!));
+        return group;
+      }
     }
     throw new Error(
       'No configured credentials match the agent security requirements',
     );
   }
 
-  private tryFill(scheme: AuthScheme): boolean {
+  private readCredential(scheme: AuthScheme): string | undefined {
     if (scheme instanceof ApiKeyAuthScheme) {
-      const key = process.env.AGENT_API_KEY;
-      if (!key) return false;
-      scheme.setCredential(key);
-      return true;
+      const envName = API_KEY_ENV_BY_SLOT[apiKeySlot(scheme)];
+      return envName ? process.env[envName] : undefined;
     }
     if (scheme instanceof HttpBearerAuthScheme) {
-      const token = process.env.AGENT_BEARER_TOKEN;
-      if (!token) return false;
-      scheme.setCredential(token);
-      return true;
+      return process.env.AGENT_BEARER_TOKEN;
     }
-    return false;
+    return undefined;
   }
 }
 ```
+
+Map every API-key location/name pair separately; one AND group may require multiple API keys. The current SDK has known requirement-normalization and credential-destination gaps ([#237](https://github.com/planetarium/a2x/issues/237)): reject partial AND groups yourself, do not combine schemes that compete for `Authorization` or the same API-key destination, and do not rely on multiple cookie API keys composing. OAuth schemes expose the flow catalogue as `params.scopes`, but selected security-requirement values are not preserved on normalized scheme instances. Configure the exact requested scopes in host policy, verify them against the raw approved card before constructing the client, and request only that configured set. Treat identity endpoints and scopes advertised by an agent card as untrusted until the exact card URL, resolved agent endpoint, HTTPS identity endpoints, client identity, audience/resource, and scopes match one host policy tuple. The backend and OAuth wiki pages show the pattern.
 
 For an interactive CLI, follow [wiki/host-cli.md](./wiki/host-cli.md) — it reproduces the full fallback chain including the OAuth2 device-code polling loop.
 
@@ -174,14 +192,65 @@ For an interactive CLI, follow [wiki/host-cli.md](./wiki/host-cli.md) — it rep
 ### Step 4 — Wire Up `A2XClient`
 
 ```typescript
-import { A2XClient } from '@a2x/sdk/client';
+import {
+  A2XClient,
+  getAgentEndpointUrl,
+  resolveAgentCard,
+} from '@a2x/sdk/client';
 import type { SendMessageParams } from '@a2x/sdk';
 import crypto from 'node:crypto';
 
-const client = new A2XClient(AGENT_URL, {
+function exactHttpsUrl(raw: string | undefined, label: string): string {
+  if (!raw) throw new Error(`${label} is required`);
+  const url = new URL(raw);
+  if (
+    url.protocol !== 'https:' || url.username || url.password ||
+    url.search || url.hash
+  ) throw new Error(`${label} must be an exact credential-free HTTPS URL`);
+  return url.toString();
+}
+function requireJsonRpcEndpoint(card: unknown, version: '0.3' | '1.0'): string {
+  if (version === '1.0') {
+    const interfaces = (card as {
+      supportedInterfaces?: Array<{ url: string; protocolBinding?: string }>;
+    }).supportedInterfaces ?? [];
+    const jsonRpc = interfaces.find(entry =>
+      entry.protocolBinding?.toUpperCase() === 'JSONRPC'
+    );
+    if (!jsonRpc) throw new Error('AgentCard has no JSON-RPC interface');
+    return jsonRpc.url;
+  }
+  return getAgentEndpointUrl(card as Parameters<typeof getAgentEndpointUrl>[0], version);
+}
+const AGENT_CARD_URL = exactHttpsUrl(
+  process.env.AGENT_CARD_URL,
+  'AGENT_CARD_URL',
+);
+if (!new URL(AGENT_CARD_URL).pathname.endsWith('.json')) {
+  throw new Error('AGENT_CARD_URL must name one exact JSON document');
+}
+const EXPECTED_AGENT_ENDPOINT = exactHttpsUrl(
+  process.env.AGENT_ENDPOINT_URL,
+  'AGENT_ENDPOINT_URL',
+);
+const noRedirectFetch: typeof fetch = (input, init) =>
+  fetch(input, { ...init, redirect: 'error' });
+const resolved = await resolveAgentCard(AGENT_CARD_URL, {
+  fetch: noRedirectFetch,
+});
+const endpoint = exactHttpsUrl(
+  requireJsonRpcEndpoint(resolved.card, resolved.version),
+  'AgentCard endpoint',
+);
+if (endpoint !== EXPECTED_AGENT_ENDPOINT) {
+  throw new Error(`AgentCard endpoint is not approved: ${endpoint}`);
+}
+
+const client = new A2XClient(resolved.card, {
   headers: { 'User-Agent': 'my-app/1.0' },
   authProvider: new EnvAuthProvider(),
-  // fetch: customFetch,  // optional: inject a fetch (e.g. with proxy / retries)
+  extensions: ['https://example.com/my-a2a-extension/v1'],
+  fetch: noRedirectFetch,
 });
 
 const params: SendMessageParams = {
@@ -196,13 +265,16 @@ const task = await client.sendMessage(params);
 console.log(task.status?.state, task.artifacts);
 ```
 
-`A2XClient` transparently handles:
+`AGENT_CARD_URL` and `EXPECTED_AGENT_ENDPOINT` must be exact HTTPS deployment-policy values; validate credentials/hash/query and the exact `.json` card path as shown in [the backend preflight](./wiki/host-backend.md#client-lifetime). `A2XClient` transparently handles:
 
 - Fetching `/.well-known/agent.json` (tries `agent.json` then `agent-card.json`)
 - Detecting protocol version (v0.3 vs. v1.0) from the card structure
 - Normalizing security requirements into `AuthScheme[][]` and calling your provider
 - Formatting the message body per protocol version
-- Retrying once on HTTP 401 via `authProvider.refresh()`
+- Activating requested A2A extensions through `X-A2A-Extensions`
+- Retrying a task-creating call once when its result is `auth-required` and `authProvider.refresh()` exists
+
+An HTTP 401 is a transport failure and is surfaced as `InternalError`; it does not invoke `refresh()` automatically.
 
 ---
 
@@ -236,21 +308,46 @@ See [wiki/streaming.md](./wiki/streaming.md) for SSE format details, terminal-st
 
 ---
 
-### Step 6 — Verify
+### Step 6 — Enable x402 Payments (Optional)
+
+`A2XClient` can run the payer-side x402 flow transparently. Install the optional payment peers, provide a viem `LocalAccount`, and always set a per-requirement authorization ceiling:
+
+```bash
+npm install @a2x/sdk @x402/core @x402/evm viem
+```
+
+```typescript
+const paidClient = new A2XClient(resolved.card, {
+  fetch: noRedirectFetch,
+  authProvider: new EnvAuthProvider(),
+  x402: {
+    signer,
+    maxAmount: 10_000n,
+    // This receives the complete accepts[] envelope before offer selection.
+    onPaymentRequired: async (required) => confirmEnvelopeWithUser(required),
+  },
+});
+```
+
+`maxAmount` is expressed in the asset's atomic units and applies to each selected requirement (or each new batch deposit); it is not an aggregate wallet budget across calls. The default selector chooses an affordable EVM `exact` offer. Enable `allowUpto` only with explicit consent because it authorizes a charge up to the advertised maximum. To use `batch-settlement`, provide `batchSettlement` storage and opt in with `allowBatchSettlement`; route each payer through a durable single-owner queue/actor for the full sign → submit → reconcile lifecycle.
+
+`onPaymentRequired` currently receives the live envelope. Treat it as read-only: mutation can change later selection or signing. Likewise, a custom `selectRequirement` must not mutate candidates and should return one supplied entry; see the payer-isolation bug [#241](https://github.com/planetarium/a2x/issues/241). Drive the [low-level manual flow](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md#low-level-signx402payment) when the user must approve the exact selected offer. A custom selector is itself explicit scheme consent: it bypasses `allowUpto` and `allowBatchSettlement`, although `maxAmount` still filters offers and batch selection still requires `batchSettlement`. Never embed a service private key in a browser bundle; use a user-owned restricted signer or a backend payer. See the [x402 payments guide](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md) for reconciliation and recovery requirements.
+
+---
+
+### Step 7 — Verify
 
 1. **Build check** — Run the project's type-check (`tsc --noEmit`).
 2. **Agent card fetch** — manually or via the built-in resolver:
    ```typescript
-   import { resolveAgentCard } from '@a2x/sdk/client';
-   const resolved = await resolveAgentCard(AGENT_URL);
    console.log(resolved.version, resolved.card);
    ```
 3. **Send a message** — confirm the round-trip works with your `AuthProvider`.
-4. **Simulate token expiry** — make the server reject with HTTP 401 once, confirm `refresh()` is invoked.
+4. **Simulate token expiry** — make the server return an `auth-required` unary task or an `auth-required` status as the first stream event, then confirm `refresh()` is invoked and the request is retried.
 5. **Try with the `a2x` CLI** for a sanity check against the same agent:
    ```bash
-   a2x a2a agent-card <AGENT_URL>
-   a2x a2a send <AGENT_URL> "ping"
+   a2x a2a agent-card <AGENT_CARD_URL>
+   a2x a2a send <AGENT_CARD_URL> "ping"
    ```
 
 ---
@@ -262,7 +359,7 @@ The CLI in this repo implements a three-step fallback that every interactive cli
 ```
 provide(requirements)
   │
-  ├─ 1. Stored credentials?           ─ yes →  match group by className       → return group
+  ├─ 1. Stored credentials?           ─ yes →  match every credential slot    → return group
   │                                             (scheme.setCredential from cache)
   │                                   ─ no  ↓
   ├─ 2. Interactive resolution
@@ -274,8 +371,8 @@ provide(requirements)
   └─ return group
 
 
-refresh(schemes)  ← SDK calls this after HTTP 401
-  • Clear stored credentials for this agent URL
+refresh(schemes)  ← SDK calls this after an auth-required task/event
+  • Clear stored credentials for this validated policy tuple
   • Re-run interactive resolution for the same schemes
   • Save the new values
   • Return the (same) scheme instances, now holding new credentials
@@ -283,7 +380,7 @@ refresh(schemes)  ← SDK calls this after HTTP 401
 
 Three properties are load-bearing:
 
-1. **Scheme class name is the stable identity.** The CLI stores `scheme.constructor.name` alongside the raw credential and matches on that when restoring. The SDK always instantiates the same classes from a given agent card, so the name is a safe key.
+1. **Persist a unique credential-slot key.** Key each slot by requirement-group index, scheme index, class, and public parameters, nested under the validated card/endpoint/identity-policy key. A valid group can contain two API-key schemes with different names.
 2. **Scheme instances are mutated, not replaced.** `AuthProvider` returns the same instances the SDK handed in — only `setCredential()` has been called. The SDK will then call `applyToRequest(ctx)` on each.
 3. **Credential extraction goes through `applyToRequest`.** The stored credential isn't exposed directly on the scheme; the CLI recovers it by running `applyToRequest` against a dummy context and reading the resulting `Authorization` / header / query value back out. This keeps the provider agnostic of each scheme's private state.
 
@@ -295,7 +392,7 @@ See [wiki/token-persistence.md](./wiki/token-persistence.md) for the `extractCre
 
 | Class / Type | Where | Contract |
 |-------------|-------|----------|
-| `A2XClient` | `@a2x/sdk/client` | One instance per remote agent; caches resolved card + auth schemes |
+| `A2XClient` | `@a2x/sdk/client` | One instance per remote agent; caches the resolved card and auth schemes; optionally activates extensions and runs x402 payments |
 | `AuthProvider` | `@a2x/sdk/client` | `provide(req[][])` → `AuthScheme[]`; optional `refresh(schemes)` |
 | `AuthScheme` (base) | `@a2x/sdk/client` | `setCredential(string): this`; `applyToRequest(ctx): void` |
 | `ApiKeyAuthScheme` | `@a2x/sdk/client` | `params: { name, location }`; header / query / cookie placement |
@@ -314,10 +411,10 @@ See [wiki/token-persistence.md](./wiki/token-persistence.md) for the `extractCre
 
 ## What This Skill Does NOT Cover
 
-- **Server-side integration** — how to expose an A2A agent. See [`a2x-integration`](../a2x-integration/SKILL.md).
-- **Agent authoring** — writing `LlmAgent`, tools, providers. See `a2x-integration/wiki/tools-and-agents.md`.
-- **x402 payments** — paywalling agent calls. See `a2a-x402-integration` skill.
-- **CLI usage** — using the packaged `a2x` CLI as a tool. See the `a2a-wallet` skill and the CLI's own docs.
+- **Server-side integration** — how to expose an A2A agent. See [`a2x-integration`](../a2x-agent-integration/SKILL.md).
+- **Agent authoring** — writing `LlmAgent`, tools, providers. See [`a2x-integration/wiki/tools-and-agents.md`](../a2x-agent-integration/wiki/tools-and-agents.md).
+- **Merchant-side x402 policy** — pricing, verification, settlement, and durable merchant state. See the [x402 payments guide](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md).
+- **CLI usage** — use the packaged `a2x` CLI and its `a2a`, `wallet`, and `x402` command help.
 
 ---
 
@@ -326,6 +423,6 @@ See [wiki/token-persistence.md](./wiki/token-persistence.md) for the `extractCre
 Remind the user to:
 
 1. Set any environment variables the `AuthProvider` needs (API keys, bearer tokens, OAuth client IDs).
-2. Audit the token storage location if they enabled persistence — a world-readable file with bearer tokens is a security hazard.
-3. Add a **connection error** path distinct from an **auth** path — the SDK throws `InternalError` for HTTP-level failures and typed `A2AError` subclasses (e.g. `TaskNotFoundError`) for protocol-level failures, while auth failures surface as a `Task` in the `auth-required` state (not a thrown error). See [wiki/error-handling.md](./wiki/error-handling.md).
-4. Consider retry / backoff for idempotent operations (`getTask`, `cancelTask`) — the SDK itself does no retrying beyond the single 401 refresh.
+2. Audit the token storage location if they enabled persistence. The reference CLI writes a plaintext `0600` file and creates its directory as `0700` when absent, but it does not repair an existing directory's mode; production applications should prefer an OS keychain or secret manager.
+3. Add a **connection error** path distinct from an **auth** path — the SDK throws `InternalError` for HTTP-level failures and typed `A2AError` subclasses (e.g. `TaskNotFoundError`) for protocol-level failures, while protocol-level task authentication failures surface as `auth-required` state (not a thrown error). See [wiki/error-handling.md](./wiki/error-handling.md).
+4. Consider retry / backoff for `getTask`. Reconcile `cancelTask` after an ambiguous transport failure because the first cancellation may already have succeeded; never automatically retry `sendMessage` without an application-level idempotency strategy.

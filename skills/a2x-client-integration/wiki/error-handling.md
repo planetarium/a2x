@@ -8,11 +8,11 @@
 
 | Layer | Source | Surface |
 |-------|--------|---------|
-| **Transport** | `fetch` threw, DNS failure, connection refused | `TypeError` (often with `code === 'ECONNREFUSED'`), `AbortError`, `fetch` spec errors |
-| **HTTP** | Non-2xx HTTP response outside the 401-refresh path | `InternalError('HTTP <status>: <statusText>')` |
+| **Transport** | `fetch` threw, DNS failure, connection refused | `TypeError` (Node's built-in `fetch` often puts `ECONNREFUSED` in `error.cause.code`), `AbortError`, fetch-spec errors |
+| **HTTP** | Any non-2xx HTTP response | `InternalError('HTTP <status>: <statusText>')` |
 | **Protocol** | Valid HTTP response containing a JSON-RPC error | Subclass of `A2AError` (e.g. `TaskNotFoundError`, `InvalidParamsError`) |
 
-> **Auth failures are not thrown.** Per the A2A spec, an authentication failure surfaces as a returned `Task` in the `auth-required` state — *not* a JSON-RPC error. `A2XClient` refreshes credentials once and retries; if it is still `auth-required`, it returns that task as-is. Check `task.status.state === 'auth-required'` rather than catching an error. See [The Auth-Required Path](#the-auth-required-path).
+> **Protocol-level task authentication failures are not thrown.** Per the A2A spec, they surface as a returned `Task` in the `auth-required` state, not a JSON-RPC error. When `refresh()` and resolved schemes are available, `A2XClient` refreshes once and retries; otherwise it returns the first task as-is. Check `task.status.state === 'auth-required'`. HTTP authentication failures are separate and are thrown as `InternalError`. See [The Auth-Required Path](#the-auth-required-path).
 
 Importable error types:
 
@@ -31,6 +31,7 @@ import {
   ContentTypeNotSupportedError,
   InvalidAgentResponseError,
   AuthenticatedExtendedCardNotConfiguredError,
+  VersionNotSupportedError,
   A2A_ERROR_CODES,
 } from '@a2x/sdk';
 ```
@@ -55,6 +56,7 @@ This is the mapping the client uses internally when it sees a JSON-RPC error:
 | `-32005` | `ContentTypeNotSupportedError` | Unsupported content type |
 | `-32006` | `InvalidAgentResponseError` | Agent returned something invalid |
 | `-32007` | `AuthenticatedExtendedCardNotConfiguredError` | Extended card requested but not configured |
+| `-32009` | `VersionNotSupportedError` | Requested A2A protocol version is unsupported |
 
 The mapping uses `A2A_ERROR_CODES` constants — consult `@a2x/sdk` source if you need the numeric values.
 
@@ -73,9 +75,9 @@ import {
 
 try {
   const task = await client.sendMessage(params);
-  // Auth failure is NOT thrown — it comes back as a task state.
+  // Protocol-level task auth failure is not thrown.
   if (task.status.state === 'auth-required') {
-    // The client already refreshed once and retried; still auth-required.
+    // Refresh was unavailable, or one refresh+retry was still auth-required.
     // Surface to user / trigger re-auth UI.
     return { ok: false, reason: 'auth' };
   }
@@ -85,8 +87,8 @@ try {
     return { ok: false, reason: 'task_missing' };
   }
   if (err instanceof InternalError && /HTTP 401/.test(err.message)) {
-    // HTTP 401 on a NON-streaming request is usually already handled via refresh.
-    // If it reaches here, the refresh also failed. Surface as auth failure.
+    // HTTP authentication failed at the transport layer. A2XClient does not
+    // call AuthProvider.refresh() for HTTP status codes.
     return { ok: false, reason: 'auth' };
   }
   if (err instanceof InternalError) {
@@ -98,10 +100,24 @@ try {
   }
   // Transport-level (fetch threw before a response was obtained)
   if (err instanceof TypeError) {
-    const code = (err as NodeJS.ErrnoException).code;
+    const code = getErrnoCode(err);
     if (code === 'ECONNREFUSED') return { ok: false, reason: 'unreachable' };
   }
   throw err;
+}
+```
+
+Use a bounded cause-chain helper because Node's built-in `fetch` wraps socket errors:
+
+```typescript
+function getErrnoCode(error: unknown): string | undefined {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current && typeof current === 'object'; depth++) {
+    const value = current as { code?: unknown; cause?: unknown };
+    if (typeof value.code === 'string') return value.code;
+    current = value.cause;
+  }
+  return undefined;
 }
 ```
 
@@ -110,37 +126,13 @@ try {
 <a id="the-auth-required-path"></a>
 ## The Auth-Required Path
 
-Authentication is modeled at **two** layers, both handled by the client:
+Authentication refresh is modeled at the protocol layer. When `sendMessage` returns a `Task` in `auth-required` state, the client calls `authProvider.refresh` and retries once only if the callback exists and schemes were resolved. `sendMessageStream` examines exactly its first event and does the same only when that event is an `auth-required` status. If refresh is unavailable or the retry is still `auth-required`, the task or event is surfaced to you. No `A2AError` is thrown for that state.
 
-1. **`auth-required` task state (protocol layer).** When `sendMessage` returns a `Task` in `auth-required` state, the client calls `authProvider.refresh` once and retries the same request. If the retry is still `auth-required`, that task is returned to you as-is — inspect `task.status.state`. No error is thrown.
-2. **HTTP 401 (transport layer).** See below.
+## HTTP 401 Handling
 
-## The 401 Refresh Path
+HTTP 401 is separate from the protocol-level `auth-required` state. For blocking and streaming requests alike, `A2XClient` throws `InternalError('HTTP 401: Unauthorized')` immediately. It does not invoke `AuthProvider.refresh()` or retry based on HTTP status.
 
-For **non-streaming** requests, the client retries exactly once on HTTP 401 — but only if:
-
-1. `authProvider` was provided, **and**
-2. `authProvider.refresh` is defined, **and**
-3. `_resolvedSchemes` has been populated (i.e. `provide` has run at least once).
-
-If **all** of those hold:
-
-```
-fetch → 401
-  ↓
-_resolvedSchemes = await authProvider.refresh(_resolvedSchemes)
-  ↓
-retry fetch exactly once
-  ↓
-  ├─ 2xx   → parse and return
-  └─ any   → throw InternalError('HTTP 401: …') or mapped A2AError
-```
-
-Points to remember:
-
-- The retry happens **once**. If the refresh itself throws or the retry also fails, the error is propagated.
-- **Streaming requests do not retry.** See [streaming.md](./streaming.md).
-- **The `auth-required` task state triggers its own one-shot refresh+retry** (see above), independent of the HTTP 401 path. It is not a JSON-RPC error and never surfaces as a thrown `A2AError`.
+If an integration uses HTTP 401 for credential expiry, handle it outside `A2XClient`: refresh the host credential, construct a fresh client so `provide()` runs again, and retry only when duplicate execution is safe. Prefer agents that follow the A2A task-state model for task-creating authentication failures.
 
 ---
 
@@ -169,7 +161,7 @@ async function withRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
 const task = await withRetry(() => client.getTask(taskId));
 ```
 
-Only retry **idempotent** calls (`getTask`, `cancelTask`, `getAgentCard`). Never auto-retry `sendMessage` — you may send the same message twice.
+Retry `getTask` and `getAgentCard` when appropriate. After an ambiguous `cancelTask` failure, fetch the task before retrying because the original cancellation may already have succeeded. Never auto-retry `sendMessage` — you may send the same message twice.
 
 ### Convert to HTTP status codes (for a Next.js / Express wrapper)
 
@@ -203,13 +195,13 @@ Safe to log: endpoint URL, HTTP status, error class name, error message, `taskId
 
 ---
 
-## Handling Connection Refused (like the CLI does)
+## Handling Connection Refused
 
-The CLI's `printConnectionError`:
+Use the cause-chain helper above for Node's built-in `fetch`:
 
 ```typescript
 export function printConnectionError(err: unknown, url: string): void {
-  if (err instanceof TypeError && (err as NodeJS.ErrnoException).code === 'ECONNREFUSED') {
+  if (err instanceof TypeError && getErrnoCode(err) === 'ECONNREFUSED') {
     console.error(`Connection refused: ${url}`);
   } else {
     console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
@@ -217,4 +209,4 @@ export function printConnectionError(err: unknown, url: string): void {
 }
 ```
 
-`ECONNREFUSED` is the most common "agent not running" symptom in dev. Distinguishing it from "agent reachable but rejected the request" makes the UX much friendlier.
+`ECONNREFUSED` is the most common "agent not running" symptom in development. The current CLI checks the top-level `code`; integrations targeting Node's built-in `fetch` should also traverse `cause` as shown here.

@@ -11,12 +11,12 @@ new A2XClient(urlOrCard, { headers, authProvider, fetch })
         │
         │   first call (e.g. sendMessage, sendMessageStream, getTask)
         ▼
-  _ensureResolved()                 ← runs once, memoizes
+  _ensureResolved()                 ← lazy; caches after completion
         │
         ├─ string URL  → resolveAgentCard() → tries well-known paths
         └─ AgentCard   → detect version, derive endpoint URL
         ▼
-  _ensureAuthenticated()            ← runs once per client lifetime
+  _ensureAuthenticated()            ← lazy; caches after completion
         │
         ├─ no authProvider          → skip
         ├─ card has no requirements → skip
@@ -30,8 +30,13 @@ new A2XClient(urlOrCard, { headers, authProvider, fetch })
         │
   fetch(endpointUrl, …)
         │
-        ├─ 200 OK  → parse JSON-RPC / SSE response
-        └─ 401     → _authProvider.refresh(_resolvedSchemes) → retry ONCE
+        ├─ non-2xx → throw InternalError
+        └─ 200 OK  → parse JSON-RPC / SSE response
+                         │
+                         └─ unary task, or first stream event when it is a
+                            status event, is auth-required
+                              → _authProvider.refresh(_resolvedSchemes)
+                              → retry ONCE
 ```
 
 ---
@@ -42,21 +47,29 @@ new A2XClient(urlOrCard, { headers, authProvider, fetch })
 
 `A2XClient` does **nothing** in the constructor. Agent-card resolution and authentication both happen on the first public method call. This matters when you construct the client at module load time — there is no network I/O until you call a method.
 
-### Resolution is memoized
+### Resolution is cached after completion
 
 `_ensureResolved()` stores the resolved card, protocol version, endpoint URL, and response parser on the instance. Re-resolution does not happen.
 
 Consequence: if the remote agent changes its card (e.g. rotates security schemes), **a long-lived client will not pick it up**. Recreate the client on such changes.
 
-### Authentication is memoized too
+Concurrent calls on a cold client can all enter `_ensureResolved()` before any one call fills the cache because the client does not memoize an in-flight promise. Avoid relying on exactly one card fetch during cold start.
 
-`_ensureAuthenticated()` runs once. The `AuthScheme[]` returned by `AuthProvider.provide()` is cached as `_resolvedSchemes` and re-applied to every subsequent request.
+This resolution/authentication race and the v1 non-JSON-RPC fallback are tracked
+in [#240](https://github.com/planetarium/a2x/issues/240). Complete one approved
+initialization before exposing a shared client to concurrent work.
 
-Consequence: if the `AuthProvider` has side effects (prompting the user, opening a browser), those happen **once per client** — not per request.
+### Authentication is cached after completion
 
-### Refresh is the only re-auth path
+The `AuthScheme[]` returned by a completed `AuthProvider.provide()` is cached as `_resolvedSchemes` and re-applied to subsequent requests.
 
-The SDK re-invokes the auth provider under two conditions, each retried exactly once: (1) a non-streaming request returned **HTTP 401** and `authProvider.refresh` is defined, or (2) a response came back as a `Task` in the **`auth-required`** state. There is no thrown auth error — if the single retry is still `auth-required`, that task is returned to you as-is.
+Concurrent first calls can invoke `provide()` more than once because the client does not deduplicate the in-flight call. Make providers concurrency-safe and deduplicate expensive token exchanges or interactive prompts. After one call populates the cache, later sequential calls reuse it.
+
+### `auth-required` is the re-auth path
+
+The SDK re-invokes the auth provider when a task-creating response reports **`auth-required`**, `authProvider.refresh` is defined, and schemes were resolved. `sendMessage` checks its returned task. `sendMessageStream` buffers exactly the first event and retries only when that event is an `auth-required` status event. Both retry at most once. If refresh is unavailable or the retry is still `auth-required`, the task or event is surfaced to the caller.
+
+HTTP 401 is not a refresh signal in `A2XClient`. Any non-2xx response is thrown as `InternalError('HTTP <status>: <statusText>')`.
 
 If you want to retry further on auth failures, inspect `task.status.state` yourself and construct a new client on failure.
 
@@ -100,9 +113,13 @@ The server responds with either:
 
 Detection happens in `detectProtocolVersion`:
 
-- Presence of `supportedInterfaces: []` → `1.0`
+- Declared `protocolVersion` starting with `0.3` → `0.3`
+- Declared `protocolVersion` starting with `1.` → `1.0`
+- Presence of a non-empty `supportedInterfaces` array → `1.0`
 - Presence of top-level `url: string` → `0.3`
 - Ambiguous → `1.0` (default)
+
+The declared version is authoritative. A v0.3 card may also advertise `supportedInterfaces`; the client must not misclassify it from shape alone.
 
 For **v0.3** the client mutates the outgoing `params`:
 
@@ -111,7 +128,7 @@ For **v0.3** the client mutates the outgoing `params`:
   - `{ text }` → `{ kind: "text", text }`
   - `{ data }` → `{ kind: "data", data }`
   - `{ raw, url, mediaType, filename }` → `{ kind: "file", file: { bytes, uri, mimeType, name } }`
-- `configuration.returnImmediately` is inverted to `configuration.blocking`
+- `configuration` passes through using the spec-shaped fields (`blocking`, `historyLength`, `pushNotificationConfig`, and `acceptedOutputModes`)
 
 For **v1.0**, params pass through unchanged.
 
@@ -124,10 +141,14 @@ This transformation is internal — your application always uses the v1.0-style 
 ```typescript
 interface A2XClientOptions {
   fetch?: typeof globalThis.fetch;     // inject a custom fetch (proxy, retries, logging)
-  headers?: Record<string, string>;    // applied to every request (after auth headers — auth wins on conflict? no, custom headers win)
+  headers?: Record<string, string>;    // applied before auth; auth schemes win on conflicts
   authProvider?: AuthProvider;         // see auth-provider.md
+  extensions?: string[];               // activate A2A extension URIs on every JSON-RPC request
+  x402?: A2XClientX402Options;         // optional transparent payer-side x402 flow
 }
 ```
+
+Register another extension later with `client.registerExtension(uri)` and inspect the current set through `client.activatedExtensions`. When `x402` is configured, the client activates the appropriate x402 extension URI automatically after resolving the card.
 
 **Header precedence** (lowest → highest):
 

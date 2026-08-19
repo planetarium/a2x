@@ -29,12 +29,15 @@ Key API:
 
 ```typescript
 export interface StoredCredential {
-  schemeClass: string;
+  slot: string;
   credential: string;
 }
-export function loadCredentials(agentUrl: string): StoredCredential[] | undefined;
-export function saveCredentials(agentUrl: string, credentials: StoredCredential[]): void;
-export function clearCredentials(agentUrl: string): void;
+export function credentialSlot(groupIndex: number, schemeIndex: number, scheme: AuthScheme): string;
+export function extractCredential(slot: string, scheme: AuthScheme): StoredCredential;
+export function credentialPolicyKey(cardUrl: string, endpoint: string, identityPolicyId: string): string;
+export function loadCredentials(policyKey: string): StoredCredential[] | undefined;
+export function saveCredentials(policyKey: string, credentials: StoredCredential[]): void;
+export function clearCredentials(policyKey: string): void;
 ```
 
 File path: `path.join(os.homedir(), '.<your-cli-name>', 'tokens.json')`.
@@ -48,7 +51,8 @@ See [oauth2-device-code.md](./oauth2-device-code.md). Exports:
 ```typescript
 export async function performDeviceCodeFlow(
   scheme: OAuth2DeviceCodeAuthScheme,
-): Promise<string>;
+  clientId: string,
+): Promise<{ access_token: string; refresh_token?: string; expires_in?: number }>;
 ```
 
 ---
@@ -57,10 +61,13 @@ export async function performDeviceCodeFlow(
 
 See [auth-fallback-chain.md](./auth-fallback-chain.md) for the complete reference. The shortest integration:
 
+Install the masked prompt dependency first: `npm install @inquirer/prompts`.
+
 ```typescript
 import * as readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import chalk from 'chalk';
+import { password } from '@inquirer/prompts';
 import type { AuthProvider } from '@a2x/sdk/client';
 import {
   AuthScheme,
@@ -74,12 +81,22 @@ import {
   OAuth2PasswordAuthScheme,
   OpenIdConnectAuthScheme,
 } from '@a2x/sdk/client';
-import { loadCredentials, saveCredentials, clearCredentials } from './token-store.js';
+import {
+  clearCredentials,
+  credentialSlot,
+  extractCredential,
+  loadCredentials,
+  saveCredentials,
+} from './token-store.js';
 import { performDeviceCodeFlow } from './device-code.js';
 
 async function prompt(q: string): Promise<string> {
   const rl = readline.createInterface({ input, output });
   try { return (await rl.question(q)).trim(); } finally { rl.close(); }
+}
+
+async function promptSecret(message: string): Promise<string> {
+  return (await password({ message, mask: '*' })).trim();
 }
 
 function schemeLabel(scheme: AuthScheme): string {
@@ -97,23 +114,23 @@ function schemeLabel(scheme: AuthScheme): string {
 
 async function resolveScheme(scheme: AuthScheme): Promise<void> {
   if (scheme instanceof ApiKeyAuthScheme) {
-    const key = await prompt(chalk.yellow(`  Enter API key (${scheme.params.name}): `));
+    const key = await promptSecret(`Enter API key (${scheme.params.name})`);
     if (!key) throw new Error('No API key provided');
     scheme.setCredential(key); return;
   }
   if (scheme instanceof HttpBearerAuthScheme) {
-    const token = await prompt(chalk.yellow('  Enter Bearer token: '));
+    const token = await promptSecret('Enter Bearer token');
     if (!token) throw new Error('No token provided');
     scheme.setCredential(token); return;
   }
   if (scheme instanceof HttpBasicAuthScheme) {
-    const cred = await prompt(chalk.yellow('  Enter Basic credentials (base64): '));
+    const cred = await promptSecret('Enter Basic credentials (base64)');
     if (!cred) throw new Error('No credentials provided');
     scheme.setCredential(cred); return;
   }
   if (scheme instanceof OAuth2DeviceCodeAuthScheme) {
-    const token = await performDeviceCodeFlow(scheme);
-    scheme.setCredential(token); return;
+    const tokens = await performDeviceCodeFlow(scheme, process.env.OAUTH_CLIENT_ID!);
+    scheme.setCredential(tokens.access_token); return;
   }
   if (
     scheme instanceof OAuth2AuthorizationCodeAuthScheme ||
@@ -121,89 +138,97 @@ async function resolveScheme(scheme: AuthScheme): Promise<void> {
     scheme instanceof OAuth2ImplicitAuthScheme ||
     scheme instanceof OAuth2PasswordAuthScheme
   ) {
-    const token = await prompt(chalk.yellow('  Enter access token: '));
+    const token = await promptSecret('Enter access token');
     if (!token) throw new Error('No token provided');
     scheme.setCredential(token); return;
   }
   if (scheme instanceof OpenIdConnectAuthScheme) {
-    const token = await prompt(chalk.yellow('  Enter OIDC token: '));
+    const token = await promptSecret('Enter OIDC token');
     if (!token) throw new Error('No token provided');
     scheme.setCredential(token); return;
   }
   throw new Error(`Unsupported auth scheme: ${scheme.constructor.name}`);
 }
 
-function extractCredential(scheme: AuthScheme): { schemeClass: string; credential: string } {
-  const ctx = { headers: {} as Record<string, string>, url: new URL('http://dummy') };
-  scheme.applyToRequest(ctx);
-  let credential = '';
-  if (scheme instanceof ApiKeyAuthScheme) {
-    credential = ctx.headers[scheme.params.name]
-      ?? ctx.url.searchParams.get(scheme.params.name) ?? '';
-  } else {
-    const auth = ctx.headers['Authorization'] ?? '';
-    const spaceIdx = auth.indexOf(' ');
-    credential = spaceIdx >= 0 ? auth.slice(spaceIdx + 1) : auth;
-  }
-  return { schemeClass: scheme.constructor.name, credential };
-}
-
 export class CliAuthProvider implements AuthProvider {
-  constructor(private readonly agentUrl: string) {}
+  private selectedGroupIndex?: number;
+
+  constructor(private readonly policyKey: string) {}
 
   async provide(requirements: AuthScheme[][]): Promise<AuthScheme[]> {
-    const stored = loadCredentials(this.agentUrl);
+    const stored = loadCredentials(this.policyKey);
     if (stored?.length) {
-      for (const group of requirements) {
-        if (this._tryRestore(group, stored)) return group;
+      for (const [groupIndex, group] of requirements.entries()) {
+        if (this._tryRestore(groupIndex, group, stored)) {
+          this.selectedGroupIndex = groupIndex;
+          return group;
+        }
       }
     }
 
     console.log(chalk.magenta.bold('\nAuthentication required by this agent.'));
 
-    let group: AuthScheme[];
+    let groupIndex: number;
     if (requirements.length === 1) {
-      group = requirements[0];
-      console.log(chalk.gray(`  Scheme: ${group.map(schemeLabel).join(' + ')}`));
+      groupIndex = 0;
+      console.log(chalk.gray(`  Scheme: ${requirements[0].map(schemeLabel).join(' + ')}`));
     } else {
       console.log(chalk.gray('  Available authentication methods:'));
       requirements.forEach((g, i) =>
         console.log(chalk.gray(`    ${i + 1}. ${g.map(schemeLabel).join(' + ')}`)));
       const choice = await prompt(chalk.yellow(`  Select method (1-${requirements.length}): `));
-      const idx = parseInt(choice, 10) - 1;
-      if (isNaN(idx) || idx < 0 || idx >= requirements.length) throw new Error('Invalid selection');
-      group = requirements[idx];
+      groupIndex = parseInt(choice, 10) - 1;
+      if (isNaN(groupIndex) || groupIndex < 0 || groupIndex >= requirements.length) {
+        throw new Error('Invalid selection');
+      }
     }
 
+    const group = requirements[groupIndex];
     for (const scheme of group) await resolveScheme(scheme);
     console.log('');
-    this._save(group);
+    this.selectedGroupIndex = groupIndex;
+    this._save(groupIndex, group);
     return group;
   }
 
   async refresh(schemes: AuthScheme[]): Promise<AuthScheme[]> {
-    clearCredentials(this.agentUrl);
+    if (this.selectedGroupIndex === undefined) {
+      throw new Error('Cannot refresh before selecting an auth group');
+    }
+    clearCredentials(this.policyKey);
     console.log(chalk.magenta.bold('\nAuthentication expired. Please re-authenticate.'));
     for (const scheme of schemes) await resolveScheme(scheme);
     console.log('');
-    this._save(schemes);
+    this._save(this.selectedGroupIndex, schemes);
     return schemes;
   }
 
-  private _tryRestore(group: AuthScheme[], stored: { schemeClass: string; credential: string }[]) {
-    for (const scheme of group) {
-      const match = stored.find(s => s.schemeClass === scheme.constructor.name);
+  private _tryRestore(
+    groupIndex: number,
+    group: AuthScheme[],
+    stored: { slot: string; credential: string }[],
+  ) {
+    for (const [schemeIndex, scheme] of group.entries()) {
+      const slot = credentialSlot(groupIndex, schemeIndex, scheme);
+      const match = stored.find(s => s.slot === slot);
       if (!match) return false;
       scheme.setCredential(match.credential);
     }
     return true;
   }
 
-  private _save(group: AuthScheme[]) {
-    saveCredentials(this.agentUrl, group.map(extractCredential));
+  private _save(groupIndex: number, group: AuthScheme[]) {
+    saveCredentials(
+      this.policyKey,
+      group.map((scheme, schemeIndex) =>
+        extractCredential(credentialSlot(groupIndex, schemeIndex, scheme), scheme),
+      ),
+    );
   }
 }
 ```
+
+Keep `readline` for the non-secret method menu only. Never fall back to echoed secret input on a non-interactive stdin; accept secrets through a protected environment, file descriptor, or credential store instead.
 
 ---
 
@@ -212,11 +237,16 @@ export class CliAuthProvider implements AuthProvider {
 ```typescript
 import { Command } from 'commander';
 import crypto from 'node:crypto';
-import { A2XClient } from '@a2x/sdk/client';
+import {
+  A2XClient,
+  getAgentEndpointUrl,
+  resolveAgentCard,
+} from '@a2x/sdk/client';
 import type { SendMessageParams } from '@a2x/sdk';
 import { CliAuthProvider } from '../cli-auth-provider.js';
+import { credentialPolicyKey } from '../token-store.js';
 
-function parseHeaders(headerArgs?: string[]): Record<string, string> | undefined {
+export function parseHeaders(headerArgs?: string[]): Record<string, string> | undefined {
   if (!headerArgs?.length) return undefined;
   const headers: Record<string, string> = {};
   for (const h of headerArgs) {
@@ -226,16 +256,48 @@ function parseHeaders(headerArgs?: string[]): Record<string, string> | undefined
   return Object.keys(headers).length > 0 ? headers : undefined;
 }
 
+export function requireJsonRpcEndpoint(
+  card: unknown,
+  version: '0.3' | '1.0',
+): string {
+  if (version === '1.0') {
+    const interfaces = (card as {
+      supportedInterfaces?: Array<{ url: string; protocolBinding?: string }>;
+    }).supportedInterfaces ?? [];
+    const jsonRpc = interfaces.find(entry =>
+      entry.protocolBinding?.toUpperCase() === 'JSONRPC'
+    );
+    if (!jsonRpc) throw new Error('AgentCard has no JSON-RPC interface');
+    return jsonRpc.url;
+  }
+  return getAgentEndpointUrl(card as Parameters<typeof getAgentEndpointUrl>[0], version);
+}
+
 export const sendCommand = new Command('send')
   .description('Send a message to an A2A agent (blocking)')
-  .argument('<url>', 'Agent base URL')
+  .argument('<url>', 'Approved AgentCard document URL')
   .argument('<message>', 'Message text')
   .option('--context-id <id>')
   .option('-H, --header <header...>')
   .action(async (url: string, message: string, opts: { contextId?: string; header?: string[] }) => {
-    const client = new A2XClient(url, {
-      headers: parseHeaders(opts.header),
-      authProvider: new CliAuthProvider(url),
+    const headers = parseHeaders(opts.header);
+    const noRedirectFetch: typeof fetch = (input, init) =>
+      fetch(input, { ...init, redirect: 'error' });
+    const resolved = await resolveAgentCard(url, { headers, fetch: noRedirectFetch });
+    const endpoint = requireJsonRpcEndpoint(resolved.card, resolved.version);
+    if (
+      url !== process.env.A2X_APPROVED_AGENT_CARD_URL ||
+      endpoint !== process.env.A2X_APPROVED_AGENT_ENDPOINT
+    ) {
+      throw new Error('Agent card or endpoint is outside the credential policy');
+    }
+    const identityPolicyId = process.env.A2X_CREDENTIAL_POLICY_ID;
+    if (!identityPolicyId) throw new Error('A2X_CREDENTIAL_POLICY_ID is required');
+    const policyKey = credentialPolicyKey(url, endpoint, identityPolicyId);
+    const client = new A2XClient(resolved.card, {
+      headers,
+      fetch: noRedirectFetch,
+      authProvider: new CliAuthProvider(policyKey),
     });
 
     const params: SendMessageParams = {
@@ -250,8 +312,15 @@ export const sendCommand = new Command('send')
     const task = await client.sendMessage(params);
     // pretty-print task — see packages/cli/src/format.ts for a full implementation
     console.log(JSON.stringify(task, null, 2));
-  });
+});
 ```
+
+The credential-bearing commands intentionally refuse arbitrary URLs.
+`A2X_APPROVED_AGENT_CARD_URL` and `A2X_APPROVED_AGENT_ENDPOINT` must be exact,
+credential-free deployment-policy URLs, while `A2X_CREDENTIAL_POLICY_ID` binds
+the approved issuer/client/audience/scope policy version. If your CLI must call
+an arbitrary URL, disable automatic credential restoration and OAuth there;
+prompt for a credential explicitly scoped to the newly verified endpoint.
 
 ---
 
@@ -260,20 +329,41 @@ export const sendCommand = new Command('send')
 ```typescript
 import { Command } from 'commander';
 import crypto from 'node:crypto';
-import { A2XClient } from '@a2x/sdk/client';
+import {
+  A2XClient,
+  getAgentEndpointUrl,
+  resolveAgentCard,
+} from '@a2x/sdk/client';
 import type { SendMessageParams } from '@a2x/sdk';
 import { CliAuthProvider } from '../cli-auth-provider.js';
+import { parseHeaders, requireJsonRpcEndpoint } from './send.js';
+import { credentialPolicyKey } from '../token-store.js';
 
 export const streamCommand = new Command('stream')
   .description('Send a message and stream the response')
-  .argument('<url>')
+  .argument('<url>', 'Approved AgentCard document URL')
   .argument('<message>')
   .option('--context-id <id>')
   .option('-H, --header <header...>')
   .action(async (url: string, message: string, opts: { contextId?: string; header?: string[] }) => {
-    const client = new A2XClient(url, {
-      headers: parseHeaders(opts.header),
-      authProvider: new CliAuthProvider(url),
+    const headers = parseHeaders(opts.header);
+    const noRedirectFetch: typeof fetch = (input, init) =>
+      fetch(input, { ...init, redirect: 'error' });
+    const resolved = await resolveAgentCard(url, { headers, fetch: noRedirectFetch });
+    const endpoint = requireJsonRpcEndpoint(resolved.card, resolved.version);
+    if (
+      url !== process.env.A2X_APPROVED_AGENT_CARD_URL ||
+      endpoint !== process.env.A2X_APPROVED_AGENT_ENDPOINT
+    ) {
+      throw new Error('Agent card or endpoint is outside the credential policy');
+    }
+    const identityPolicyId = process.env.A2X_CREDENTIAL_POLICY_ID;
+    if (!identityPolicyId) throw new Error('A2X_CREDENTIAL_POLICY_ID is required');
+    const policyKey = credentialPolicyKey(url, endpoint, identityPolicyId);
+    const client = new A2XClient(resolved.card, {
+      headers,
+      fetch: noRedirectFetch,
+      authProvider: new CliAuthProvider(policyKey),
     });
 
     const params: SendMessageParams = {
@@ -332,6 +422,7 @@ program.parse();
   "bin": { "my-cli": "./dist/index.js" },
   "dependencies": {
     "@a2x/sdk": "latest",
+    "@inquirer/prompts": "latest",
     "chalk": "^5",
     "commander": "^12"
   },
@@ -349,7 +440,7 @@ program.parse();
 
 1. Run against an unauthenticated agent — no prompting should happen.
 2. Run against an agent with `{ apiKey: [] }` — first run prompts, second run reads from store.
-3. Manually break the stored credential (edit `~/.<your-cli>/tokens.json`) — the next run should hit 401 and re-prompt via `refresh()`.
+3. Manually break the stored credential (edit `~/.<your-cli>/tokens.json`) and have the test agent return `auth-required` — the next run should re-prompt via `refresh()`.
 4. Run against an agent with OAuth2 device code — confirm the verification URL and polling behavior.
 5. Run against an agent with multiple auth groups — confirm the menu works and your choice persists.
 
