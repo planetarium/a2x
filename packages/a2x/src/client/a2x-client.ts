@@ -1148,8 +1148,8 @@ export class A2XClient {
     if (!this._resolvedSchemes) return;
     replaceHeaderBag(ctx.headers, normalizeHeaderBag(ctx.headers));
     for (const scheme of this._resolvedSchemes) {
-      // Preserve the complete context custom schemes historically received,
-      // then collapse case variants after their reads/writes/deletes.
+      // Give each scheme the current case-normalized headers, then normalize
+      // its reads/writes/deletes before applying the next scheme.
       const nextHeaders = { ...ctx.headers };
       scheme.applyToRequest({ headers: nextHeaders, url: ctx.url });
       replaceHeaderBag(ctx.headers, normalizeHeaderBag(nextHeaders));

@@ -14,6 +14,7 @@ import { normalizeScheme, normalizeRequirements } from '../client/auth-normalize
 import type { AuthProvider } from '../client/auth-provider.js';
 import type { AgentCardV03, AgentCardV10 } from '../types/agent-card.js';
 import type { SecuritySchemeV03, SecuritySchemeV10 } from '../types/security.js';
+import { InvalidAgentResponseError } from '../types/errors.js';
 import { TaskState } from '../types/task.js';
 
 // ─── Test Fixtures ───
@@ -687,9 +688,10 @@ describe('normalizeRequirements', () => {
       manySchemes[name] = schemes.oauth!;
     }
 
-    expect(() => normalizeRequirements([requirement], manySchemes)).toThrow(
-      'more than 256 authentication alternatives',
-    );
+    expect(() => normalizeRequirements([requirement], manySchemes))
+      .toThrow(InvalidAgentResponseError);
+    expect(() => normalizeRequirements([requirement], manySchemes))
+      .toThrow('more than 256 authentication alternatives');
   });
 
   it('preserves requirement-specific OpenID Connect scopes', () => {

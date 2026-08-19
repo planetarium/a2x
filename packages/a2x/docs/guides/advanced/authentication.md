@@ -239,7 +239,7 @@ const authProvider: AuthProvider = {
 accept only a case-insensitive `Bearer` token type before returning the access
 token.
 
-An explicitly empty security requirement (`{}`) is an anonymous alternative, so the client skips the provider. A non-empty alternative is omitted as a whole if any named scheme is absent, unsupported, or would overwrite another scheme's HTTP credential destination. Distinct cookie API keys compose. Expansion is capped at 256 alternatives to reject malicious combinatorial cards; when no supported non-empty alternative remains, a configured provider fails before the request is sent.
+An explicitly empty security requirement (`{}`) is an anonymous alternative, so the client skips the provider. A non-empty alternative is omitted as a whole if any named scheme is absent, unsupported, or would overwrite another scheme's HTTP credential destination. Distinct cookie API keys compose. Expansion is capped at 256 alternatives to reject malicious combinatorial cards; malformed requirement shapes, non-string scope lists, and cap violations throw `InvalidAgentResponseError` before the provider or transport runs. When no supported non-empty alternative remains, a configured provider fails before the request is sent.
 
 On a v1.0 AgentCard, each security requirement value uses the canonical protobuf JSON wrapper `{ list: string[] }`. The client also accepts the legacy a2x `{ values: string[] }` spelling when reading older cards, but newly generated cards always emit `list`.
 

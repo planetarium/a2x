@@ -10,6 +10,7 @@ import type {
   SecuritySchemeV10,
   SecurityRequirement,
 } from '../types/security.js';
+import { InvalidAgentResponseError } from '../types/errors.js';
 import {
   AuthScheme,
   ApiKeyAuthScheme,
@@ -88,7 +89,7 @@ export function normalizeRequirements(
     const entries = Object.entries(requirement);
     if (entries.length === 0) {
       if (result.length >= MAX_NORMALIZED_AUTH_GROUPS) {
-        throw new RangeError(
+        throw new InvalidAgentResponseError(
           `AgentCard expands to more than ${MAX_NORMALIZED_AUTH_GROUPS} authentication alternatives`,
         );
       }
@@ -119,7 +120,7 @@ export function normalizeRequirements(
           (MAX_NORMALIZED_AUTH_GROUPS - result.length) / classes.length,
         )
       ) {
-        throw new RangeError(
+        throw new InvalidAgentResponseError(
           `AgentCard expands to more than ${MAX_NORMALIZED_AUTH_GROUPS} authentication alternatives`,
         );
       }
