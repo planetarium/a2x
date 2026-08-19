@@ -172,35 +172,66 @@ The streaming counterpart buffers the first event: when it observes `auth-requir
 
 ### Static headers
 
-For API keys and bearer tokens, pass them as headers on the client:
+Use an `AuthProvider` for credentials owned by a declared security scheme. It receives OR-of-AND requirement groups and must return one complete group after setting every credential:
 
 ```ts
-const client = new A2XClient(url, {
-  auth: { apiKey: 'your-secret-key' },
-});
+import {
+  A2XClient,
+  ApiKeyAuthScheme,
+  type AuthProvider,
+  type AuthScheme,
+} from '@a2x/sdk/client';
+
+const authProvider: AuthProvider = {
+  async provide(requirements: AuthScheme[][]) {
+    const group = requirements.find(group =>
+      group.length === 1 && group[0] instanceof ApiKeyAuthScheme
+    );
+    if (!group) throw new Error('No supported authentication alternative');
+    group[0]!.setCredential(process.env.AGENT_API_KEY!);
+    return group;
+  },
+};
+
+const client = new A2XClient(url, { authProvider });
 ```
 
 ### OAuth flows
 
-`AuthenticatedA2AClient` (exported from `@a2x/sdk/auth`) wraps `A2XClient` and adds token acquisition/refresh. For Device Code specifically:
+OAuth scheme classes expose two distinct scope fields:
+
+- `params.scopes` is the flow's advertised scope-description map.
+- `params.requiredScopes` is the exact scope list from the selected security requirement.
+
+Providers should reject missing or unknown `requiredScopes`, intersect that list with host policy, and request only those scopes. Do not request every key in `params.scopes`, and do not trust OAuth endpoints or scopes merely because an AgentCard advertised them.
+
+The client expands OAuth flows into requirement alternatives but does not run an OAuth grant. Acquire a token in your `AuthProvider`, then set it on the supplied scheme:
 
 ```ts
-import { DeviceFlowClient } from '@a2x/sdk/auth';
+import {
+  OAuth2DeviceCodeAuthScheme,
+  type AuthProvider,
+} from '@a2x/sdk/client';
 
-const flow = new DeviceFlowClient({
-  deviceAuthorizationUrl: 'https://auth.example.com/device/code',
-  tokenUrl: 'https://auth.example.com/token',
-  clientId: 'your-client-id',
-  scopes: ['api'],
-});
-
-const { userCode, verificationUri } = await flow.start();
-console.log(`Go to ${verificationUri} and enter code: ${userCode}`);
-
-const tokens = await flow.pollForTokens();
+const authProvider: AuthProvider = {
+  async provide(requirements) {
+    const group = requirements.find(group =>
+      group.length === 1 && group[0] instanceof OAuth2DeviceCodeAuthScheme
+    );
+    if (!group) throw new Error('Device code is not an available alternative');
+    const scheme = group[0] as OAuth2DeviceCodeAuthScheme;
+    const token = await runHostApprovedDeviceFlow({
+      deviceAuthorizationUrl: scheme.params.deviceAuthorizationUrl,
+      tokenUrl: scheme.params.tokenUrl,
+      scopes: scheme.params.requiredScopes,
+    });
+    scheme.setCredential(token.accessToken);
+    return group;
+  },
+};
 ```
 
-Use the returned `access_token` as the bearer on subsequent `A2XClient` calls.
+An explicitly empty security requirement (`{}`) is an anonymous alternative, so the client skips the provider. A non-empty alternative is omitted as a whole if any named scheme is absent or unsupported; when no supported non-empty alternative remains, a configured provider fails before the request is sent.
 
 ## Exposing an authenticated extended AgentCard
 

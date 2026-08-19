@@ -413,12 +413,12 @@ describe('normalizeRequirements', () => {
           deviceCode: {
             deviceAuthorizationUrl: 'http://auth/device',
             tokenUrl: 'http://auth/token',
-            scopes: {},
+            scopes: { invoke: 'Invoke the agent' },
           },
           authorizationCode: {
             authorizationUrl: 'http://auth/authorize',
             tokenUrl: 'http://auth/token',
-            scopes: {},
+            scopes: { invoke: 'Invoke the agent' },
           },
         },
       },
@@ -456,6 +456,12 @@ describe('normalizeRequirements', () => {
     expect(result[0][0]).toBeInstanceOf(OAuth2DeviceCodeAuthScheme);
     expect(result[1]).toHaveLength(1);
     expect(result[1][0]).toBeInstanceOf(OAuth2AuthorizationCodeAuthScheme);
+    expect(
+      (result[0][0] as OAuth2DeviceCodeAuthScheme).params.requiredScopes,
+    ).toEqual(['invoke']);
+    expect(
+      (result[1][0] as OAuth2AuthorizationCodeAuthScheme).params.requiredScopes,
+    ).toEqual(['invoke']);
   });
 
   it('combines AND schemes with OAuth2 flow expansion', () => {
@@ -472,12 +478,34 @@ describe('normalizeRequirements', () => {
     expect(result[1][1]).toBeInstanceOf(OAuth2AuthorizationCodeAuthScheme);
   });
 
-  it('skips unknown scheme names', () => {
+  it('rejects a non-empty requirement containing an unknown scheme', () => {
     const requirements = [{ unknown: [] as string[] }];
     const result = normalizeRequirements(requirements, schemes);
 
-    expect(result).toHaveLength(1);
-    expect(result[0]).toHaveLength(0);
+    expect(result).toEqual([]);
+  });
+
+  it('rejects an entire AND requirement when one scheme is unsupported', () => {
+    const requirements = [{ apiKey: [] as string[], unknown: [] as string[] }];
+    const result = normalizeRequirements(requirements, schemes);
+
+    expect(result).toEqual([]);
+  });
+
+  it('preserves an explicitly empty anonymous requirement', () => {
+    const result = normalizeRequirements([{}], schemes);
+
+    expect(result).toEqual([[]]);
+  });
+
+  it('forms the Cartesian product of multiple multi-flow AND schemes', () => {
+    const result = normalizeRequirements(
+      [{ oauth: ['invoke'], secondOAuth: ['invoke'] }],
+      { ...schemes, secondOAuth: schemes.oauth! },
+    );
+
+    expect(result).toHaveLength(4);
+    expect(result.every((group) => group.length === 2)).toBe(true);
   });
 
   it('returns empty for empty requirements', () => {
@@ -579,6 +607,40 @@ describe('A2XClient auth integration', () => {
     expect(headers.authorization).toBeUndefined();
   });
 
+  it('preserves the built request context for custom auth schemes', async () => {
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      headers: { Cookie: 'session=caller' },
+      authProvider: {
+        async provide(requirements) {
+          const group = requirements.find(
+            (candidate) => candidate[0] instanceof ApiKeyAuthScheme,
+          )!;
+          group[0]!.applyToRequest = (ctx) => {
+            ctx.headers['X-Context-Signature'] = [
+              ctx.headers['Content-Type'],
+              ctx.headers.Cookie,
+              ctx.url.pathname,
+            ].join('|');
+            ctx.headers.Cookie = `${ctx.headers.Cookie}; auth=provider`;
+          };
+          return group;
+        },
+      },
+    });
+
+    await client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    });
+
+    const headers = mockFetch.mock.calls[0]![1].headers as Record<string, string>;
+    expect(headers['X-Context-Signature']).toBe(
+      'application/json|session=caller|/a2a',
+    );
+    expect(headers.Cookie).toBe('session=caller; auth=provider');
+  });
+
   it('does not call authProvider when no security requirements', async () => {
     const cardWithoutAuth: AgentCardV10 = {
       ...V10_CARD_WITH_AUTH,
@@ -599,6 +661,51 @@ describe('A2XClient auth integration', () => {
     });
 
     expect(provide).not.toHaveBeenCalled();
+  });
+
+  it('does not call authProvider when anonymous access is an explicit alternative', async () => {
+    const anonymousCard: AgentCardV10 = {
+      ...V10_CARD_WITH_AUTH,
+      securityRequirements: [{ apiKey: [] }, {}],
+    };
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const provide = vi.fn();
+    const client = new A2XClient(anonymousCard, {
+      fetch: mockFetch,
+      authProvider: { provide },
+    });
+
+    await client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    });
+
+    expect(provide).not.toHaveBeenCalled();
+    const headers = mockFetch.mock.calls[0]![1].headers as Record<string, string>;
+    expect(headers['x-api-key']).toBeUndefined();
+  });
+
+  it('fails before sending when every non-empty auth requirement is unsupported', async () => {
+    const unsupportedCard: AgentCardV10 = {
+      ...V10_CARD_WITH_AUTH,
+      securitySchemes: {
+        mtls: { mtlsSecurityScheme: {} },
+      },
+      securityRequirements: [{ mtls: [] }],
+    };
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const provide = vi.fn();
+    const client = new A2XClient(unsupportedCard, {
+      fetch: mockFetch,
+      authProvider: { provide },
+    });
+
+    await expect(
+      client.sendMessage({
+        message: { role: 'user', parts: [{ text: 'Hello' }] },
+      }),
+    ).rejects.toThrow('none of its security requirements are supported');
+    expect(provide).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it('works without authProvider (public agents)', async () => {

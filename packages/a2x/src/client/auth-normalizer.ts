@@ -29,8 +29,10 @@ import {
  * Normalize agent card securityRequirements + securitySchemes
  * into AuthScheme[][] (outer: OR, inner: AND).
  *
- * OAuth2 schemes with multiple flows are expanded into
- * separate OR groups, each containing a single flow class.
+ * OAuth2 schemes with multiple flows are expanded into separate OR groups.
+ * A non-empty requirement is discarded as a whole when any named scheme is
+ * absent or unsupported; an explicitly empty requirement remains an
+ * anonymous alternative.
  */
 export function normalizeRequirements(
   requirements: SecurityRequirement[],
@@ -39,32 +41,35 @@ export function normalizeRequirements(
   const result: AuthScheme[][] = [];
 
   for (const requirement of requirements) {
-    const schemeNames = Object.keys(requirement);
-    const nonOAuth2Schemes: AuthScheme[] = [];
-    const oAuth2FlowGroups: AuthScheme[][] = [];
+    const entries = Object.entries(requirement);
+    if (entries.length === 0) {
+      result.push([]);
+      continue;
+    }
 
-    for (const schemeName of schemeNames) {
+    // Each named scheme is an AND slot. A slot may normalize to multiple
+    // OAuth flows, so form the Cartesian product of those alternatives.
+    let groups: AuthScheme[][] = [[]];
+    let supported = true;
+    for (const [schemeName, requiredScopes] of entries) {
       const raw = schemes[schemeName];
-      if (!raw) continue;
-
-      const classes = normalizeScheme(raw);
-
-      if (classes.length > 1) {
-        // OAuth2 with multiple flows — each flow becomes a separate OR group
-        oAuth2FlowGroups.push(...classes.map((cls) => [cls]));
-      } else if (classes.length === 1) {
-        nonOAuth2Schemes.push(classes[0]);
+      if (!raw) {
+        supported = false;
+        break;
       }
+
+      const classes = normalizeScheme(raw, requiredScopes);
+      if (classes.length === 0) {
+        supported = false;
+        break;
+      }
+
+      groups = groups.flatMap((group) =>
+        classes.map((scheme) => [...group, scheme]),
+      );
     }
 
-    if (oAuth2FlowGroups.length > 0) {
-      // Combine non-OAuth2 AND schemes with each OAuth2 flow as separate OR groups
-      for (const flowGroup of oAuth2FlowGroups) {
-        result.push([...nonOAuth2Schemes, ...flowGroup]);
-      }
-    } else {
-      result.push(nonOAuth2Schemes);
-    }
+    if (supported) result.push(...groups);
   }
 
   return result;
@@ -78,17 +83,21 @@ export function normalizeRequirements(
  */
 export function normalizeScheme(
   raw: SecuritySchemeV03 | SecuritySchemeV10,
+  requiredScopes?: readonly string[],
 ): AuthScheme[] {
   // v0.3: has a `type` field directly
   if ('type' in raw) {
-    return normalizeV03Scheme(raw as SecuritySchemeV03);
+    return normalizeV03Scheme(raw as SecuritySchemeV03, requiredScopes);
   }
 
   // v1.0: has nested scheme objects
-  return normalizeV10Scheme(raw as SecuritySchemeV10);
+  return normalizeV10Scheme(raw as SecuritySchemeV10, requiredScopes);
 }
 
-function normalizeV03Scheme(scheme: SecuritySchemeV03): AuthScheme[] {
+function normalizeV03Scheme(
+  scheme: SecuritySchemeV03,
+  requiredScopes?: readonly string[],
+): AuthScheme[] {
   switch (scheme.type) {
     case 'apiKey':
       return [
@@ -108,7 +117,7 @@ function normalizeV03Scheme(scheme: SecuritySchemeV03): AuthScheme[] {
       return [];
 
     case 'oauth2':
-      return normalizeOAuth2FlowsV03(scheme.flows);
+      return normalizeOAuth2FlowsV03(scheme.flows, requiredScopes);
 
     case 'openIdConnect':
       return [new OpenIdConnectAuthScheme(scheme.openIdConnectUrl)];
@@ -122,7 +131,10 @@ function normalizeV03Scheme(scheme: SecuritySchemeV03): AuthScheme[] {
   }
 }
 
-function normalizeV10Scheme(scheme: SecuritySchemeV10): AuthScheme[] {
+function normalizeV10Scheme(
+  scheme: SecuritySchemeV10,
+  requiredScopes?: readonly string[],
+): AuthScheme[] {
   if (scheme.apiKeySecurityScheme) {
     const s = scheme.apiKeySecurityScheme;
     return [
@@ -145,7 +157,10 @@ function normalizeV10Scheme(scheme: SecuritySchemeV10): AuthScheme[] {
   }
 
   if (scheme.oauth2SecurityScheme) {
-    return normalizeOAuth2FlowsV10(scheme.oauth2SecurityScheme.flows);
+    return normalizeOAuth2FlowsV10(
+      scheme.oauth2SecurityScheme.flows,
+      requiredScopes,
+    );
   }
 
   if (scheme.openIdConnectSecurityScheme) {
@@ -168,6 +183,7 @@ function normalizeV10Scheme(scheme: SecuritySchemeV10): AuthScheme[] {
 
 function normalizeOAuth2FlowsV03(
   flows: NonNullable<Extract<SecuritySchemeV03, { type: 'oauth2' }>['flows']>,
+  requiredScopes?: readonly string[],
 ): AuthScheme[] {
   const result: AuthScheme[] = [];
 
@@ -180,6 +196,7 @@ function normalizeOAuth2FlowsV03(
         flows.deviceCode.tokenUrl,
         flows.deviceCode.scopes ?? {},
         flows.deviceCode.refreshUrl,
+        requiredScopes,
       ),
     );
   }
@@ -191,6 +208,8 @@ function normalizeOAuth2FlowsV03(
         flows.authorizationCode.tokenUrl,
         flows.authorizationCode.scopes ?? {},
         flows.authorizationCode.refreshUrl,
+        undefined,
+        requiredScopes,
       ),
     );
   }
@@ -201,6 +220,7 @@ function normalizeOAuth2FlowsV03(
         flows.clientCredentials.tokenUrl,
         flows.clientCredentials.scopes ?? {},
         flows.clientCredentials.refreshUrl,
+        requiredScopes,
       ),
     );
   }
@@ -211,6 +231,7 @@ function normalizeOAuth2FlowsV03(
         flows.implicit.authorizationUrl,
         flows.implicit.scopes ?? {},
         flows.implicit.refreshUrl,
+        requiredScopes,
       ),
     );
   }
@@ -221,6 +242,7 @@ function normalizeOAuth2FlowsV03(
         flows.password.tokenUrl,
         flows.password.scopes ?? {},
         flows.password.refreshUrl,
+        requiredScopes,
       ),
     );
   }
@@ -230,6 +252,7 @@ function normalizeOAuth2FlowsV03(
 
 function normalizeOAuth2FlowsV10(
   flows: NonNullable<SecuritySchemeV10['oauth2SecurityScheme']>['flows'],
+  requiredScopes?: readonly string[],
 ): AuthScheme[] {
   const result: AuthScheme[] = [];
 
@@ -240,6 +263,7 @@ function normalizeOAuth2FlowsV10(
         flows.deviceCode.tokenUrl,
         flows.deviceCode.scopes ?? {},
         flows.deviceCode.refreshUrl,
+        requiredScopes,
       ),
     );
   }
@@ -252,6 +276,7 @@ function normalizeOAuth2FlowsV10(
         flows.authorizationCode.scopes ?? {},
         flows.authorizationCode.refreshUrl,
         flows.authorizationCode.pkceRequired,
+        requiredScopes,
       ),
     );
   }
@@ -262,6 +287,7 @@ function normalizeOAuth2FlowsV10(
         flows.clientCredentials.tokenUrl,
         flows.clientCredentials.scopes ?? {},
         flows.clientCredentials.refreshUrl,
+        requiredScopes,
       ),
     );
   }
@@ -272,6 +298,7 @@ function normalizeOAuth2FlowsV10(
         flows.implicit.authorizationUrl,
         flows.implicit.scopes ?? {},
         flows.implicit.refreshUrl,
+        requiredScopes,
       ),
     );
   }
@@ -282,6 +309,7 @@ function normalizeOAuth2FlowsV10(
         flows.password.tokenUrl,
         flows.password.scopes ?? {},
         flows.password.refreshUrl,
+        requiredScopes,
       ),
     );
   }

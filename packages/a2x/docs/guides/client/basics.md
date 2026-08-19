@@ -27,6 +27,8 @@ const client = new A2XClient(cardUrl, {
 
 Resolved authentication schemes are applied after custom headers and replace a custom header with the same case-insensitive name. This prevents values such as `authorization` and `Authorization` from being combined by Fetch. Do not use `headers` to compete with a header owned by the selected auth scheme; put that credential in the `AuthProvider` instead.
 
+A custom `AuthScheme.applyToRequest()` still receives the complete built request context, including static and protocol headers, so it can compute request signatures or augment cookies. After each scheme runs, the client collapses any remaining case-variant header names so later schemes and Fetch see one value.
+
 ## Send a message
 
 ```ts

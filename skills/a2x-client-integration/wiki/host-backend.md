@@ -66,9 +66,17 @@ const ALLOWED_OAUTH_SCOPES = new Set(
   (process.env.OAUTH_ALLOWED_SCOPES ?? '').split(/\s+/).filter(Boolean),
 );
 
-function approvedScope(scopes: Record<string, string>): string {
-  const requested = Object.keys(scopes);
-  const rejected = requested.filter(scope => !ALLOWED_OAUTH_SCOPES.has(scope));
+function approvedScope(
+  advertised: Record<string, string>,
+  required: readonly string[] | undefined,
+): string {
+  if (!required) {
+    throw new Error('OAuth requirement omitted requiredScopes');
+  }
+  const requested = [...new Set(required)];
+  const rejected = requested.filter(scope =>
+    !(scope in advertised) || !ALLOWED_OAUTH_SCOPES.has(scope)
+  );
   if (rejected.length) {
     throw new Error(`Refusing unapproved OAuth scopes: ${rejected.join(', ')}`);
   }
@@ -85,6 +93,13 @@ function assertGrantedScope(granted?: string): void {
     throw new Error(`Token granted unapproved scopes: ${rejected.join(', ')}`);
   }
 }
+
+// Implement with trusted JWT verification or token introspection. Never use
+// decode-only JWT claims for this check.
+declare function assertTokenAudience(
+  token: string,
+  expectedAudience: string,
+): Promise<void>;
 
 function apiKeySlot(scheme: ApiKeyAuthScheme): string {
   const name = scheme.params.location === 'header'
@@ -152,11 +167,15 @@ async function exchangeClientCredentials(
 ): Promise<string | undefined> {
   const clientId = process.env.OAUTH_CLIENT_ID;
   const clientSecret = process.env.OAUTH_CLIENT_SECRET;
-  if (!clientId || !clientSecret) return undefined;
+  const expectedAudience = process.env.OAUTH_EXPECTED_AUDIENCE;
+  if (!clientId || !clientSecret || !expectedAudience) return undefined;
 
   // Agent-card discovery is not a trust decision. Validate before sending secrets.
   const tokenUrl = trustedOAuthEndpoint(scheme.params.tokenUrl, 'token endpoint');
-  const scope = approvedScope(scheme.params.scopes);
+  const scope = approvedScope(
+    scheme.params.scopes,
+    scheme.params.requiredScopes,
+  );
   const res = await fetch(tokenUrl, {
     method: 'POST',
     redirect: 'error',
@@ -171,11 +190,13 @@ async function exchangeClientCredentials(
   if (!res.ok) return undefined;
   const data = (await res.json()) as { access_token?: string; scope?: string };
   assertGrantedScope(data.scope);
+  if (!data.access_token) return undefined;
+  await assertTokenAudience(data.access_token, expectedAudience);
   return data.access_token;
 }
 ```
 
-Configure exact `OAUTH_TOKEN_ENDPOINTS` and `OAUTH_ALLOWED_SCOPES` from deployment policy; do not derive either from the agent card. In multi-agent or multi-tenant hosts, key that policy by agent, issuer, client identity, and expected audience/resource. Add an explicit development-only exception if local HTTP identity infrastructure is unavoidable. Redirects are rejected because an otherwise trusted endpoint could redirect the client secret elsewhere.
+Configure exact `OAUTH_TOKEN_ENDPOINTS` and `OAUTH_ALLOWED_SCOPES` from deployment policy; do not derive either from the agent card. `params.scopes` is only the advertised catalogue, while `params.requiredScopes` is the selected requirement: request only the latter and reject a required value absent from either the catalogue or host allowlist. In multi-agent or multi-tenant hosts, bind one provider and token cache to the exact `(card URL, resolved agent endpoint, issuer/token endpoint, client identity, expected audience/resource, required scopes)` tuple. Verify the token audience/resource (cryptographically or through trusted introspection) before attaching it. Add an explicit development-only exception if local HTTP identity infrastructure is unavoidable. Redirects are rejected because an otherwise trusted endpoint could redirect the client secret elsewhere.
 
 API-key slots are keyed by placement and name because a valid AND group can require several distinct API keys. Add every expected slot to `API_KEY_ENV_BY_SLOT`; do not reuse one environment variable for the whole class.
 
@@ -183,19 +204,61 @@ API-key slots are keyed by placement and name because a valid AND group can requ
 
 ## Client Lifetime
 
-A long-lived backend should create the client **once** at startup and reuse it:
+A long-lived backend should create the client **once** at startup, after binding discovery to the exact endpoint in host policy, and reuse it:
 
 ```typescript
 // src/agents/my-agent-client.ts
-import { A2XClient } from '@a2x/sdk/client';
+import {
+  A2XClient,
+  getAgentEndpointUrl,
+  resolveAgentCard,
+} from '@a2x/sdk/client';
 import { EnvAuthProvider } from './env-auth-provider.js';
 
-export const myAgentClient = new A2XClient(process.env.AGENT_URL!, {
-  authProvider: new EnvAuthProvider(),
-});
+function exactHttpsUrl(raw: string | undefined, label: string): string {
+  if (!raw) throw new Error(`${label} is required`);
+  const url = new URL(raw);
+  if (url.protocol !== 'https:' || url.username || url.password || url.hash) {
+    throw new Error(`${label} must be an exact credential-free HTTPS URL`);
+  }
+  return url.toString();
+}
+
+const AGENT_CARD_URL = exactHttpsUrl(
+  process.env.AGENT_CARD_URL,
+  'AGENT_CARD_URL',
+);
+const EXPECTED_AGENT_ENDPOINT = exactHttpsUrl(
+  process.env.AGENT_ENDPOINT_URL,
+  'AGENT_ENDPOINT_URL',
+);
+const noRedirectFetch: typeof fetch = (input, init) =>
+  fetch(input, { ...init, redirect: 'error' });
+
+async function createMyAgentClient(): Promise<A2XClient> {
+  const resolved = await resolveAgentCard(AGENT_CARD_URL, {
+    fetch: noRedirectFetch,
+  });
+  const endpoint = exactHttpsUrl(
+    getAgentEndpointUrl(resolved.card, resolved.version),
+    'AgentCard endpoint',
+  );
+  if (endpoint !== EXPECTED_AGENT_ENDPOINT) {
+    throw new Error(`AgentCard endpoint is not approved: ${endpoint}`);
+  }
+
+  // EnvAuthProvider's endpoint, client ID, audience/resource, and scope
+  // allowlists are deployment policy for this exact card+endpoint tuple.
+  return new A2XClient(resolved.card, {
+    fetch: noRedirectFetch,
+    authProvider: new EnvAuthProvider(),
+  });
+}
+
+export const myAgentClientPromise = createMyAgentClient();
 ```
 
-Reuse one `A2XClient` per remote agent and credential identity. It caches the card and resolved schemes, while each request builds its own transport state. Do not share a client across users, mutate its extension set during concurrent calls, or share an x402 client without following the payment storage and reconciliation requirements.
+Await `myAgentClientPromise` during startup before accepting work. This prevents token exchange or attachment until the card URL and resolved A2A endpoint match policy; the no-redirect fetch prevents a trusted URL from silently moving either discovery or requests elsewhere. Reuse one `A2XClient` per remote agent and credential identity. It caches the card and resolved schemes, while each request builds its own transport state. Do not share a client across users, mutate its extension set during concurrent calls, or share an x402 client without following the payment storage and reconciliation requirements.
 
 ### Watch out for
 
@@ -242,26 +305,41 @@ import Redis from 'ioredis';
 
 const redis = new Redis(process.env.REDIS_URL!);
 
+// Implement with trusted JWT verification or token introspection. Decoding a
+// JWT without signature/issuer validation is not sufficient.
+declare function assertTokenAudience(
+  token: string,
+  expectedAudience: string,
+): Promise<void>;
+
 async function getCachedOrExchange(
   scheme: OAuth2ClientCredentialsAuthScheme,
-  agentUrl: string,
+  agentEndpoint: string,
   clientIdentity: string,
+  expectedAudience: string,
 ): Promise<string> {
   const tokenUrl = trustedOAuthEndpoint(scheme.params.tokenUrl, 'token endpoint');
-  const scopes = approvedScope(scheme.params.scopes)
+  const scopes = approvedScope(
+    scheme.params.scopes,
+    scheme.params.requiredScopes,
+  )
     .split(' ')
     .filter(Boolean)
     .sort()
     .join(' ');
   // clientIdentity is a stable public ID (client/tenant), never the secret.
   const key = `a2a:${JSON.stringify([
-    agentUrl,
+    agentEndpoint,
     tokenUrl.toString(),
     clientIdentity,
+    expectedAudience,
     scopes,
   ])}`;
   const cached = await redis.get(key);
-  if (cached) return cached;
+  if (cached) {
+    await assertTokenAudience(cached, expectedAudience);
+    return cached;
+  }
 
   const clientId = process.env.OAUTH_CLIENT_ID;
   const clientSecret = process.env.OAUTH_CLIENT_SECRET;
@@ -285,6 +363,7 @@ async function getCachedOrExchange(
   };
   if (!access_token) throw new Error('Token response omitted access_token');
   assertGrantedScope(scope);
+  await assertTokenAudience(access_token, expectedAudience);
   // Cache for 90% of the advertised lifetime to avoid edge-of-expiry races
   const ttl = Number.isFinite(expires_in) && expires_in > 0
     ? Math.max(1, Math.floor(expires_in * 0.9))
@@ -299,12 +378,14 @@ Use it as the OAuth branch of `resolveCredential`:
 ```typescript
 if (scheme instanceof OAuth2ClientCredentialsAuthScheme) {
   const credentialIdentity = process.env.OAUTH_CREDENTIAL_ID;
-  const agentUrl = process.env.AGENT_URL;
-  if (!credentialIdentity || !agentUrl) return undefined;
+  const agentEndpoint = process.env.AGENT_ENDPOINT_URL;
+  const audience = process.env.OAUTH_EXPECTED_AUDIENCE;
+  if (!credentialIdentity || !agentEndpoint || !audience) return undefined;
   return getCachedOrExchange(
     scheme,
-    agentUrl,
+    agentEndpoint,
     credentialIdentity, // stable public client+tenant label
+    audience,
   );
 }
 ```
@@ -313,15 +394,16 @@ if (scheme instanceof OAuth2ClientCredentialsAuthScheme) {
 
 ## Card Preflight at Startup
 
-Consider probing the agent card at boot so discovery and routing failures surface immediately, not on the first request:
+Resolve the policy-bound client at boot so discovery and routing failures surface before the process accepts traffic:
 
 ```typescript
 // src/main.ts
-import { myAgentClient } from './agents/my-agent-client.js';
+import { myAgentClientPromise } from './agents/my-agent-client.js';
 
 (async () => {
   try {
-    await myAgentClient.getAgentCard(); // triggers card fetch only
+    const myAgentClient = await myAgentClientPromise;
+    await myAgentClient.getAgentCard(); // already fetched and endpoint-checked
   } catch (err) {
     console.error('Agent client preflight failed:', err);
     process.exit(1);
@@ -330,7 +412,7 @@ import { myAgentClient } from './agents/my-agent-client.js';
 })();
 ```
 
-`getAgentCard()` does not invoke `AuthProvider.provide()`. Test authentication separately by normalizing the card's requirements and calling the provider, or perform an authenticated operation whose effects are safe in your environment.
+`getAgentCard()` does not invoke `AuthProvider.provide()`. The factory above nevertheless validates the exact card+endpoint boundary before any provider can exchange or attach a token. Test authentication separately by normalizing the card's requirements and calling the provider, or perform an authenticated operation whose effects are safe in your environment. A cache or provider created for one tuple must never be reused after any tuple field changes.
 
 ---
 

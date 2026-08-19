@@ -179,7 +179,7 @@ export class EnvAuthProvider implements AuthProvider {
 }
 ```
 
-Map every API-key location/name pair separately; one AND group may require multiple API keys. Treat OAuth endpoints and scopes advertised by an agent card as untrusted until exact HTTPS endpoints, client identity, audience/resource, and scopes match host policy. The backend and OAuth wiki pages show both patterns.
+Map every API-key location/name pair separately; one AND group may require multiple API keys. OAuth schemes expose the flow catalogue as `params.scopes` and the selected requirement values as `params.requiredScopes`; request only the latter after validating them against the catalogue and host policy. Treat OAuth endpoints and scopes advertised by an agent card as untrusted until the exact card URL, resolved agent endpoint, HTTPS OAuth endpoints, client identity, audience/resource, and scopes match one host policy tuple. The backend and OAuth wiki pages show both patterns.
 
 For an interactive CLI, follow [wiki/host-cli.md](./wiki/host-cli.md) — it reproduces the full fallback chain including the OAuth2 device-code polling loop.
 
@@ -344,11 +344,11 @@ See [wiki/token-persistence.md](./wiki/token-persistence.md) for the `extractCre
 | `ApiKeyAuthScheme` | `@a2x/sdk/client` | `params: { name, location }`; header / query / cookie placement |
 | `HttpBearerAuthScheme` | `@a2x/sdk/client` | `Authorization: Bearer <token>` |
 | `HttpBasicAuthScheme` | `@a2x/sdk/client` | `Authorization: Basic <base64>` |
-| `OAuth2DeviceCodeAuthScheme` | `@a2x/sdk/client` | `params: { deviceAuthorizationUrl, tokenUrl, scopes, refreshUrl? }` |
-| `OAuth2AuthorizationCodeAuthScheme` | `@a2x/sdk/client` | `params: { authorizationUrl, tokenUrl, scopes, refreshUrl?, pkceRequired? }` |
-| `OAuth2ClientCredentialsAuthScheme` | `@a2x/sdk/client` | `params: { tokenUrl, scopes, refreshUrl? }` |
-| `OAuth2ImplicitAuthScheme` | `@a2x/sdk/client` | `params: { authorizationUrl, scopes, refreshUrl? }` |
-| `OAuth2PasswordAuthScheme` | `@a2x/sdk/client` | `params: { tokenUrl, scopes, refreshUrl? }` |
+| `OAuth2DeviceCodeAuthScheme` | `@a2x/sdk/client` | `params: { deviceAuthorizationUrl, tokenUrl, scopes, refreshUrl?, requiredScopes? }` |
+| `OAuth2AuthorizationCodeAuthScheme` | `@a2x/sdk/client` | `params: { authorizationUrl, tokenUrl, scopes, refreshUrl?, pkceRequired?, requiredScopes? }` |
+| `OAuth2ClientCredentialsAuthScheme` | `@a2x/sdk/client` | `params: { tokenUrl, scopes, refreshUrl?, requiredScopes? }` |
+| `OAuth2ImplicitAuthScheme` | `@a2x/sdk/client` | `params: { authorizationUrl, scopes, refreshUrl?, requiredScopes? }` |
+| `OAuth2PasswordAuthScheme` | `@a2x/sdk/client` | `params: { tokenUrl, scopes, refreshUrl?, requiredScopes? }` |
 | `OpenIdConnectAuthScheme` | `@a2x/sdk/client` | `params: { openIdConnectUrl }` |
 | `resolveAgentCard` | `@a2x/sdk/client` | Standalone card fetcher; tries well-known paths |
 | `normalizeRequirements` | `@a2x/sdk/client` | Low-level; expose if you want to inspect requirements without a client |

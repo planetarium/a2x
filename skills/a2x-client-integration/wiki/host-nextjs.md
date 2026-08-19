@@ -240,39 +240,79 @@ The direct bridge above is appropriate only for unpaid, non-funds-bearing stream
 
 For paid streams, enqueue a durable job before returning a subscription identifier. A worker should own and drain `sendMessageStream()` through terminal receipt, reconciliation, or quarantine; persist sanitized events; and expose a replayable SSE subscription to the browser. Browser cancellation closes only that subscription. Apply worker-owned deadlines and handle `X402ReconciliationError`—never derive the upstream abort signal from `request.signal` after payment submission.
 
-Minimal architecture skeleton (the queue and stores are application adapters):
+Minimal architecture skeleton (the queue and stores are application adapters). The job and an outbox row must be committed atomically under a unique owner-scoped idempotency key; an unconditional enqueue after `createOnce` can enqueue the same paid job twice:
 
 ```typescript
 // POST /api/agent/jobs — authenticate session and enforce CSRF/rate/budget policy.
-const job = await jobs.createOnce({
+const idempotencyKey = requireOwnerScopedIdempotencyKey(
+  request.headers.get('Idempotency-Key'),
+  session.userId,
+);
+const job = await jobs.createOnceWithOutbox({
   ownerId: session.userId,
-  idempotencyKey: request.headers.get('Idempotency-Key')!,
+  idempotencyKey, // unique with ownerId
   text: boundedMessage,
   credentialRef: session.a2aCredentialRef, // reference, never a browser token
-});
-await payerQueue.enqueue(job.id, {
-  partitionKey: `${AGENT_URL}:${PAYER_ADDRESS}`,
+  outbox: {
+    topic: 'payer-jobs',
+    partitionKey: `${AGENT_URL}:${PAYER_ADDRESS}`,
+  },
 });
 return Response.json({ jobId: job.id }, { status: 202 });
 ```
 
+An outbox dispatcher publishes each row with `job.id` as the queue deduplication key and marks it delivered transactionally/idempotently. Repeating the POST returns the existing job and cannot create another outbox row.
+
 ```typescript
 // One active worker per partition; clientForWorker injects server credentials,
 // signer policy, and durable batchSettlement storage.
-import { X402ReconciliationError } from '@a2x/sdk/x402';
+import {
+  TERMINAL_STATES,
+  TaskState,
+  type Task,
+} from '@a2x/sdk';
+import {
+  X402ReconciliationError,
+  getX402Receipts,
+} from '@a2x/sdk/x402';
 
 async function executePaidJob(job: AgentJob): Promise<void> {
   const client = await clientForWorker(job.credentialRef);
+  let terminalTask: Task | undefined;
   try {
     for await (const event of client.sendMessageStream(job.params)) {
       await jobEvents.append(job.id, sanitizeForBrowser(event));
+      if ('status' in event && TERMINAL_STATES.has(event.status.state)) {
+        terminalTask = {
+          id: event.taskId,
+          contextId: event.contextId,
+          status: event.status,
+        };
+      }
+    }
+
+    if (!terminalTask) {
+      await jobs.quarantine(job.id, new Error('paid stream ended before a terminal status'));
+      return;
+    }
+    if (terminalTask.status.state !== TaskState.COMPLETED) {
+      await jobs.fail(job.id, terminalTask.status);
+      return;
+    }
+    const receipt = getX402Receipts(terminalTask).at(-1);
+    if (!receipt?.success) {
+      await jobs.quarantine(job.id, new Error('completed paid stream omitted a successful receipt'));
+      return;
     }
     await jobs.complete(job.id);
   } catch (error) {
     if (error instanceof X402ReconciliationError) {
       await jobs.quarantine(job.id, error);
+      return;
     }
-    throw error;
+    // The worker may already have submitted payment. Do not let the queue
+    // auto-retry an ambiguous paid attempt.
+    await jobs.quarantine(job.id, error);
   }
 }
 ```

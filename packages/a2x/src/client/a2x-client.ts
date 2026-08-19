@@ -75,6 +75,60 @@ import type {
   X402PaymentRequiredResponse,
 } from '../x402/types.js';
 
+function canonicalJson(value: unknown): string {
+  if (value === null) return 'null';
+  if (value === undefined) return 'undefined';
+  if (typeof value === 'string') return `string:${JSON.stringify(value)}`;
+  if (typeof value === 'boolean') return `boolean:${value}`;
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return `number:${value}`;
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(',')}]`;
+  }
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+      .join(',')}}`;
+  }
+  throw new TypeError('Value is not JSON-compatible');
+}
+
+function requirementFingerprint(
+  requirement: X402PaymentRequirements,
+): string | undefined {
+  try {
+    return canonicalJson(requirement);
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeHeaderBag(
+  headers: Record<string, string>,
+): Record<string, string> {
+  const result: Record<string, string> = {};
+  const casing = new Map<string, string>();
+  for (const [name, value] of Object.entries(headers)) {
+    const lower = name.toLowerCase();
+    const previous = casing.get(lower);
+    if (previous !== undefined) delete result[previous];
+    casing.set(lower, name);
+    result[name] = value;
+  }
+  return result;
+}
+
+function replaceHeaderBag(
+  target: Record<string, string>,
+  source: Record<string, string>,
+): void {
+  for (const name of Object.keys(target)) delete target[name];
+  Object.assign(target, source);
+}
+
 // ─── Types ───
 
 /**
@@ -115,10 +169,10 @@ export interface A2XClientX402Options {
    * `accepts[]` (already filtered by `maxAmount` if set). Default: the first
    * EVM `scheme === 'exact'` option (see `allowUpto`).
    *
-   * The callback receives detached copies and must return one of those array
-   * entries by identity. The client maps that choice to a private, pristine
-   * snapshot, so returning a captured/fabricated object, reordering the array,
-   * or mutating any live or detached entry cannot alter what is signed.
+   * The callback receives detached copies. Return one supplied entry, an
+   * unchanged structural copy of one, or `undefined`. The client maps the
+   * result to a private, pristine snapshot, so reordering or mutation cannot
+   * alter what is signed.
    */
   selectRequirement?: (
     requirements: X402PaymentRequirements[],
@@ -589,7 +643,7 @@ export class A2XClient {
             eventTask?.status.state === 'input-required' &&
             getX402PaymentRequirements(eventTask)
           ) {
-            pendingTask = eventTask;
+            pendingTask = structuredClone(eventTask);
             // A valid retry prompt proves the previous voucher was rejected.
             // Clear before yielding so consumer-driven iterator close cannot
             // mistake this safe exit for an ambiguous response.
@@ -874,14 +928,27 @@ export class A2XClient {
           X402PaymentRequirements,
           X402PaymentRequirements
         >();
+        const snapshotsByFingerprint = new Map<
+          string,
+          X402PaymentRequirements
+        >();
         const choices = affordable.map((requirement) => {
           const choice = structuredClone(requirement);
           selectedSnapshots.set(choice, requirement);
+          const fingerprint = requirementFingerprint(requirement);
+          if (fingerprint !== undefined) {
+            snapshotsByFingerprint.set(fingerprint, requirement);
+          }
           return choice;
         });
         const chosen = userSelect(choices);
         if (!chosen) return undefined;
-        return selectedSnapshots.get(chosen);
+        const selected = selectedSnapshots.get(chosen);
+        if (selected) return selected;
+        const fingerprint = requirementFingerprint(chosen);
+        return fingerprint === undefined
+          ? undefined
+          : snapshotsByFingerprint.get(fingerprint);
       }
       // Only auto-pick an option the EVM signer can fulfil, exact-first and
       // never `upto` / `batch-settlement` unless opted in — see defaultSelect
@@ -1086,7 +1153,16 @@ export class A2XClient {
       rawRequirements,
       rawSchemes as Parameters<typeof normalizeRequirements>[1],
     );
-    if (requirements.length === 0) return;
+    if (requirements.length === 0) {
+      throw new UnsupportedOperationError(
+        'The AgentCard requires authentication, but none of its security requirements are supported.',
+      );
+    }
+    if (requirements.some((group) => group.length === 0)) {
+      // An explicit empty requirement is an anonymous OR alternative.
+      this._resolvedSchemes = [];
+      return;
+    }
 
     this._resolvedSchemes = await this._authProvider.provide(requirements);
   }
@@ -1096,20 +1172,13 @@ export class A2XClient {
    */
   private _applyAuth(ctx: AuthRequestContext): void {
     if (!this._resolvedSchemes) return;
+    replaceHeaderBag(ctx.headers, normalizeHeaderBag(ctx.headers));
     for (const scheme of this._resolvedSchemes) {
-      // Fetch treats header names case-insensitively, while a plain object does
-      // not. Apply each scheme into a scratch header bag, then replace any
-      // caller header with the same case-insensitive name before merging.
-      const authHeaders: Record<string, string> = {};
-      scheme.applyToRequest({ headers: authHeaders, url: ctx.url });
-      for (const [name, value] of Object.entries(authHeaders)) {
-        for (const existing of Object.keys(ctx.headers)) {
-          if (existing.toLowerCase() === name.toLowerCase()) {
-            delete ctx.headers[existing];
-          }
-        }
-        ctx.headers[name] = value;
-      }
+      // Preserve the complete context custom schemes historically received,
+      // then collapse case variants after their reads/writes/deletes.
+      const nextHeaders = { ...ctx.headers };
+      scheme.applyToRequest({ headers: nextHeaders, url: ctx.url });
+      replaceHeaderBag(ctx.headers, normalizeHeaderBag(nextHeaders));
     }
   }
 

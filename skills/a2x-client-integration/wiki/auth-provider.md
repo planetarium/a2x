@@ -49,6 +49,10 @@ The `requirements` parameter mirrors the OpenAPI-style security semantics from t
 | `securityRequirements: [{ apiKey: [], bearer: [] }]` | `[ [ApiKeyAuthScheme, HttpBearerAuthScheme] ]` (AND — both) |
 | `securityRequirements: [{ oauth2: [...] }]` with 3 OAuth2 flows | `[ [DeviceCodeScheme], [AuthorizationCodeScheme], [ClientCredentialsScheme] ]` (OR per flow) |
 
+Requirement values are preserved as `params.requiredScopes` on normalized OAuth schemes; `params.scopes` remains the flow's advertised catalogue. Request only `requiredScopes` after checking each value against the catalogue and host policy.
+
+If any named scheme in a non-empty AND requirement is absent or unsupported, the SDK omits that entire alternative rather than presenting a partially satisfiable group. An explicit empty requirement (`{}`) remains an anonymous alternative; when one exists, `A2XClient` skips `provide()`. If a provider is configured and no supported non-empty alternative remains, the client throws before sending.
+
 Your `provide()` must:
 
 1. Pick exactly one group from the outer array (either by preference, user choice, or what credentials it has available).
@@ -91,6 +95,8 @@ await client.sendMessage(...)
         │
         ├── [first completed initialization] if card has securityRequirements:
         │       requirements = normalizeRequirements(card)
+        │       anonymous alternative → skip provider
+        │       no supported alternative → throw
         │       schemes = await authProvider.provide(requirements)
         │       cache schemes
         │

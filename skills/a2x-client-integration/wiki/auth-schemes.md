@@ -109,6 +109,7 @@ scheme.params  // {
   //   tokenUrl: string,
   //   scopes: Record<string, string>,
   //   refreshUrl?: string,
+  //   requiredScopes?: readonly string[],
   // }
 ```
 
@@ -136,6 +137,7 @@ scheme.params  // {
   //   scopes: Record<string, string>,
   //   refreshUrl?: string,
   //   pkceRequired?: boolean,
+  //   requiredScopes?: readonly string[],
   // }
 ```
 
@@ -160,6 +162,7 @@ scheme.params  // {
   //   tokenUrl: string,
   //   scopes: Record<string, string>,
   //   refreshUrl?: string,
+  //   requiredScopes?: readonly string[],
   // }
 ```
 
@@ -172,7 +175,10 @@ Machine-to-machine flow — typically best for backend services:
 ```typescript
 async function resolveClientCredentials(scheme: OAuth2ClientCredentialsAuthScheme) {
   const tokenUrl = trustedOAuthEndpoint(scheme.params.tokenUrl, 'token endpoint');
-  const scope = approvedScope(scheme.params.scopes); // host-configured allowlist
+  const scope = approvedScope(
+    scheme.params.scopes,
+    scheme.params.requiredScopes,
+  ); // selected requirement intersected with host policy
   const res = await fetch(tokenUrl, {
     method: 'POST',
     redirect: 'error',
@@ -189,7 +195,7 @@ async function resolveClientCredentials(scheme: OAuth2ClientCredentialsAuthSchem
 }
 ```
 
-`trustedOAuthEndpoint` should require an exact configured HTTPS endpoint, and `approvedScope` must reject card-advertised scopes outside a host policy keyed by agent, issuer, client identity, and expected audience/resource. See [oauth2-device-code.md](./oauth2-device-code.md) for complete policy helpers.
+`trustedOAuthEndpoint` should require an exact configured HTTPS endpoint. `approvedScope` must request only `requiredScopes` and reject a value absent from either the advertised `scopes` catalogue or host policy keyed by card URL, resolved agent endpoint, issuer, client identity, and expected audience/resource. See [oauth2-device-code.md](./oauth2-device-code.md) for complete policy helpers.
 
 ---
 
@@ -200,6 +206,7 @@ scheme.params  // {
   //   authorizationUrl: string,
   //   scopes: Record<string, string>,
   //   refreshUrl?: string,
+  //   requiredScopes?: readonly string[],
   // }
 ```
 
@@ -214,6 +221,7 @@ scheme.params  // {
   //   tokenUrl: string,
   //   scopes: Record<string, string>,
   //   refreshUrl?: string,
+  //   requiredScopes?: readonly string[],
   // }
 ```
 

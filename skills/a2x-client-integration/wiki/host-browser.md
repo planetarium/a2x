@@ -191,7 +191,7 @@ Only `OAuth2AuthorizationCodeAuthScheme` (with PKCE) and `OAuth2ImplicitAuthSche
 
 Recommended approach: **don't run OAuth2 from a provider impl**. Use a proper OIDC library (e.g. `oidc-client-ts`) for the login flow, store the resulting access token somewhere, and provide a simple `SessionBearerProvider` that reads from there.
 
-Configure the library with an expected HTTPS issuer, exact endpoints, client identity, audience/resource, and allowed scopes from application policy. Do not accept endpoints or privileges merely because the agent card advertised them, and reject cross-origin redirects before sending credentials or showing a login link.
+Configure the library with an expected HTTPS issuer, exact endpoints, client identity, audience/resource, and allowed scopes from application policy. Request only `scheme.params.requiredScopes` after checking every value against both `scheme.params.scopes` and that policy. Do not accept endpoints or privileges merely because the agent card advertised them, and reject cross-origin redirects before sending credentials or showing a login link.
 
 Attempting to run `OAuth2DeviceCodeAuthScheme` from a browser is possible but weird — there's no terminal to display the code. Render it in the UI instead:
 
@@ -200,7 +200,10 @@ Attempting to run `OAuth2DeviceCodeAuthScheme` from a browser is possible but we
 async function performDeviceCodeFlow(scheme, callbacks) {
   const deviceUrl = requireConfiguredOAuthEndpoint(scheme.params.deviceAuthorizationUrl);
   const tokenUrl = requireConfiguredOAuthEndpoint(scheme.params.tokenUrl);
-  const scopes = requireAllowedScopes(scheme.params.scopes);
+  const scopes = requireAllowedScopes(
+    scheme.params.requiredScopes,
+    scheme.params.scopes,
+  );
   const deviceData = /* POST deviceUrl with redirect: 'error' */;
   const verificationUri = requireConfiguredVerificationOrigin(
     deviceData.verification_uri_complete ?? deviceData.verification_uri,

@@ -126,9 +126,17 @@ function trustedVerificationUrl(raw: string): URL {
   return url;
 }
 
-function approvedScope(scopes: Record<string, string>): string {
-  const requested = Object.keys(scopes);
-  const rejected = requested.filter(scope => !ALLOWED_OAUTH_SCOPES.has(scope));
+function approvedScope(
+  advertised: Record<string, string>,
+  required: readonly string[] | undefined,
+): string {
+  if (!required) {
+    throw new Error('OAuth requirement omitted requiredScopes');
+  }
+  const requested = [...new Set(required)];
+  const rejected = requested.filter(scope =>
+    !(scope in advertised) || !ALLOWED_OAUTH_SCOPES.has(scope)
+  );
   if (rejected.length) {
     throw new Error(`Refusing unapproved OAuth scopes: ${rejected.join(', ')}`);
   }
@@ -146,12 +154,21 @@ function assertGrantedScope(granted?: string): void {
   }
 }
 
+// Implement with trusted JWT verification or token introspection. Never trust
+// claims from decode-only parsing.
+declare function assertTokenAudience(
+  token: string,
+  expectedAudience: string,
+): Promise<void>;
+
 export async function performDeviceCodeFlow(
   scheme: OAuth2DeviceCodeAuthScheme,
   clientId: string,
 ): Promise<TokenResponse> {
   if (!clientId) throw new Error('OAuth client ID is required');
-  const { scopes } = scheme.params;
+  const expectedAudience = process.env.OAUTH_EXPECTED_AUDIENCE;
+  if (!expectedAudience) throw new Error('OAuth expected audience is required');
+  const { scopes, requiredScopes } = scheme.params;
   const deviceAuthorizationUrl = trustedOAuthEndpoint(
     scheme.params.deviceAuthorizationUrl,
     'device authorization endpoint',
@@ -159,7 +176,7 @@ export async function performDeviceCodeFlow(
   const tokenUrl = trustedOAuthEndpoint(scheme.params.tokenUrl, 'token endpoint');
 
   // Step 1: Request a device code
-  const scopeStr = approvedScope(scopes);
+  const scopeStr = approvedScope(scopes, requiredScopes);
   const deviceRes = await fetch(deviceAuthorizationUrl, {
     method: 'POST',
     redirect: 'error',
@@ -232,6 +249,7 @@ export async function performDeviceCodeFlow(
         throw new Error('Token response omitted access_token');
       }
       assertGrantedScope(tokenData.scope);
+      await assertTokenAudience(tokenData.access_token, expectedAudience);
       console.log(' Authorized!');
       return tokenData;
     }
@@ -257,7 +275,7 @@ export async function performDeviceCodeFlow(
 }
 ```
 
-Configure exact `OAUTH_ENDPOINTS`, `OAUTH_VERIFICATION_ORIGINS`, `OAUTH_ALLOWED_SCOPES`, and the client ID from trusted host policy. In multi-agent or multi-tenant hosts, key policy by agent, issuer, client identity, and expected audience/resource. Reject redirects so an approved endpoint cannot forward secrets elsewhere. If local HTTP identity infrastructure is required, implement a narrow development-only exception rather than weakening the production rule.
+Configure exact `OAUTH_ENDPOINTS`, `OAUTH_VERIFICATION_ORIGINS`, `OAUTH_ALLOWED_SCOPES`, and the client ID from trusted host policy. `params.scopes` is the advertised catalogue; request only `params.requiredScopes`, rejecting missing values or any value absent from the catalogue/allowlist. In multi-agent or multi-tenant hosts, bind policy and token persistence to the exact card URL, resolved agent endpoint, issuer, client identity, expected audience/resource, and required scopes; validate the resulting token's audience/resource before attachment. Reject redirects so an approved endpoint cannot forward secrets elsewhere. If local HTTP identity infrastructure is required, implement a narrow development-only exception rather than weakening the production rule.
 
 Use it from `resolveScheme`:
 

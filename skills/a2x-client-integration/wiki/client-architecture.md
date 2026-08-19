@@ -20,9 +20,10 @@ new A2XClient(urlOrCard, { headers, authProvider, fetch })
         │
         ├─ no authProvider          → skip
         ├─ card has no requirements → skip
-        └─ normalizeRequirements(card) → AuthProvider.provide(req[][])
-                                         ↓
-                                    cached as _resolvedSchemes
+        └─ normalizeRequirements(card)
+              ├─ explicit anonymous alternative → cache []
+              ├─ no supported alternative       → throw
+              └─ AuthProvider.provide(req[][])   → cached schemes
         ▼
   build JSON-RPC request
         │
@@ -58,6 +59,8 @@ Concurrent calls on a cold client can all enter `_ensureResolved()` before any o
 ### Authentication is cached after completion
 
 The `AuthScheme[]` returned by a completed `AuthProvider.provide()` is cached as `_resolvedSchemes` and re-applied to subsequent requests.
+
+Normalization drops a whole non-empty requirement when any named scheme is absent or unsupported; it never turns a partial AND group into a satisfiable one. An explicit `{}` alternative is anonymous and bypasses the provider. OAuth requirement values are retained as `scheme.params.requiredScopes`, distinct from the advertised `params.scopes` catalogue.
 
 Concurrent first calls can invoke `provide()` more than once because the client does not deduplicate the in-flight call. Make providers concurrency-safe and deduplicate expensive token exchanges or interactive prompts. After one call populates the cache, later sequential calls reuse it.
 
@@ -98,6 +101,8 @@ Content-Type: application/json
 
 { "jsonrpc": "2.0", "id": …, "method": "message/stream", "params": … }
 ```
+
+Each custom scheme receives the complete built request context, including static and protocol headers. After every `applyToRequest()` call, remaining case-variant header names are collapsed so a scheme can inspect or augment context without producing duplicate values for Fetch.
 
 The server responds with either:
 - `Content-Type: text/event-stream` — parsed by `parseSSEStream`, yielded as `TaskStatusUpdateEvent` | `TaskArtifactUpdateEvent`
