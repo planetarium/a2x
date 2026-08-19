@@ -520,6 +520,23 @@ describe('A2XClient', () => {
       expect(mockFetch).toHaveBeenCalledTimes(1);
     });
 
+    it('retries discovery after a card fails JSON-RPC validation', async () => {
+      const grpcOnlyCard: AgentCardV10 = {
+        ...V10_CARD,
+        supportedInterfaces: [
+          { url: 'http://localhost/grpc', protocolBinding: 'GRPC', protocolVersion: '1.0' },
+        ],
+      };
+      const mockFetch = vi.fn()
+        .mockReturnValueOnce(createMockFetch(grpcOnlyCard)())
+        .mockReturnValueOnce(createMockFetch(V10_CARD)());
+      const client = new A2XClient('http://localhost:4000', { fetch: mockFetch });
+
+      await expect(client.getAgentCard()).rejects.toThrow('no JSONRPC interface');
+      await expect(client.getAgentCard()).resolves.toEqual(V10_CARD);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
     it('should return pre-provided AgentCard without fetch', async () => {
       const mockFetch = vi.fn();
       const client = new A2XClient(V03_CARD, { fetch: mockFetch });

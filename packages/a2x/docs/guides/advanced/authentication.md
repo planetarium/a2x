@@ -225,13 +225,19 @@ const authProvider: AuthProvider = {
     const token = await runHostApprovedDeviceFlow({
       deviceAuthorizationUrl: scheme.params.deviceAuthorizationUrl,
       tokenUrl: scheme.params.tokenUrl,
-      scopes: scheme.params.requiredScopes,
+      advertisedScopes: scheme.params.scopes,
+      requiredScopes: scheme.params.requiredScopes,
     });
     scheme.setCredential(token.accessToken);
     return group;
   },
 };
 ```
+
+`runHostApprovedDeviceFlow` must reject required scopes absent from
+`advertisedScopes` or host policy, validate the issuer/audience binding, and
+accept only a case-insensitive `Bearer` token type before returning the access
+token.
 
 An explicitly empty security requirement (`{}`) is an anonymous alternative, so the client skips the provider. A non-empty alternative is omitted as a whole if any named scheme is absent, unsupported, or would overwrite another scheme's HTTP credential destination. Distinct cookie API keys compose. Expansion is capped at 256 alternatives to reject malicious combinatorial cards; when no supported non-empty alternative remains, a configured provider fails before the request is sent.
 

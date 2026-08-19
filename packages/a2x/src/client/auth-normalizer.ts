@@ -31,6 +31,9 @@ function authDestination(scheme: AuthScheme): string {
     const name = scheme.params.location === 'header'
       ? scheme.params.name.toLowerCase()
       : scheme.params.name;
+    if (scheme.params.location === 'header' && name === 'cookie') {
+      return 'cookie:*';
+    }
     return `${scheme.params.location}:${name}`;
   }
   return 'header:authorization';
@@ -40,6 +43,11 @@ function hasConflictingDestinations(group: AuthScheme[]): boolean {
   const destinations = new Set<string>();
   for (const scheme of group) {
     const destination = authDestination(scheme);
+    if (
+      destination === 'cookie:*'
+        ? [...destinations].some((candidate) => candidate.startsWith('cookie:'))
+        : destination.startsWith('cookie:') && destinations.has('cookie:*')
+    ) return true;
     if (destinations.has(destination)) return true;
     destinations.add(destination);
   }

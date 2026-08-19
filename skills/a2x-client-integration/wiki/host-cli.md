@@ -34,9 +34,10 @@ export interface StoredCredential {
 }
 export function credentialSlot(groupIndex: number, schemeIndex: number, scheme: AuthScheme): string;
 export function extractCredential(slot: string, scheme: AuthScheme): StoredCredential;
-export function loadCredentials(agentUrl: string): StoredCredential[] | undefined;
-export function saveCredentials(agentUrl: string, credentials: StoredCredential[]): void;
-export function clearCredentials(agentUrl: string): void;
+export function credentialPolicyKey(cardUrl: string, endpoint: string, identityPolicyId: string): string;
+export function loadCredentials(policyKey: string): StoredCredential[] | undefined;
+export function saveCredentials(policyKey: string, credentials: StoredCredential[]): void;
+export function clearCredentials(policyKey: string): void;
 ```
 
 File path: `path.join(os.homedir(), '.<your-cli-name>', 'tokens.json')`.
@@ -152,10 +153,10 @@ async function resolveScheme(scheme: AuthScheme): Promise<void> {
 export class CliAuthProvider implements AuthProvider {
   private selectedGroupIndex?: number;
 
-  constructor(private readonly agentUrl: string) {}
+  constructor(private readonly policyKey: string) {}
 
   async provide(requirements: AuthScheme[][]): Promise<AuthScheme[]> {
-    const stored = loadCredentials(this.agentUrl);
+    const stored = loadCredentials(this.policyKey);
     if (stored?.length) {
       for (const [groupIndex, group] of requirements.entries()) {
         if (this._tryRestore(groupIndex, group, stored)) {
@@ -194,7 +195,7 @@ export class CliAuthProvider implements AuthProvider {
     if (this.selectedGroupIndex === undefined) {
       throw new Error('Cannot refresh before selecting an auth group');
     }
-    clearCredentials(this.agentUrl);
+    clearCredentials(this.policyKey);
     console.log(chalk.magenta.bold('\nAuthentication expired. Please re-authenticate.'));
     for (const scheme of schemes) await resolveScheme(scheme);
     console.log('');
@@ -218,7 +219,7 @@ export class CliAuthProvider implements AuthProvider {
 
   private _save(groupIndex: number, group: AuthScheme[]) {
     saveCredentials(
-      this.agentUrl,
+      this.policyKey,
       group.map((scheme, schemeIndex) =>
         extractCredential(credentialSlot(groupIndex, schemeIndex, scheme), scheme),
       ),
@@ -236,9 +237,14 @@ Keep `readline` for the non-secret method menu only. Never fall back to echoed s
 ```typescript
 import { Command } from 'commander';
 import crypto from 'node:crypto';
-import { A2XClient } from '@a2x/sdk/client';
+import {
+  A2XClient,
+  getAgentEndpointUrl,
+  resolveAgentCard,
+} from '@a2x/sdk/client';
 import type { SendMessageParams } from '@a2x/sdk';
 import { CliAuthProvider } from '../cli-auth-provider.js';
+import { credentialPolicyKey } from '../token-store.js';
 
 export function parseHeaders(headerArgs?: string[]): Record<string, string> | undefined {
   if (!headerArgs?.length) return undefined;
@@ -257,9 +263,18 @@ export const sendCommand = new Command('send')
   .option('--context-id <id>')
   .option('-H, --header <header...>')
   .action(async (url: string, message: string, opts: { contextId?: string; header?: string[] }) => {
-    const client = new A2XClient(url, {
-      headers: parseHeaders(opts.header),
-      authProvider: new CliAuthProvider(url),
+    const headers = parseHeaders(opts.header);
+    const noRedirectFetch: typeof fetch = (input, init) =>
+      fetch(input, { ...init, redirect: 'error' });
+    const resolved = await resolveAgentCard(url, { headers, fetch: noRedirectFetch });
+    const endpoint = getAgentEndpointUrl(resolved.card, resolved.version);
+    const identityPolicyId = process.env.A2X_CREDENTIAL_POLICY_ID;
+    if (!identityPolicyId) throw new Error('A2X_CREDENTIAL_POLICY_ID is required');
+    const policyKey = credentialPolicyKey(url, endpoint, identityPolicyId);
+    const client = new A2XClient(resolved.card, {
+      headers,
+      fetch: noRedirectFetch,
+      authProvider: new CliAuthProvider(policyKey),
     });
 
     const params: SendMessageParams = {
@@ -284,10 +299,15 @@ export const sendCommand = new Command('send')
 ```typescript
 import { Command } from 'commander';
 import crypto from 'node:crypto';
-import { A2XClient } from '@a2x/sdk/client';
+import {
+  A2XClient,
+  getAgentEndpointUrl,
+  resolveAgentCard,
+} from '@a2x/sdk/client';
 import type { SendMessageParams } from '@a2x/sdk';
 import { CliAuthProvider } from '../cli-auth-provider.js';
 import { parseHeaders } from './send.js';
+import { credentialPolicyKey } from '../token-store.js';
 
 export const streamCommand = new Command('stream')
   .description('Send a message and stream the response')
@@ -296,9 +316,18 @@ export const streamCommand = new Command('stream')
   .option('--context-id <id>')
   .option('-H, --header <header...>')
   .action(async (url: string, message: string, opts: { contextId?: string; header?: string[] }) => {
-    const client = new A2XClient(url, {
-      headers: parseHeaders(opts.header),
-      authProvider: new CliAuthProvider(url),
+    const headers = parseHeaders(opts.header);
+    const noRedirectFetch: typeof fetch = (input, init) =>
+      fetch(input, { ...init, redirect: 'error' });
+    const resolved = await resolveAgentCard(url, { headers, fetch: noRedirectFetch });
+    const endpoint = getAgentEndpointUrl(resolved.card, resolved.version);
+    const identityPolicyId = process.env.A2X_CREDENTIAL_POLICY_ID;
+    if (!identityPolicyId) throw new Error('A2X_CREDENTIAL_POLICY_ID is required');
+    const policyKey = credentialPolicyKey(url, endpoint, identityPolicyId);
+    const client = new A2XClient(resolved.card, {
+      headers,
+      fetch: noRedirectFetch,
+      authProvider: new CliAuthProvider(policyKey),
     });
 
     const params: SendMessageParams = {

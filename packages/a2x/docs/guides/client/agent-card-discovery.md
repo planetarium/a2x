@@ -11,7 +11,8 @@ Useful fields at a glance:
 - `capabilities.streaming` — whether `message/stream` is supported.
 - `skills[]` — declared capabilities (ids, tags).
 - `securityRequirements` / `securitySchemes` — what auth the agent expects.
-- `protocolVersion` — the A2A version the card was issued under (`0.3` or `1.0`).
+- A recognized top-level `protocolVersion` identifies the version when present;
+  v1.0 commonly declares a version per `supportedInterfaces[]` entry instead.
 
 ## Resolving a card manually
 
@@ -40,10 +41,14 @@ There is no `preferredVersion` client option. Use the card document published fo
 
 ## Calling non-A2X agents
 
-`A2XClient` is a protocol-level client, not an A2X-only one. Any agent whose AgentCard is valid A2A works, regardless of what SDK produced it. The only thing that changes is the URL you pass.
+`A2XClient` is a protocol-level client, not an A2X-only one. It works with A2A
+agents produced by any SDK when their card advertises a supported JSON-RPC
+interface.
 
 ## Caching and refreshing
 
-`A2XClient` caches the card after the first fetch. If the remote agent rolls out a new version, drop the client and construct a new one, or use `resolveAgentCard({ force: true })` to bypass the cache.
+`A2XClient` caches the card after the first successful fetch. If the remote agent
+rolls out a new version, call `resolveAgentCard(url)` again and construct a new
+client from the returned card. The standalone resolver does not cache.
 
 For long-running processes you can add a periodic refresh yourself — the card is cheap to refetch.

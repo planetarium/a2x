@@ -67,7 +67,12 @@ export class ApiKeyAuthScheme extends AuthScheme {
       if (existingName && existingName !== 'Cookie') {
         delete ctx.headers[existingName];
       }
-      ctx.headers['Cookie'] = [existing, `${this.name}=${this.credential!}`]
+      const unrelated = existing
+        ?.split(';')
+        .map((pair) => pair.trim())
+        .filter((pair) => pair.split('=', 1)[0] !== this.name)
+        .join('; ');
+      ctx.headers['Cookie'] = [unrelated, `${this.name}=${this.credential!}`]
         .filter(Boolean)
         .join('; ');
     }

@@ -46,25 +46,27 @@ function normalizeOAuthEndpoint(raw: string): string {
   return url.toString();
 }
 
-const TRUSTED_OAUTH_TOKEN_ENDPOINTS = new Set(
-  (process.env.OAUTH_TOKEN_ENDPOINTS ?? '')
-    .split(',')
-    .map(value => value.trim())
-    .filter(Boolean)
-    .map(normalizeOAuthEndpoint),
-);
+// One module instance represents one exact agent/identity tuple. Do not use a
+// shared pool of endpoints across agents: membership in that pool would let one
+// card select another agent's token endpoint and receive this client secret.
+export const OAUTH_POLICY = Object.freeze({
+  agentEndpoint: normalizeOAuthEndpoint(process.env.AGENT_ENDPOINT_URL!),
+  tokenEndpoint: normalizeOAuthEndpoint(process.env.OAUTH_TOKEN_ENDPOINT!),
+  clientId: process.env.OAUTH_CLIENT_ID!,
+  clientSecret: process.env.OAUTH_CLIENT_SECRET!,
+  expectedAudience: process.env.OAUTH_EXPECTED_AUDIENCE!,
+  allowedScopes: new Set(
+    (process.env.OAUTH_ALLOWED_SCOPES ?? '').split(/\s+/).filter(Boolean),
+  ),
+});
 
 function trustedOAuthEndpoint(raw: string, purpose: string): URL {
   const normalized = normalizeOAuthEndpoint(raw);
-  if (!TRUSTED_OAUTH_TOKEN_ENDPOINTS.has(normalized)) {
+  if (normalized !== OAUTH_POLICY.tokenEndpoint) {
     throw new Error(`Refusing untrusted OAuth ${purpose}: ${normalized}`);
   }
   return new URL(normalized);
 }
-
-const ALLOWED_OAUTH_SCOPES = new Set(
-  (process.env.OAUTH_ALLOWED_SCOPES ?? '').split(/\s+/).filter(Boolean),
-);
 
 function approvedScope(
   advertised: Record<string, string>,
@@ -75,7 +77,7 @@ function approvedScope(
   }
   const requested = [...new Set(required)];
   const rejected = requested.filter(scope =>
-    !(scope in advertised) || !ALLOWED_OAUTH_SCOPES.has(scope)
+    !(scope in advertised) || !OAUTH_POLICY.allowedScopes.has(scope)
   );
   if (rejected.length) {
     throw new Error(`Refusing unapproved OAuth scopes: ${rejected.join(', ')}`);
@@ -172,9 +174,9 @@ async function resolveCredential(
 async function exchangeClientCredentials(
   scheme: OAuth2ClientCredentialsAuthScheme,
 ): Promise<string | undefined> {
-  const clientId = process.env.OAUTH_CLIENT_ID;
-  const clientSecret = process.env.OAUTH_CLIENT_SECRET;
-  const expectedAudience = process.env.OAUTH_EXPECTED_AUDIENCE;
+  const clientId = OAUTH_POLICY.clientId;
+  const clientSecret = OAUTH_POLICY.clientSecret;
+  const expectedAudience = OAUTH_POLICY.expectedAudience;
   if (!clientId || !clientSecret || !expectedAudience) return undefined;
 
   // Agent-card discovery is not a trust decision. Validate before sending secrets.
@@ -208,7 +210,16 @@ async function exchangeClientCredentials(
 }
 ```
 
-Configure exact `OAUTH_TOKEN_ENDPOINTS` and `OAUTH_ALLOWED_SCOPES` from deployment policy; do not derive either from the agent card. `params.scopes` is only the advertised catalogue, while `params.requiredScopes` is the selected requirement: request only the latter and reject a required value absent from either the catalogue or host allowlist. In multi-agent or multi-tenant hosts, bind one provider and token cache to the exact `(card URL, resolved agent endpoint, issuer/token endpoint, client identity, expected audience/resource, required scopes)` tuple. Verify the token audience/resource (cryptographically or through trusted introspection) before attaching it. Add an explicit development-only exception if local HTTP identity infrastructure is unavoidable. Redirects are rejected because an otherwise trusted endpoint could redirect the client secret elsewhere.
+Configure the singular exact `OAUTH_TOKEN_ENDPOINT`, client identity, audience,
+and allowed scopes for this agent deployment; do not derive them from the card
+or combine endpoints from multiple agents into one allowlist. `params.scopes` is
+only the advertised catalogue, while `params.requiredScopes` is the selected
+requirement. Request only the latter and reject a required value absent from the
+catalogue or this tuple's policy. Verify the token audience/resource
+(cryptographically or through trusted introspection) before attaching it. Add
+an explicit development-only exception if local HTTP identity infrastructure
+is unavoidable. Redirects are rejected because an otherwise trusted endpoint
+could redirect the client secret elsewhere.
 
 API-key slots are keyed by placement and name because a valid AND group can require several distinct API keys. Add every expected slot to `API_KEY_ENV_BY_SLOT`; do not reuse one environment variable for the whole class.
 
@@ -225,7 +236,7 @@ import {
   getAgentEndpointUrl,
   resolveAgentCard,
 } from '@a2x/sdk/client';
-import { EnvAuthProvider } from './env-auth-provider.js';
+import { EnvAuthProvider, OAUTH_POLICY } from './env-auth-provider.js';
 
 function exactHttpsUrl(raw: string | undefined, label: string): string {
   if (!raw) throw new Error(`${label} is required`);
@@ -253,6 +264,9 @@ const EXPECTED_AGENT_ENDPOINT = exactHttpsUrl(
   process.env.AGENT_ENDPOINT_URL,
   'AGENT_ENDPOINT_URL',
 );
+if (EXPECTED_AGENT_ENDPOINT !== OAUTH_POLICY.agentEndpoint) {
+  throw new Error('Agent and OAuth policy endpoints are not the same tuple');
+}
 const noRedirectFetch: typeof fetch = (input, init) =>
   fetch(input, { ...init, redirect: 'error' });
 
@@ -499,7 +513,7 @@ async function callAgent(params: SendMessageParams) {
   try {
     const task = await myAgentClient.sendMessage(params);
     log.info({
-      agent: process.env.AGENT_URL,
+      agent: process.env.AGENT_ENDPOINT_URL,
       method: 'sendMessage',
       taskId: task.id,
       state: task.status?.state,
@@ -508,7 +522,7 @@ async function callAgent(params: SendMessageParams) {
     return task;
   } catch (err) {
     log.error({
-      agent: process.env.AGENT_URL,
+      agent: process.env.AGENT_ENDPOINT_URL,
       method: 'sendMessage',
       err: err instanceof Error ? { name: err.name, message: err.message } : err,
       durationMs: Date.now() - start,

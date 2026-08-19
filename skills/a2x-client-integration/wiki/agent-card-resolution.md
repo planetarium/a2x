@@ -119,14 +119,34 @@ const requirements = card.securityRequirements ?? card.security ?? [];
 If you need card caching at the application layer (e.g. to avoid repeated GETs when you create short-lived clients), call `resolveAgentCard` once, then pass the resolved card to `A2XClient`:
 
 ```typescript
+import {
+  A2XClient,
+  getAgentEndpointUrl,
+  resolveAgentCard,
+} from '@a2x/sdk/client';
+
 // once, e.g. at app startup
-const resolved = await resolveAgentCard(AGENT_URL);
+const noRedirectFetch: typeof fetch = (input, init) =>
+  fetch(input, { ...init, redirect: 'error' });
+const resolved = await resolveAgentCard(AGENT_CARD_URL, {
+  fetch: noRedirectFetch,
+});
+const endpoint = getAgentEndpointUrl(resolved.card, resolved.version);
+if (endpoint !== EXPECTED_AGENT_ENDPOINT) {
+  throw new Error(`AgentCard endpoint is not approved: ${endpoint}`);
+}
 
 // later, per request
 function makeClient() {
-  return new A2XClient(resolved.card, { authProvider });
+  return new A2XClient(resolved.card, {
+    authProvider,
+    fetch: noRedirectFetch,
+  });
 }
 ```
+
+`AGENT_CARD_URL` and `EXPECTED_AGENT_ENDPOINT` must be exact host-policy values.
+Never restore or attach credentials until this binding succeeds.
 
 When you pass an `AgentCard` object instead of a URL, `A2XClient` skips the HTTP GET entirely. It still runs `detectProtocolVersion` and `getAgentEndpointUrl` to derive routing info.
 

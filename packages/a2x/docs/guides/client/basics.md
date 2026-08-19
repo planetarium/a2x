@@ -103,17 +103,17 @@ await client.sendMessage({
     parts: [
       { text: 'What does this image show?' },
       {
-        file: {
-          mimeType: 'image/png',
-          bytes: base64Png,    // or: uri: 'https://…'
-        },
+        raw: base64Png,
+        mediaType: 'image/png',
       },
     ],
   },
 });
 ```
 
-Whether a particular agent accepts image/file parts depends on its capabilities (check the AgentCard's `inputs`/`outputs` fields).
+Whether a particular agent accepts image/file parts depends on its declared
+`defaultInputModes` and the selected skill's `inputModes`. Inspect the matching
+output-mode fields before assuming a binary response format.
 
 ## Handling errors
 

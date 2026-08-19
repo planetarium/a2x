@@ -85,7 +85,10 @@ If you plan to expose JSON-RPC over HTTP **and** another transport (e.g. gRPC), 
 
 ## Consuming: what `A2XClient` does
 
-On the client side, `A2XClient` reads the remote card's `protocolVersion` field (or infers v0.3 when absent) and routes calls accordingly. You usually don't need to pick a version yourself:
+On the client side, `A2XClient` uses a recognized top-level `protocolVersion`
+when present. Otherwise it infers v1.0 from `supportedInterfaces`, v0.3 from a
+top-level `url`, and defaults an otherwise ambiguous shape to v1.0. You usually
+do not need to pick a version yourself:
 
 ```ts
 import { resolveAgentCard } from '@a2x/sdk/client';

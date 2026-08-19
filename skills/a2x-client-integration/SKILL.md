@@ -192,7 +192,11 @@ For an interactive CLI, follow [wiki/host-cli.md](./wiki/host-cli.md) — it rep
 ### Step 4 — Wire Up `A2XClient`
 
 ```typescript
-import { A2XClient } from '@a2x/sdk/client';
+import {
+  A2XClient,
+  getAgentEndpointUrl,
+  resolveAgentCard,
+} from '@a2x/sdk/client';
 import type { SendMessageParams } from '@a2x/sdk';
 import crypto from 'node:crypto';
 
@@ -300,7 +304,9 @@ npm install @a2x/sdk @x402/core @x402/evm viem
 ```
 
 ```typescript
-const paidClient = new A2XClient(AGENT_URL, {
+const paidClient = new A2XClient(resolved.card, {
+  fetch: noRedirectFetch,
+  authProvider: new EnvAuthProvider(),
   x402: {
     signer,
     maxAmount: 10_000n,
@@ -321,16 +327,14 @@ const paidClient = new A2XClient(AGENT_URL, {
 1. **Build check** — Run the project's type-check (`tsc --noEmit`).
 2. **Agent card fetch** — manually or via the built-in resolver:
    ```typescript
-   import { resolveAgentCard } from '@a2x/sdk/client';
-   const resolved = await resolveAgentCard(AGENT_URL);
    console.log(resolved.version, resolved.card);
    ```
 3. **Send a message** — confirm the round-trip works with your `AuthProvider`.
 4. **Simulate token expiry** — make the server return an `auth-required` unary task or an `auth-required` status as the first stream event, then confirm `refresh()` is invoked and the request is retried.
 5. **Try with the `a2x` CLI** for a sanity check against the same agent:
    ```bash
-   a2x a2a agent-card <AGENT_URL>
-   a2x a2a send <AGENT_URL> "ping"
+   a2x a2a agent-card <AGENT_CARD_URL>
+   a2x a2a send <AGENT_CARD_URL> "ping"
    ```
 
 ---

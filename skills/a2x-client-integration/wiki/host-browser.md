@@ -185,7 +185,7 @@ export function ChatInput() {
   const onSubmit = useCallback(async (form: FormData) => {
     setBusy(true);
     setOutput('');
-    const client = makeAgentClient(() => accessToken);
+    const client = await makeAgentClient(() => accessToken);
 
     try {
       for await (const event of client.sendMessageStream({
@@ -216,11 +216,9 @@ export function ChatInput() {
 }
 ```
 
-Memoize the client if the token is stable:
-
-```typescript
-const client = useMemo(() => makeAgentClient(() => accessToken), [accessToken]);
-```
+For repeated calls, cache the validated card and endpoint policy separately,
+then construct a synchronous per-token client. Do not treat the promise returned
+by `makeAgentClient()` as an `A2XClient`.
 
 ---
 

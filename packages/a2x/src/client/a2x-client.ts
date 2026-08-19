@@ -1235,8 +1235,9 @@ export class A2XClient {
   private async _resolveOnce(): Promise<void> {
     if (this._resolved) return;
 
+    let resolved: ResolvedAgentCard;
     if (typeof this._urlOrCard === 'string') {
-      this._resolved = await resolveAgentCard(this._urlOrCard, {
+      resolved = await resolveAgentCard(this._urlOrCard, {
         fetch: this._fetchImpl,
         headers: this._headers,
       });
@@ -1248,18 +1249,20 @@ export class A2XClient {
       );
       const endpointUrl = getAgentEndpointUrl(card, version);
 
-      this._resolved = {
+      resolved = {
         card,
         version,
         baseUrl: new URL(endpointUrl).origin,
       };
     }
 
-    this._parser = getResponseParser(this._resolved!.version);
-    this._endpointUrl = getAgentEndpointUrl(
-      this._resolved!.card,
-      this._resolved.version,
-    );
+    // Validate every derived value before publishing any resolved state. A
+    // failed discovery must remain retryable on the next request.
+    const parser = getResponseParser(resolved.version);
+    const endpointUrl = getAgentEndpointUrl(resolved.card, resolved.version);
+    this._resolved = resolved;
+    this._parser = parser;
+    this._endpointUrl = endpointUrl;
     this._activateX402Extension();
   }
 

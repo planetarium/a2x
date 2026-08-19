@@ -110,6 +110,20 @@ describe('AuthScheme', () => {
       expect(ctx.headers['Cookie']).toBe('session=abc123');
     });
 
+    it('replaces the same cookie name while preserving unrelated cookies', () => {
+      const scheme = new ApiKeyAuthScheme('session', 'cookie');
+      scheme.setCredential('fresh');
+      const ctx = {
+        headers: { cookie: 'session=stale; other=ok' } as Record<string, string>,
+        url: new URL('http://example.com'),
+      };
+
+      scheme.applyToRequest(ctx);
+
+      expect(ctx.headers.Cookie).toBe('other=ok; session=fresh');
+      expect(ctx.headers.cookie).toBeUndefined();
+    });
+
     it('returns params', () => {
       const scheme = new ApiKeyAuthScheme('x-api-key', 'header');
       expect(scheme.params).toEqual({ name: 'x-api-key', location: 'header' });
@@ -517,6 +531,22 @@ describe('normalizeRequirements', () => {
     expect(result).toEqual([]);
   });
 
+  it('rejects a Cookie header API key combined with cookie API keys', () => {
+    const result = normalizeRequirements(
+      [{ wholeCookieHeader: [], sessionCookie: [] }],
+      {
+        wholeCookieHeader: {
+          apiKeySecurityScheme: { location: 'header', name: 'Cookie' },
+        },
+        sessionCookie: {
+          apiKeySecurityScheme: { location: 'cookie', name: 'session' },
+        },
+      },
+    );
+
+    expect(result).toEqual([]);
+  });
+
   it('rejects multi-OAuth AND groups that collide on Authorization', () => {
     const result = normalizeRequirements(
       [{ oauth: ['invoke'], secondOAuth: ['invoke'] }],
@@ -559,12 +589,12 @@ describe('normalizeRequirements', () => {
 
 describe('A2XClient auth integration', () => {
   it('accepts the legacy a2x values spelling for v1.0 requirement scopes', async () => {
-    const legacyCard = {
+    const legacyCard: AgentCardV10 = {
       ...V10_CARD_WITH_AUTH,
       securityRequirements: [
         { schemes: { deviceCode: { values: ['agent:invoke'] } } },
       ],
-    } as unknown as AgentCardV10;
+    };
     const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
     const provide = vi.fn(async (requirements: AuthScheme[][]) => {
       const scheme = requirements[0]![0] as OAuth2DeviceCodeAuthScheme;

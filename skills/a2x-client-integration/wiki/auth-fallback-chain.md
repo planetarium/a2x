@@ -10,7 +10,7 @@ This is the **reference pattern** for an interactive `AuthProvider`, based on `p
 provide(requirements)
   │
   │   ── Step 1: Stored credentials ────────────────────────────────────────
-  │     loadCredentials(agentUrl) → Array<{ slot, credential }>
+  │     loadCredentials(policyKey) → Array<{ slot, credential }>
   │     for each group and groupIndex in requirements:
   │       if all schemes have a stored match by unique slot key:
   │         scheme.setCredential(match.credential) for each
@@ -33,7 +33,7 @@ provide(requirements)
 refresh(schemes)   ← SDK calls after an auth-required task/event
   │
   │   ── Step 3: Invalidate and re-prompt ──────────────────────────────
-  │     clearCredentials(agentUrl)
+  │     clearCredentials(policyKey)
   │
   │     for each scheme in schemes:
   │       resolveScheme(scheme)   ← same interactive UI as Step 2
@@ -231,10 +231,10 @@ async function resolveScheme(scheme: AuthScheme): Promise<void> {
 export class CliAuthProvider implements AuthProvider {
   private selectedGroupIndex?: number;
 
-  constructor(private readonly agentUrl: string) {}
+  constructor(private readonly policyKey: string) {}
 
   async provide(requirements: AuthScheme[][]): Promise<AuthScheme[]> {
-    const stored = loadCredentials(this.agentUrl);
+    const stored = loadCredentials(this.policyKey);
     if (stored?.length) {
       for (const [groupIndex, group] of requirements.entries()) {
         if (this._tryRestore(groupIndex, group, stored)) {
@@ -262,7 +262,7 @@ export class CliAuthProvider implements AuthProvider {
     if (this.selectedGroupIndex === undefined) {
       throw new Error('Cannot refresh before selecting an auth group');
     }
-    clearCredentials(this.agentUrl);
+    clearCredentials(this.policyKey);
     for (const scheme of schemes) await resolveScheme(scheme);
     this._save(this.selectedGroupIndex, schemes);
     return schemes;
@@ -286,7 +286,7 @@ export class CliAuthProvider implements AuthProvider {
     const entries = group.map((scheme, schemeIndex) =>
       extractCredential(credentialSlot(groupIndex, schemeIndex, scheme), scheme),
     );
-    saveCredentials(this.agentUrl, entries);
+    saveCredentials(this.policyKey, entries);
   }
 }
 ```

@@ -6,16 +6,17 @@ How to persist credentials across process restarts so users don't re-authenticat
 
 ## Single-Process File Store
 
-Store credentials in a user-local JSON file keyed by agent URL and unique requirement slot:
+Store credentials in a user-local JSON file keyed by the validated agent/policy
+tuple and unique requirement slot:
 
 This example makes each file replacement atomic and treats corruption or I/O errors as fatal. It is still a **single-writer** store: atomic replacement does not prevent two processes from losing each other's read-modify-write updates. For multiple processes, hold an inter-process lock across the entire read-modify-write transaction or use a transactional database/credential store.
 
 ```json
 {
-  "https://agent.example.com": [
+  "[\"https://agent.example.com/.well-known/agent.json\",\"https://agent.example.com/a2a\",\"prod-client-audience-policy-v1\"]": [
     { "slot": "[0,0,\"ApiKeyAuthScheme\",{\"name\":\"x-api-key\",\"location\":\"header\"}]", "credential": "sk-abc123..." }
   ],
-  "https://other.example.com/a2a": [
+  "[\"https://other.example.com/.well-known/agent.json\",\"https://other.example.com/a2a\",\"prod-client-audience-policy-v1\"]": [
     { "slot": "[0,0,\"HttpBearerAuthScheme\",{}]", "credential": "eyJhbGci..." }
   ]
 }
@@ -96,42 +97,48 @@ function writeStore(data: StoreData): void {
   }
 }
 
-export function loadCredentials(agentUrl: string): StoredCredential[] | undefined {
-  return readStore()[agentUrl];
+export function credentialPolicyKey(
+  cardDocumentUrl: string,
+  resolvedEndpoint: string,
+  identityPolicyId: string,
+): string {
+  if (!identityPolicyId) throw new Error('identityPolicyId is required');
+  return JSON.stringify([cardDocumentUrl, resolvedEndpoint, identityPolicyId]);
 }
 
-export function saveCredentials(agentUrl: string, credentials: StoredCredential[]): void {
+export function loadCredentials(policyKey: string): StoredCredential[] | undefined {
+  return readStore()[policyKey];
+}
+
+export function saveCredentials(policyKey: string, credentials: StoredCredential[]): void {
   const store = readStore();
-  store[agentUrl] = credentials;
+  store[policyKey] = credentials;
   writeStore(store);
 }
 
-export function clearCredentials(agentUrl: string): void {
+export function clearCredentials(policyKey: string): void {
   const store = readStore();
-  delete store[agentUrl];
+  delete store[policyKey];
   writeStore(store);
 }
 ```
 
 ---
 
-## Agent URL as the Key
+## Validated Policy Tuple as the Key
 
-The CLI uses the exact string the user typed as the agent URL (e.g. `http://localhost:3000`, `https://agent.example.com`, `https://agent.example.com/.well-known/agent.json`). This is deliberate:
+Do not key automatic restoration only by the URL the user typed. Resolve the
+exact card document without redirects, validate the resolved JSON-RPC endpoint,
+then key by all three values passed to `credentialPolicyKey`:
 
-- No canonicalization → two different aliases for the same agent get two different entries, which is fine because any group that works for one works for the other (same card, same schemes).
-- Avoids DNS lookups or URL-parse edge cases (trailing slashes, default ports) from silently deduplicating entries.
+- `cardDocumentUrl`: the exact approved card document, not merely an origin.
+- `resolvedEndpoint`: the exact approved JSON-RPC endpoint from that card.
+- `identityPolicyId`: a host-controlled, non-secret version identifier binding
+  OAuth issuer/endpoints, client ID, audience/resource, and allowed scopes.
 
-If you want canonicalization, do it explicitly and consistently:
-
-```typescript
-function canonicalKey(url: string): string {
-  const u = new URL(url);
-  return `${u.protocol}//${u.host}`;   // origin only, drop path/query
-}
-```
-
-Just be aware: if two agents share an origin but have different cards (different paths), you'll conflate their credentials.
+If any tuple member changes, do not try the old credential. Prompt or acquire a
+new one after validating the new tuple. Canonicalizing to an origin is unsafe
+because different card paths and endpoints can share one origin.
 
 ---
 
@@ -216,7 +223,7 @@ The file permissions and atomic replacement reduce accidental exposure and parti
 | Encrypted file (libsodium / GPG) | If you must use a file; add a passphrase prompt. |
 | In-memory only | Forfeits step 1 of the fallback chain, but safest. Suitable for short-lived workers. |
 
-When switching stores, keep the same shape — `Record<agentUrl, Array<{ slot, credential }>>` — and only swap the backing read/write functions. Migrate legacy CLI entries keyed by `schemeClass` carefully; a class name alone is ambiguous when one requirement group contains two instances of that class.
+When switching stores, keep the same shape — `Record<policyKey, Array<{ slot, credential }>>` — and only swap the backing read/write functions. Do not automatically migrate URL-only keys: require re-authentication under the validated tuple. Migrate legacy CLI entries keyed by `schemeClass` carefully; a class name alone is ambiguous when one requirement group contains two instances of that class.
 
 ### File permissions
 
@@ -240,7 +247,7 @@ Safe: scheme class names, agent URLs, `scheme.params.name` for API keys.
 
 ```typescript
 async refresh(schemes: AuthScheme[]): Promise<AuthScheme[]> {
-  clearCredentials(this.agentUrl);
+  clearCredentials(this.policyKey);
   for (const scheme of schemes) await resolveScheme(scheme);
   if (this.selectedGroupIndex === undefined) {
     throw new Error('Cannot refresh before selecting an auth group');
@@ -293,8 +300,8 @@ interface StoredCredential {
   expiresAt?: number;    // Unix ms
 }
 
-export function loadCredentials(agentUrl: string): StoredCredential[] | undefined {
-  const entries = readStore()[agentUrl];
+export function loadCredentials(policyKey: string): StoredCredential[] | undefined {
+  const entries = readStore()[policyKey];
   if (!entries) return undefined;
   const now = Date.now();
   const fresh = entries.filter(e => !e.expiresAt || e.expiresAt > now + 30_000);
@@ -312,14 +319,19 @@ Expose a "logout" path your UI can call:
 
 ```typescript
 import { clearCredentials } from './token-store.js';
+import { resolveValidatedCredentialPolicyKey } from './agent-policy.js';
 
 program
   .command('logout <url>')
   .description('Clear stored credentials for an agent')
-  .action((url: string) => {
-    clearCredentials(url);
+  .action(async (url: string) => {
+    const policyKey = await resolveValidatedCredentialPolicyKey(url);
+    clearCredentials(policyKey);
     console.log('Cleared credentials for', url);
   });
 ```
+
+The helper must perform the same no-redirect card resolution, exact endpoint
+check, and identity-policy binding used before automatic restoration.
 
 Also consider a `logout --all` that wipes the entire file — useful when switching machines or rotating everything.

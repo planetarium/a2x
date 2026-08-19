@@ -19,8 +19,13 @@ import {
 import type { AuthProvider } from '@a2x/sdk/client';
 import { getApprovedCard, noRedirectFetch } from './approved-agent-card.js';
 
+type SessionCredentials = {
+  apiKeys?: Record<string, string>; // keyed by `location:name`
+  bearerToken?: string;
+};
+
 class SessionAuthProvider implements AuthProvider {
-  constructor(private readonly session: { apiKey?: string; bearerToken?: string }) {}
+  constructor(private readonly session: SessionCredentials) {}
 
   async provide(requirements: AuthScheme[][]): Promise<AuthScheme[]> {
     for (const group of requirements) {
@@ -37,8 +42,15 @@ class SessionAuthProvider implements AuthProvider {
 
   private tryFill(group: AuthScheme[]): boolean {
     for (const scheme of group) {
-      if (scheme instanceof ApiKeyAuthScheme && this.session.apiKey) {
-        scheme.setCredential(this.session.apiKey);
+      if (scheme instanceof ApiKeyAuthScheme) {
+        const name = scheme.params.location === 'header'
+          ? scheme.params.name.toLowerCase()
+          : scheme.params.name;
+        const credential = this.session.apiKeys?.[
+          `${scheme.params.location}:${name}`
+        ];
+        if (!credential) return false;
+        scheme.setCredential(credential);
         continue;
       }
       if (scheme instanceof HttpBearerAuthScheme && this.session.bearerToken) {
@@ -51,7 +63,7 @@ class SessionAuthProvider implements AuthProvider {
   }
 }
 
-export async function agentClientFor(session: { apiKey?: string; bearerToken?: string }) {
+export async function agentClientFor(session: SessionCredentials) {
   const resolved = await getApprovedCard(); // policy-bound cache below
   return new A2XClient(resolved.card, {
     fetch: noRedirectFetch,
@@ -285,7 +297,7 @@ const job = await jobs.createOnceWithOutbox({
   credentialRef: session.a2aCredentialRef, // reference, never a browser token
   outbox: {
     topic: 'payer-jobs',
-    partitionKey: `${AGENT_URL}:${PAYER_ADDRESS}`,
+    partitionKey: `${process.env.AGENT_ENDPOINT_URL}:${PAYER_ADDRESS}`,
   },
 });
 return Response.json({ jobId: job.id }, { status: 202 });
@@ -294,8 +306,9 @@ return Response.json({ jobId: job.id }, { status: 202 });
 An outbox dispatcher publishes each row with `job.id` as the queue deduplication key and marks it delivered transactionally/idempotently. Repeating the POST returns the existing job and cannot create another outbox row.
 
 ```typescript
-// One active worker per partition; clientForWorker injects server credentials,
-// signer policy, and durable batchSettlement storage.
+// One active worker per partition. This high-level recovery example is only
+// for exact/upto payments: clientForWorker must omit batchSettlement and keep
+// allowBatchSettlement false. Batch recovery requires the low-level flow below.
 import {
   TERMINAL_STATES,
   TaskState,
@@ -400,7 +413,7 @@ async function recoverPersistedPaidExecution(
 }
 ```
 
-The durable execution row is separate from queue deduplication: it prevents an at-least-once delivery from starting the paid operation twice. The high-level stream can persist the payment boundary and safely query an existing task, but it cannot reconstruct every signed exact/upto payload or batch reconciliation object after process death. For automatic recovery beyond querying the merchant task, use the [low-level x402 flow](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md#low-level-signx402payment) and durably store the signed payload, task/context IDs, batch binding, and attempt state before submission. Otherwise quarantine an ambiguous attempt; never call `sendMessageStream(job.params)` again.
+The durable execution row is separate from queue deduplication: it prevents an at-least-once delivery from starting the paid operation twice. This high-level helper is restricted to non-batch exact/upto payments: it can persist the payment boundary and safely query an existing merchant task, but it cannot reconstruct every signed payload after process death. Batch settlement must use the [low-level x402 flow](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md#low-level-signx402payment), durably store the signed payload, task/context IDs, batch binding, payer-storage pending attempt, and submission state, then call `reconcileX402BatchSettlement` before completing the job or accepting another partitioned payment. Otherwise quarantine an ambiguous attempt; never call `sendMessageStream(job.params)` again.
 
 ```typescript
 // GET /api/agent/jobs/:id/events — verify session ownership on every read.
@@ -461,10 +474,12 @@ This makes the file fail to import from a client component, catching leakage at 
 
 ```env
 # .env.local
-AGENT_URL=https://agent.example.com
+AGENT_CARD_URL=https://agent.example.com/.well-known/agent.json
+AGENT_ENDPOINT_URL=https://agent.example.com/a2a
 # If your auth provider needs secrets beyond the user session:
 # AGENT_CLIENT_ID=...
 # AGENT_CLIENT_SECRET=...
 ```
 
-Only `AGENT_URL` is typically needed — user credentials come from the session, not env.
+`AGENT_CARD_URL` and `AGENT_ENDPOINT_URL` are required by the policy-bound
+examples. User credentials come from the session, not env.

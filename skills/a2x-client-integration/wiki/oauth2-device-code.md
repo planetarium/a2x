@@ -76,6 +76,12 @@ interface TokenErrorResponse {
   error_description?: string;
 }
 
+function assertBearerTokenType(tokenType: string): void {
+  if (typeof tokenType !== 'string' || tokenType.toLowerCase() !== 'bearer') {
+    throw new Error('Token endpoint returned a non-Bearer token type');
+  }
+}
+
 function normalizeOAuthEndpoint(raw: string): string {
   const url = new URL(raw);
   if (url.protocol !== 'https:' || url.username || url.password || url.hash) {
@@ -84,14 +90,23 @@ function normalizeOAuthEndpoint(raw: string): string {
   return url.toString();
 }
 
-// Configure all policy below from the host, never from the discovered card.
-const TRUSTED_OAUTH_ENDPOINTS = new Set(
-  (process.env.OAUTH_ENDPOINTS ?? '')
-    .split(',')
-    .map(value => value.trim())
-    .filter(Boolean)
-    .map(normalizeOAuthEndpoint),
-);
+// One exact identity policy belongs to one approved card+agent endpoint tuple.
+// Never pool endpoints from several agents: a hostile card could select another
+// entry and receive this tuple's device code, refresh token, or client secret.
+const OAUTH_POLICY = Object.freeze({
+  deviceAuthorizationEndpoint: normalizeOAuthEndpoint(
+    process.env.OAUTH_DEVICE_AUTHORIZATION_ENDPOINT!,
+  ),
+  tokenEndpoint: normalizeOAuthEndpoint(process.env.OAUTH_TOKEN_ENDPOINT!),
+  refreshEndpoint: normalizeOAuthEndpoint(
+    process.env.OAUTH_REFRESH_ENDPOINT ?? process.env.OAUTH_TOKEN_ENDPOINT!,
+  ),
+  clientId: process.env.OAUTH_CLIENT_ID!,
+  expectedAudience: process.env.OAUTH_EXPECTED_AUDIENCE!,
+  allowedScopes: new Set(
+    (process.env.OAUTH_ALLOWED_SCOPES ?? '').split(/\s+/).filter(Boolean),
+  ),
+});
 
 const TRUSTED_VERIFICATION_ORIGINS = new Set(
   (process.env.OAUTH_VERIFICATION_ORIGINS ?? '')
@@ -101,13 +116,13 @@ const TRUSTED_VERIFICATION_ORIGINS = new Set(
     .map(value => new URL(value).origin),
 );
 
-const ALLOWED_OAUTH_SCOPES = new Set(
-  (process.env.OAUTH_ALLOWED_SCOPES ?? '').split(/\s+/).filter(Boolean),
-);
-
-function trustedOAuthEndpoint(raw: string, purpose: string): URL {
+function trustedOAuthEndpoint(
+  raw: string,
+  expected: string,
+  purpose: string,
+): URL {
   const normalized = normalizeOAuthEndpoint(raw);
-  if (!TRUSTED_OAUTH_ENDPOINTS.has(normalized)) {
+  if (normalized !== expected) {
     throw new Error(`Refusing untrusted OAuth ${purpose}: ${normalized}`);
   }
   return new URL(normalized);
@@ -135,7 +150,7 @@ function approvedScope(
   }
   const requested = [...new Set(required)];
   const rejected = requested.filter(scope =>
-    !(scope in advertised) || !ALLOWED_OAUTH_SCOPES.has(scope)
+    !(scope in advertised) || !OAUTH_POLICY.allowedScopes.has(scope)
   );
   if (rejected.length) {
     throw new Error(`Refusing unapproved OAuth scopes: ${rejected.join(', ')}`);
@@ -172,15 +187,22 @@ export async function performDeviceCodeFlow(
   scheme: OAuth2DeviceCodeAuthScheme,
   clientId: string,
 ): Promise<TokenResponse> {
-  if (!clientId) throw new Error('OAuth client ID is required');
-  const expectedAudience = process.env.OAUTH_EXPECTED_AUDIENCE;
+  if (!clientId || clientId !== OAUTH_POLICY.clientId) {
+    throw new Error('OAuth client ID does not match the approved tuple');
+  }
+  const expectedAudience = OAUTH_POLICY.expectedAudience;
   if (!expectedAudience) throw new Error('OAuth expected audience is required');
   const { scopes, requiredScopes } = scheme.params;
   const deviceAuthorizationUrl = trustedOAuthEndpoint(
     scheme.params.deviceAuthorizationUrl,
+    OAUTH_POLICY.deviceAuthorizationEndpoint,
     'device authorization endpoint',
   );
-  const tokenUrl = trustedOAuthEndpoint(scheme.params.tokenUrl, 'token endpoint');
+  const tokenUrl = trustedOAuthEndpoint(
+    scheme.params.tokenUrl,
+    OAUTH_POLICY.tokenEndpoint,
+    'token endpoint',
+  );
 
   // Step 1: Request a device code
   const scopeStr = approvedScope(scopes, requiredScopes);
@@ -256,6 +278,7 @@ export async function performDeviceCodeFlow(
       if (typeof tokenData.access_token !== 'string' || !tokenData.access_token) {
         throw new Error('Token response omitted access_token');
       }
+      assertBearerTokenType(tokenData.token_type);
       assertGrantedScope(tokenData.scope, requestedScopes);
       await assertTokenPolicy(
         tokenData.access_token,
@@ -287,7 +310,15 @@ export async function performDeviceCodeFlow(
 }
 ```
 
-Configure exact `OAUTH_ENDPOINTS`, `OAUTH_VERIFICATION_ORIGINS`, `OAUTH_ALLOWED_SCOPES`, and the client ID from trusted host policy. `params.scopes` is the advertised catalogue; request only `params.requiredScopes`, rejecting missing values or any value absent from the catalogue/allowlist. In multi-agent or multi-tenant hosts, bind policy and token persistence to the exact card URL, resolved agent endpoint, issuer, client identity, expected audience/resource, and required scopes; validate the resulting token's audience/resource before attachment. Reject redirects so an approved endpoint cannot forward secrets elsewhere. If local HTTP identity infrastructure is required, implement a narrow development-only exception rather than weakening the production rule.
+Configure singular exact device, token, and refresh endpoints plus verification
+origins, client ID, audience, and allowed scopes for this approved card+agent
+tuple. Do not combine identity endpoints from several agents into one allowlist.
+`params.scopes` is the advertised catalogue; request only
+`params.requiredScopes`, rejecting missing values or any value absent from the
+catalogue/policy. Validate the resulting token's audience/resource before
+attachment. Reject redirects so an approved endpoint cannot forward secrets
+elsewhere. If local HTTP identity infrastructure is required, implement a
+narrow development-only exception rather than weakening the production rule.
 
 Use it from `resolveScheme`:
 
@@ -384,7 +415,7 @@ private _save(groupIndex: number, group: AuthScheme[]): void {
         : {}),
     };
   });
-  saveCredentials(this.agentUrl, entries);
+  saveCredentials(this.policyKey, entries);
 }
 
 async refresh(schemes: AuthScheme[]): Promise<AuthScheme[]> {
@@ -392,7 +423,7 @@ async refresh(schemes: AuthScheme[]): Promise<AuthScheme[]> {
   if (groupIndex === undefined) {
     throw new Error('Cannot refresh before selecting an auth group');
   }
-  const stored = loadCredentials(this.agentUrl) ?? [];
+  const stored = loadCredentials(this.policyKey) ?? [];
   const clientId = process.env.OAUTH_CLIENT_ID!;
 
   for (const [schemeIndex, scheme] of schemes.entries()) {
@@ -425,7 +456,7 @@ export async function tryRefreshToken(
   refreshToken: string,
   clientId: string,
 ): Promise<TokenResponse | undefined> {
-  const expectedAudience = process.env.OAUTH_EXPECTED_AUDIENCE;
+  const expectedAudience = OAUTH_POLICY.expectedAudience;
   if (!expectedAudience) throw new Error('OAuth expected audience is required');
   const scope = approvedScope(
     scheme.params.scopes,
@@ -434,6 +465,7 @@ export async function tryRefreshToken(
   const requestedScopes = scope.split(/\s+/).filter(Boolean);
   const trustedTokenUrl = trustedOAuthEndpoint(
     scheme.params.refreshUrl ?? scheme.params.tokenUrl,
+    OAUTH_POLICY.refreshEndpoint,
     'refresh endpoint',
   );
   const res = await fetch(trustedTokenUrl, {
@@ -451,6 +483,7 @@ export async function tryRefreshToken(
   const data = (await res.json()) as TokenResponse | TokenErrorResponse;
   if (!('access_token' in data)) return undefined;
   if (typeof data.access_token !== 'string' || !data.access_token) return undefined;
+  assertBearerTokenType(data.token_type);
   assertGrantedScope(data.scope, requestedScopes);
   await assertTokenPolicy(data.access_token, expectedAudience, requestedScopes);
   return data;
