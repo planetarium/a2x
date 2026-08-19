@@ -391,6 +391,21 @@ function formatPartToV03(part: Record<string, unknown>): Record<string, unknown>
   return part;
 }
 
+/**
+ * Copy an auth scheme without sharing its mutable credential slot.
+ *
+ * AuthProvider.refresh() is allowed to update schemes with setCredential().
+ * Give it snapshots so those writes cannot become visible to requests before
+ * the refresh succeeds. Property descriptors preserve each scheme's prototype
+ * and configuration without coupling this boundary to every constructor.
+ */
+function snapshotAuthSchemes(schemes: AuthScheme[]): AuthScheme[] {
+  return schemes.map((scheme) => Object.create(
+    Object.getPrototypeOf(scheme) as object,
+    Object.getOwnPropertyDescriptors(scheme),
+  ) as AuthScheme);
+}
+
 // ─── A2XClient ───
 
 export class A2XClient {
@@ -832,10 +847,16 @@ export class A2XClient {
       !isRetry &&
       'status' in firstEvent &&
       firstEvent.status?.state === TaskState.AUTH_REQUIRED &&
-      (await this._refreshAuth(authGeneration))
+      this._authProvider?.refresh &&
+      this._resolvedSchemes
     ) {
-      yield* this._streamWithAuthRetry(params, signal, true, onTransport);
-      return;
+      // Close the rejected response before refreshing and opening another SSE
+      // connection. parseSSEStream() cancels its reader on early return.
+      await events.return(undefined);
+      if (await this._refreshAuth(authGeneration)) {
+        yield* this._streamWithAuthRetry(params, signal, true, onTransport);
+        return;
+      }
     }
     yield firstEvent;
     yield* events;
@@ -1469,11 +1490,23 @@ export class A2XClient {
    */
   private async _refreshAuth(expectedGeneration: number): Promise<boolean> {
     if (!this._authProvider?.refresh || !this._resolvedSchemes) return false;
-    if (this._authGeneration !== expectedGeneration) return true;
+    if (this._authGeneration !== expectedGeneration) {
+      // A later generation may itself already be refreshing. Waiting for that
+      // work prevents a stale failure from spending its sole retry on the
+      // intermediate credentials that triggered the newer refresh.
+      return this._authRefreshPromise
+        ? await this._authRefreshPromise
+        : true;
+    }
     if (!this._authRefreshPromise) {
-      const schemes = this._resolvedSchemes;
+      const authProvider = this._authProvider;
+      const schemes = snapshotAuthSchemes(this._resolvedSchemes);
       this._authRefreshPromise = (async () => {
-        this._resolvedSchemes = await this._authProvider!.refresh!(schemes);
+        const refreshed = await authProvider.refresh!(schemes);
+        // The provider retains the objects it received and returned. Publish a
+        // second snapshot so later provider-side mutation cannot alter the
+        // generation that requests observe.
+        this._resolvedSchemes = snapshotAuthSchemes(refreshed);
         this._authGeneration += 1;
         return true;
       })();

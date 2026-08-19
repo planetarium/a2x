@@ -268,6 +268,12 @@ export async function* parseSSEStream(
       }
     }
   } finally {
-    reader.releaseLock();
+    try {
+      // An early consumer return must tear down the HTTP response rather than
+      // leave a live SSE connection behind with only its reader lock released.
+      await reader.cancel();
+    } finally {
+      reader.releaseLock();
+    }
   }
 }
