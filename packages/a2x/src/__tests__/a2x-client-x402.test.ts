@@ -389,6 +389,69 @@ describe('A2XClient.sendMessage — native x402 dance', () => {
     ).rejects.toBeInstanceOf(X402NoSupportedRequirementError);
   });
 
+  it.each([
+    {
+      name: 'a V1 offer also carrying amount',
+      task: paymentRequiredTask,
+      mutate: (offer: Record<string, unknown>) => {
+        offer.amount = '1';
+      },
+      allowUpto: false,
+    },
+    {
+      name: 'a V1 offer missing maxAmountRequired',
+      task: paymentRequiredTask,
+      mutate: (offer: Record<string, unknown>) => {
+        delete offer.maxAmountRequired;
+      },
+      allowUpto: false,
+    },
+    {
+      name: 'a V2 offer also carrying maxAmountRequired',
+      task: uptoRequiredTask,
+      mutate: (offer: Record<string, unknown>) => {
+        offer.maxAmountRequired = '1';
+      },
+      allowUpto: true,
+    },
+    {
+      name: 'a V2 offer missing amount',
+      task: uptoRequiredTask,
+      mutate: (offer: Record<string, unknown>) => {
+        delete offer.amount;
+      },
+      allowUpto: true,
+    },
+  ])('rejects $name instead of signing an ambiguous amount', async ({ task, mutate, allowUpto }) => {
+    const requiredTask = task() as {
+      status: {
+        message: { metadata: Record<string, Record<string, unknown>> };
+      };
+    };
+    const required = requiredTask.status.message.metadata[
+      X402_METADATA_KEYS.REQUIRED
+    ]!;
+    mutate((required.accepts as Array<Record<string, unknown>>)[0]!);
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(requiredTask),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        maxAmount: 100n,
+        allowUpto,
+      },
+    });
+
+    await expect(
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      }),
+    ).rejects.toBeInstanceOf(X402NoSupportedRequirementError);
+    expect(rpcRequests).toHaveLength(1);
+  });
+
   it('does not sign an upto-only offer unless allowUpto is set', async () => {
     const { fetch } = scriptedFetch([() => jsonRpcOk(uptoRequiredTask())]);
     const client = new A2XClient(AGENT_URL, {
@@ -1773,6 +1836,122 @@ describe('A2XClient.sendMessage — batch-settlement', () => {
     expect(
       channels.get(signedChannelId(recorded).toLowerCase()),
     ).toMatchObject({ quarantineReason: 'ambiguous-response' });
+  });
+
+  it('aborts before approval or signing when cancelled at the payment prompt', async () => {
+    const { channels, storage } = channelStorage();
+    const required = batchRequiredTask() as { status: { message: unknown } };
+    const { fetch, rpcRequests } = scriptedFetch([
+      () =>
+        batchSse([
+          batchStatusEvent('input-required', required.status.message),
+        ]),
+    ]);
+    const controller = new AbortController();
+    const onPaymentRequired = vi.fn();
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+        onPaymentRequired,
+      },
+    });
+    const events = client.sendMessageStream(
+      {
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      },
+      controller.signal,
+    );
+
+    const prompt = await events.next();
+    expect(prompt.done).toBe(false);
+    controller.abort();
+    await expect(events.next()).rejects.toMatchObject({ name: 'AbortError' });
+
+    expect(onPaymentRequired).not.toHaveBeenCalled();
+    expect(rpcRequests).toHaveLength(1);
+    expect(channels.size).toBe(0);
+  });
+
+  it('keeps cancellation during approval before batch signing and submission', async () => {
+    const { channels, storage } = channelStorage();
+    const required = batchRequiredTask() as { status: { message: unknown } };
+    const { fetch, rpcRequests } = scriptedFetch([
+      () =>
+        batchSse([
+          batchStatusEvent('input-required', required.status.message),
+        ]),
+    ]);
+    const controller = new AbortController();
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+        onPaymentRequired: () => {
+          controller.abort();
+        },
+      },
+    });
+    const events = client.sendMessageStream(
+      {
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      },
+      controller.signal,
+    );
+
+    const prompt = await events.next();
+    expect(prompt.done).toBe(false);
+    await expect(events.next()).rejects.toMatchObject({ name: 'AbortError' });
+
+    expect(rpcRequests).toHaveLength(1);
+    expect(channels.size).toBe(0);
+  });
+
+  it('releases a signed batch attempt when cancelled before transport handoff', async () => {
+    const { channels, storage } = channelStorage();
+    const required = batchRequiredTask() as { status: { message: unknown } };
+    const { fetch, rpcRequests } = scriptedFetch([
+      () =>
+        batchSse([
+          batchStatusEvent('input-required', required.status.message),
+        ]),
+    ]);
+    const controller = new AbortController();
+    const signer = {
+      ...TEST_ACCOUNT,
+      signTypedData: async (
+        parameters: Parameters<typeof TEST_ACCOUNT.signTypedData>[0],
+      ) => {
+        const signature = await TEST_ACCOUNT.signTypedData(parameters);
+        controller.abort();
+        return signature;
+      },
+    } as typeof TEST_ACCOUNT;
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer,
+        batchSettlement: { storage },
+        allowBatchSettlement: true,
+      },
+    });
+    const events = client.sendMessageStream(
+      {
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      },
+      controller.signal,
+    );
+
+    const prompt = await events.next();
+    expect(prompt.done).toBe(false);
+    await expect(events.next()).rejects.toMatchObject({ name: 'AbortError' });
+
+    expect(rpcRequests).toHaveLength(1);
+    expect(channels.size).toBe(0);
   });
 
   it('ignores receipts from an exchange it did not pay with a voucher', async () => {

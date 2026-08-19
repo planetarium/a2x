@@ -50,7 +50,10 @@ import {
   X402_FOUNDATION_EXTENSION_URI,
   X402_METADATA_KEYS,
 } from '../x402/constants.js';
-import { detectX402Version, requirementAmount } from '../x402/versions.js';
+import {
+  detectX402Version,
+  type X402Version,
+} from '../x402/versions.js';
 import {
   defaultSelect,
   signX402Payment,
@@ -184,9 +187,10 @@ export interface A2XClientX402Options {
    * Maximum atomic units the client is willing to authorize per
    * requirement. Default: no cap.
    *
-   * Always enforced — any requirement whose `maxAmountRequired` exceeds
-   * this is filtered out before the selector runs, so a custom
-   * `selectRequirement` only sees the affordable subset. If nothing
+   * Always enforced — any requirement whose V1 `maxAmountRequired` or V2
+   * `amount` exceeds this is filtered out before the selector runs, so a
+   * custom `selectRequirement` only sees the affordable subset. Missing or
+   * mixed version-specific amount fields are also filtered out. If nothing
    * remains, signing throws `X402NoSupportedRequirementError`.
    *
    * For `batch-settlement` the cap applies to the **deposit**, not just the
@@ -709,7 +713,13 @@ export class A2XClient {
           }
 
           yield event;
-          if (pendingTask) break;
+          if (pendingTask) {
+            // A caller commonly aborts in response to the payment prompt and
+            // then lets `for await` request the next item. Stop at that resumed
+            // yield boundary before approval or signing begins.
+            signal?.throwIfAborted();
+            break;
+          }
         }
       } catch (cause) {
         // `observe` already surfaced (and released) an unsafe channel. Do
@@ -747,9 +757,13 @@ export class A2XClient {
       const required = getX402PaymentRequirements(pendingTask);
       if (!required) return;
 
+      signal?.throwIfAborted();
       const decision = await this._x402.onPaymentRequired?.(
         structuredClone(required),
       );
+      // Approval hooks may wait for user input. Cancellation during that wait
+      // must not proceed into signing once the hook resolves.
+      signal?.throwIfAborted();
       if (decision === false) {
         // Decline cleanly: surface the rejection follow-up's events to
         // the caller (typically a single `failed` + payment-rejected
@@ -854,6 +868,10 @@ export class A2XClient {
     // request submitted, so a payload that cannot even be encoded never
     // counts as having possibly reached the merchant.
     const body = JSON.stringify(request);
+    // An already-aborted fetch cannot receive the serialized voucher. Check
+    // before persisting batch submission so cancellation remains a clean,
+    // recoverable pre-transport exit.
+    signal?.throwIfAborted();
     await onTransport?.();
     const response = await this._fetchImpl(url.toString(), {
       method: 'POST',
@@ -983,19 +1001,24 @@ export class A2XClient {
     const userSelect = x402.selectRequirement;
     const select = (
       reqs: X402PaymentRequirements[],
+      version: X402Version,
     ): X402PaymentRequirements | undefined => {
       // Work from a private snapshot so no retained task/envelope reference
       // can change an offer after affordability policy has inspected it.
       const snapshot = structuredClone(reqs);
       // maxAmount is enforced first regardless of caller predicate, so a
       // user-provided selectRequirement only sees the affordable subset.
-      const usable = snapshot.filter((r) =>
-        hasUsableBatchDepositPolicy(r, x402),
+      const usable = snapshot.filter(
+        (r) =>
+          hasConsistentAmountShape(r, version) &&
+          hasUsableBatchDepositPolicy(r, x402),
       );
       const affordable =
         x402.maxAmount === undefined
           ? usable
-          : usable.filter((r) => isWithinBudget(r, x402.maxAmount!));
+          : usable.filter((r) =>
+              isWithinBudget(r, version, x402.maxAmount!),
+            );
       if (userSelect) {
         // Map by object identity rather than array index. Selectors commonly
         // sort candidates in place, and that must not change which pristine
@@ -1037,9 +1060,10 @@ export class A2XClient {
       });
     };
     const required = getX402PaymentRequirements(task);
+    const version = required ? detectX402Version(required) : undefined;
     const selected =
-      required && detectX402Version(required)
-        ? select(required.accepts as X402PaymentRequirements[])
+      required && version
+        ? select(required.accepts as X402PaymentRequirements[], version)
         : undefined;
     const batchSettlement = x402.batchSettlement;
     const release =
@@ -1631,16 +1655,41 @@ function hasUsableBatchDepositPolicy(
 
 function isWithinBudget(
   requirement: X402PaymentRequirements,
+  version: X402Version,
   maxAmount: bigint,
 ): boolean {
   try {
-    // Read through the version-agnostic accessor: V2 requirements carry
-    // `amount`, not `maxAmountRequired` — reading the V1 field directly would
-    // throw here and the catch below would silently disable the budget cap.
-    return BigInt(requirementAmount(requirement)) <= maxAmount;
+    const amount =
+      version === 1
+        ? (requirement as unknown as Record<string, unknown>).maxAmountRequired
+        : (requirement as unknown as Record<string, unknown>).amount;
+    return typeof amount === 'string' && BigInt(amount) <= maxAmount;
   } catch {
-    // Unparseable amount — defer to the signer to fail loudly rather
-    // than silently swallow the requirement.
-    return true;
+    // A cap cannot be authoritative when the amount is unparseable.
+    return false;
   }
+}
+
+/**
+ * Require each offer's amount field to agree with its envelope version.
+ * JSON objects may carry unknown extension keys, but accepting the other
+ * version's amount key makes it ambiguous which value policy inspected and
+ * which value the version-specific signer will authorize.
+ */
+function hasConsistentAmountShape(
+  requirement: X402PaymentRequirements,
+  version: X402Version,
+): boolean {
+  const record = requirement as unknown as Record<string, unknown>;
+  const hasV1Amount = Object.prototype.hasOwnProperty.call(
+    record,
+    'maxAmountRequired',
+  );
+  const hasV2Amount = Object.prototype.hasOwnProperty.call(record, 'amount');
+
+  return version === 1
+    ? hasV1Amount &&
+        typeof record.maxAmountRequired === 'string' &&
+        !hasV2Amount
+    : hasV2Amount && typeof record.amount === 'string' && !hasV1Amount;
 }
