@@ -12,7 +12,7 @@ import type {
 import type {
   SecuritySchemeV10,
   SecurityRequirement,
-  SecurityRequirementV10,
+  CanonicalSecurityRequirementV10,
 } from '../types/security.js';
 import type { AgentCardMapper } from './agent-card-mapper.js';
 
@@ -129,15 +129,17 @@ export class V10AgentCardMapper implements AgentCardMapper<AgentCardV10> {
   /**
    * Convert internal flat SecurityRequirement to v1.0 wrapped format.
    * Internal: { "oauth2": ["read", "write"], "apiKey": [] }
-   * v1.0:    { schemes: { "oauth2": { values: ["read", "write"] }, "apiKey": { values: [] } } }
+   * v1.0:    { schemes: { "oauth2": { list: ["read", "write"] }, "apiKey": { list: [] } } }
    */
   private mapSecurityRequirement(
     requirement: SecurityRequirement,
-  ): SecurityRequirementV10 {
-    const schemes: Record<string, { values: string[] }> = {};
-    for (const [name, scopes] of Object.entries(requirement)) {
-      schemes[name] = { values: scopes };
-    }
+  ): CanonicalSecurityRequirementV10 {
+    const schemes = Object.fromEntries(
+      Object.entries(requirement).map(([name, scopes]) => [
+        name,
+        { list: scopes },
+      ]),
+    );
     return { schemes };
   }
 
@@ -148,11 +150,12 @@ export class V10AgentCardMapper implements AgentCardMapper<AgentCardV10> {
       return undefined;
     }
 
-    const schemes: Record<string, SecuritySchemeV10> = {};
-
-    for (const [name, scheme] of state.securitySchemes) {
-      schemes[name] = scheme.toV10Schema();
-    }
+    const schemes = Object.fromEntries(
+      [...state.securitySchemes].map(([name, scheme]) => [
+        name,
+        scheme.toV10Schema(),
+      ]),
+    ) as Record<string, SecuritySchemeV10>;
 
     return Object.keys(schemes).length > 0 ? schemes : undefined;
   }

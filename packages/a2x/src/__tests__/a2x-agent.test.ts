@@ -247,8 +247,33 @@ describe('Layer 3: A2XServer', () => {
         httpAuthSecurityScheme: { scheme: 'bearer' },
       });
       expect(card.securityRequirements).toEqual([
-        { schemes: { bearer: { values: [] } } },
+        { schemes: { bearer: { list: [] } } },
       ]);
+    });
+
+    it('should preserve __proto__ as a v1.0 security scheme name', () => {
+      const a2x = createA2XAgent();
+      a2x
+        .setDefaultUrl('https://example.com/a2a')
+        .addSecurityScheme(
+          '__proto__',
+          new ApiKeyAuthorization({ in: 'header', name: 'X-Special-Key' }),
+        )
+        .addSecurityRequirement(Object.fromEntries([['__proto__', []]]));
+
+      const card = a2x.getAgentCard() as AgentCardV10;
+      const wireCard = JSON.parse(JSON.stringify(card)) as AgentCardV10;
+
+      expect(Object.hasOwn(wireCard.securitySchemes!, '__proto__')).toBe(true);
+      expect(wireCard.securitySchemes!['__proto__']).toEqual({
+        apiKeySecurityScheme: { location: 'header', name: 'X-Special-Key' },
+      });
+      expect(Object.hasOwn(
+        wireCard.securityRequirements![0]!.schemes,
+        '__proto__',
+      )).toBe(true);
+      expect(wireCard.securityRequirements![0]!.schemes['__proto__'])
+        .toEqual({ list: [] });
     });
   });
 
@@ -277,6 +302,29 @@ describe('Layer 3: A2XServer', () => {
       expect(card.preferredTransport).toBe('JSONRPC');
       // v0.3 skill uses "security" not "securityRequirements"
       expect(card.skills[0].security).toEqual([{ api_key: [] }]);
+    });
+
+    it('should preserve __proto__ as a v0.3 security scheme name', () => {
+      const a2x = createA2XAgent(undefined, undefined, '0.3');
+      a2x
+        .setDefaultUrl('https://example.com/a2a')
+        .addSecurityScheme(
+          '__proto__',
+          new ApiKeyAuthorization({ in: 'header', name: 'X-Special-Key' }),
+        )
+        .addSecurityRequirement(Object.fromEntries([['__proto__', []]]));
+
+      const card = a2x.getAgentCard() as AgentCardV03;
+      const wireCard = JSON.parse(JSON.stringify(card)) as AgentCardV03;
+
+      expect(Object.hasOwn(wireCard.securitySchemes!, '__proto__')).toBe(true);
+      expect(wireCard.securitySchemes!['__proto__']).toEqual({
+        type: 'apiKey',
+        in: 'header',
+        name: 'X-Special-Key',
+      });
+      expect(Object.hasOwn(wireCard.security![0]!, '__proto__')).toBe(true);
+      expect(wireCard.security![0]!['__proto__']).toEqual([]);
     });
 
     it('should emit DeviceCode as non-standard v0.3 extension', () => {

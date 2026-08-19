@@ -75,6 +75,65 @@ import type {
   X402PaymentRequiredResponse,
 } from '../x402/types.js';
 
+function normalizeHeaderBag(
+  headers: Record<string, string>,
+): Record<string, string> {
+  const result = Object.create(null) as Record<string, string>;
+  const casing = new Map<string, string>();
+  const cookieValues: string[] = [];
+  for (const [name, value] of Object.entries(headers)) {
+    const lower = name.toLowerCase();
+    if (lower === 'cookie') {
+      if (value) cookieValues.push(value);
+      continue;
+    }
+    const previous = casing.get(lower);
+    if (previous !== undefined) delete result[previous];
+    casing.set(lower, name);
+    Object.defineProperty(result, name, {
+      value,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  }
+  if (cookieValues.length > 0) {
+    Object.defineProperty(result, 'Cookie', {
+      value: cookieValues.join('; '),
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return result;
+}
+
+function replaceHeaderBag(
+  target: Record<string, string>,
+  source: Record<string, string>,
+): void {
+  for (const name of Object.keys(target)) delete target[name];
+  for (const [name, value] of Object.entries(source)) {
+    Object.defineProperty(target, name, {
+      value,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  }
+}
+
+function getHeaderValue(
+  headers: Record<string, string>,
+  name: string,
+): string | undefined {
+  const lower = name.toLowerCase();
+  const entry = Object.entries(headers).find(
+    ([candidate]) => candidate.toLowerCase() === lower,
+  );
+  return entry?.[1];
+}
+
 // ─── Types ───
 
 /**
@@ -713,7 +772,14 @@ export class A2XClient {
     });
     const url = new URL(this._endpointUrl!);
 
-    this._applyAuth({ headers, url });
+    this._applyAuth(
+      { headers, url },
+      [
+        'Content-Type',
+        'Accept',
+        ...(this._extensions.size > 0 ? ['X-A2A-Extensions'] : []),
+      ],
+    );
 
     // Everything above ran locally; serialize the body before declaring the
     // request submitted, so a payload that cannot even be encoded never
@@ -1024,37 +1090,129 @@ export class A2XClient {
     const rawCard = card as unknown as Record<string, unknown>;
 
     // v0.3 uses "security", v1.0 uses "securityRequirements"
-    const rawRequirementsField =
-      (rawCard.security as unknown[] | undefined) ??
-      (rawCard.securityRequirements as unknown[] | undefined) ??
-      [];
+    const rawRequirementsValue =
+      rawCard.security ?? rawCard.securityRequirements ?? [];
+    if (!Array.isArray(rawRequirementsValue)) {
+      throw new InvalidAgentResponseError(
+        'AgentCard security requirements must be an array.',
+      );
+    }
+    const rawRequirementsField = rawRequirementsValue;
     if (rawRequirementsField.length === 0) return;
 
-    // Normalize v1.0 wrapped format { schemes: { name: { values: [...] } } }
+    // Normalize v1.0 wrapped format { schemes: { name: { list: [...] } } }
     // to internal flat format { name: [...] }
     const rawRequirements = rawRequirementsField.map((req) => {
-      const r = req as Record<string, unknown>;
-      if (r.schemes && typeof r.schemes === 'object') {
-        // v1.0 format
-        const flat: Record<string, string[]> = {};
-        for (const [name, val] of Object.entries(r.schemes as Record<string, unknown>)) {
-          const v = val as { values?: string[] };
-          flat[name] = v.values ?? [];
-        }
-        return flat;
+      if (!req || typeof req !== 'object' || Array.isArray(req)) {
+        throw new InvalidAgentResponseError(
+          'Each AgentCard security requirement must be an object.',
+        );
       }
-      // v0.3 format (already flat)
-      return r as Record<string, string[]>;
+      const r = req as Record<string, unknown>;
+      if (this._resolved!.version === '1.0') {
+        // v1.0 format
+        const requirementKeys = Object.keys(r);
+        if (
+          requirementKeys.length !== 1 ||
+          requirementKeys[0] !== 'schemes'
+        ) {
+          throw new InvalidAgentResponseError(
+            'A v1.0 AgentCard security requirement may contain only schemes.',
+          );
+        }
+        if (
+          !r.schemes ||
+          typeof r.schemes !== 'object' ||
+          Array.isArray(r.schemes)
+        ) {
+          throw new InvalidAgentResponseError(
+            'AgentCard security requirement schemes must be an object.',
+          );
+        }
+        const flatEntries: Array<[string, string[]]> = [];
+        for (const [name, val] of Object.entries(r.schemes as Record<string, unknown>)) {
+          if (!val || typeof val !== 'object' || Array.isArray(val)) {
+            throw new InvalidAgentResponseError(
+              `AgentCard security requirement "${name}" must be a StringList object.`,
+            );
+          }
+          const v = val as { list?: unknown; values?: unknown };
+          const keys = Object.keys(v);
+          const unknownKey = keys.find(
+            (key) => key !== 'list' && key !== 'values',
+          );
+          if (unknownKey !== undefined) {
+            throw new InvalidAgentResponseError(
+              `AgentCard security requirement "${name}" contains unknown StringList field "${unknownKey}".`,
+            );
+          }
+          if (Object.hasOwn(v, 'list') && Object.hasOwn(v, 'values')) {
+            throw new InvalidAgentResponseError(
+              `AgentCard security requirement "${name}" cannot contain both list and values.`,
+            );
+          }
+          // `list` is the A2A v1.0 StringList field. Accept `values` as a
+          // compatibility bridge for cards emitted by older a2x releases.
+          const scopes = Object.hasOwn(v, 'list')
+            ? v.list
+            : Object.hasOwn(v, 'values')
+              ? v.values
+              : [];
+          if (
+            !Array.isArray(scopes) ||
+            !scopes.every((scope): scope is string => typeof scope === 'string')
+          ) {
+            throw new InvalidAgentResponseError(
+              `AgentCard security requirement "${name}" must contain an array of strings.`,
+            );
+          }
+          flatEntries.push([name, scopes]);
+        }
+        return Object.fromEntries(flatEntries);
+      }
+      // v0.3 format is already flat, but still comes from an untrusted card.
+      const flatEntries: Array<[string, string[]]> = [];
+      for (const [name, scopes] of Object.entries(r)) {
+        if (
+          !Array.isArray(scopes) ||
+          !scopes.every((scope): scope is string => typeof scope === 'string')
+        ) {
+          throw new InvalidAgentResponseError(
+            `AgentCard security requirement "${name}" must contain an array of strings.`,
+          );
+        }
+        flatEntries.push([name, scopes]);
+      }
+      return Object.fromEntries(flatEntries);
     });
 
-    const rawSchemes =
-      (rawCard.securitySchemes as Record<string, unknown> | undefined) ?? {};
+    const rawSchemesValue = rawCard.securitySchemes;
+    if (
+      rawSchemesValue !== undefined &&
+      (!rawSchemesValue ||
+        typeof rawSchemesValue !== 'object' ||
+        Array.isArray(rawSchemesValue))
+    ) {
+      throw new InvalidAgentResponseError(
+        'AgentCard securitySchemes must be an object.',
+      );
+    }
+    const rawSchemes = rawSchemesValue ?? {};
 
     const requirements = normalizeRequirements(
       rawRequirements,
       rawSchemes as Parameters<typeof normalizeRequirements>[1],
     );
-    if (requirements.length === 0) return;
+    if (requirements.length === 0) {
+      throw new UnsupportedOperationError(
+        'The AgentCard requires authentication, but none of its security requirement alternatives can be satisfied safely.',
+      );
+    }
+    if (requirements.some((group) => group.length === 0)) {
+      // An explicit empty requirement is an anonymous OR alternative.
+      this._resolvedSchemes = [];
+      return;
+    }
 
     this._resolvedSchemes = await this._authProvider.provide(requirements);
   }
@@ -1062,10 +1220,32 @@ export class A2XClient {
   /**
    * Apply resolved auth schemes to the request context.
    */
-  private _applyAuth(ctx: AuthRequestContext): void {
+  private _applyAuth(
+    ctx: AuthRequestContext,
+    transportOwnedHeaders: readonly string[],
+  ): void {
     if (!this._resolvedSchemes) return;
+    replaceHeaderBag(ctx.headers, normalizeHeaderBag(ctx.headers));
+    const protectedValues = new Map(
+      transportOwnedHeaders.map((name) => [
+        name.toLowerCase(),
+        getHeaderValue(ctx.headers, name),
+      ]),
+    );
     for (const scheme of this._resolvedSchemes) {
-      scheme.applyToRequest(ctx);
+      // Give each scheme the current case-normalized headers, then normalize
+      // its reads/writes/deletes before applying the next scheme.
+      const nextHeaders = { ...ctx.headers };
+      scheme.applyToRequest({ headers: nextHeaders, url: ctx.url });
+      const normalized = normalizeHeaderBag(nextHeaders);
+      for (const [name, value] of protectedValues) {
+        if (getHeaderValue(normalized, name) !== value) {
+          throw new UnsupportedOperationError(
+            `Authentication cannot overwrite transport-owned header "${name}".`,
+          );
+        }
+      }
+      replaceHeaderBag(ctx.headers, normalized);
     }
   }
 
@@ -1192,7 +1372,13 @@ export class A2XClient {
     const headers = this._buildHeaders();
     const url = new URL(this._endpointUrl!);
 
-    this._applyAuth({ headers, url });
+    this._applyAuth(
+      { headers, url },
+      [
+        'Content-Type',
+        ...(this._extensions.size > 0 ? ['X-A2A-Extensions'] : []),
+      ],
+    );
 
     // Everything above ran locally; serialize the body before declaring the
     // request submitted, so a payload that cannot even be encoded never

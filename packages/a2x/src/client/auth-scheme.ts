@@ -60,7 +60,27 @@ export class ApiKeyAuthScheme extends AuthScheme {
     } else if (this.location === 'query') {
       ctx.url.searchParams.set(this.name, this.credential!);
     } else if (this.location === 'cookie') {
-      ctx.headers['Cookie'] = `${this.name}=${this.credential!}`;
+      const existingNames = Object.keys(ctx.headers).filter(
+        (name) => name.toLowerCase() === 'cookie',
+      );
+      const existing = existingNames
+        .map((name) => ctx.headers[name])
+        .filter(Boolean)
+        .join('; ');
+      for (const name of existingNames) {
+        delete ctx.headers[name];
+      }
+      const unrelated = existing
+        .split(';')
+        .map((pair) => pair.trim())
+        .filter(
+          (pair) =>
+            pair.length > 0 && pair.split('=', 1)[0]!.trim() !== this.name,
+        )
+        .join('; ');
+      ctx.headers['Cookie'] = [unrelated, `${this.name}=${this.credential!}`]
+        .filter(Boolean)
+        .join('; ');
     }
   }
 }
@@ -101,6 +121,7 @@ export class OAuth2DeviceCodeAuthScheme extends AuthScheme {
     readonly tokenUrl: string,
     readonly scopes: Record<string, string>,
     readonly refreshUrl?: string,
+    readonly requiredScopes?: readonly string[],
   ) {
     super();
   }
@@ -111,6 +132,9 @@ export class OAuth2DeviceCodeAuthScheme extends AuthScheme {
       tokenUrl: this.tokenUrl,
       scopes: this.scopes,
       refreshUrl: this.refreshUrl,
+      ...(this.requiredScopes !== undefined
+        ? { requiredScopes: this.requiredScopes }
+        : {}),
     };
   }
 
@@ -128,6 +152,7 @@ export class OAuth2AuthorizationCodeAuthScheme extends AuthScheme {
     readonly scopes: Record<string, string>,
     readonly refreshUrl?: string,
     readonly pkceRequired?: boolean,
+    readonly requiredScopes?: readonly string[],
   ) {
     super();
   }
@@ -139,6 +164,9 @@ export class OAuth2AuthorizationCodeAuthScheme extends AuthScheme {
       scopes: this.scopes,
       refreshUrl: this.refreshUrl,
       pkceRequired: this.pkceRequired,
+      ...(this.requiredScopes !== undefined
+        ? { requiredScopes: this.requiredScopes }
+        : {}),
     };
   }
 
@@ -154,6 +182,7 @@ export class OAuth2ClientCredentialsAuthScheme extends AuthScheme {
     readonly tokenUrl: string,
     readonly scopes: Record<string, string>,
     readonly refreshUrl?: string,
+    readonly requiredScopes?: readonly string[],
   ) {
     super();
   }
@@ -163,6 +192,9 @@ export class OAuth2ClientCredentialsAuthScheme extends AuthScheme {
       tokenUrl: this.tokenUrl,
       scopes: this.scopes,
       refreshUrl: this.refreshUrl,
+      ...(this.requiredScopes !== undefined
+        ? { requiredScopes: this.requiredScopes }
+        : {}),
     };
   }
 
@@ -178,6 +210,7 @@ export class OAuth2ImplicitAuthScheme extends AuthScheme {
     readonly authorizationUrl: string,
     readonly scopes: Record<string, string>,
     readonly refreshUrl?: string,
+    readonly requiredScopes?: readonly string[],
   ) {
     super();
   }
@@ -187,6 +220,9 @@ export class OAuth2ImplicitAuthScheme extends AuthScheme {
       authorizationUrl: this.authorizationUrl,
       scopes: this.scopes,
       refreshUrl: this.refreshUrl,
+      ...(this.requiredScopes !== undefined
+        ? { requiredScopes: this.requiredScopes }
+        : {}),
     };
   }
 
@@ -202,6 +238,7 @@ export class OAuth2PasswordAuthScheme extends AuthScheme {
     readonly tokenUrl: string,
     readonly scopes: Record<string, string>,
     readonly refreshUrl?: string,
+    readonly requiredScopes?: readonly string[],
   ) {
     super();
   }
@@ -211,6 +248,9 @@ export class OAuth2PasswordAuthScheme extends AuthScheme {
       tokenUrl: this.tokenUrl,
       scopes: this.scopes,
       refreshUrl: this.refreshUrl,
+      ...(this.requiredScopes !== undefined
+        ? { requiredScopes: this.requiredScopes }
+        : {}),
     };
   }
 
@@ -222,12 +262,20 @@ export class OAuth2PasswordAuthScheme extends AuthScheme {
 // ─── OpenID Connect ───
 
 export class OpenIdConnectAuthScheme extends AuthScheme {
-  constructor(readonly openIdConnectUrl: string) {
+  constructor(
+    readonly openIdConnectUrl: string,
+    readonly requiredScopes?: readonly string[],
+  ) {
     super();
   }
 
   get params() {
-    return { openIdConnectUrl: this.openIdConnectUrl };
+    return {
+      openIdConnectUrl: this.openIdConnectUrl,
+      ...(this.requiredScopes !== undefined
+        ? { requiredScopes: this.requiredScopes }
+        : {}),
+    };
   }
 
   applyToRequest(ctx: AuthRequestContext): void {

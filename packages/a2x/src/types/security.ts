@@ -7,9 +7,31 @@
 /** Internal / v0.3 format: flat Record<string, string[]> */
 export type SecurityRequirement = Record<string, string[]>;
 
-/** v1.0 wire format: wrapped { schemes: { name: { values: string[] } } } */
+/** Canonical v1.0 protobuf JSON StringList output. */
+export interface StringListV10 {
+  /** Protobuf JSON may omit `list` when it is empty. */
+  list?: string[];
+}
+
+/** Legacy a2x StringList spelling accepted only when reading older cards. */
+export interface LegacyStringListV10 {
+  values: string[];
+  list?: never;
+}
+
+/** Exclusive canonical-or-legacy StringList shape accepted by readers. */
+export type CompatibleStringListV10 =
+  | (StringListV10 & { values?: never })
+  | LegacyStringListV10;
+
+/** v1.0 AgentCard input, including the legacy a2x reader bridge. */
 export interface SecurityRequirementV10 {
-  schemes: Record<string, { values: string[] }>;
+  schemes: Record<string, CompatibleStringListV10>;
+}
+
+/** Canonical v1.0 AgentCard output emitted by SDK mappers. */
+export interface CanonicalSecurityRequirementV10 {
+  schemes: Record<string, StringListV10>;
 }
 
 // ─── v0.3 SecurityScheme Types ───
