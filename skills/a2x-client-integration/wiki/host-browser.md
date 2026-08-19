@@ -25,7 +25,11 @@ For these cases, [proxy through a backend](./host-nextjs.md) and let the browser
 
 ```typescript
 // src/lib/agent.ts
-import { A2XClient } from '@a2x/sdk/client';
+import {
+  A2XClient,
+  getAgentEndpointUrl,
+  resolveAgentCard,
+} from '@a2x/sdk/client';
 import type { AuthProvider } from '@a2x/sdk/client';
 import { AuthScheme, HttpBearerAuthScheme } from '@a2x/sdk/client';
 
@@ -53,8 +57,43 @@ class SessionBearerProvider implements AuthProvider {
   }
 }
 
-export function makeAgentClient(getToken: () => string | null) {
-  return new A2XClient(import.meta.env.VITE_AGENT_URL, {
+export async function makeAgentClient(getToken: () => string | null) {
+  const exactBrowserUrl = (raw: string, label: string) => {
+    const url = new URL(raw);
+    if (
+      url.protocol !== 'https:' || url.username || url.password ||
+      url.search || url.hash
+    ) throw new Error(`${label} must be an exact credential-free HTTPS URL`);
+    return url.toString();
+  };
+  const cardUrl = exactBrowserUrl(
+    import.meta.env.VITE_AGENT_CARD_URL,
+    'VITE_AGENT_CARD_URL',
+  );
+  if (!new URL(cardUrl).pathname.endsWith('.json')) {
+    throw new Error('VITE_AGENT_CARD_URL must name one exact JSON document');
+  }
+  const expectedEndpoint = exactBrowserUrl(
+    import.meta.env.VITE_AGENT_ENDPOINT_URL,
+    'VITE_AGENT_ENDPOINT_URL',
+  );
+  const noRedirectFetch: typeof fetch = (input, init) =>
+    fetch(input, { ...init, redirect: 'error' });
+  const resolved = await resolveAgentCard(cardUrl, { fetch: noRedirectFetch });
+  const endpoint = exactBrowserUrl(
+    getAgentEndpointUrl(resolved.card, resolved.version),
+    'AgentCard endpoint',
+  );
+  if (endpoint !== expectedEndpoint) {
+    throw new Error(`AgentCard endpoint is not approved: ${endpoint}`);
+  }
+  // This production pattern is same-origin. A deliberate cross-origin
+  // deployment needs its own exact-origin policy plus the CORS rules below.
+  if (new URL(endpoint).origin !== window.location.origin) {
+    throw new Error('Agent endpoint is not same-origin');
+  }
+  return new A2XClient(resolved.card, {
+    fetch: noRedirectFetch,
     authProvider: new SessionBearerProvider(getToken),
   });
 }

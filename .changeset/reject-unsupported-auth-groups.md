@@ -2,4 +2,4 @@
 "@a2x/sdk": patch
 ---
 
-Reject incomplete client authentication alternatives when any named scheme is missing or unsupported, preserve explicit anonymous alternatives, and expand multiple OAuth flow slots as a Cartesian product.
+Reject incomplete or destination-colliding client authentication alternatives, preserve explicit anonymous alternatives, compose distinct cookie API keys, and cap eager OAuth-flow expansion from untrusted AgentCards.

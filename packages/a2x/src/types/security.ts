@@ -7,9 +7,9 @@
 /** Internal / v0.3 format: flat Record<string, string[]> */
 export type SecurityRequirement = Record<string, string[]>;
 
-/** v1.0 wire format: wrapped { schemes: { name: { values: string[] } } } */
+/** v1.0 wire format: wrapped { schemes: { name: { list: string[] } } } */
 export interface SecurityRequirementV10 {
-  schemes: Record<string, { values: string[] }>;
+  schemes: Record<string, { list: string[] }>;
 }
 
 // ─── v0.3 SecurityScheme Types ───

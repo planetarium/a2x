@@ -12,7 +12,7 @@ The SDK hands you an `OAuth2DeviceCodeAuthScheme` with the endpoints and scopes;
 - Kiosk apps / embedded devices
 - Containers / SSH sessions
 
-The SDK only ever constructs this scheme when the agent card (v1.0) declares a `deviceCode` flow (v0.3 does not define device-code).
+Device Code is native to an A2A v1.0 AgentCard. The SDK also consumes the non-standard `deviceCode` flow emitted by a2x v0.3 cards for compatibility; third-party v0.3 implementations may ignore that extension.
 
 ---
 
@@ -143,22 +143,29 @@ function approvedScope(
   return requested.join(' ');
 }
 
-function assertGrantedScope(granted?: string): void {
+function assertGrantedScope(
+  granted: string | undefined,
+  requested: readonly string[],
+): void {
   if (!granted) return;
-  const rejected = granted
-    .split(/\s+/)
-    .filter(Boolean)
-    .filter(scope => !ALLOWED_OAUTH_SCOPES.has(scope));
-  if (rejected.length) {
-    throw new Error(`Token granted unapproved scopes: ${rejected.join(', ')}`);
+  const grantedSet = new Set(granted.split(/\s+/).filter(Boolean));
+  const requestedSet = new Set(requested);
+  const unexpected = [...grantedSet].filter(scope => !requestedSet.has(scope));
+  const missing = [...requestedSet].filter(scope => !grantedSet.has(scope));
+  if (unexpected.length || missing.length) {
+    throw new Error(
+      `Token scope mismatch (unexpected: ${unexpected.join(', ') || 'none'}; ` +
+      `missing: ${missing.join(', ') || 'none'})`,
+    );
   }
 }
 
-// Implement with trusted JWT verification or token introspection. Never trust
-// claims from decode-only parsing.
-declare function assertTokenAudience(
+// Implement with trusted JWT verification or token introspection. Verify
+// issuer, audience/resource, and exact scopes; never trust decode-only claims.
+declare function assertTokenPolicy(
   token: string,
   expectedAudience: string,
+  requestedScopes: readonly string[],
 ): Promise<void>;
 
 export async function performDeviceCodeFlow(
@@ -177,6 +184,7 @@ export async function performDeviceCodeFlow(
 
   // Step 1: Request a device code
   const scopeStr = approvedScope(scopes, requiredScopes);
+  const requestedScopes = scopeStr.split(/\s+/).filter(Boolean);
   const deviceRes = await fetch(deviceAuthorizationUrl, {
     method: 'POST',
     redirect: 'error',
@@ -248,8 +256,12 @@ export async function performDeviceCodeFlow(
       if (typeof tokenData.access_token !== 'string' || !tokenData.access_token) {
         throw new Error('Token response omitted access_token');
       }
-      assertGrantedScope(tokenData.scope);
-      await assertTokenAudience(tokenData.access_token, expectedAudience);
+      assertGrantedScope(tokenData.scope, requestedScopes);
+      await assertTokenPolicy(
+        tokenData.access_token,
+        expectedAudience,
+        requestedScopes,
+      );
       console.log(' Authorized!');
       return tokenData;
     }
@@ -389,7 +401,7 @@ async refresh(schemes: AuthScheme[]): Promise<AuthScheme[]> {
       const previous = stored.find(entry => entry.slot === slot);
       let tokens = previous?.refreshCredential
         ? await tryRefreshToken(
-            scheme.params.tokenUrl,
+            scheme,
             previous.refreshCredential,
             clientId,
           )
@@ -408,12 +420,22 @@ async refresh(schemes: AuthScheme[]): Promise<AuthScheme[]> {
   return schemes;
 }
 
-async function tryRefreshToken(
-  tokenUrl: string,
+export async function tryRefreshToken(
+  scheme: OAuth2DeviceCodeAuthScheme,
   refreshToken: string,
   clientId: string,
 ): Promise<TokenResponse | undefined> {
-  const trustedTokenUrl = trustedOAuthEndpoint(tokenUrl, 'refresh endpoint');
+  const expectedAudience = process.env.OAUTH_EXPECTED_AUDIENCE;
+  if (!expectedAudience) throw new Error('OAuth expected audience is required');
+  const scope = approvedScope(
+    scheme.params.scopes,
+    scheme.params.requiredScopes,
+  );
+  const requestedScopes = scope.split(/\s+/).filter(Boolean);
+  const trustedTokenUrl = trustedOAuthEndpoint(
+    scheme.params.refreshUrl ?? scheme.params.tokenUrl,
+    'refresh endpoint',
+  );
   const res = await fetch(trustedTokenUrl, {
     method: 'POST',
     redirect: 'error',
@@ -422,13 +444,15 @@ async function tryRefreshToken(
       grant_type: 'refresh_token',
       refresh_token: refreshToken,
       client_id: clientId,
+      ...(scope ? { scope } : {}),
     }),
   });
   if (!res.ok) return undefined;
   const data = (await res.json()) as TokenResponse | TokenErrorResponse;
   if (!('access_token' in data)) return undefined;
   if (typeof data.access_token !== 'string' || !data.access_token) return undefined;
-  assertGrantedScope(data.scope);
+  assertGrantedScope(data.scope, requestedScopes);
+  await assertTokenPolicy(data.access_token, expectedAudience, requestedScopes);
   return data;
 }
 ```

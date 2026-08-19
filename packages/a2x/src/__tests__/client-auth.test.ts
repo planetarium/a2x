@@ -46,8 +46,8 @@ const V10_CARD_WITH_AUTH: AgentCardV10 = {
     },
   },
   securityRequirements: [
-    { apiKey: [] },
-    { deviceCode: ['agent:invoke'] },
+    { schemes: { apiKey: { list: [] } } },
+    { schemes: { deviceCode: { list: ['agent:invoke'] } } },
   ],
   skills: [],
   defaultInputModes: ['text/plain'],
@@ -309,10 +309,12 @@ describe('normalizeScheme', () => {
 
     it('normalizes openIdConnect scheme', () => {
       const raw: SecuritySchemeV03 = { type: 'openIdConnect', openIdConnectUrl: 'http://auth/.well-known' };
-      const result = normalizeScheme(raw);
+      const result = normalizeScheme(raw, ['openid']);
 
       expect(result).toHaveLength(1);
       expect(result[0]).toBeInstanceOf(OpenIdConnectAuthScheme);
+      expect((result[0] as OpenIdConnectAuthScheme).params.requiredScopes)
+        .toEqual(['openid']);
     });
 
     it('returns empty for mutualTLS', () => {
@@ -423,6 +425,11 @@ describe('normalizeRequirements', () => {
         },
       },
     },
+    oidc: {
+      openIdConnectSecurityScheme: {
+        openIdConnectUrl: 'http://auth/.well-known/openid-configuration',
+      },
+    },
   };
 
   it('creates separate OR groups for each requirement', () => {
@@ -498,14 +505,48 @@ describe('normalizeRequirements', () => {
     expect(result).toEqual([[]]);
   });
 
-  it('forms the Cartesian product of multiple multi-flow AND schemes', () => {
+  it('rejects an AND group whose schemes overwrite one Authorization header', () => {
+    const result = normalizeRequirements(
+      [{ bearer: [], oidc: ['openid'] }],
+      {
+        bearer: { httpAuthSecurityScheme: { scheme: 'bearer' } },
+        oidc: schemes.oidc!,
+      },
+    );
+
+    expect(result).toEqual([]);
+  });
+
+  it('rejects multi-OAuth AND groups that collide on Authorization', () => {
     const result = normalizeRequirements(
       [{ oauth: ['invoke'], secondOAuth: ['invoke'] }],
       { ...schemes, secondOAuth: schemes.oauth! },
     );
 
-    expect(result).toHaveLength(4);
-    expect(result.every((group) => group.length === 2)).toBe(true);
+    expect(result).toEqual([]);
+  });
+
+  it('bounds OAuth flow expansion from an untrusted AgentCard', () => {
+    const requirement: Record<string, string[]> = {};
+    const manySchemes: Record<string, SecuritySchemeV10> = {};
+    for (let index = 0; index < 9; index++) {
+      const name = `oauth${index}`;
+      requirement[name] = ['invoke'];
+      manySchemes[name] = schemes.oauth!;
+    }
+
+    expect(() => normalizeRequirements([requirement], manySchemes)).toThrow(
+      'more than 256 authentication alternatives',
+    );
+  });
+
+  it('preserves requirement-specific OpenID Connect scopes', () => {
+    const result = normalizeRequirements([{ oidc: ['openid', 'profile'] }], schemes);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]![0]).toBeInstanceOf(OpenIdConnectAuthScheme);
+    expect((result[0]![0] as OpenIdConnectAuthScheme).params.requiredScopes)
+      .toEqual(['openid', 'profile']);
   });
 
   it('returns empty for empty requirements', () => {
@@ -517,6 +558,33 @@ describe('normalizeRequirements', () => {
 // ═══ A2XClient Auth Integration Tests ═══
 
 describe('A2XClient auth integration', () => {
+  it('accepts the legacy a2x values spelling for v1.0 requirement scopes', async () => {
+    const legacyCard = {
+      ...V10_CARD_WITH_AUTH,
+      securityRequirements: [
+        { schemes: { deviceCode: { values: ['agent:invoke'] } } },
+      ],
+    } as unknown as AgentCardV10;
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const provide = vi.fn(async (requirements: AuthScheme[][]) => {
+      const scheme = requirements[0]![0] as OAuth2DeviceCodeAuthScheme;
+      expect(scheme.params.requiredScopes).toEqual(['agent:invoke']);
+      return [scheme.setCredential('legacy-compatible-token')];
+    });
+    const client = new A2XClient(legacyCard, {
+      fetch: mockFetch,
+      authProvider: { provide },
+    });
+
+    await client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    });
+
+    expect(provide).toHaveBeenCalledTimes(1);
+    expect(mockFetch.mock.calls[0]![1].headers.Authorization)
+      .toBe('Bearer legacy-compatible-token');
+  });
+
   it('calls authProvider.provide() and applies credentials', async () => {
     const mockFetch = createMockFetch(
       createJsonRpcSuccess(TASK_RESULT),
@@ -584,7 +652,7 @@ describe('A2XClient auth integration', () => {
           httpAuthSecurityScheme: { scheme: 'bearer' },
         },
       },
-      securityRequirements: [{ bearer: [] }],
+      securityRequirements: [{ schemes: { bearer: { list: [] } } }],
     };
     const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
     const client = new A2XClient(bearerCard, {
@@ -605,6 +673,46 @@ describe('A2XClient auth integration', () => {
     const headers = mockFetch.mock.calls[0]![1].headers as Record<string, string>;
     expect(headers.Authorization).toBe('Bearer provider-value');
     expect(headers.authorization).toBeUndefined();
+  });
+
+  it('composes distinct cookie API-key schemes in one AND group', async () => {
+    const cookieCard: AgentCardV10 = {
+      ...V10_CARD_WITH_AUTH,
+      securitySchemes: {
+        session: {
+          apiKeySecurityScheme: { location: 'cookie', name: 'session' },
+        },
+        tenant: {
+          apiKeySecurityScheme: { location: 'cookie', name: 'tenant' },
+        },
+      },
+      securityRequirements: [{
+        schemes: {
+          session: { list: [] },
+          tenant: { list: [] },
+        },
+      }],
+    };
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const client = new A2XClient(cookieCard, {
+      fetch: mockFetch,
+      headers: { cookie: 'caller=present' },
+      authProvider: {
+        async provide(requirements) {
+          requirements[0]![0]!.setCredential('one');
+          requirements[0]![1]!.setCredential('two');
+          return requirements[0]!;
+        },
+      },
+    });
+
+    await client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    });
+
+    const headers = mockFetch.mock.calls[0]![1].headers as Record<string, string>;
+    expect(headers.Cookie).toBe('caller=present; session=one; tenant=two');
+    expect(headers.cookie).toBeUndefined();
   });
 
   it('preserves the built request context for custom auth schemes', async () => {
@@ -666,7 +774,10 @@ describe('A2XClient auth integration', () => {
   it('does not call authProvider when anonymous access is an explicit alternative', async () => {
     const anonymousCard: AgentCardV10 = {
       ...V10_CARD_WITH_AUTH,
-      securityRequirements: [{ apiKey: [] }, {}],
+      securityRequirements: [
+        { schemes: { apiKey: { list: [] } } },
+        { schemes: {} },
+      ],
     };
     const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
     const provide = vi.fn();
@@ -690,7 +801,7 @@ describe('A2XClient auth integration', () => {
       securitySchemes: {
         mtls: { mtlsSecurityScheme: {} },
       },
-      securityRequirements: [{ mtls: [] }],
+      securityRequirements: [{ schemes: { mtls: { list: [] } } }],
     };
     const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
     const provide = vi.fn();
@@ -853,6 +964,145 @@ describe('A2XClient auth integration', () => {
     expect(provide).toHaveBeenCalledTimes(1);
     // Both requests should have the auth header
     expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('deduplicates concurrent card and authentication initialization', async () => {
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const provide = vi.fn(async (requirements: AuthScheme[][]) => {
+      await gate;
+      return [requirements[0]![0]!.setCredential('shared-key')];
+    });
+    const client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      authProvider: { provide },
+    });
+
+    const first = client.sendMessage({
+      message: { role: 'user', parts: [{ text: '1' }] },
+    });
+    const second = client.sendMessage({
+      message: { role: 'user', parts: [{ text: '2' }] },
+    });
+    await vi.waitFor(() => expect(provide).toHaveBeenCalledTimes(1));
+    release();
+    await Promise.all([first, second]);
+
+    expect(provide).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch.mock.calls.map((call) => call[1].headers['x-api-key']))
+      .toEqual(['shared-key', 'shared-key']);
+  });
+
+  it('deduplicates concurrent credential refreshes', async () => {
+    const authRequiredTask = {
+      id: 'task-auth',
+      contextId: 'ctx-auth',
+      status: { state: TaskState.AUTH_REQUIRED, timestamp: new Date().toISOString() },
+    };
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(() => {
+      callCount += 1;
+      const body = callCount <= 2
+        ? createJsonRpcSuccess(authRequiredTask)
+        : createJsonRpcSuccess(TASK_RESULT);
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: () => Promise.resolve(body),
+        headers: new Headers({ 'content-type': 'application/json' }),
+      });
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const refresh = vi.fn(async (resolved: AuthScheme[]) => {
+      await gate;
+      resolved[0]!.setCredential('new-key');
+      return resolved;
+    });
+    const client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      authProvider: {
+        async provide(requirements) {
+          return [requirements[0]![0]!.setCredential('old-key')];
+        },
+        refresh,
+      },
+    });
+
+    const first = client.sendMessage({
+      message: { role: 'user', parts: [{ text: '1' }] },
+    });
+    const second = client.sendMessage({
+      message: { role: 'user', parts: [{ text: '2' }] },
+    });
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+    release();
+    await Promise.all([first, second]);
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    expect(mockFetch.mock.calls.slice(2).map((call) => call[1].headers['x-api-key']))
+      .toEqual(['new-key', 'new-key']);
+  });
+
+  it('does not refresh again for a late auth failure from an older generation', async () => {
+    const authRequiredTask = {
+      id: 'task-auth',
+      contextId: 'ctx-auth',
+      status: { state: TaskState.AUTH_REQUIRED, timestamp: new Date().toISOString() },
+    };
+    let releaseLate!: () => void;
+    const lateResponse = new Promise<void>((resolve) => { releaseLate = resolve; });
+    let releaseFirst!: () => void;
+    const firstResponse = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(async () => {
+      const thisCall = ++callCount;
+      if (thisCall === 1) await firstResponse;
+      if (thisCall === 2) {
+        releaseFirst();
+        await lateResponse;
+      }
+      const body = thisCall <= 2
+        ? createJsonRpcSuccess(authRequiredTask)
+        : createJsonRpcSuccess(TASK_RESULT);
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: () => Promise.resolve(body),
+        headers: new Headers({ 'content-type': 'application/json' }),
+      };
+    });
+    const refresh = vi.fn(async (resolved: AuthScheme[]) => {
+      resolved[0]!.setCredential('new-key');
+      releaseLate();
+      return resolved;
+    });
+    const client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      authProvider: {
+        async provide(requirements) {
+          return [requirements[0]![0]!.setCredential('old-key')];
+        },
+        refresh,
+      },
+    });
+
+    await Promise.all([
+      client.sendMessage({
+        message: { role: 'user', parts: [{ text: '1' }] },
+      }),
+      client.sendMessage({
+        message: { role: 'user', parts: [{ text: '2' }] },
+      }),
+    ]);
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenCalledTimes(4);
   });
 
 });

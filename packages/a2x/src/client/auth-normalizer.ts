@@ -23,6 +23,29 @@ import {
   OpenIdConnectAuthScheme,
 } from './auth-scheme.js';
 
+/** Bound eager OAuth-flow expansion from an untrusted AgentCard. */
+const MAX_NORMALIZED_AUTH_GROUPS = 256;
+
+function authDestination(scheme: AuthScheme): string {
+  if (scheme instanceof ApiKeyAuthScheme) {
+    const name = scheme.params.location === 'header'
+      ? scheme.params.name.toLowerCase()
+      : scheme.params.name;
+    return `${scheme.params.location}:${name}`;
+  }
+  return 'header:authorization';
+}
+
+function hasConflictingDestinations(group: AuthScheme[]): boolean {
+  const destinations = new Set<string>();
+  for (const scheme of group) {
+    const destination = authDestination(scheme);
+    if (destinations.has(destination)) return true;
+    destinations.add(destination);
+  }
+  return false;
+}
+
 // ─── Public API ───
 
 /**
@@ -43,6 +66,11 @@ export function normalizeRequirements(
   for (const requirement of requirements) {
     const entries = Object.entries(requirement);
     if (entries.length === 0) {
+      if (result.length >= MAX_NORMALIZED_AUTH_GROUPS) {
+        throw new RangeError(
+          `AgentCard expands to more than ${MAX_NORMALIZED_AUTH_GROUPS} authentication alternatives`,
+        );
+      }
       result.push([]);
       continue;
     }
@@ -64,12 +92,25 @@ export function normalizeRequirements(
         break;
       }
 
+      if (
+        groups.length >
+        Math.floor(
+          (MAX_NORMALIZED_AUTH_GROUPS - result.length) / classes.length,
+        )
+      ) {
+        throw new RangeError(
+          `AgentCard expands to more than ${MAX_NORMALIZED_AUTH_GROUPS} authentication alternatives`,
+        );
+      }
+
       groups = groups.flatMap((group) =>
         classes.map((scheme) => [...group, scheme]),
       );
     }
 
-    if (supported) result.push(...groups);
+    if (supported) {
+      result.push(...groups.filter((group) => !hasConflictingDestinations(group)));
+    }
   }
 
   return result;
@@ -120,7 +161,12 @@ function normalizeV03Scheme(
       return normalizeOAuth2FlowsV03(scheme.flows, requiredScopes);
 
     case 'openIdConnect':
-      return [new OpenIdConnectAuthScheme(scheme.openIdConnectUrl)];
+      return [
+        new OpenIdConnectAuthScheme(
+          scheme.openIdConnectUrl,
+          requiredScopes,
+        ),
+      ];
 
     case 'mutualTLS':
       // Not supported at HTTP level — skip
@@ -167,6 +213,7 @@ function normalizeV10Scheme(
     return [
       new OpenIdConnectAuthScheme(
         scheme.openIdConnectSecurityScheme.openIdConnectUrl,
+        requiredScopes,
       ),
     ];
   }

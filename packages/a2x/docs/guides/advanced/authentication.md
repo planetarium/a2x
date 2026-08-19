@@ -205,6 +205,8 @@ OAuth scheme classes expose two distinct scope fields:
 
 Providers should reject missing or unknown `requiredScopes`, intersect that list with host policy, and request only those scopes. Do not request every key in `params.scopes`, and do not trust OAuth endpoints or scopes merely because an AgentCard advertised them.
 
+`OpenIdConnectAuthScheme.params.requiredScopes` carries the same selected requirement values; validate them against trusted OIDC discovery, issuer, client, audience/resource, and scope policy before acquiring an access token.
+
 The client expands OAuth flows into requirement alternatives but does not run an OAuth grant. Acquire a token in your `AuthProvider`, then set it on the supplied scheme:
 
 ```ts
@@ -231,7 +233,7 @@ const authProvider: AuthProvider = {
 };
 ```
 
-An explicitly empty security requirement (`{}`) is an anonymous alternative, so the client skips the provider. A non-empty alternative is omitted as a whole if any named scheme is absent or unsupported; when no supported non-empty alternative remains, a configured provider fails before the request is sent.
+An explicitly empty security requirement (`{}`) is an anonymous alternative, so the client skips the provider. A non-empty alternative is omitted as a whole if any named scheme is absent, unsupported, or would overwrite another scheme's HTTP credential destination. Distinct cookie API keys compose. Expansion is capped at 256 alternatives to reject malicious combinatorial cards; when no supported non-empty alternative remains, a configured provider fails before the request is sent.
 
 ## Exposing an authenticated extended AgentCard
 
@@ -242,9 +244,13 @@ Declaring security also unlocks `agent/getAuthenticatedExtendedCard` — a way t
 Clients can introspect expected auth before calling:
 
 ```ts
-const resolved = await client.resolveAgentCard();
-console.log(resolved.card.securitySchemes);
-console.log(resolved.card.securityRequirements);
+const card = await client.getAgentCard();
+console.log(card.securitySchemes);
+console.log(
+  'securityRequirements' in card
+    ? card.securityRequirements // v1.0
+    : card.security,            // v0.3
+);
 ```
 
 This lets UI clients surface the right login flow to users dynamically.

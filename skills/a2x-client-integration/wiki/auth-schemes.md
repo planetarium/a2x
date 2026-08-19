@@ -51,9 +51,9 @@ Application:
 |------------|--------|
 | `'header'` | `headers[scheme.params.name] = credential` |
 | `'query'` | `url.searchParams.set(scheme.params.name, credential)` |
-| `'cookie'` | `headers['Cookie'] = '<name>=<credential>'` |
+| `'cookie'` | Append `<name>=<credential>` to the existing `Cookie` header. |
 
-Note: `'cookie'` overwrites any existing `Cookie` header. If multiple cookie-based schemes are active (rare), merge before calling `applyToRequest` or use a custom fetch.
+Distinct cookie schemes compose in one AND group. Alternatives that would overwrite the same header/query/cookie destination—or combine two schemes that both own `Authorization`—are omitted during normalization because they cannot be represented faithfully in one HTTP request.
 
 Example masked prompt (CLI; see [host-cli.md](./host-cli.md) for `promptSecret`):
 
@@ -232,14 +232,17 @@ Deprecated by OAuth2 spec. If supported, POST `grant_type=password` with usernam
 ## `OpenIdConnectAuthScheme`
 
 ```typescript
-scheme.params  // { openIdConnectUrl: string }
+scheme.params  // {
+  //   openIdConnectUrl: string,
+  //   requiredScopes?: readonly string[],
+  // }
 ```
 
-Credential format: ID token.
+Credential format: an audience-bound access token for the A2A resource. Use an ID token only when that resource explicitly defines and safely validates it as its bearer credential.
 
 Application: `headers['Authorization'] = 'Bearer <credential>'`
 
-The `openIdConnectUrl` points to the OIDC discovery document (`.well-known/openid-configuration`). You are responsible for running whichever OIDC flow is appropriate and providing the resulting token.
+The `openIdConnectUrl` points to the OIDC discovery document (`.well-known/openid-configuration`). The selected requirement values are exposed as `requiredScopes`. You are responsible for running whichever OIDC flow is appropriate, validating the exact issuer/audience/resource/scopes, and providing the resulting access token.
 
 ---
 

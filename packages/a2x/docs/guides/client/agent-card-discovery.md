@@ -16,10 +16,12 @@ Useful fields at a glance:
 ## Resolving a card manually
 
 ```ts
-import { A2XClient } from '@a2x/sdk/client';
+import { A2XClient, resolveAgentCard } from '@a2x/sdk/client';
 
-const client = new A2XClient('https://agent.example.com/.well-known/agent.json');
-const resolved = await client.resolveAgentCard();
+const resolved = await resolveAgentCard(
+  'https://agent.example.com/.well-known/agent.json',
+);
+const client = new A2XClient(resolved.card);
 
 console.log(resolved.version);  // '0.3' | '1.0'
 console.log(resolved.card);     // parsed AgentCard for that version
@@ -31,16 +33,10 @@ console.log(resolved.card);     // parsed AgentCard for that version
 
 A2A has two spec versions in the wild. You don't pick — the remote agent declares, and the client adapts:
 
-- If the card declares `protocolVersion: '1.0'`, `A2XClient` uses the v1.0 endpoints and shapes.
-- If it declares `0.3` (or omits the field), the client uses v0.3.
+- A recognized top-level `protocolVersion` is authoritative (notably v0.3 cards).
+- Otherwise, a non-empty v1.0 `supportedInterfaces` array selects v1.0; a top-level `url` selects v0.3.
 
-You can force a preference:
-
-```ts
-const client = new A2XClient(url, { preferredVersion: '1.0' });
-```
-
-When the remote supports both, this picks your preference; when it only supports one, the client falls back gracefully.
+There is no `preferredVersion` client option. Use the card document published for the desired protocol when a peer exposes multiple version-specific cards.
 
 ## Calling non-A2X agents
 

@@ -83,22 +83,29 @@ function approvedScope(
   return requested.join(' ');
 }
 
-function assertGrantedScope(granted?: string): void {
+function assertGrantedScope(
+  granted: string | undefined,
+  requested: readonly string[],
+): void {
   if (!granted) return;
-  const rejected = granted
-    .split(/\s+/)
-    .filter(Boolean)
-    .filter(scope => !ALLOWED_OAUTH_SCOPES.has(scope));
-  if (rejected.length) {
-    throw new Error(`Token granted unapproved scopes: ${rejected.join(', ')}`);
+  const grantedSet = new Set(granted.split(/\s+/).filter(Boolean));
+  const requestedSet = new Set(requested);
+  const unexpected = [...grantedSet].filter(scope => !requestedSet.has(scope));
+  const missing = [...requestedSet].filter(scope => !grantedSet.has(scope));
+  if (unexpected.length || missing.length) {
+    throw new Error(
+      `Token scope mismatch (unexpected: ${unexpected.join(', ') || 'none'}; ` +
+      `missing: ${missing.join(', ') || 'none'})`,
+    );
   }
 }
 
-// Implement with trusted JWT verification or token introspection. Never use
-// decode-only JWT claims for this check.
-declare function assertTokenAudience(
+// Implement with trusted JWT verification or token introspection. Verify
+// issuer, audience/resource, and exact scopes; never use decode-only claims.
+declare function assertTokenPolicy(
   token: string,
   expectedAudience: string,
+  requestedScopes: readonly string[],
 ): Promise<void>;
 
 function apiKeySlot(scheme: ApiKeyAuthScheme): string {
@@ -176,6 +183,7 @@ async function exchangeClientCredentials(
     scheme.params.scopes,
     scheme.params.requiredScopes,
   );
+  const requestedScopes = scope.split(/\s+/).filter(Boolean);
   const res = await fetch(tokenUrl, {
     method: 'POST',
     redirect: 'error',
@@ -189,9 +197,13 @@ async function exchangeClientCredentials(
   });
   if (!res.ok) return undefined;
   const data = (await res.json()) as { access_token?: string; scope?: string };
-  assertGrantedScope(data.scope);
+  assertGrantedScope(data.scope, requestedScopes);
   if (!data.access_token) return undefined;
-  await assertTokenAudience(data.access_token, expectedAudience);
+  await assertTokenPolicy(
+    data.access_token,
+    expectedAudience,
+    requestedScopes,
+  );
   return data.access_token;
 }
 ```
@@ -271,25 +283,7 @@ Await `myAgentClientPromise` during startup before accepting work. This prevents
 
 ### Watch out for
 
-- **First call races.** If multiple requests arrive simultaneously and `_ensureAuthenticated` hasn't run yet, they will all enter `provide()` in parallel. Deduplicate only the underlying token exchange, then fill and return the `AuthScheme` instances supplied to each invocation:
-
-  ```typescript
-  private tokenInflight?: Promise<string>;
-
-  async provide(requirements: AuthScheme[][]): Promise<AuthScheme[]> {
-    const group = requirements.find(group =>
-      group.length === 1 && group[0] instanceof OAuth2ClientCredentialsAuthScheme,
-    );
-    if (!group) throw new Error('No supported authentication group');
-
-    this.tokenInflight ??= this.exchangeToken()
-      .finally(() => { this.tokenInflight = undefined; });
-    group[0].setCredential(await this.tokenInflight);
-    return group;
-  }
-  ```
-
-  Never cache or return one invocation's `AuthScheme[]` from another invocation: the client expects the exact instances it passed to the provider. `A2XClient` itself does not dedupe, so providers must make credential acquisition concurrency-safe.
+- **Shared initialization.** One `A2XClient` memoizes in-flight card resolution and authentication initialization, so concurrent cold calls share one `provide()` result instead of racing scheme assignments. Concurrent `auth-required` responses also share one in-flight `refresh()`. A provider object reused across *different* clients still needs its own concurrency-safe cache keyed by the complete agent/credential policy tuple. Always mutate and return the exact `AuthScheme[]` supplied to that invocation.
 
 - **Stale token caches across restarts.** If you roll out a new deploy, the new process starts with an empty `_resolvedSchemes` and calls `provide()` again. That's fine for client_credentials (re-exchange is cheap) but could be a problem for pre-fetched secrets with rate limits.
 
@@ -314,11 +308,12 @@ import Redis from 'ioredis';
 
 const redis = new Redis(process.env.REDIS_URL!);
 
-// Implement with trusted JWT verification or token introspection. Decoding a
-// JWT without signature/issuer validation is not sufficient.
-declare function assertTokenAudience(
+// Implement with trusted JWT verification or token introspection. Verify the
+// exact issuer, audience/resource, and scopes.
+declare function assertTokenPolicy(
   token: string,
   expectedAudience: string,
+  requestedScopes: readonly string[],
 ): Promise<void>;
 
 async function getCachedOrExchange(
@@ -336,6 +331,7 @@ async function getCachedOrExchange(
     .filter(Boolean)
     .sort()
     .join(' ');
+  const requestedScopes = scopes.split(/\s+/).filter(Boolean);
   // clientIdentity is a stable public ID (client/tenant), never the secret.
   const key = `a2a:${JSON.stringify([
     agentEndpoint,
@@ -346,7 +342,7 @@ async function getCachedOrExchange(
   ])}`;
   const cached = await redis.get(key);
   if (cached) {
-    await assertTokenAudience(cached, expectedAudience);
+    await assertTokenPolicy(cached, expectedAudience, requestedScopes);
     return cached;
   }
 
@@ -371,8 +367,8 @@ async function getCachedOrExchange(
     scope?: string;
   };
   if (!access_token) throw new Error('Token response omitted access_token');
-  assertGrantedScope(scope);
-  await assertTokenAudience(access_token, expectedAudience);
+  assertGrantedScope(scope, requestedScopes);
+  await assertTokenPolicy(access_token, expectedAudience, requestedScopes);
   // Cache for 90% of the advertised lifetime to avoid edge-of-expiry races
   const ttl = Number.isFinite(expires_in) && expires_in > 0
     ? Math.max(1, Math.floor(expires_in * 0.9))

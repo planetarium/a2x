@@ -255,8 +255,12 @@ It does not call any OAuth2 `refresh_token` endpoint, even for schemes that prov
 ```typescript
 async refresh(schemes: AuthScheme[]): Promise<AuthScheme[]> {
   for (const scheme of schemes) {
-    if (scheme instanceof OAuth2DeviceCodeAuthScheme && scheme.params.refreshUrl) {
-      const refreshed = await tryRefreshToken(scheme.params.refreshUrl, loadRefreshToken(...));
+    if (scheme instanceof OAuth2DeviceCodeAuthScheme) {
+      const refreshed = await tryRefreshToken(
+        scheme, // validates refreshUrl ?? tokenUrl, scopes, issuer, and audience
+        loadRefreshToken(...),
+        process.env.OAUTH_CLIENT_ID!,
+      );
       if (refreshed) {
         scheme.setCredential(refreshed.access_token);
         saveRefreshToken(refreshed.refresh_token);

@@ -60,7 +60,16 @@ export class ApiKeyAuthScheme extends AuthScheme {
     } else if (this.location === 'query') {
       ctx.url.searchParams.set(this.name, this.credential!);
     } else if (this.location === 'cookie') {
-      ctx.headers['Cookie'] = `${this.name}=${this.credential!}`;
+      const existingName = Object.keys(ctx.headers).find(
+        (name) => name.toLowerCase() === 'cookie',
+      );
+      const existing = existingName ? ctx.headers[existingName] : undefined;
+      if (existingName && existingName !== 'Cookie') {
+        delete ctx.headers[existingName];
+      }
+      ctx.headers['Cookie'] = [existing, `${this.name}=${this.credential!}`]
+        .filter(Boolean)
+        .join('; ');
     }
   }
 }
@@ -242,12 +251,20 @@ export class OAuth2PasswordAuthScheme extends AuthScheme {
 // ─── OpenID Connect ───
 
 export class OpenIdConnectAuthScheme extends AuthScheme {
-  constructor(readonly openIdConnectUrl: string) {
+  constructor(
+    readonly openIdConnectUrl: string,
+    readonly requiredScopes?: readonly string[],
+  ) {
     super();
   }
 
   get params() {
-    return { openIdConnectUrl: this.openIdConnectUrl };
+    return {
+      openIdConnectUrl: this.openIdConnectUrl,
+      ...(this.requiredScopes !== undefined
+        ? { requiredScopes: this.requiredScopes }
+        : {}),
+    };
   }
 
   applyToRequest(ctx: AuthRequestContext): void {

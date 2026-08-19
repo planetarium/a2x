@@ -54,15 +54,15 @@ new A2XClient(urlOrCard, { headers, authProvider, fetch })
 
 Consequence: if the remote agent changes its card (e.g. rotates security schemes), **a long-lived client will not pick it up**. Recreate the client on such changes.
 
-Concurrent calls on a cold client can all enter `_ensureResolved()` before any one call fills the cache because the client does not memoize an in-flight promise. Avoid relying on exactly one card fetch during cold start.
+Concurrent calls on a cold client share one in-flight resolution promise, so one card and endpoint initialize the instance coherently.
 
 ### Authentication is cached after completion
 
 The `AuthScheme[]` returned by a completed `AuthProvider.provide()` is cached as `_resolvedSchemes` and re-applied to subsequent requests.
 
-Normalization drops a whole non-empty requirement when any named scheme is absent or unsupported; it never turns a partial AND group into a satisfiable one. An explicit `{}` alternative is anonymous and bypasses the provider. OAuth requirement values are retained as `scheme.params.requiredScopes`, distinct from the advertised `params.scopes` catalogue.
+Normalization drops a whole non-empty requirement when any named scheme is absent, unsupported, or would overwrite another scheme's HTTP destination; it never turns a partial AND group into a satisfiable one. Distinct cookie API keys compose, and expansion stops above 256 alternatives. An explicit `{}` alternative is anonymous and bypasses the provider. OAuth and OIDC requirement values are retained as `scheme.params.requiredScopes`, distinct from the OAuth flow's advertised `params.scopes` catalogue.
 
-Concurrent first calls can invoke `provide()` more than once because the client does not deduplicate the in-flight call. Make providers concurrency-safe and deduplicate expensive token exchanges or interactive prompts. After one call populates the cache, later sequential calls reuse it.
+Concurrent first calls share one in-flight authentication promise and one `provide()` result. Concurrent `auth-required` responses likewise share one `refresh()` call. Providers reused by multiple client instances still need tuple-keyed concurrency control of their own.
 
 ### `auth-required` is the re-auth path
 

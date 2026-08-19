@@ -81,7 +81,7 @@ Notes:
 `getAgentEndpointUrl(card, version)` picks the JSON-RPC endpoint:
 
 - **v0.3** — use `card.url`. Throws if absent.
-- **v1.0** — find the interface with `protocolBinding` (case-insensitive) `JSONRPC`. If none match, falls back to the **first** interface in `supportedInterfaces`.
+- **v1.0** — find the interface with `protocolBinding` (case-insensitive) `JSONRPC`. Throws if the card advertises only other transports; the client never posts JSON-RPC to a gRPC or HTTP+JSON endpoint.
 
 The same extraction is used internally by `A2XClient` to determine where to POST JSON-RPC requests.
 

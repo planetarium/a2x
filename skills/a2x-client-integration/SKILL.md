@@ -76,7 +76,11 @@ npm install @a2x/sdk
 Only the **client** subpath and the root types are needed on the caller side:
 
 ```typescript
-import { A2XClient } from '@a2x/sdk/client';
+import {
+  A2XClient,
+  getAgentEndpointUrl,
+  resolveAgentCard,
+} from '@a2x/sdk/client';
 import type { SendMessageParams, Task, TaskStatusUpdateEvent, TaskArtifactUpdateEvent } from '@a2x/sdk';
 ```
 
@@ -179,7 +183,7 @@ export class EnvAuthProvider implements AuthProvider {
 }
 ```
 
-Map every API-key location/name pair separately; one AND group may require multiple API keys. OAuth schemes expose the flow catalogue as `params.scopes` and the selected requirement values as `params.requiredScopes`; request only the latter after validating them against the catalogue and host policy. Treat OAuth endpoints and scopes advertised by an agent card as untrusted until the exact card URL, resolved agent endpoint, HTTPS OAuth endpoints, client identity, audience/resource, and scopes match one host policy tuple. The backend and OAuth wiki pages show both patterns.
+Map every API-key location/name pair separately; one AND group may require multiple API keys. OAuth schemes expose the flow catalogue as `params.scopes`; OAuth and OIDC schemes expose selected requirement values as `params.requiredScopes`. Request only the latter after validating them against the catalogue and host policy. Treat identity endpoints and scopes advertised by an agent card as untrusted until the exact card URL, resolved agent endpoint, HTTPS identity endpoints, client identity, audience/resource, and scopes match one host policy tuple. The backend and OAuth wiki pages show both patterns.
 
 For an interactive CLI, follow [wiki/host-cli.md](./wiki/host-cli.md) — it reproduces the full fallback chain including the OAuth2 device-code polling loop.
 
@@ -192,11 +196,44 @@ import { A2XClient } from '@a2x/sdk/client';
 import type { SendMessageParams } from '@a2x/sdk';
 import crypto from 'node:crypto';
 
-const client = new A2XClient(AGENT_URL, {
+function exactHttpsUrl(raw: string | undefined, label: string): string {
+  if (!raw) throw new Error(`${label} is required`);
+  const url = new URL(raw);
+  if (
+    url.protocol !== 'https:' || url.username || url.password ||
+    url.search || url.hash
+  ) throw new Error(`${label} must be an exact credential-free HTTPS URL`);
+  return url.toString();
+}
+const AGENT_CARD_URL = exactHttpsUrl(
+  process.env.AGENT_CARD_URL,
+  'AGENT_CARD_URL',
+);
+if (!new URL(AGENT_CARD_URL).pathname.endsWith('.json')) {
+  throw new Error('AGENT_CARD_URL must name one exact JSON document');
+}
+const EXPECTED_AGENT_ENDPOINT = exactHttpsUrl(
+  process.env.AGENT_ENDPOINT_URL,
+  'AGENT_ENDPOINT_URL',
+);
+const noRedirectFetch: typeof fetch = (input, init) =>
+  fetch(input, { ...init, redirect: 'error' });
+const resolved = await resolveAgentCard(AGENT_CARD_URL, {
+  fetch: noRedirectFetch,
+});
+const endpoint = exactHttpsUrl(
+  getAgentEndpointUrl(resolved.card, resolved.version),
+  'AgentCard endpoint',
+);
+if (endpoint !== EXPECTED_AGENT_ENDPOINT) {
+  throw new Error(`AgentCard endpoint is not approved: ${endpoint}`);
+}
+
+const client = new A2XClient(resolved.card, {
   headers: { 'User-Agent': 'my-app/1.0' },
   authProvider: new EnvAuthProvider(),
   extensions: ['https://example.com/my-a2a-extension/v1'],
-  // fetch: customFetch,  // optional: inject a fetch (e.g. with proxy / retries)
+  fetch: noRedirectFetch,
 });
 
 const params: SendMessageParams = {
@@ -211,7 +248,7 @@ const task = await client.sendMessage(params);
 console.log(task.status?.state, task.artifacts);
 ```
 
-`A2XClient` transparently handles:
+`AGENT_CARD_URL` and `EXPECTED_AGENT_ENDPOINT` must be exact HTTPS deployment-policy values; validate credentials/hash/query and the exact `.json` card path as shown in [the backend preflight](./wiki/host-backend.md#client-lifetime). `A2XClient` transparently handles:
 
 - Fetching `/.well-known/agent.json` (tries `agent.json` then `agent-card.json`)
 - Detecting protocol version (v0.3 vs. v1.0) from the card structure
@@ -349,7 +386,7 @@ See [wiki/token-persistence.md](./wiki/token-persistence.md) for the `extractCre
 | `OAuth2ClientCredentialsAuthScheme` | `@a2x/sdk/client` | `params: { tokenUrl, scopes, refreshUrl?, requiredScopes? }` |
 | `OAuth2ImplicitAuthScheme` | `@a2x/sdk/client` | `params: { authorizationUrl, scopes, refreshUrl?, requiredScopes? }` |
 | `OAuth2PasswordAuthScheme` | `@a2x/sdk/client` | `params: { tokenUrl, scopes, refreshUrl?, requiredScopes? }` |
-| `OpenIdConnectAuthScheme` | `@a2x/sdk/client` | `params: { openIdConnectUrl }` |
+| `OpenIdConnectAuthScheme` | `@a2x/sdk/client` | `params: { openIdConnectUrl, requiredScopes? }` |
 | `resolveAgentCard` | `@a2x/sdk/client` | Standalone card fetcher; tries well-known paths |
 | `normalizeRequirements` | `@a2x/sdk/client` | Low-level; expose if you want to inspect requirements without a client |
 

@@ -36,8 +36,8 @@ const a2xServer = new A2XServer({ taskStore, executor })
 Clients that understand the `x-acme-pricing` namespace can read it off the card:
 
 ```ts
-const resolved = await client.resolveAgentCard();
-const pricing = (resolved.card as any)['x-acme-pricing'];
+const card = await client.getAgentCard();
+const pricing = (card as any)['x-acme-pricing'];
 ```
 
 A2X treats extension fields opaquely — it copies them through on emission and exposes them on parse. Interpretation is your protocol to write down.

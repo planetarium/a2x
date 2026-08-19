@@ -42,6 +42,8 @@ import type { AuthProvider } from '@a2x/sdk/client';
 
 The `requirements` parameter mirrors the OpenAPI-style security semantics from the agent card:
 
+The v1.0 wire uses `{ schemes: { name: { list: [...] } } }`; the SDK unwraps that `StringList.list` shape before calling the provider. Older a2x cards that used `values` remain accepted for compatibility.
+
 | Card construct | SDK representation |
 |----------------|--------------------|
 | `securityRequirements: [{ apiKey: [] }]` | `[ [ApiKeyAuthScheme] ]` |
@@ -49,9 +51,9 @@ The `requirements` parameter mirrors the OpenAPI-style security semantics from t
 | `securityRequirements: [{ apiKey: [], bearer: [] }]` | `[ [ApiKeyAuthScheme, HttpBearerAuthScheme] ]` (AND — both) |
 | `securityRequirements: [{ oauth2: [...] }]` with 3 OAuth2 flows | `[ [DeviceCodeScheme], [AuthorizationCodeScheme], [ClientCredentialsScheme] ]` (OR per flow) |
 
-Requirement values are preserved as `params.requiredScopes` on normalized OAuth schemes; `params.scopes` remains the flow's advertised catalogue. Request only `requiredScopes` after checking each value against the catalogue and host policy.
+Requirement values are preserved as `params.requiredScopes` on normalized OAuth and OpenID Connect schemes; OAuth `params.scopes` remains the flow's advertised catalogue. Request only `requiredScopes` after checking each value against the catalogue and host policy.
 
-If any named scheme in a non-empty AND requirement is absent or unsupported, the SDK omits that entire alternative rather than presenting a partially satisfiable group. An explicit empty requirement (`{}`) remains an anonymous alternative; when one exists, `A2XClient` skips `provide()`. If a provider is configured and no supported non-empty alternative remains, the client throws before sending.
+If any named scheme in a non-empty AND requirement is absent, unsupported, or collides with another scheme's HTTP destination, the SDK omits that entire alternative rather than presenting a partially satisfiable group. Distinct cookie API keys compose. Expansion is capped at 256 alternatives so an untrusted card cannot force an exponential allocation. An explicit empty requirement (`{}`) remains an anonymous alternative; when one exists, `A2XClient` skips `provide()`. If a provider is configured and no supported non-empty alternative remains, the client throws before sending.
 
 Your `provide()` must:
 
@@ -73,7 +75,7 @@ After initialization completes, the SDK retains one active `AuthScheme` set deri
 - re-applied on every outgoing request
 - passed to `refresh()` after an `auth-required` task or an `auth-required` first stream event
 
-Concurrent cold-start resolution can construct transient competing sets before one is cached; do not use object identity as a persistence key or assume construction happens exactly once.
+One client shares its in-flight initialization across concurrent cold calls, so it retains one coherent scheme set. Do not use object identity as a persistence key across client instances or process restarts.
 
 **Do not construct new `AuthScheme` instances inside `provide()`.** Mutate the ones the SDK hands you (via `setCredential`) and return them.
 
@@ -115,7 +117,7 @@ await client.sendMessage(...)
 
 Key properties:
 
-- A completed `provide()` result is reused, but concurrent cold-start calls can invoke `provide()` more than once. Make it concurrency-safe and deduplicate interactive or expensive work in the provider.
+- A client shares one in-flight `provide()` and one in-flight `refresh()` across concurrent calls, then reuses the completed scheme set. A provider shared by multiple clients must still isolate and deduplicate work by the complete agent/credential tuple.
 - `refresh()` is called **at most once per `auth-required` task-creating request**, and only when it exists and schemes were previously resolved. If refresh is unavailable or the retry is also `auth-required`, the task or event is surfaced.
 - `sendMessageStream()` buffers exactly its first event. It can refresh only when that event is an `auth-required` status event; a later status event does not trigger refresh.
 - An HTTP 401 is not refreshed automatically; both blocking and streaming calls surface it as `InternalError('HTTP 401: Unauthorized')`.

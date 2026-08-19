@@ -161,14 +161,16 @@ describe('AgentCardResolver', () => {
       expect(getAgentEndpointUrl(card, '1.0')).toBe('http://localhost/jsonrpc');
     });
 
-    it('should fallback to first interface if no JSONRPC in v1.0', () => {
+    it('should reject a v1.0 card without a JSONRPC interface', () => {
       const card: AgentCardV10 = {
         ...V10_CARD,
         supportedInterfaces: [
           { url: 'http://localhost/grpc', protocolBinding: 'GRPC', protocolVersion: '1.0' },
         ],
       };
-      expect(getAgentEndpointUrl(card, '1.0')).toBe('http://localhost/grpc');
+      expect(() => getAgentEndpointUrl(card, '1.0')).toThrow(
+        'no JSONRPC interface',
+      );
     });
 
     it('should throw for v0.3 card without url', () => {

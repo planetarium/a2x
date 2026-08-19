@@ -10,9 +10,7 @@ import { A2XClient } from '@a2x/sdk/client';
 const client = new A2XClient('https://agent.example.com/.well-known/agent.json');
 ```
 
-Pass the AgentCard URL (the `.well-known` path). The client fetches and caches the card on first use and uses it to figure out how to route subsequent calls.
-
-You can also pass the JSON-RPC endpoint directly, but the card URL is preferred — it supports discovery, version negotiation, and auth scheme introspection.
+Pass the AgentCard URL (the `.well-known` path), or a base URL whose well-known paths the resolver should probe. The client fetches and caches the card on first use and uses its declared JSON-RPC interface for subsequent calls. A bare JSON-RPC endpoint is not a supported string input; resolve a card first and pass the card object when discovery is handled elsewhere.
 
 ## Custom headers and authentication
 
@@ -34,6 +32,7 @@ A custom `AuthScheme.applyToRequest()` still receives the complete built request
 ```ts
 const task = await client.sendMessage({
   message: {
+    messageId: crypto.randomUUID(),
     role: 'user',
     parts: [{ text: 'Summarize the attached log.' }],
   },
@@ -43,7 +42,7 @@ console.log(task.status.state);           // 'completed'
 console.log(task.status.message?.parts);  // agent's reply parts
 ```
 
-`sendMessage()` is **unary**: one request, one response. It blocks until the task completes (or fails).
+`sendMessage()` is **unary**: it returns one `Task` rather than an event stream. The task is not necessarily terminal—`configuration.blocking`, the peer's behavior, and interrupted states such as `input-required` determine what comes back. Inspect `task.status.state` and poll with `getTask()` when work remains.
 
 The return value is a full `Task` object with status, artifacts, and the agent's final message. See the API reference for the exact shape.
 
@@ -64,7 +63,11 @@ const canceled = await client.cancelTask('task-abc123');
 
 ```ts
 await client.sendMessage({
-  message: { role: 'user', parts: [{ text: 'Hello' }] },
+  message: {
+    messageId: crypto.randomUUID(),
+    role: 'user',
+    parts: [{ text: 'Hello' }],
+  },
   configuration: {
     // Wait for the task to reach a terminal state before resolving.
     // false → return as soon as the agent picks the task up.
@@ -95,6 +98,7 @@ await client.getTask('task-abc123', { historyLength: 1 });
 ```ts
 await client.sendMessage({
   message: {
+    messageId: crypto.randomUUID(),
     role: 'user',
     parts: [
       { text: 'What does this image show?' },

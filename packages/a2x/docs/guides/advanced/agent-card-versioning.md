@@ -88,16 +88,14 @@ If you plan to expose JSON-RPC over HTTP **and** another transport (e.g. gRPC), 
 On the client side, `A2XClient` reads the remote card's `protocolVersion` field (or infers v0.3 when absent) and routes calls accordingly. You usually don't need to pick a version yourself:
 
 ```ts
-const resolved = await client.resolveAgentCard();
+import { resolveAgentCard } from '@a2x/sdk/client';
+
+const resolved = await resolveAgentCard(agentCardUrl);
 console.log(resolved.version);   // '0.3' | '1.0'
 console.log(resolved.card);      // the parsed card for that version
 ```
 
-To force a preference when the remote supports both:
-
-```ts
-const client = new A2XClient(url, { preferredVersion: '1.0' });
-```
+`A2XClient` has no `preferredVersion` option. The resolved card is authoritative; use a deployment-specific card URL when a peer publishes separate cards for different protocol versions.
 
 ## Recommendation
 
