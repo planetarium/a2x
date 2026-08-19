@@ -1403,9 +1403,10 @@ export class A2XClient {
   private _assertNotAuthProviderReentry(): void {
     const invocation = authProviderInvocation.getStore();
     if (!invocation?.active || invocation.client !== this) return;
+    const purpose = invocation.callback === 'provide' ? 'acquisition' : 'refresh';
     throw new UnsupportedOperationError(
       `AuthProvider.${invocation.callback}() cannot call an authenticated operation ` +
-        'on the same A2XClient; use a separate client or transport for credential acquisition.',
+        `on the same A2XClient; use a separate client or transport for credential ${purpose}.`,
     );
   }
 

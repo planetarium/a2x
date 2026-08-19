@@ -1953,7 +1953,8 @@ describe('A2XClient auth integration', () => {
     });
 
     await expect(client.getTask('outer')).rejects.toThrow(
-      'AuthProvider.provide() cannot call an authenticated operation on the same A2XClient',
+      'AuthProvider.provide() cannot call an authenticated operation on the same A2XClient; ' +
+        'use a separate client or transport for credential acquisition.',
     );
     expect(provide).toHaveBeenCalledTimes(1);
     expect(mockFetch).not.toHaveBeenCalled();
@@ -1977,7 +1978,8 @@ describe('A2XClient auth integration', () => {
     await expect(client.sendMessage({
       message: { role: 'user', parts: [{ text: 'outer' }] },
     })).rejects.toThrow(
-      'AuthProvider.provide() cannot call an authenticated operation on the same A2XClient',
+      'AuthProvider.provide() cannot call an authenticated operation on the same A2XClient; ' +
+        'use a separate client or transport for credential acquisition.',
     );
     expect(provide).toHaveBeenCalledTimes(1);
     expect(mockFetch).not.toHaveBeenCalled();
@@ -2011,7 +2013,8 @@ describe('A2XClient auth integration', () => {
     await expect(client.sendMessage({
       message: { role: 'user', parts: [{ text: 'outer' }] },
     })).rejects.toThrow(
-      'AuthProvider.refresh() cannot call an authenticated operation on the same A2XClient',
+      'AuthProvider.refresh() cannot call an authenticated operation on the same A2XClient; ' +
+        'use a separate client or transport for credential refresh.',
     );
     expect(refresh).toHaveBeenCalledTimes(1);
     expect(mockFetch).toHaveBeenCalledTimes(1);
