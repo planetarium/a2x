@@ -1939,4 +1939,107 @@ describe('A2XClient auth integration', () => {
     expect(order).toEqual(['cancel', 'retry']);
   });
 
+  it('rejects provide re-entry through the same client after an async boundary', async () => {
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    let client!: A2XClient;
+    const provide = vi.fn(async (requirements: AuthScheme[][]) => {
+      await Promise.resolve();
+      await client.getTask('bootstrap');
+      return [requirements[0]![0]!.setCredential('key')];
+    });
+    client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      authProvider: { provide },
+    });
+
+    await expect(client.getTask('outer')).rejects.toThrow(
+      'AuthProvider.provide() cannot call an authenticated operation on the same A2XClient; ' +
+        'use a separate client or transport for credential acquisition.',
+    );
+    expect(provide).toHaveBeenCalledTimes(1);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects provide re-entry through a streaming operation', async () => {
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    let client!: A2XClient;
+    const provide = vi.fn(async (requirements: AuthScheme[][]) => {
+      await Promise.resolve();
+      await client.sendMessageStream({
+        message: { role: 'user', parts: [{ text: 'bootstrap' }] },
+      }).next();
+      return [requirements[0]![0]!.setCredential('key')];
+    });
+    client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      authProvider: { provide },
+    });
+
+    await expect(client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'outer' }] },
+    })).rejects.toThrow(
+      'AuthProvider.provide() cannot call an authenticated operation on the same A2XClient; ' +
+        'use a separate client or transport for credential acquisition.',
+    );
+    expect(provide).toHaveBeenCalledTimes(1);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects refresh re-entry when the nested call would refresh again', async () => {
+    const authRequiredTask = {
+      id: 'task-auth',
+      contextId: 'ctx-auth',
+      status: { state: TaskState.AUTH_REQUIRED, timestamp: new Date().toISOString() },
+    };
+    const mockFetch = createMockFetch(createJsonRpcSuccess(authRequiredTask));
+    let client!: A2XClient;
+    const refresh = vi.fn(async (schemes: AuthScheme[]) => {
+      await Promise.resolve();
+      await client.sendMessage({
+        message: { role: 'user', parts: [{ text: 'bootstrap' }] },
+      });
+      return schemes;
+    });
+    client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      authProvider: {
+        async provide(requirements) {
+          return [requirements[0]![0]!.setCredential('old-key')];
+        },
+        refresh,
+      },
+    });
+
+    await expect(client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'outer' }] },
+    })).rejects.toThrow(
+      'AuthProvider.refresh() cannot call an authenticated operation on the same A2XClient; ' +
+        'use a separate client or transport for credential refresh.',
+    );
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not treat provider-owned async work as re-entry after provide settles', async () => {
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let lateCall!: Promise<Task>;
+    let client!: A2XClient;
+    client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      authProvider: {
+        async provide(requirements) {
+          lateCall = gate.then(() => client.getTask('late'));
+          return [requirements[0]![0]!.setCredential('key')];
+        },
+      },
+    });
+
+    await client.getTask('outer');
+    release();
+    await expect(lateCall).resolves.toMatchObject({ id: TASK_RESULT.id });
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
 });

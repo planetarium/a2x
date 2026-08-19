@@ -43,6 +43,10 @@ import { getResponseParser } from './response-parser.js';
 import type { ResponseParser } from './response-parser.js';
 import { parseSSEStream } from './sse-parser.js';
 import type { AuthProvider } from './auth-provider.js';
+import {
+  authProviderInvocation,
+  type AuthProviderInvocation,
+} from './auth-provider-context.js';
 import type { AuthScheme, AuthRequestContext } from './auth-scheme.js';
 import { normalizeRequirements } from './auth-normalizer.js';
 import {
@@ -516,6 +520,7 @@ export class A2XClient {
    * task is the final settled task.
    */
   async sendMessage(params: SendMessageParams): Promise<Task> {
+    this._assertNotAuthProviderReentry();
     const first = await this._sendMessageOnce(params);
     if (!this._x402) return first;
     if (first.status.state !== 'input-required') return first;
@@ -629,6 +634,7 @@ export class A2XClient {
     params: SendMessageParams,
     signal?: AbortSignal,
   ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
+    this._assertNotAuthProviderReentry();
     if (!this._x402) {
       yield* this._sendMessageStreamOnce(params, signal);
       return;
@@ -1170,6 +1176,7 @@ export class A2XClient {
     taskId: string,
     options?: { historyLength?: number; metadata?: Record<string, unknown> },
   ): Promise<Task> {
+    this._assertNotAuthProviderReentry();
     await this._ensureResolved();
     await this._ensureAuthenticated();
     const params: Record<string, unknown> = { id: taskId };
@@ -1189,6 +1196,7 @@ export class A2XClient {
    * Uses JSON-RPC method `tasks/cancel`.
    */
   async cancelTask(taskId: string): Promise<Task> {
+    this._assertNotAuthProviderReentry();
     await this._ensureResolved();
     await this._ensureAuthenticated();
     const request = this._buildJsonRpcRequest(A2A_METHODS.CANCEL_TASK, {
@@ -1216,6 +1224,7 @@ export class A2XClient {
    * Client handles: credential acquisition via provide() callback.
    */
   private async _ensureAuthenticated(): Promise<void> {
+    this._assertNotAuthProviderReentry();
     if (this._resolvedSchemes) return;
     if (!this._authProvider) return;
 
@@ -1368,8 +1377,33 @@ export class A2XClient {
       return;
     }
 
-    this._resolvedSchemes = await authProvider.provide(requirements);
+    const invocation: AuthProviderInvocation = {
+      client: this,
+      callback: 'provide',
+      active: true,
+    };
+    try {
+      this._resolvedSchemes = await authProviderInvocation.run(
+        invocation,
+        () => authProvider.provide(requirements),
+      );
+    } finally {
+      // Async resources retained by the provider may outlive the callback.
+      // They are no longer re-entry once the callback itself has settled.
+      invocation.active = false;
+      authProviderInvocation.close(invocation);
+    }
     this._authGeneration += 1;
+  }
+
+  private _assertNotAuthProviderReentry(): void {
+    const invocation = authProviderInvocation.getStore(this);
+    if (!invocation) return;
+    const purpose = invocation.callback === 'provide' ? 'acquisition' : 'refresh';
+    throw new UnsupportedOperationError(
+      `AuthProvider.${invocation.callback}() cannot call an authenticated operation ` +
+        `on the same A2XClient; use a separate client or transport for credential ${purpose}.`,
+    );
   }
 
   /**
@@ -1604,7 +1638,21 @@ export class A2XClient {
       const authProvider = this._authProvider;
       const schemes = snapshotAuthSchemes(this._resolvedSchemes);
       this._authRefreshPromise = (async () => {
-        const refreshed = await authProvider.refresh!(schemes);
+        const invocation: AuthProviderInvocation = {
+          client: this,
+          callback: 'refresh',
+          active: true,
+        };
+        let refreshed: AuthScheme[];
+        try {
+          refreshed = await authProviderInvocation.run(
+            invocation,
+            () => authProvider.refresh!(schemes),
+          );
+        } finally {
+          invocation.active = false;
+          authProviderInvocation.close(invocation);
+        }
         // The provider retains the objects it received and returned. Publish a
         // second snapshot so later provider-side mutation cannot alter the
         // generation that requests observe.

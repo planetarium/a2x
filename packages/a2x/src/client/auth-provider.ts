@@ -19,6 +19,8 @@ export interface AuthProvider {
    * Client iterates groups, resolves all schemes in a group via
    * setCredential(), and returns the resolved group.
    * Throw if no group can be satisfied — authentication fails.
+   * Do not call an authenticated operation on the same A2XClient from this
+   * callback. Use a separate client or transport for credential acquisition.
    */
   provide(requirements: AuthScheme[][]): Promise<AuthScheme[]>;
 
@@ -26,6 +28,8 @@ export interface AuthProvider {
    * Called by SDK when a previously-authenticated request gets
    * an auth error (e.g., token expired). Optional.
    * Receives the same scheme array that was previously returned by provide().
+   * Do not call an authenticated operation on the same A2XClient from this
+   * callback. Use a separate client or transport for credential refresh.
    */
   refresh?(schemes: AuthScheme[]): Promise<AuthScheme[]>;
 }
