@@ -60,15 +60,18 @@ export class ApiKeyAuthScheme extends AuthScheme {
     } else if (this.location === 'query') {
       ctx.url.searchParams.set(this.name, this.credential!);
     } else if (this.location === 'cookie') {
-      const existingName = Object.keys(ctx.headers).find(
+      const existingNames = Object.keys(ctx.headers).filter(
         (name) => name.toLowerCase() === 'cookie',
       );
-      const existing = existingName ? ctx.headers[existingName] : undefined;
-      if (existingName && existingName !== 'Cookie') {
-        delete ctx.headers[existingName];
+      const existing = existingNames
+        .map((name) => ctx.headers[name])
+        .filter(Boolean)
+        .join('; ');
+      for (const name of existingNames) {
+        delete ctx.headers[name];
       }
       const unrelated = existing
-        ?.split(';')
+        .split(';')
         .map((pair) => pair.trim())
         .filter((pair) => pair.split('=', 1)[0] !== this.name)
         .join('; ');

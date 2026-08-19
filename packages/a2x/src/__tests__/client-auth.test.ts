@@ -124,6 +124,25 @@ describe('AuthScheme', () => {
       expect(ctx.headers.cookie).toBeUndefined();
     });
 
+    it('coalesces every case-insensitive Cookie header variant', () => {
+      const scheme = new ApiKeyAuthScheme('session', 'cookie');
+      scheme.setCredential('fresh');
+      const ctx = {
+        headers: {
+          Cookie: 'session=stale; first=one',
+          cookie: 'second=two',
+          COOKIE: 'session=older; third=three',
+        } as Record<string, string>,
+        url: new URL('http://example.com'),
+      };
+
+      scheme.applyToRequest(ctx);
+
+      expect(ctx.headers).toEqual({
+        Cookie: 'first=one; second=two; third=three; session=fresh',
+      });
+    });
+
     it('returns params', () => {
       const scheme = new ApiKeyAuthScheme('x-api-key', 'header');
       expect(scheme.params).toEqual({ name: 'x-api-key', location: 'header' });
