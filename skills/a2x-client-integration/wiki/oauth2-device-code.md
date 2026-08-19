@@ -200,7 +200,7 @@ The device-code flow is typically used with **public** clients (no secret), so `
 
 The access token goes into the store via `saveCredentials` keyed by `scheme.constructor.name === 'OAuth2DeviceCodeAuthScheme'`. On subsequent runs, the CLI restores it with `scheme.setCredential` — no new device-code flow.
 
-If you want to also store `refresh_token` and run a token refresh on 401 instead of re-doing the device-code flow, extend `StoredCredential`:
+If you want to also store `refresh_token` and exchange it when the agent reports `auth-required` instead of re-doing the device-code flow, extend `StoredCredential`:
 
 ```typescript
 interface StoredCredential {

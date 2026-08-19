@@ -45,8 +45,12 @@ function readStore(): StoreData {
 }
 
 function writeStore(data: StoreData): void {
-  fs.mkdirSync(STORE_DIR, { recursive: true });
-  fs.writeFileSync(STORE_PATH, JSON.stringify(data, null, 2), 'utf-8');
+  fs.mkdirSync(STORE_DIR, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(STORE_PATH, JSON.stringify(data, null, 2), {
+    encoding: 'utf-8',
+    mode: 0o600,
+  });
+  fs.chmodSync(STORE_PATH, 0o600);
 }
 
 export function loadCredentials(agentUrl: string): StoredCredential[] | undefined {
@@ -154,11 +158,11 @@ if (scheme instanceof ApiKeyAuthScheme) {
 
 The CLI's `~/.a2x/tokens.json` is:
 
-- **world-readable by default** on Unix (file is created with `0644`).
+- restricted to the current user on Unix (`0600`) inside a `0700` directory; the CLI reapplies `chmod(0600)` after every write.
 - **plaintext** — anyone with filesystem access can copy tokens.
 - **unencrypted** at rest.
 
-This is acceptable for a developer CLI on a personal machine; it is **not** acceptable for anything approaching production. Options for a production-grade store:
+The file permissions reduce accidental cross-user exposure, but plaintext credentials are still unsuitable for many production environments. Options for a production-grade store:
 
 | Backend | Notes |
 |---------|-------|
@@ -169,9 +173,9 @@ This is acceptable for a developer CLI on a personal machine; it is **not** acce
 
 When switching stores, keep the same shape — `Record<agentUrl, Array<{ schemeClass, credential }>>` — and only swap the backing read/write functions. The `AuthProvider` doesn't need to know.
 
-### Permissions hardening (file store)
+### File permissions
 
-If you stick with a file store, tighten permissions:
+Match the CLI's permissions when implementing a file store:
 
 ```typescript
 function writeStore(data: StoreData): void {

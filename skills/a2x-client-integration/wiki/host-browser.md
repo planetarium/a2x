@@ -72,7 +72,7 @@ Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key
 Access-Control-Allow-Methods: GET, POST, OPTIONS
 ```
 
-…and respond to `OPTIONS` preflight requests. The built-in `toA2x` server emits `Access-Control-Allow-Origin: *` and handles `OPTIONS`. Servers behind reverse proxies may need manual CORS config.
+…and respond to `OPTIONS` preflight requests. The built-in `toA2x` listener emits `Access-Control-Allow-Origin: *` and handles `OPTIONS`, but its default `Access-Control-Allow-Headers` permits only `Content-Type`. Browser calls using `Authorization`, API-key, or extension headers therefore need a reverse proxy or host wrapper that returns the complete allow-list above.
 
 Streaming (`message/stream`) triggers a preflight because the client sends `Accept: text/event-stream` and a JSON body — the preflight must succeed or the browser will never open the SSE connection.
 

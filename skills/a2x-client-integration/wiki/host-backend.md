@@ -128,7 +128,7 @@ export const myAgentClient = new A2XClient(process.env.AGENT_URL!, {
 });
 ```
 
-`A2XClient` is safe to share: the `fetch` call is stateless, and the only mutable state (`_resolvedSchemes`) is set once. Concurrent requests will all go through the same already-authenticated schemes.
+Reuse one `A2XClient` per remote agent and credential identity. It caches the card and resolved schemes, while each request builds its own transport state. Do not share a client across users, mutate its extension set during concurrent calls, or share an x402 client without following the payment storage and reconciliation requirements.
 
 ### Watch out for
 
@@ -190,9 +190,9 @@ if (scheme instanceof OAuth2ClientCredentialsAuthScheme) {
 
 ---
 
-## Fail-Fast at Startup
+## Card Preflight at Startup
 
-Consider probing the agent at boot so misconfiguration surfaces immediately, not on the first request:
+Consider probing the agent card at boot so discovery and routing failures surface immediately, not on the first request:
 
 ```typescript
 // src/main.ts
@@ -200,7 +200,7 @@ import { myAgentClient } from './agents/my-agent-client.js';
 
 (async () => {
   try {
-    await myAgentClient.getAgentCard(); // triggers card fetch + auth resolution
+    await myAgentClient.getAgentCard(); // triggers card fetch only
   } catch (err) {
     console.error('Agent client preflight failed:', err);
     process.exit(1);
@@ -208,6 +208,8 @@ import { myAgentClient } from './agents/my-agent-client.js';
   // start server
 })();
 ```
+
+`getAgentCard()` does not invoke `AuthProvider.provide()`. Test authentication separately by normalizing the card's requirements and calling the provider, or perform an authenticated operation whose effects are safe in your environment.
 
 ---
 
@@ -265,7 +267,7 @@ breaker.fallback(() => ({ error: 'agent_unavailable' } as const));
 const result = await breaker.fire(params);
 ```
 
-Only protect **idempotent** operations (`getTask`, `cancelTask`) or operations where re-sending is tolerable. `sendMessage` should generally **not** be retried automatically.
+Retry `getTask` when appropriate. After an ambiguous `cancelTask` failure, read the task before retrying because the cancellation may already have succeeded. `sendMessage` should generally **not** be retried automatically.
 
 ---
 

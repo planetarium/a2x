@@ -21,8 +21,8 @@ export interface AuthProvider {
   provide(requirements: AuthScheme[][]): Promise<AuthScheme[]>;
 
   /**
-   * (Optional) Called once by the SDK after a non-streaming request
-   * returns HTTP 401. Receives the same scheme instances previously
+   * (Optional) Called once by the SDK when a task-creating response
+   * reports `auth-required`. Receives the same scheme instances previously
    * returned by provide(). Implementations typically re-prompt / re-fetch
    * and call setCredential() with a new value.
    */
@@ -67,7 +67,7 @@ The SDK constructs `AuthScheme` instances once per client from the agent card. T
 - returned by `provide()`
 - cached inside the client
 - re-applied on every outgoing request
-- passed to `refresh()` on 401
+- passed to `refresh()` after an `auth-required` task or first stream event
 
 **Do not construct new `AuthScheme` instances inside `provide()`.** Mutate the ones the SDK hands you (via `setCredential`) and return them.
 
@@ -94,9 +94,9 @@ await client.sendMessage(...)
         │
         ├── build request, applyToRequest(ctx) for each cached scheme
         │
-        ├── fetch → response
+        ├── fetch → task or stream
         │
-        ├── if response.status === 401 and refresh exists:
+        ├── if the task or first stream event is auth-required and refresh exists:
         │       schemes = await authProvider.refresh(cachedSchemes)
         │       cache schemes (may be same instances)
         │       retry request exactly once
@@ -107,8 +107,9 @@ await client.sendMessage(...)
 Key properties:
 
 - `provide()` is called **at most once per client instance** under normal operation.
-- `refresh()` is called **at most once per failing request**. If the retry also fails, the error is thrown without another refresh attempt.
-- For `sendMessageStream()`, only `provide()` is invoked — there is no refresh path for streaming requests. A 401 during streaming surfaces as an `InternalError` (`HTTP 401: …`).
+- `refresh()` is called **at most once per `auth-required` task-creating request**. If the retry is also `auth-required`, the task or event is surfaced without another refresh attempt.
+- `sendMessageStream()` buffers its first event so it can refresh and retry once before yielding an `auth-required` event.
+- An HTTP 401 is not refreshed automatically; both blocking and streaming calls surface it as `InternalError('HTTP 401: Unauthorized')`.
 
 ---
 

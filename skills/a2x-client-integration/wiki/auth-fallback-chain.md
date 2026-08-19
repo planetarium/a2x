@@ -30,7 +30,7 @@ provide(requirements)
   │     saveCredentials(agentUrl, group.map(extractCredential))
   │     return group
 
-refresh(schemes)   ← SDK calls after HTTP 401
+refresh(schemes)   ← SDK calls after an auth-required task/event
   │
   │   ── Step 3: Invalidate and re-prompt ──────────────────────────────
   │     clearCredentials(agentUrl)
@@ -52,7 +52,7 @@ Each step addresses a distinct failure mode:
 |------|-------------------|
 | 1. Stored | **Second-run friction.** Without persistence, the user re-authenticates on every CLI invocation. |
 | 2. Interactive | **First-run bootstrap.** Stored credentials don't exist yet, or the user switched to a different agent. |
-| 3. Refresh | **Credential expiry.** Stored token worked last time, but the agent now returns 401 — stored credentials are stale. |
+| 3. Refresh | **Credential expiry.** Stored token worked last time, but the agent now returns an `auth-required` task or first stream event — stored credentials are stale. |
 
 Skipping Step 1 is fine for short-lived workers that always re-prompt anyway (none, for a backend service). Skipping Step 3 leaves you vulnerable to stale tokens — any OAuth2-backed agent benefits from it.
 
@@ -125,7 +125,9 @@ If the agent requires `apiKey AND bearer` (AND within a group) and the store has
 
 ### Refresh is NOT the same as re-provide
 
-The SDK only calls `refresh(schemes)` — passing the already-resolved scheme array. It does not re-call `provide(requirements)`. So `refresh` does not get to pick a different group; it re-runs the same group with fresh credentials.
+When a task-creating response reports `auth-required`, the SDK only calls `refresh(schemes)` — passing the already-resolved scheme array. It does not re-call `provide(requirements)`. So `refresh` does not get to pick a different group; it re-runs the same group with fresh credentials.
+
+An HTTP 401 is a transport failure, not this refresh signal. `A2XClient` throws it as `InternalError` without invoking the provider.
 
 Consequence: if the user's stored credentials are stale **AND** that scheme group is no longer acceptable (e.g. agent added an AND requirement), `refresh` alone cannot recover. The CLI's `refresh` still works for the common case (one scheme in the group, credential expired) which is the important one.
 
