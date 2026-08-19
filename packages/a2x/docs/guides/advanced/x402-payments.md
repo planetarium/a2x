@@ -1317,7 +1317,7 @@ If the merchant's terminal task records a payment failure (the latest receipt is
 |---|---|---|
 | `signer` | required | viem `LocalAccount` used to produce the EIP-3009 authorization. |
 | `maxAmount` | no cap | Atomic-unit ceiling. Filters `accepts[]` before the selector runs. |
-| `selectRequirement` | first EVM `scheme === 'exact'` | Predicate over the (already filtered) requirements. Return `undefined` to abort. |
+| `selectRequirement` | first EVM `scheme === 'exact'` | Predicate over detached copies of the already filtered requirements. Return one supplied array entry by identity, or `undefined` to abort; captured/fabricated objects are rejected and mutations are ignored. |
 | `allowUpto` | `false` | Let the default selector fall back to an EVM `upto` offer when no `exact` one fits. See [Paying an `upto` offer](#paying-an-upto-offer). |
 | `upto` | none | RPC configuration for the `upto` payer — `{ rpcUrl }`, or keyed by numeric chain id. Needed only when the merchant offers [gas-sponsored Permit2 approval](#gas-sponsored-permit2-approval). |
 | `onPaymentRequired` | none | Hook between `payment-required` and signing. Return `false` to send `payment-rejected` cleanly; throw to abort *locally* without telling the merchant. |

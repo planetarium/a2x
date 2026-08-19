@@ -137,35 +137,46 @@ import {
   HttpBearerAuthScheme,
 } from '@a2x/sdk/client';
 
+const API_KEY_ENV_BY_SLOT: Record<string, string | undefined> = {
+  'header:x-api-key': process.env.AGENT_API_KEY,
+  'header:x-tenant-key': process.env.AGENT_TENANT_API_KEY,
+};
+
+function apiKeySlot(scheme: ApiKeyAuthScheme): string {
+  const name = scheme.params.location === 'header'
+    ? scheme.params.name.toLowerCase()
+    : scheme.params.name;
+  return `${scheme.params.location}:${name}`;
+}
+
 export class EnvAuthProvider implements AuthProvider {
   async provide(requirements: AuthScheme[][]): Promise<AuthScheme[]> {
     // Pick the first group we can satisfy from env.
     for (const group of requirements) {
-      const ok = group.every((scheme) => this.tryFill(scheme));
-      if (ok) return group;
+      const credentials = group.map((scheme) => this.readCredential(scheme));
+      if (credentials.every((value): value is string => value !== undefined)) {
+        group.forEach((scheme, index) => scheme.setCredential(credentials[index]));
+        return group;
+      }
     }
     throw new Error(
       'No configured credentials match the agent security requirements',
     );
   }
 
-  private tryFill(scheme: AuthScheme): boolean {
+  private readCredential(scheme: AuthScheme): string | undefined {
     if (scheme instanceof ApiKeyAuthScheme) {
-      const key = process.env.AGENT_API_KEY;
-      if (!key) return false;
-      scheme.setCredential(key);
-      return true;
+      return API_KEY_ENV_BY_SLOT[apiKeySlot(scheme)];
     }
     if (scheme instanceof HttpBearerAuthScheme) {
-      const token = process.env.AGENT_BEARER_TOKEN;
-      if (!token) return false;
-      scheme.setCredential(token);
-      return true;
+      return process.env.AGENT_BEARER_TOKEN;
     }
-    return false;
+    return undefined;
   }
 }
 ```
+
+Map every API-key location/name pair separately; one AND group may require multiple API keys. Treat OAuth endpoints advertised by an agent card as untrusted until their HTTPS origins match a host-configured allowlist. The backend and OAuth wiki pages show both patterns.
 
 For an interactive CLI, follow [wiki/host-cli.md](./wiki/host-cli.md) — it reproduces the full fallback chain including the OAuth2 device-code polling loop.
 

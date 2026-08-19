@@ -1,6 +1,6 @@
 # OAuth2 Device Code Flow
 
-The SDK hands you an `OAuth2DeviceCodeAuthScheme` with the endpoints and scopes; running the flow is **your** responsibility. This is the implementation lifted from `packages/cli/src/cli-auth-provider.ts`.
+The SDK hands you an `OAuth2DeviceCodeAuthScheme` with the endpoints and scopes; running the flow is **your** responsibility. The implementation below is based on `packages/cli/src/cli-auth-provider.ts` and adds an origin allowlist because agent-card discovery metadata is not a trust anchor.
 
 ---
 
@@ -74,15 +74,38 @@ interface TokenErrorResponse {
   error_description?: string;
 }
 
+// Configure this from host/deployment policy, never from the discovered card.
+const TRUSTED_OAUTH_ORIGINS = new Set(
+  (process.env.OAUTH_ISSUER_ORIGINS ?? '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean)
+    .map(value => new URL(value).origin),
+);
+
+function trustedOAuthUrl(raw: string, purpose: string): URL {
+  const url = new URL(raw);
+  if (url.protocol !== 'https:' || !TRUSTED_OAUTH_ORIGINS.has(url.origin)) {
+    throw new Error(`Refusing untrusted OAuth ${purpose} origin: ${url.origin}`);
+  }
+  return url;
+}
+
 export async function performDeviceCodeFlow(
   scheme: OAuth2DeviceCodeAuthScheme,
 ): Promise<string> {
-  const { deviceAuthorizationUrl, tokenUrl, scopes } = scheme.params;
+  const { scopes } = scheme.params;
+  const deviceAuthorizationUrl = trustedOAuthUrl(
+    scheme.params.deviceAuthorizationUrl,
+    'device authorization endpoint',
+  );
+  const tokenUrl = trustedOAuthUrl(scheme.params.tokenUrl, 'token endpoint');
 
   // Step 1: Request a device code
   const scopeStr = Object.keys(scopes).join(' ');
   const deviceRes = await fetch(deviceAuthorizationUrl, {
     method: 'POST',
+    redirect: 'error',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       ...(scopeStr ? { scope: scopeStr } : {}),
@@ -98,10 +121,16 @@ export async function performDeviceCodeFlow(
   const deviceData = (await deviceRes.json()) as DeviceAuthResponse;
   const pollInterval = (deviceData.interval ?? 5) * 1000;
 
+  // A compromised endpoint can return a phishing URL. Validate before displaying it.
+  const verificationUrl = trustedOAuthUrl(
+    deviceData.verification_uri_complete ?? deviceData.verification_uri,
+    'verification page',
+  );
+
   // Step 2: Display instructions to the user
   console.log('');
   console.log('  To authenticate, visit:');
-  console.log(`  ${deviceData.verification_uri_complete ?? deviceData.verification_uri}`);
+  console.log(`  ${verificationUrl.toString()}`);
   if (!deviceData.verification_uri_complete) {
     console.log(`  and enter code: ${deviceData.user_code}`);
   }
@@ -116,6 +145,7 @@ export async function performDeviceCodeFlow(
 
     const tokenRes = await fetch(tokenUrl, {
       method: 'POST',
+      redirect: 'error',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
         grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
@@ -150,6 +180,8 @@ export async function performDeviceCodeFlow(
   throw new Error('Device code expired before authorization was completed');
 }
 ```
+
+Set `OAUTH_ISSUER_ORIGINS` from trusted host configuration, for example `https://login.example.com`. Validate the device, token, and displayed verification URLs before sending a client secret, refresh token, device code, or directing a user to a page. Reject redirects so an allowlisted endpoint cannot forward secrets to another origin. If local HTTP identity infrastructure is required, implement a narrow development-only exception rather than weakening the production rule.
 
 Use it from `resolveScheme`:
 
@@ -238,8 +270,10 @@ async function tryRefreshToken(
   refreshToken: string,
   scheme: OAuth2DeviceCodeAuthScheme,
 ): Promise<boolean> {
-  const res = await fetch(tokenUrl, {
+  const trustedTokenUrl = trustedOAuthUrl(tokenUrl, 'refresh endpoint');
+  const res = await fetch(trustedTokenUrl, {
     method: 'POST',
+    redirect: 'error',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       grant_type: 'refresh_token',

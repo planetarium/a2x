@@ -236,6 +236,10 @@ export async function POST(request: Request) {
 
 **Important**: Set `runtime = 'nodejs'` — the SDK uses `fetch` and `URL`, both available in Edge, but the device-code flow, `node:crypto`, and some Node globals referenced elsewhere in your auth provider require Node.
 
+The direct bridge above is appropriate only for unpaid, non-funds-bearing streams. Do **not** use the browser connection as the owner of an x402 stream, especially with batch settlement: a disconnect can close the upstream generator after payment submission and leave the financial result ambiguous.
+
+For paid streams, enqueue a durable job before returning a subscription identifier. A worker should own and drain `sendMessageStream()` through terminal receipt, reconciliation, or quarantine; persist sanitized events; and expose a replayable SSE subscription to the browser. Browser cancellation closes only that subscription. Apply worker-owned deadlines and handle `X402ReconciliationError`—never derive the upstream abort signal from `request.signal` after payment submission.
+
 ---
 
 ## Pages Router — API Route

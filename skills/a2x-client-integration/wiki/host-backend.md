@@ -28,6 +28,34 @@ import {
   OAuth2ClientCredentialsAuthScheme,
 } from '@a2x/sdk/client';
 
+const API_KEY_ENV_BY_SLOT: Record<string, string | undefined> = {
+  'header:x-api-key': process.env.AGENT_API_KEY,
+  'header:x-tenant-key': process.env.AGENT_TENANT_API_KEY,
+};
+
+const TRUSTED_OAUTH_ORIGINS = new Set(
+  (process.env.OAUTH_ISSUER_ORIGINS ?? '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean)
+    .map(value => new URL(value).origin),
+);
+
+function trustedOAuthEndpoint(raw: string, purpose: string): URL {
+  const url = new URL(raw);
+  if (url.protocol !== 'https:' || !TRUSTED_OAUTH_ORIGINS.has(url.origin)) {
+    throw new Error(`Refusing untrusted OAuth ${purpose} origin: ${url.origin}`);
+  }
+  return url;
+}
+
+function apiKeySlot(scheme: ApiKeyAuthScheme): string {
+  const name = scheme.params.location === 'header'
+    ? scheme.params.name.toLowerCase()
+    : scheme.params.name;
+  return `${scheme.params.location}:${name}`;
+}
+
 export class EnvAuthProvider implements AuthProvider {
   async provide(requirements: AuthScheme[][]): Promise<AuthScheme[]> {
     for (const group of requirements) {
@@ -35,7 +63,7 @@ export class EnvAuthProvider implements AuthProvider {
     }
     throw new Error(
       'No configured credentials match the agent security requirements. ' +
-      'Set AGENT_API_KEY, AGENT_BEARER_TOKEN, or OAUTH_CLIENT_* env vars.',
+      'Configure the required API-key slots, AGENT_BEARER_TOKEN, or OAUTH_CLIENT_* env vars.',
     );
   }
 
@@ -66,7 +94,7 @@ export class EnvAuthProvider implements AuthProvider {
 
 function fillStatic(scheme: AuthScheme): boolean {
   if (scheme instanceof ApiKeyAuthScheme) {
-    const key = process.env.AGENT_API_KEY;
+    const key = API_KEY_ENV_BY_SLOT[apiKeySlot(scheme)];
     if (!key) return false;
     scheme.setCredential(key);
     return true;
@@ -94,8 +122,11 @@ async function fillClientCredentials(
   const clientSecret = process.env.OAUTH_CLIENT_SECRET;
   if (!clientId || !clientSecret) return false;
 
-  const res = await fetch(scheme.params.tokenUrl, {
+  // Agent-card discovery is not a trust decision. Validate before sending secrets.
+  const tokenUrl = trustedOAuthEndpoint(scheme.params.tokenUrl, 'token endpoint');
+  const res = await fetch(tokenUrl, {
     method: 'POST',
+    redirect: 'error',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       grant_type: 'client_credentials',
@@ -111,6 +142,10 @@ async function fillClientCredentials(
   return true;
 }
 ```
+
+Configure `OAUTH_ISSUER_ORIGINS` from deployment policy, for example `https://login.example.com`; do not derive it from the agent card. Add an explicit development-only exception if local HTTP identity infrastructure is unavoidable. Redirects are rejected because an otherwise trusted endpoint could redirect the client secret to another origin.
+
+API-key slots are keyed by placement and name because a valid AND group can require several distinct API keys. Add every expected slot to `API_KEY_ENV_BY_SLOT`; do not reuse one environment variable for the whole class.
 
 ---
 
@@ -132,21 +167,37 @@ Reuse one `A2XClient` per remote agent and credential identity. It caches the ca
 
 ### Watch out for
 
-- **First call races.** If multiple requests arrive simultaneously and `_ensureAuthenticated` hasn't run yet, they will all enter `provide()` in parallel. For `AuthProvider`s that do expensive work (OAuth2 token exchange), add your own in-flight-promise dedupe:
+- **First call races.** If multiple requests arrive simultaneously and `_ensureAuthenticated` hasn't run yet, they will all enter `provide()` in parallel. Deduplicate only the underlying token exchange, then fill and return the `AuthScheme` instances supplied to each invocation:
 
   ```typescript
-  private inflight?: Promise<AuthScheme[]>;
+  private tokenInflight?: Promise<string>;
 
   async provide(requirements: AuthScheme[][]): Promise<AuthScheme[]> {
-    this.inflight ??= this.doProvide(requirements)
-      .finally(() => { this.inflight = undefined; });
-    return this.inflight;
+    const group = requirements.find(group =>
+      group.length === 1 && group[0] instanceof OAuth2ClientCredentialsAuthScheme,
+    );
+    if (!group) throw new Error('No supported authentication group');
+
+    this.tokenInflight ??= this.exchangeToken()
+      .finally(() => { this.tokenInflight = undefined; });
+    group[0].setCredential(await this.tokenInflight);
+    return group;
   }
   ```
 
-  Note: `A2XClient` itself does not dedupe — it relies on the provider to be idempotent-enough.
+  Never cache or return one invocation's `AuthScheme[]` from another invocation: the client expects the exact instances it passed to the provider. `A2XClient` itself does not dedupe, so providers must make credential acquisition concurrency-safe.
 
 - **Stale token caches across restarts.** If you roll out a new deploy, the new process starts with an empty `_resolvedSchemes` and calls `provide()` again. That's fine for client_credentials (re-exchange is cheap) but could be a problem for pre-fetched secrets with rate limits.
+
+---
+
+## Horizontal x402 Ownership
+
+For paid calls, route each `(agent URL, payer identity, payment channel)` to one durable owner for the complete sign → submit → terminal receipt/reconciliation lifecycle. A load-balancer affinity cookie is not sufficient.
+
+If ownership can move between workers, store a monotonically increasing fencing token with the reservation in a transactional database. Every sign, submit, reconciliation, and quarantine write must compare-and-set that token and reject stale owners. A short expiring lock by itself can allow two workers to spend after a pause or network partition.
+
+The worker—not an HTTP client connection—owns a paid stream after submission. It must drain the stream to a terminal state or reconcile/quarantine the payment even if the browser disconnects. Persist sanitized events and let browsers subscribe to a replayable stream.
 
 ---
 
@@ -168,7 +219,8 @@ async function getCachedOrExchange(
   const cached = await redis.get(key);
   if (cached) return cached;
 
-  const res = await fetch(scheme.params.tokenUrl, { /* … */ });
+  const tokenUrl = trustedOAuthEndpoint(scheme.params.tokenUrl, 'token endpoint');
+  const res = await fetch(tokenUrl, { redirect: 'error', /* … */ });
   const { access_token, expires_in = 3600 } = await res.json() as {
     access_token: string;
     expires_in?: number;
@@ -234,9 +286,16 @@ async function getSecret(name: string): Promise<string | undefined> {
   }
 }
 
-// Inside fillStatic:
+const API_KEY_SECRET_BY_SLOT: Record<string, string | undefined> = {
+  'header:x-api-key': 'agent/api-key',
+  'header:x-tenant-key': 'agent/tenant-key',
+};
+
+// Inside a slot-aware async equivalent of fillStatic:
 if (scheme instanceof ApiKeyAuthScheme) {
-  const key = await getSecret('agent/api-key');
+  const secretName = API_KEY_SECRET_BY_SLOT[apiKeySlot(scheme)];
+  if (!secretName) return false;
+  const key = await getSecret(secretName);
   if (!key) return false;
   scheme.setCredential(key);
   return true;

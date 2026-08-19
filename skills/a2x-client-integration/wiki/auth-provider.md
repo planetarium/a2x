@@ -128,27 +128,30 @@ import {
   HttpBearerAuthScheme,
 } from '@a2x/sdk/client';
 
+const API_KEY_ENV_BY_SLOT: Record<string, string | undefined> = {
+  'header:x-api-key': process.env.AGENT_API_KEY,
+  'header:x-tenant-key': process.env.AGENT_TENANT_API_KEY,
+};
+
 class EnvAuthProvider implements AuthProvider {
   async provide(requirements: AuthScheme[][]): Promise<AuthScheme[]> {
     for (const group of requirements) {
-      if (this.tryFill(group)) return group;
+      const credentials = group.map(scheme => this.lookup(scheme));
+      if (credentials.every((value): value is string => value !== undefined)) {
+        group.forEach((scheme, index) => scheme.setCredential(credentials[index]));
+        return group;
+      }
     }
     throw new Error('No credentials configured for the required schemes');
   }
 
-  private tryFill(group: AuthScheme[]): boolean {
-    const filled: AuthScheme[] = [];
-    for (const scheme of group) {
-      const value = this.lookup(scheme);
-      if (!value) return false;
-      scheme.setCredential(value);
-      filled.push(scheme);
-    }
-    return filled.length === group.length;
-  }
-
   private lookup(scheme: AuthScheme): string | undefined {
-    if (scheme instanceof ApiKeyAuthScheme) return process.env.AGENT_API_KEY;
+    if (scheme instanceof ApiKeyAuthScheme) {
+      const name = scheme.params.location === 'header'
+        ? scheme.params.name.toLowerCase()
+        : scheme.params.name;
+      return API_KEY_ENV_BY_SLOT[`${scheme.params.location}:${name}`];
+    }
     if (scheme instanceof HttpBearerAuthScheme) return process.env.AGENT_BEARER_TOKEN;
     return undefined;
   }

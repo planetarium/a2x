@@ -27,6 +27,7 @@ import {
   X402_PAYMENT_STATUS,
 } from '../x402/constants.js';
 import type { Task } from '../types/task.js';
+import type { X402PaymentRequirements } from '../x402/types.js';
 import { reconcileX402BatchSettlement } from '../x402/client.js';
 import {
   X402AttemptPendingError,
@@ -495,6 +496,63 @@ describe('A2XClient.sendMessage — native x402 dance', () => {
     });
     expect(selectRequirement).toHaveBeenCalledTimes(1);
     expect(rpcRequests).toHaveLength(2);
+  });
+
+  it('rejects a custom selection captured outside the affordable candidates', async () => {
+    const required = paymentRequiredTask() as {
+      status: {
+        message: { metadata: Record<string, Record<string, unknown>> };
+      };
+    };
+    const envelope = required.status.message.metadata[
+      X402_METADATA_KEYS.REQUIRED
+    ]!;
+    const captured = (envelope.accepts as X402PaymentRequirements[])[0]!;
+    const { fetch, rpcRequests } = scriptedFetch([() => jsonRpcOk(required)]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        maxAmount: 100n,
+        selectRequirement: () => captured,
+      },
+    });
+
+    await expect(
+      client.sendMessage({
+        message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+      }),
+    ).rejects.toBeInstanceOf(X402NoSupportedRequirementError);
+    expect(rpcRequests).toHaveLength(1);
+  });
+
+  it('ignores mutations a custom selector makes to an affordable candidate', async () => {
+    const { fetch, rpcRequests } = scriptedFetch([
+      () => jsonRpcOk(paymentRequiredTask()),
+      () => jsonRpcOk(completedTaskWithReceipt()),
+    ]);
+    const client = new A2XClient(AGENT_URL, {
+      fetch,
+      x402: {
+        signer: TEST_ACCOUNT,
+        maxAmount: 1000n,
+        selectRequirement: (requirements) => {
+          requirements[0]!.maxAmountRequired = '999999';
+          return requirements[0];
+        },
+      },
+    });
+
+    await client.sendMessage({
+      message: { messageId: 'm1', role: 'user', parts: [{ text: 'hi' }] },
+    });
+    const followup = rpcRequests[1]!.body as {
+      params: { message: { metadata: Record<string, unknown> } };
+    };
+    const signed = followup.params.message.metadata[
+      X402_METADATA_KEYS.PAYLOAD
+    ] as { payload: { authorization: { value: string } } };
+    expect(signed.payload.authorization.value).toBe('1000');
   });
 
   it('does not run the dance when no x402 option is configured', async () => {

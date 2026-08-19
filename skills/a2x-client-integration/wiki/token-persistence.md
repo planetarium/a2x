@@ -4,9 +4,11 @@ How to persist credentials across process restarts so users don't re-authenticat
 
 ---
 
-## File-Based Store
+## Single-Process File Store
 
 Store credentials in a user-local JSON file keyed by agent URL and unique requirement slot:
+
+This example makes each file replacement atomic and treats corruption or I/O errors as fatal. It is still a **single-writer** store: atomic replacement does not prevent two processes from losing each other's read-modify-write updates. For multiple processes, hold an inter-process lock across the entire read-modify-write transaction or use a transactional database/credential store.
 
 ```json
 {
@@ -25,6 +27,7 @@ Full implementation, one file:
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { randomUUID } from 'node:crypto';
 
 const STORE_DIR = path.join(os.homedir(), '.myapp');
 const STORE_PATH = path.join(STORE_DIR, 'tokens.json');
@@ -39,19 +42,30 @@ type StoreData = Record<string, StoredCredential[]>;
 function readStore(): StoreData {
   try {
     return JSON.parse(fs.readFileSync(STORE_PATH, 'utf-8')) as StoreData;
-  } catch {
-    return {};
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {};
+    throw error;
   }
 }
 
 function writeStore(data: StoreData): void {
   fs.mkdirSync(STORE_DIR, { recursive: true, mode: 0o700 });
   fs.chmodSync(STORE_DIR, 0o700);
-  fs.writeFileSync(STORE_PATH, JSON.stringify(data, null, 2), {
-    encoding: 'utf-8',
-    mode: 0o600,
-  });
-  fs.chmodSync(STORE_PATH, 0o600);
+  const tempPath = `${STORE_PATH}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), {
+      encoding: 'utf-8',
+      flag: 'wx',
+      mode: 0o600,
+    });
+    const fd = fs.openSync(tempPath, 'r');
+    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fs.renameSync(tempPath, STORE_PATH);
+    fs.chmodSync(STORE_PATH, 0o600);
+  } catch (error) {
+    try { fs.unlinkSync(tempPath); } catch { /* already renamed or absent */ }
+    throw error;
+  }
 }
 
 export function loadCredentials(agentUrl: string): StoredCredential[] | undefined {
@@ -126,9 +140,18 @@ export function extractCredential(slot: string, scheme: AuthScheme): {
 
   let credential = '';
   if (scheme instanceof ApiKeyAuthScheme) {
-    credential = ctx.headers[scheme.params.name]
-      ?? ctx.url.searchParams.get(scheme.params.name)
-      ?? '';
+    if (scheme.params.location === 'cookie') {
+      const cookie = ctx.headers.Cookie ?? '';
+      const pair = cookie.split(';').map(value => value.trim()).find(value => {
+        const separator = value.indexOf('=');
+        return separator >= 0 && value.slice(0, separator) === scheme.params.name;
+      });
+      credential = pair ? pair.slice(pair.indexOf('=') + 1) : '';
+    } else {
+      credential = ctx.headers[scheme.params.name]
+        ?? ctx.url.searchParams.get(scheme.params.name)
+        ?? '';
+    }
   } else {
     // Bearer-style: "Bearer <token>" or "Basic <base64>"
     const auth = ctx.headers['Authorization'] ?? '';
@@ -144,26 +167,8 @@ Why this works:
 
 - The slot combines the requirement-group position, scheme position, subclass, and public parameters. It remains unique when one AND group contains two API-key schemes, and a card-shape change invalidates the old slot instead of silently applying it to a different scheme.
 - Every scheme has a defined `applyToRequest` that mutates the context.
-- API keys may land in `headers[name]`, `url.searchParams`, or `Cookie` — the `ApiKeyAuthScheme` branch handles header/query; cookie-placed keys would need an extra branch. The CLI does not handle cookie placement today, but the pattern extends cleanly.
+- API keys may land in `headers[name]`, `url.searchParams`, or `Cookie`; the branch handles all three placements.
 - All other schemes (Bearer, Basic, OAuth2 variants, OIDC) place credentials in `Authorization` with a `<scheme> <value>` format — strip the prefix.
-
-### Handling cookie-based API keys (extension)
-
-```typescript
-if (scheme instanceof ApiKeyAuthScheme) {
-  if (scheme.params.location === 'cookie') {
-    const cookieHeader = ctx.headers['Cookie'] ?? '';
-    const match = cookieHeader.match(new RegExp(`${scheme.params.name}=([^;]*)`));
-    credential = match?.[1] ?? '';
-  } else {
-    credential = ctx.headers[scheme.params.name]
-      ?? ctx.url.searchParams.get(scheme.params.name)
-      ?? '';
-  }
-}
-```
-
----
 
 ## Security Considerations
 
@@ -174,7 +179,7 @@ The CLI's `~/.a2x/tokens.json` is:
 - **plaintext** — anyone with filesystem access can copy tokens.
 - **unencrypted** at rest.
 
-The file permissions reduce accidental cross-user exposure, but plaintext credentials are still unsuitable for many production environments. Options for a production-grade store:
+The file permissions and atomic replacement reduce accidental exposure and partial writes, but plaintext credentials and single-writer semantics are still unsuitable for many production environments. Options for a production-grade store:
 
 | Backend | Notes |
 |---------|-------|
@@ -187,24 +192,7 @@ When switching stores, keep the same shape — `Record<agentUrl, Array<{ slot, c
 
 ### File permissions
 
-Enforce both directory and file permissions when implementing a file store:
-
-```typescript
-function writeStore(data: StoreData): void {
-  fs.mkdirSync(STORE_DIR, { recursive: true, mode: 0o700 });
-  fs.chmodSync(STORE_DIR, 0o700);
-  fs.writeFileSync(STORE_PATH, JSON.stringify(data, null, 2), {
-    encoding: 'utf-8',
-    mode: 0o600,
-  });
-}
-```
-
-On re-write of an existing file, `mode` only affects creation; explicitly `chmod` if you want to enforce it:
-
-```typescript
-fs.chmodSync(STORE_PATH, 0o600);
-```
+The example enforces both directory and file permissions. On rewrite, `mode` only affects creation, so it also calls `chmod`. Atomic rename must use a temporary file in the same directory; cross-filesystem renames are not atomic.
 
 Windows: `mode` is largely ignored; rely on the user's home-directory ACLs.
 
@@ -226,6 +214,9 @@ Safe: scheme class names, agent URLs, `scheme.params.name` for API keys.
 async refresh(schemes: AuthScheme[]): Promise<AuthScheme[]> {
   clearCredentials(this.agentUrl);
   for (const scheme of schemes) await resolveScheme(scheme);
+  if (this.selectedGroupIndex === undefined) {
+    throw new Error('Cannot refresh before selecting an auth group');
+  }
   this._save(this.selectedGroupIndex, schemes);
   return schemes;
 }
@@ -246,6 +237,9 @@ async refresh(schemes: AuthScheme[]): Promise<AuthScheme[]> {
     }
     // Fall back to re-prompt
     await resolveScheme(scheme);
+  }
+  if (this.selectedGroupIndex === undefined) {
+    throw new Error('Cannot refresh before selecting an auth group');
   }
   this._save(this.selectedGroupIndex, schemes);
   return schemes;

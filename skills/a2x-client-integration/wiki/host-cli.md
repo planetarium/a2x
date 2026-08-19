@@ -59,10 +59,13 @@ export async function performDeviceCodeFlow(
 
 See [auth-fallback-chain.md](./auth-fallback-chain.md) for the complete reference. The shortest integration:
 
+Install the masked prompt dependency first: `npm install @inquirer/prompts`.
+
 ```typescript
 import * as readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import chalk from 'chalk';
+import { password } from '@inquirer/prompts';
 import type { AuthProvider } from '@a2x/sdk/client';
 import {
   AuthScheme,
@@ -90,6 +93,10 @@ async function prompt(q: string): Promise<string> {
   try { return (await rl.question(q)).trim(); } finally { rl.close(); }
 }
 
+async function promptSecret(message: string): Promise<string> {
+  return (await password({ message, mask: '*' })).trim();
+}
+
 function schemeLabel(scheme: AuthScheme): string {
   if (scheme instanceof ApiKeyAuthScheme) return `API Key (${scheme.params.name})`;
   if (scheme instanceof HttpBearerAuthScheme) return 'Bearer Token';
@@ -105,17 +112,17 @@ function schemeLabel(scheme: AuthScheme): string {
 
 async function resolveScheme(scheme: AuthScheme): Promise<void> {
   if (scheme instanceof ApiKeyAuthScheme) {
-    const key = await prompt(chalk.yellow(`  Enter API key (${scheme.params.name}): `));
+    const key = await promptSecret(`Enter API key (${scheme.params.name})`);
     if (!key) throw new Error('No API key provided');
     scheme.setCredential(key); return;
   }
   if (scheme instanceof HttpBearerAuthScheme) {
-    const token = await prompt(chalk.yellow('  Enter Bearer token: '));
+    const token = await promptSecret('Enter Bearer token');
     if (!token) throw new Error('No token provided');
     scheme.setCredential(token); return;
   }
   if (scheme instanceof HttpBasicAuthScheme) {
-    const cred = await prompt(chalk.yellow('  Enter Basic credentials (base64): '));
+    const cred = await promptSecret('Enter Basic credentials (base64)');
     if (!cred) throw new Error('No credentials provided');
     scheme.setCredential(cred); return;
   }
@@ -129,12 +136,12 @@ async function resolveScheme(scheme: AuthScheme): Promise<void> {
     scheme instanceof OAuth2ImplicitAuthScheme ||
     scheme instanceof OAuth2PasswordAuthScheme
   ) {
-    const token = await prompt(chalk.yellow('  Enter access token: '));
+    const token = await promptSecret('Enter access token');
     if (!token) throw new Error('No token provided');
     scheme.setCredential(token); return;
   }
   if (scheme instanceof OpenIdConnectAuthScheme) {
-    const token = await prompt(chalk.yellow('  Enter OIDC token: '));
+    const token = await promptSecret('Enter OIDC token');
     if (!token) throw new Error('No token provided');
     scheme.setCredential(token); return;
   }
@@ -218,6 +225,8 @@ export class CliAuthProvider implements AuthProvider {
   }
 }
 ```
+
+Keep `readline` for the non-secret method menu only. Never fall back to echoed secret input on a non-interactive stdin; accept secrets through a protected environment, file descriptor, or credential store instead.
 
 ---
 

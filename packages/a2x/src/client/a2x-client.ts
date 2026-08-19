@@ -114,6 +114,11 @@ export interface A2XClientX402Options {
    * Custom predicate to pick a requirement out of the merchant's
    * `accepts[]` (already filtered by `maxAmount` if set). Default: the first
    * EVM `scheme === 'exact'` option (see `allowUpto`).
+   *
+   * The callback receives detached copies and must return one of those array
+   * entries by identity. The client maps that choice back to the original
+   * affordable requirement, so returning a captured/fabricated object or
+   * mutating an entry cannot bypass `maxAmount` or alter what is signed.
    */
   selectRequirement?: (
     requirements: X402PaymentRequirements[],
@@ -850,7 +855,16 @@ export class A2XClient {
         x402.maxAmount === undefined
           ? usable
           : usable.filter((r) => isWithinBudget(r, x402.maxAmount!));
-      if (userSelect) return userSelect(affordable);
+      if (userSelect) {
+        // Do not let trusted-but-fallible host policy accidentally escape the
+        // cap by returning a requirement captured from onPaymentRequired, or
+        // alter a requirement after it passed the affordability check.
+        const choices = structuredClone(affordable);
+        const chosen = userSelect(choices);
+        if (!chosen) return undefined;
+        const index = choices.indexOf(chosen);
+        return index >= 0 ? affordable[index] : undefined;
+      }
       // Only auto-pick an option the EVM signer can fulfil, exact-first and
       // never `upto` / `batch-settlement` unless opted in — see defaultSelect
       // in x402/client.ts for the safety rationale. undefined surfaces as
@@ -1065,7 +1079,19 @@ export class A2XClient {
   private _applyAuth(ctx: AuthRequestContext): void {
     if (!this._resolvedSchemes) return;
     for (const scheme of this._resolvedSchemes) {
-      scheme.applyToRequest(ctx);
+      // Fetch treats header names case-insensitively, while a plain object does
+      // not. Apply each scheme into a scratch header bag, then replace any
+      // caller header with the same case-insensitive name before merging.
+      const authHeaders: Record<string, string> = {};
+      scheme.applyToRequest({ headers: authHeaders, url: ctx.url });
+      for (const [name, value] of Object.entries(authHeaders)) {
+        for (const existing of Object.keys(ctx.headers)) {
+          if (existing.toLowerCase() === name.toLowerCase()) {
+            delete ctx.headers[existing];
+          }
+        }
+        ctx.headers[name] = value;
+      }
     }
   }
 

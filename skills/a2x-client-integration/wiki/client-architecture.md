@@ -154,7 +154,7 @@ Register another extension later with `client.registerExtension(uri)` and inspec
 
 `this._headers` (from `options.headers`) wins over `Content-Type` and `Accept`. Be careful not to override `Content-Type` or `Accept` unintentionally.
 
-`AuthScheme.applyToRequest()` runs **after** headers are built, so auth schemes overwrite any user-provided `Authorization` header.
+`AuthScheme.applyToRequest()` runs **after** headers are built. For each scheme-produced header, the client removes a same-name user header case-insensitively before writing the authenticated value, so `authorization` cannot coexist with `Authorization`. Do not use `options.headers` to compete with provider-managed authentication.
 
 ---
 

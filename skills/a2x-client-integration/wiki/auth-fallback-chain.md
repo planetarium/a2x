@@ -1,6 +1,6 @@
 # Authentication Fallback Chain
 
-This is the **reference pattern** for an interactive `AuthProvider`, based on `packages/cli/src/cli-auth-provider.ts` and hardened with collision-safe credential slots. Use it as the blueprint for any interactive client (CLI, TUI, dev tools) that must survive restarts and token expiry.
+This is the **reference pattern** for an interactive `AuthProvider`, based on `packages/cli/src/cli-auth-provider.ts` and hardened with collision-safe credential slots and masked secret input. Use it as the blueprint for any interactive client (CLI, TUI, dev tools) that must survive restarts and token expiry.
 
 ---
 
@@ -92,9 +92,18 @@ function extractCredential(slot: string, scheme: AuthScheme): { slot: string; cr
 
   let credential = '';
   if (scheme instanceof ApiKeyAuthScheme) {
-    credential = ctx.headers[scheme.params.name]
-      ?? ctx.url.searchParams.get(scheme.params.name)
-      ?? '';
+    if (scheme.params.location === 'cookie') {
+      const cookie = ctx.headers.Cookie ?? '';
+      const pair = cookie.split(';').map(value => value.trim()).find(value => {
+        const separator = value.indexOf('=');
+        return separator >= 0 && value.slice(0, separator) === scheme.params.name;
+      });
+      credential = pair ? pair.slice(pair.indexOf('=') + 1) : '';
+    } else {
+      credential = ctx.headers[scheme.params.name]
+        ?? ctx.url.searchParams.get(scheme.params.name)
+        ?? '';
+    }
   } else {
     // Bearer-style: extract token from "Bearer xxx" or "Basic xxx"
     const auth = ctx.headers['Authorization'] ?? '';
@@ -134,9 +143,12 @@ Consequence: if the user's stored credentials are stale **AND** that scheme grou
 
 ## Full CLI Reference (Condensed)
 
+Install a TTY-aware masked prompt: `npm install @inquirer/prompts`.
+
 ```typescript
 import * as readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
+import { password } from '@inquirer/prompts';
 import type { AuthProvider } from '@a2x/sdk/client';
 import {
   AuthScheme,
@@ -168,21 +180,25 @@ async function prompt(question: string): Promise<string> {
   }
 }
 
+async function promptSecret(message: string): Promise<string> {
+  return (await password({ message, mask: '*' })).trim();
+}
+
 async function resolveScheme(scheme: AuthScheme): Promise<void> {
   if (scheme instanceof ApiKeyAuthScheme) {
-    const key = await prompt(`Enter API key (${scheme.params.name}): `);
+    const key = await promptSecret(`Enter API key (${scheme.params.name})`);
     if (!key) throw new Error('No API key provided');
     scheme.setCredential(key);
     return;
   }
   if (scheme instanceof HttpBearerAuthScheme) {
-    const token = await prompt('Enter Bearer token: ');
+    const token = await promptSecret('Enter Bearer token');
     if (!token) throw new Error('No token provided');
     scheme.setCredential(token);
     return;
   }
   if (scheme instanceof HttpBasicAuthScheme) {
-    const cred = await prompt('Enter Basic credentials (base64): ');
+    const cred = await promptSecret('Enter Basic credentials (base64)');
     if (!cred) throw new Error('No credentials provided');
     scheme.setCredential(cred);
     return;
@@ -198,13 +214,13 @@ async function resolveScheme(scheme: AuthScheme): Promise<void> {
     scheme instanceof OAuth2ImplicitAuthScheme ||
     scheme instanceof OAuth2PasswordAuthScheme
   ) {
-    const token = await prompt('Enter access token: ');
+    const token = await promptSecret('Enter access token');
     if (!token) throw new Error('No token provided');
     scheme.setCredential(token);
     return;
   }
   if (scheme instanceof OpenIdConnectAuthScheme) {
-    const token = await prompt('Enter OIDC token: ');
+    const token = await promptSecret('Enter OIDC token');
     if (!token) throw new Error('No token provided');
     scheme.setCredential(token);
     return;
@@ -274,6 +290,8 @@ export class CliAuthProvider implements AuthProvider {
   }
 }
 ```
+
+Use ordinary `readline` only for non-secret menu choices. Do not fall back to echoed input when stdin is not an interactive TTY; require a secret through a protected environment, file descriptor, or credential store instead.
 
 For the token-store implementation and `extractCredential` helper, see [token-persistence.md](./token-persistence.md). For the device-code polling loop, see [oauth2-device-code.md](./oauth2-device-code.md).
 

@@ -55,11 +55,11 @@ Application:
 
 Note: `'cookie'` overwrites any existing `Cookie` header. If multiple cookie-based schemes are active (rare), merge before calling `applyToRequest` or use a custom fetch.
 
-Example prompt (CLI):
+Example masked prompt (CLI; see [host-cli.md](./host-cli.md) for `promptSecret`):
 
 ```typescript
 if (scheme instanceof ApiKeyAuthScheme) {
-  const key = await prompt(`Enter API key (${scheme.params.name}): `);
+  const key = await promptSecret(`Enter API key (${scheme.params.name})`);
   scheme.setCredential(key);
 }
 ```
@@ -94,7 +94,7 @@ If you are prompting the user, encode before `setCredential`:
 
 ```typescript
 const user = await prompt('Username: ');
-const pass = await prompt('Password: ');
+const pass = await promptSecret('Password');
 const encoded = Buffer.from(`${user}:${pass}`).toString('base64');
 scheme.setCredential(encoded);
 ```
@@ -116,7 +116,7 @@ Credential format: access token (opaque or JWT — the scheme does not care).
 
 Application: `headers['Authorization'] = 'Bearer <credential>'`
 
-The scheme does **not** run the device-code flow for you. You are responsible for:
+The scheme does **not** run the device-code flow for you. Treat every URL advertised by the card as untrusted: require a preconfigured HTTPS issuer/origin allowlist, reject redirects, and validate the returned verification URL before displaying it. You are responsible for:
 
 1. POST to `deviceAuthorizationUrl` (form-encoded) with optional `scope`.
 2. Display the returned `verification_uri` / `user_code` to the user.
@@ -171,8 +171,10 @@ Machine-to-machine flow — typically best for backend services:
 
 ```typescript
 async function resolveClientCredentials(scheme: OAuth2ClientCredentialsAuthScheme) {
-  const res = await fetch(scheme.params.tokenUrl, {
+  const tokenUrl = trustedOAuthUrl(scheme.params.tokenUrl, 'token endpoint');
+  const res = await fetch(tokenUrl, {
     method: 'POST',
+    redirect: 'error',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       grant_type: 'client_credentials',
@@ -185,6 +187,8 @@ async function resolveClientCredentials(scheme: OAuth2ClientCredentialsAuthSchem
   scheme.setCredential(access_token);
 }
 ```
+
+`trustedOAuthUrl` must compare the parsed HTTPS origin against host configuration, never against a value learned from the agent card. See [oauth2-device-code.md](./oauth2-device-code.md) for a complete helper.
 
 ---
 

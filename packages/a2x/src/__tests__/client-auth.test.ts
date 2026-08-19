@@ -521,6 +521,64 @@ describe('A2XClient auth integration', () => {
     expect(headers['x-api-key']).toBe('my-secret-key');
   });
 
+  it('replaces case-variant custom API-key headers with the resolved credential', async () => {
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      headers: { 'X-API-KEY': 'caller-value' },
+      authProvider: {
+        async provide(requirements) {
+          const group = requirements.find(
+            (candidate) => candidate[0] instanceof ApiKeyAuthScheme,
+          )!;
+          group[0]!.setCredential('provider-value');
+          return group;
+        },
+      },
+    });
+
+    await client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    });
+
+    const headers = mockFetch.mock.calls[0]![1].headers as Record<string, string>;
+    expect(headers['x-api-key']).toBe('provider-value');
+    expect(
+      Object.keys(headers).filter((name) => name.toLowerCase() === 'x-api-key'),
+    ).toEqual(['x-api-key']);
+  });
+
+  it('replaces a lowercase authorization header with bearer auth', async () => {
+    const bearerCard: AgentCardV10 = {
+      ...V10_CARD_WITH_AUTH,
+      securitySchemes: {
+        bearer: {
+          httpAuthSecurityScheme: { scheme: 'bearer' },
+        },
+      },
+      securityRequirements: [{ bearer: [] }],
+    };
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const client = new A2XClient(bearerCard, {
+      fetch: mockFetch,
+      headers: { authorization: 'Bearer caller-value' },
+      authProvider: {
+        async provide(requirements) {
+          requirements[0]![0]!.setCredential('provider-value');
+          return requirements[0]!;
+        },
+      },
+    });
+
+    await client.sendMessage({
+      message: { role: 'user', parts: [{ text: 'Hello' }] },
+    });
+
+    const headers = mockFetch.mock.calls[0]![1].headers as Record<string, string>;
+    expect(headers.Authorization).toBe('Bearer provider-value');
+    expect(headers.authorization).toBeUndefined();
+  });
+
   it('does not call authProvider when no security requirements', async () => {
     const cardWithoutAuth: AgentCardV10 = {
       ...V10_CARD_WITH_AUTH,

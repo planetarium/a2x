@@ -14,6 +14,19 @@ Pass the AgentCard URL (the `.well-known` path). The client fetches and caches t
 
 You can also pass the JSON-RPC endpoint directly, but the card URL is preferred — it supports discovery, version negotiation, and auth scheme introspection.
 
+## Custom headers and authentication
+
+Pass static headers through the client options:
+
+```ts
+const client = new A2XClient(cardUrl, {
+  headers: { 'User-Agent': 'my-service/1.0' },
+  authProvider,
+});
+```
+
+Resolved authentication schemes are applied after custom headers and replace a custom header with the same case-insensitive name. This prevents values such as `authorization` and `Authorization` from being combined by Fetch. Do not use `headers` to compete with a header owned by the selected auth scheme; put that credential in the `AuthProvider` instead.
+
 ## Send a message
 
 ```ts

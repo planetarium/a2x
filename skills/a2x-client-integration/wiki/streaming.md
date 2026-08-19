@@ -80,7 +80,7 @@ import { TERMINAL_STATES } from '@a2x/sdk';
 
 The set contains normalized lowercase `TaskState` values and `Set.has()` is case-sensitive. Events parsed by the SDK are normalized before they reach this check.
 
-The generator does **not** automatically time out — if the server never signals termination, you will hang until the connection drops. Always use either a client-supplied abort or a wrapper with a timeout.
+The generator does **not** automatically time out — if the server never signals termination, it can hang until the connection drops. For unpaid calls, use a client-supplied abort or timeout. For x402 calls after payment submission, an abort is an ambiguous financial outcome: use a durable worker-owned deadline and continue to reconciliation or quarantine instead of tying cancellation to a browser/request socket.
 
 ---
 
@@ -118,11 +118,11 @@ The `taskId` is available on every event's `taskId` field after the first status
 
 ## x402 Payment Streams
 
-When the client is constructed with `x402`, the same generator owns the payment round trip. It yields the initial `payment-required` status, invokes `onPaymentRequired`, signs and resubmits when approved, then continues yielding verification, work, artifact, and completion events. Configure batch support with durable `batchSettlement` storage and opt into default selection separately with `allowBatchSettlement`. The default selector's `allowUpto`, `allowBatchSettlement`, and `maxRetries` rules match blocking `sendMessage`; a custom `selectRequirement` bypasses the two scheme opt-in flags.
+When the client is constructed with `x402`, the same generator owns the payment round trip. It yields the initial `payment-required` status, invokes `onPaymentRequired`, signs and resubmits when approved, then continues yielding verification, work, artifact, and completion events. Configure batch support with durable `batchSettlement` storage and opt into default selection separately with `allowBatchSettlement`. The default selector's `allowUpto`, `allowBatchSettlement`, and `maxRetries` rules match blocking `sendMessage`; a custom `selectRequirement` bypasses the two scheme opt-in flags but still receives detached, `maxAmount`-filtered candidates and must return one of them by identity.
 
 Unlike blocking `sendMessage`, a terminal unsuccessful payment receipt in a stream is yielded as a failed status; the stream does not convert it to `X402PaymentFailedError`. Inspect terminal status and x402 receipt metadata in the streamed events. Batch reconciliation failures still throw `X402ReconciliationError` before an unsafe terminal event can be yielded.
 
-Breaking out after a payment payload has been submitted can leave the result ambiguous, especially for `batch-settlement`. Use durable channel storage, route a channel through one process owner or a durable cross-process reservation, and handle `X402ReconciliationError` as described in the [x402 payments guide](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md).
+Breaking out or timing out after a payment payload has been submitted can leave the result ambiguous, especially for `batch-settlement`. Use durable channel storage, route a channel through one process owner or a fenced durable cross-process reservation, and let a durable worker drain the upstream stream to a terminal result. Browser cancellation should only close the browser's subscription. Handle `X402ReconciliationError` as described in the [x402 payments guide](https://github.com/planetarium/a2x/blob/main/packages/a2x/docs/guides/advanced/x402-payments.md).
 
 ---
 
