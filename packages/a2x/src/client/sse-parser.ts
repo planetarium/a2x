@@ -127,6 +127,24 @@ function unwrapData(data: string): Record<string, unknown> {
     throw new StreamErrorEnvelopeError(message, code, err.data);
   }
 
+  // HTTP+JSON StreamResponse is a protobuf oneof wrapper.
+  for (const key of ['task', 'message', 'statusUpdate', 'artifactUpdate']) {
+    const value = parsed[key];
+    if (value && typeof value === 'object') {
+      return value as Record<string, unknown>;
+    }
+  }
+
+  // REST mid-stream errors use google.rpc.Status JSON representation.
+  if (parsed.error && typeof parsed.error === 'object') {
+    const err = parsed.error as Record<string, unknown>;
+    throw new StreamErrorEnvelopeError(
+      typeof err.message === 'string' ? err.message : 'Remote agent error',
+      typeof err.code === 'number' ? err.code : undefined,
+      err.details,
+    );
+  }
+
   return parsed;
 }
 

@@ -11,6 +11,7 @@ A self-contained TypeScript SDK for building [A2A (Agent-to-Agent)](https://a2a-
 - **Multi-version AgentCard** — Generate v0.3 and v1.0 AgentCards from the same instance. A v1.0 server accepts the v1.0 JSON-RPC method names (`SendMessage`, `GetTask`, …), the `A2A-Extensions` header, and `A2A-Version` pinning, while still serving v0.3-speaking clients.
 - **Multi-provider** — Anthropic Claude, OpenAI GPT, and Google Gemini out of the box.
 - **Framework-agnostic** — Works with Express, Fastify, Hono, Next.js, or any HTTP framework.
+- **JSON-RPC and HTTP+JSON transports** — First-class A2A v1.0 client and server bindings with deterministic AgentCard selection, REST resources, structured errors, and SSE streaming.
 - **SSE streaming** — First-class `message/stream` support via Server-Sent Events.
 - **Multi-modal artifacts** — Agents can yield `text`, `file`, and `data` events; the default executor maps each into A2A `TextPart` / `FilePart` / `DataPart` artifacts.
 - **Built-in auth** — API Key, Bearer, OAuth 2.0 (Authorization Code, Client Credentials, Device Code), OpenID Connect, and Mutual TLS.
@@ -39,7 +40,7 @@ npm install openai               # OpenAI GPT
 ## Quick Start
 
 ```typescript
-import { LlmAgent, toA2x } from '@a2x/sdk';
+import { A2A_TRANSPORTS, LlmAgent, toA2x } from '@a2x/sdk';
 import { GoogleProvider } from '@a2x/sdk/google';
 
 const agent = new LlmAgent({
@@ -55,12 +56,14 @@ const agent = new LlmAgent({
 const app = toA2x(agent, {
   port: 4000,
   defaultUrl: 'http://localhost:4000/a2a',
+  transports: [A2A_TRANSPORTS.JSONRPC, A2A_TRANSPORTS.HTTP_JSON],
 });
 ```
 
 This starts an A2A-compliant server with:
 - `GET /.well-known/agent.json` — Agent discovery
 - `POST /a2a` — JSON-RPC endpoint (`message/send`, `message/stream`, `tasks/get`, `tasks/cancel`)
+- `/a2a/message:send`, `/a2a/message:stream`, and `/a2a/tasks/*` — v1.0 HTTP+JSON routes when `HTTP+JSON` is configured
 
 ## Providers
 
@@ -207,9 +210,15 @@ export async function POST(request: Request) {
 ## Client
 
 ```typescript
-import { A2XClient } from '@a2x/sdk/client';
+import { A2A_TRANSPORTS, A2XClient } from '@a2x/sdk/client';
 
-const client = new A2XClient('https://agent.example.com/.well-known/agent.json');
+const client = new A2XClient('https://agent.example.com/.well-known/agent.json', {
+  // Default order is JSONRPC, then HTTP+JSON.
+  preferredTransports: [
+    A2A_TRANSPORTS.HTTP_JSON,
+    A2A_TRANSPORTS.JSONRPC,
+  ],
+});
 
 // Send a message
 const task = await client.sendMessage({

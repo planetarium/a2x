@@ -16,6 +16,8 @@ import {
  */
 export interface RouteContext {
   activatedExtensions?: readonly string[];
+  /** Emit an initial Task snapshot for bindings whose stream schema requires it. */
+  includeInitialTask?: boolean;
 }
 
 export type MethodHandler = (
@@ -94,6 +96,21 @@ export class JsonRpcRouter {
   }
 
   /**
+   * Route an operation without adding a JSON-RPC response envelope.
+   * Transport adapters use this boundary so domain errors remain typed.
+   */
+  async routeResult(
+    request: JSONRPCRequest,
+    context?: RouteContext,
+  ): Promise<unknown> {
+    const handler = this.handlers.get(request.method);
+    if (!handler) {
+      throw new MethodNotFoundError(`Method '${request.method}' not found`);
+    }
+    return handler(request.params, request, context);
+  }
+
+  /**
    * Route a streaming JSON-RPC request, returning an AsyncGenerator.
    */
   routeStream(
@@ -105,6 +122,18 @@ export class JsonRpcRouter {
       throw new MethodNotFoundError(
         `Stream method '${request.method}' not found`,
       );
+    }
+    return handler(request.params, request, context);
+  }
+
+  /** Transport-neutral streaming counterpart to routeResult(). */
+  routeStreamResult(
+    request: JSONRPCRequest,
+    context?: RouteContext,
+  ): AsyncGenerator<unknown> {
+    const handler = this.streamHandlers.get(request.method);
+    if (!handler) {
+      throw new MethodNotFoundError(`Method '${request.method}' not found`);
     }
     return handler(request.params, request, context);
   }

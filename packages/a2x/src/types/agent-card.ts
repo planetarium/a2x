@@ -14,6 +14,7 @@ import type {
   SecuritySchemeV03,
   SecuritySchemeV10,
 } from './security.js';
+import type { A2ATransport } from './transport.js';
 
 // ═══ SDK Internal Normalized State (version-agnostic) ═══
 
@@ -40,6 +41,7 @@ export interface A2XAgentState {
   description?: string;
   version?: string;
   defaultUrl?: string;
+  defaultTransport?: A2ATransport;
   interfaces: A2XInterfaceEntry[];
   provider?: AgentProvider;
   capabilities: {

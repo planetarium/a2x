@@ -53,6 +53,22 @@ const handler = new DefaultRequestHandler(a2xServer);
 
 `handler` is what you mount. See [Manual Wiring](../advanced/manual-wiring.md) for why each step exists.
 
+This setup advertises and serves JSON-RPC. To mount the v1.0 HTTP+JSON binding instead, make the binding explicit in both the card and the HTTP adapter:
+
+```ts
+import {
+  A2A_TRANSPORTS,
+  HttpJsonRequestHandler,
+} from '@a2x/sdk';
+
+a2xServer.setDefaultTransport(A2A_TRANSPORTS.HTTP_JSON);
+const httpJsonHandler = new HttpJsonRequestHandler(handler, {
+  basePath: '/a2a',
+});
+```
+
+`setDefaultTransport()` changes AgentCard metadata; `HttpJsonRequestHandler` is the route implementation. Mount both together so the card advertises only a reachable binding.
+
 ## Express
 
 ```ts
@@ -102,6 +118,37 @@ Three things to notice:
 2. `createSSEStream()` wraps the async iterable as an SSE-formatted `ReadableStream`.
 3. Wiring `res.on('close') → reader.cancel()` is what makes client disconnects propagate into the agent's `AbortSignal`. Without it, the LLM loop keeps running after the TCP connection dies. See [Streaming Responses](./streaming.md#client-disconnect-stops-the-work) for the why.
 
+### Express with HTTP+JSON
+
+Mount the REST adapter at the same base path advertised in the AgentCard. It resolves the complete v1.0 route set, including `/message:send`, `/message:stream`, `/tasks`, task subscription, push-config CRUD, and `/extendedAgentCard`:
+
+```ts
+app.use('/a2a', async (req, res) => {
+  const response = await httpJsonHandler.handle({
+    method: req.method,
+    url: new URL(req.originalUrl, 'https://my-agent.example.com'),
+    body: req.body,
+    context: { headers: req.headers, query: req.query },
+  });
+
+  res.status(response.status).set(response.headers);
+  if (response.body && typeof response.body === 'object' &&
+      Symbol.asyncIterator in response.body) {
+    const stream = createSSEStream(response.body);
+    const reader = stream.getReader();
+    res.on('close', () => void reader.cancel().catch(() => {}));
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(typeof value === 'string' ? value : new TextDecoder().decode(value));
+    }
+    res.end();
+  } else {
+    res.send(response.body);
+  }
+});
+```
+
 ## Next.js App Router
 
 ```ts
@@ -135,13 +182,15 @@ export async function POST(request: Request) {
 
 ## Fastify, Hono, etc.
 
-The recipe is always the same:
+For JSON-RPC, the recipe is always the same:
 
 1. Expose `GET /.well-known/agent.json` → `handler.getAgentCard()`.
 2. Expose `POST /a2a` → `handler.handle(body, { headers, query })`.
 3. Detect async iterable → stream with `createSSEStream()`; otherwise respond with JSON.
 
 The only framework-specific bit is how the framework reads bodies and writes streams.
+
+For HTTP+JSON, pass the framework request to `HttpJsonRequestHandler.handle()` and write its status, headers, and body as shown above. `HttpJsonRequestHandler.canHandle()` is available when JSON-RPC and REST share a server and you need to dispatch selectively.
 
 ## Where to mount
 

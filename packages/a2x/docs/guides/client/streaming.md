@@ -66,27 +66,11 @@ Breaking out of the loop is enough on its own: when the underlying HTTP connecti
 
 Use the A2A `tasks/resubscribe` method to attach another consumer while the original task stream is still active. If the original HTTP reader has already been canceled, the server aborts that execution and resubscribe returns its persisted `canceled` state rather than restarting it.
 
-`A2XClient` doesn't yet expose a convenience helper, so issue the call at the JSON-RPC level. The response is an SSE stream with the same event shape as `message/stream`:
+Use `subscribeTask()` to reattach through whichever binding the client selected. Both JSON-RPC and HTTP+JSON deliver the response as SSE:
 
 ```ts
-async function resubscribe(url: string, taskId: string) {
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'text/event-stream',
-    },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'tasks/resubscribe',
-      params: { id: taskId },
-    }),
-  });
-
-  // Parse the SSE body however you like — reuse your own SSE parser,
-  // or the one the A2X transport layer exports if you prefer.
-  return response.body!.getReader();
+for await (const event of client.subscribeTask(taskId)) {
+  render(event);
 }
 ```
 
@@ -95,11 +79,11 @@ Behavior to know:
 - **Forward-only while active.** Events that fired before a live resubscribe call are not replayed — you see what the server publishes from that point on.
 - **Interaction-ending replay.** If the interaction already ended, you receive one `status-update`, then the stream ends. This includes terminal states plus `input-required` and `auth-required`.
 - **Disconnected primary streams are canceled.** After the original reader closes, resubscribe returns `canceled`; it cannot resume the aborted agent invocation.
-- **Unknown task.** The server emits a single JSON-RPC error envelope (`{ jsonrpc: "2.0", id: <request id>, error: { code: -32001, ... } }`) on the same SSE stream and closes — same shape as a non-streaming error response, just delivered over `data:` SSE chunks.
+- **Unknown task.** The stream ends with the binding-specific error envelope: JSON-RPC error for `JSONRPC`, or `google.rpc.Status` JSON for `HTTP+JSON`.
 
 ### SSE wire shape
 
-Every SSE chunk is a full JSON-RPC success response (per A2A spec a2a-v0.3 §SendStreamingMessageSuccessResponse), keyed by the original request id:
+JSON-RPC SSE chunks are full JSON-RPC success responses, keyed by the original request id:
 
 ```
 data: {"jsonrpc":"2.0","id":1,"result":{"kind":"status-update","taskId":"…","status":{"state":"working"}}}
@@ -108,6 +92,14 @@ data: {"jsonrpc":"2.0","id":1,"result":{"kind":"artifact-update","taskId":"…",
 ```
 
 There is no `event:` field, no `event: done` terminator. Stream end is signalled by the server closing the connection after a terminal status (`final: true` in v0.3, or simply the last yielded event in v1.0). Servers from before this release may still emit the legacy `event: status_update`/`event: done` shape; the SDK parser keeps tolerating it for one minor and logs a one-time deprecation warning when it sees it.
+
+HTTP+JSON uses the same `data:`-only SSE framing, with the v1.0 `StreamResponse` oneof wrapper:
+
+```
+data: {"task":{"id":"…","status":{"state":"TASK_STATE_SUBMITTED"}}}
+
+data: {"statusUpdate":{"taskId":"…","status":{"state":"TASK_STATE_WORKING"}}}
+```
 
 ## Accumulating output
 

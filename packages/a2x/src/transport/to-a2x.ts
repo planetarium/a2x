@@ -14,6 +14,17 @@ import { A2XServer } from '../a2x/a2x-agent.js';
 import { DefaultRequestHandler } from './request-handler.js';
 import { createSSEStream } from './sse-handler.js';
 import type { RequestContext } from '../types/auth.js';
+import { JSONParseError } from '../types/errors.js';
+import {
+  A2A_HTTP_JSON_MEDIA_TYPE,
+  HttpJsonRequestHandler,
+  toHttpJsonErrorResponse,
+  validateHttpJsonContentType,
+} from './http-json-handler.js';
+import type { A2ATransport } from '../types/transport.js';
+import { A2A_TRANSPORTS } from '../types/transport.js';
+
+const REQUEST_BODY_LIMIT_BYTES = 1024 * 1024;
 
 export interface ToA2xOptions {
   port?: number;
@@ -23,14 +34,24 @@ export interface ToA2xOptions {
   securitySchemes?: Record<string, BaseSecurityScheme>;
   securityRequirements?: SecurityRequirement[];
   protocolVersion?: ProtocolVersion;
+  /** Protocol bindings to expose. Defaults to JSONRPC only. */
+  transports?: readonly A2ATransport[];
 }
 
 export interface ToA2xResult {
   handler: DefaultRequestHandler;
+  httpJsonHandler?: HttpJsonRequestHandler;
   a2xServer: A2XServer;
   /** @deprecated Renamed to {@link ToA2xResult.a2xServer}. Use `a2xServer`. */
   a2xAgent: A2XServer;
   listen(port?: number): Promise<void>;
+}
+
+export interface A2xRequestListenerOptions {
+  /** Explicitly mounted HTTP+JSON handler. Omit to serve JSON-RPC only. */
+  httpJsonHandler?: HttpJsonRequestHandler;
+  /** Whether to accept JSON-RPC requests. Defaults to true. */
+  jsonRpcEnabled?: boolean;
 }
 
 /**
@@ -59,8 +80,39 @@ export function toA2x(
     protocolVersion: options.protocolVersion,
   });
 
-  // Apply configuration
-  a2xServer.setDefaultUrl(options.defaultUrl);
+  // Apply configuration. The first binding is the primary AgentInterface;
+  // additional bindings share the URL and expose their binding-specific
+  // routes beneath it.
+  const transports = [...new Set(
+    options.transports ?? [A2A_TRANSPORTS.JSONRPC],
+  )];
+  if (transports.length === 0) {
+    throw new Error('toA2x: at least one transport is required');
+  }
+  const invalidTransport = transports.find(
+    (transport) =>
+      transport !== A2A_TRANSPORTS.JSONRPC &&
+      transport !== A2A_TRANSPORTS.HTTP_JSON,
+  );
+  if (invalidTransport) {
+    throw new Error(`toA2x: unsupported transport '${invalidTransport}'`);
+  }
+  if (
+    (options.protocolVersion ?? '1.0') === '0.3' &&
+    transports.some((transport) => transport !== A2A_TRANSPORTS.JSONRPC)
+  ) {
+    throw new Error('toA2x: HTTP+JSON requires protocolVersion "1.0"');
+  }
+  a2xServer
+    .setDefaultUrl(options.defaultUrl)
+    .setDefaultTransport(transports[0]!);
+  for (const transport of transports.slice(1)) {
+    a2xServer.addInterface({
+      url: options.defaultUrl,
+      protocol: transport,
+      protocolVersion: options.protocolVersion ?? '1.0',
+    });
+  }
 
   if (options.skills) {
     for (const skill of options.skills) {
@@ -81,9 +133,15 @@ export function toA2x(
   }
 
   const handler = new DefaultRequestHandler(a2xServer);
+  const httpJsonHandler = transports.includes(A2A_TRANSPORTS.HTTP_JSON)
+    ? new HttpJsonRequestHandler(handler, {
+        basePath: new URL(options.defaultUrl).pathname,
+      })
+    : undefined;
 
   return {
     handler,
+    ...(httpJsonHandler ? { httpJsonHandler } : {}),
     a2xServer,
     // Deprecated alias — same instance, kept for backward compatibility.
     a2xAgent: a2xServer,
@@ -93,7 +151,10 @@ export function toA2x(
       const { createServer } = await import('node:http');
 
       const server = createServer(
-        createA2xRequestListener(handler, `http://localhost:${listenPort}`),
+        createA2xRequestListener(handler, `http://localhost:${listenPort}`, {
+          httpJsonHandler,
+          jsonRpcEnabled: transports.includes(A2A_TRANSPORTS.JSONRPC),
+        }),
       );
 
       return new Promise<void>((resolve) => {
@@ -106,9 +167,8 @@ export function toA2x(
 }
 
 /**
- * Build a Node.js `http.RequestListener` that dispatches `/.well-known/`
- * card lookups to `handler.getAgentCard()` and `POST /a2a` JSON-RPC
- * requests through `handler.handle()`.
+ * Build a Node.js `http.RequestListener` for AgentCard discovery, JSON-RPC,
+ * and explicitly supplied HTTP+JSON adapters.
  *
  * Exported separately so it can be unit-tested without going through
  * `listen(port)` (which never resolves until the server closes), and so
@@ -122,20 +182,33 @@ export function toA2x(
 export function createA2xRequestListener(
   handler: DefaultRequestHandler,
   defaultOrigin = 'http://localhost',
+  options?: A2xRequestListenerOptions,
 ): (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void> {
   return async (req, res) => {
     // CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
 
     if (req.method === 'OPTIONS') {
+      const requestedHeaders = req.headers['access-control-request-headers'];
+      res.setHeader(
+        'Access-Control-Allow-Headers',
+        Array.isArray(requestedHeaders)
+          ? requestedHeaders.join(', ')
+          : (requestedHeaders ??
+            'Content-Type, Authorization, A2A-Version, A2A-Extensions, X-A2A-Extensions'),
+      );
+      res.setHeader('Vary', 'Access-Control-Request-Headers');
       res.writeHead(204);
       res.end();
       return;
     }
 
     const parsedUrl = new URL(req.url ?? '/', defaultOrigin);
+    const context: RequestContext = {
+      headers: req.headers as Record<string, string | string[] | undefined>,
+      query: Object.fromEntries(parsedUrl.searchParams.entries()),
+    };
 
     // GET /.well-known/agent.json or /.well-known/agent-card.json.
     // Both paths are valid agent-card discovery endpoints — the v0.3
@@ -163,12 +236,102 @@ export function createA2xRequestListener(
       return;
     }
 
-    // POST /a2a (JSON-RPC)
-    if (req.method === 'POST') {
-      let body = '';
-      for await (const chunk of req) {
-        body += chunk;
+    const restHandler = options?.httpJsonHandler;
+    if (restHandler?.canHandle(req.method ?? 'GET', parsedUrl)) {
+      let parsedBody: unknown;
+      if (req.method === 'POST') {
+        let requestBody: Awaited<ReturnType<typeof readRequestBody>>;
+        try {
+          requestBody = await readRequestBody(req);
+        } catch (error) {
+          const errorResponse = toHttpJsonErrorResponse(error);
+          res.writeHead(errorResponse.status, errorResponse.headers);
+          res.end(JSON.stringify(errorResponse.body));
+          return;
+        }
+        if (!requestBody.ok) {
+          writeHttpJsonPayloadTooLarge(res);
+          return;
+        }
+        const body = requestBody.body;
+        try {
+          validateHttpJsonContentType({
+            method: req.method,
+            url: parsedUrl,
+            context,
+          });
+        } catch (error) {
+          const errorResponse = toHttpJsonErrorResponse(error);
+          res.writeHead(errorResponse.status, errorResponse.headers);
+          res.end(JSON.stringify(errorResponse.body));
+          return;
+        }
+        if (body.length > 0) {
+          try {
+            parsedBody = JSON.parse(body);
+          } catch {
+            const errorResponse = toHttpJsonErrorResponse(
+              new JSONParseError('Invalid JSON request body'),
+            );
+            res.writeHead(errorResponse.status, errorResponse.headers);
+            res.end(JSON.stringify(errorResponse.body));
+            return;
+          }
+        }
+      } else {
+        // A body is not part of any HTTP+JSON GET or DELETE operation, but it
+        // still has to be consumed so the socket remains reusable.
+        drainRequest(req);
       }
+      const response = await restHandler.handle({
+        method: req.method ?? 'GET',
+        url: parsedUrl,
+        body: parsedBody,
+        context,
+      });
+      res.writeHead(response.status, response.headers);
+      if (isAsyncGenerator(response.body)) {
+        await writeSseResponse(res, response.body);
+      } else {
+        res.end(JSON.stringify(response.body));
+      }
+      return;
+    }
+
+    // POST /a2a (JSON-RPC)
+    if (req.method === 'POST' && options?.jsonRpcEnabled !== false) {
+      let requestBody: Awaited<ReturnType<typeof readRequestBody>>;
+      try {
+        requestBody = await readRequestBody(req);
+      } catch (error) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: null,
+            error: {
+              code: -32603,
+              message: error instanceof Error ? error.message : 'Internal error',
+            },
+          }),
+        );
+        return;
+      }
+      if (!requestBody.ok) {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: null,
+            error: {
+              code: -32600,
+              message: `Request body exceeds the ${REQUEST_BODY_LIMIT_BYTES}-byte limit`,
+            },
+          }),
+        );
+        return;
+      }
+      const body = requestBody.body;
 
       // JSON-RPC over HTTP convention: parse and handler errors are
       // surfaced as JSON-RPC error responses with HTTP 200, not as
@@ -190,11 +353,6 @@ export function createA2xRequestListener(
         );
         return;
       }
-
-      const context: RequestContext = {
-        headers: req.headers as Record<string, string | string[] | undefined>,
-        query: Object.fromEntries(parsedUrl.searchParams.entries()),
-      };
 
       let result: Awaited<ReturnType<typeof handler.handle>>;
       try {
@@ -273,4 +431,120 @@ export function createA2xRequestListener(
     res.writeHead(404);
     res.end('Not Found');
   };
+}
+
+function isAsyncGenerator(value: unknown): value is AsyncGenerator<unknown> {
+  return Boolean(value && typeof value === 'object' && Symbol.asyncIterator in value);
+}
+
+async function readRequestBody(
+  req: import('node:http').IncomingMessage,
+): Promise<{ ok: true; body: string } | { ok: false }> {
+  const contentLength = Number(req.headers['content-length']);
+  if (
+    Number.isFinite(contentLength) &&
+    contentLength > REQUEST_BODY_LIMIT_BYTES
+  ) {
+    drainRequest(req);
+    return { ok: false };
+  }
+
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let byteLength = 0;
+
+    const cleanup = () => {
+      req.off('data', onData);
+      req.off('end', onEnd);
+      req.off('error', onError);
+      req.off('aborted', onAborted);
+    };
+    const onData = (chunk: Buffer | string) => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      byteLength += buffer.byteLength;
+      if (byteLength > REQUEST_BODY_LIMIT_BYTES) {
+        cleanup();
+        drainRequest(req);
+        resolve({ ok: false });
+        return;
+      }
+      chunks.push(buffer);
+    };
+    const onEnd = () => {
+      cleanup();
+      resolve({ ok: true, body: Buffer.concat(chunks).toString('utf8') });
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onAborted = () => {
+      cleanup();
+      // Node may emit ECONNRESET after `aborted`; keep it from becoming an
+      // unhandled EventEmitter error after this promise has already settled.
+      req.once('error', () => {});
+      reject(new Error('Request aborted while reading body'));
+    };
+
+    req.once('end', onEnd);
+    req.once('error', onError);
+    req.once('aborted', onAborted);
+    // Register data last because it switches the request into flowing mode.
+    req.on('data', onData);
+  });
+}
+
+function drainRequest(req: import('node:http').IncomingMessage): void {
+  // An oversized client may disconnect while the unread remainder is being
+  // discarded. Consume that error so the server process stays alive.
+  req.once('error', () => {});
+  req.resume();
+}
+
+function writeHttpJsonPayloadTooLarge(
+  res: import('node:http').ServerResponse,
+): void {
+  res.writeHead(413, { 'Content-Type': A2A_HTTP_JSON_MEDIA_TYPE });
+  res.end(
+    JSON.stringify({
+      error: {
+        code: 413,
+        status: 'RESOURCE_EXHAUSTED',
+        message: `Request body exceeds the ${REQUEST_BODY_LIMIT_BYTES}-byte limit`,
+        details: [
+          {
+            '@type': 'type.googleapis.com/google.rpc.ErrorInfo',
+            reason: 'REQUEST_BODY_TOO_LARGE',
+            domain: 'a2a-protocol.org',
+            metadata: {
+              maxBytes: String(REQUEST_BODY_LIMIT_BYTES),
+            },
+          },
+        ],
+      },
+    }),
+  );
+}
+
+async function writeSseResponse(
+  res: import('node:http').ServerResponse,
+  events: AsyncGenerator<unknown>,
+): Promise<void> {
+  let closed = false;
+  const markClosed = () => {
+    closed = true;
+  };
+  res.on('close', markClosed);
+  try {
+    for await (const event of events) {
+      if (closed) break;
+      res.write(`data: ${JSON.stringify(event)}\n\n`);
+    }
+  } finally {
+    if (closed) {
+      await events.return(undefined).catch(() => {});
+    } else {
+      res.end();
+    }
+  }
 }

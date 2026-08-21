@@ -67,7 +67,7 @@ export class V10AgentCardMapper implements AgentCardMapper<AgentCardV10> {
     if (state.defaultUrl) {
       interfaces.push({
         url: state.defaultUrl,
-        protocolBinding: 'JSONRPC',
+        protocolBinding: state.defaultTransport ?? 'JSONRPC',
         protocolVersion: '1.0',
       });
     }

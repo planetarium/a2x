@@ -16,6 +16,7 @@ import type {
 import type { SecurityRequirement } from '../types/security.js';
 import type { AuthResult } from '../types/auth.js';
 import { AuthenticatedExtendedCardNotConfiguredError } from '../types/errors.js';
+import type { A2ATransport } from '../types/transport.js';
 import { AgentExecutor, StreamingMode } from './agent-executor.js';
 import { AgentCardMapperFactory } from './agent-card-mapper.js';
 import type { TaskStore } from './task-store.js';
@@ -62,6 +63,7 @@ export class A2XServer {
   private _description?: string;
   private _version?: string;
   private _defaultUrl?: string;
+  private _defaultTransport: A2ATransport = 'JSONRPC';
   private _interfaces: A2XInterfaceEntry[] = [];
   private _provider?: AgentProvider;
   private _capabilities: A2XAgentState['capabilities'] = {};
@@ -133,6 +135,24 @@ export class A2XServer {
       throw new Error('A2XServer.setDefaultUrl: url must not be empty');
     }
     this._defaultUrl = url;
+    this._invalidateCache();
+    return this;
+  }
+
+  /** Set the protocol binding advertised for the default interface. */
+  setDefaultTransport(protocol: A2ATransport): this {
+    const normalized = protocol.toUpperCase();
+    if (normalized !== 'JSONRPC' && normalized !== 'HTTP+JSON') {
+      throw new Error(
+        `A2XServer.setDefaultTransport: unsupported transport '${protocol}'`,
+      );
+    }
+    if (this._protocolVersion === '0.3' && normalized !== 'JSONRPC') {
+      throw new Error(
+        'A2XServer.setDefaultTransport: v0.3 servers support JSONRPC only',
+      );
+    }
+    this._defaultTransport = normalized;
     this._invalidateCache();
     return this;
   }
@@ -537,6 +557,7 @@ export class A2XServer {
       description,
       version: this._version ?? '1.0.0',
       defaultUrl: this._defaultUrl,
+      defaultTransport: this._defaultTransport,
       interfaces: [...this._interfaces],
       provider: this._provider,
       capabilities: {

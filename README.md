@@ -36,6 +36,7 @@ The optional x402 integration requires `@x402/core` and `@x402/evm`
 - **Builder pattern** — Override any auto-extracted value with chainable methods (`setName()`, `addSkill()`, `addSecurityScheme()`, etc.).
 - **ADK-compatible patterns** — Familiar `LlmAgent`, `SequentialAgent`, `ParallelAgent`, `LoopAgent`, `FunctionTool`, `AgentTool`, `Runner`, and `Session` APIs.
 - **Client SDK** — `A2XClient` for interacting with any A2A-compliant agent, with built-in auth scheme support.
+- **JSON-RPC and HTTP+JSON transports** — Serve and consume both standard v1.0 HTTP bindings, including REST task listing, push-config CRUD, authenticated extended cards, and SSE streams. AgentCard selection is deterministic and fails closed for unsupported bindings.
 - **Device Flow auth** — Built-in OAuth 2.0 Device Authorization Grant (RFC 8628) for CLI and browserless environments.
 - **Framework-agnostic** — Works with Express, Fastify, Hono, Next.js, or any HTTP framework.
 - **SSE streaming** — First-class support for `message/stream` via Server-Sent Events.
@@ -160,7 +161,7 @@ for await (const event of client.sendMessageStream({
 **Quick prototype** with `toA2x()`:
 
 ```typescript
-import { LlmAgent, toA2x } from '@a2x/sdk';
+import { A2A_TRANSPORTS, LlmAgent, toA2x } from '@a2x/sdk';
 import { GoogleProvider } from '@a2x/sdk/google';
 
 const agent = new LlmAgent({
@@ -173,6 +174,8 @@ const agent = new LlmAgent({
 const app = toA2x(agent, {
   port: 4000,
   defaultUrl: 'http://localhost:4000/a2a',
+  // Defaults to JSONRPC only. Add HTTP_JSON to expose the v1.0 REST routes.
+  transports: [A2A_TRANSPORTS.JSONRPC, A2A_TRANSPORTS.HTTP_JSON],
 });
 ```
 

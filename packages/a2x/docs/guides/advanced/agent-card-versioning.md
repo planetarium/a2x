@@ -11,7 +11,7 @@ You usually don't pick. `toA2x()` and `DefaultRequestHandler.getAgentCard()` ren
 | Where the endpoint URL lives | top-level `url` | `supportedInterfaces[].url` |
 | Transport selection | `preferredTransport` string | `supportedInterfaces[].protocolBinding` |
 | Security declarations | `security` array + `securitySchemes` map | `securityRequirements` array + `securitySchemes` map |
-| Multiple transports on one agent | not supported | supported via multiple `supportedInterfaces` |
+| Multiple transports on one agent | `additionalInterfaces` | `supportedInterfaces` |
 
 A2X models everything internally in a version-neutral shape and renders it through the configured wire format. This means:
 
@@ -42,6 +42,7 @@ A2A v1.0 renamed every JSON-RPC method (spec §9.4) and both request headers. A 
 | `message/send` | `SendMessage` |
 | `message/stream` | `SendStreamingMessage` |
 | `tasks/get` | `GetTask` |
+| — | `ListTasks` |
 | `tasks/cancel` | `CancelTask` |
 | `tasks/resubscribe` | `SubscribeToTask` |
 | `tasks/pushNotificationConfig/set` | `CreateTaskPushNotificationConfig` |
@@ -50,7 +51,7 @@ A2A v1.0 renamed every JSON-RPC method (spec §9.4) and both request headers. A 
 | `tasks/pushNotificationConfig/delete` | `DeleteTaskPushNotificationConfig` |
 | `agent/getAuthenticatedExtendedCard` | `GetExtendedAgentCard` |
 
-Both tables are exported as `A2A_METHODS` and `A2A_METHODS_V10`. v1.0's new `ListTasks` method has no v0.3 counterpart and is not implemented.
+Both tables are exported as `A2A_METHODS` and `A2A_METHODS_V10`. v1.0's `ListTasks` has no v0.3 counterpart. It is available when the configured `TaskStore` implements the optional `listTasks()` method; `InMemoryTaskStore` does.
 
 Three behaviors to know, and where they diverge from strict spec text:
 
@@ -81,28 +82,52 @@ Conforming clients read this to decide whether to call `agent/getAuthenticatedEx
 
 ### 3. Multi-transport agents
 
-If you plan to expose JSON-RPC over HTTP **and** another transport (e.g. gRPC), only v1.0 expresses this cleanly. Legacy v0.3 consumers will only see the first/primary interface.
+If you expose JSON-RPC and HTTP+JSON together, use v1.0 `supportedInterfaces` so clients can select a binding and version per endpoint. The standalone `toA2x()` helper generates these entries from its `transports` option.
+
+### The v1.0 HTTP+JSON binding
+
+A2X implements HTTP+JSON for v1.0. The client and server share the same version mapping, authentication, extension activation, task lifecycle, retries, and x402 flow as JSON-RPC; only framing, routes, streaming wrappers, and error envelopes differ.
+
+```ts
+import { A2A_TRANSPORTS, toA2x } from '@a2x/sdk';
+
+toA2x(agent, {
+  defaultUrl: 'https://agent.example.com/a2a',
+  transports: [A2A_TRANSPORTS.HTTP_JSON],
+});
+```
+
+HTTP+JSON is intentionally rejected for v0.3. This prevents a v0.3 AgentCard from being sent the incompatible v1.0 REST shape.
 
 ## Consuming: what `A2XClient` does
 
 On the client side, `A2XClient` reads the remote card's `protocolVersion` field (or infers v0.3 when absent) and routes calls accordingly. You usually don't need to pick a version yourself:
 
 ```ts
-const resolved = await client.resolveAgentCard();
+import { resolveAgentCard } from '@a2x/sdk/client';
+
+const resolved = await resolveAgentCard(url);
 console.log(resolved.version);   // '0.3' | '1.0'
 console.log(resolved.card);      // the parsed card for that version
 ```
 
-To force a preference when the remote supports both:
+To prefer REST when the remote supports both installed bindings:
 
 ```ts
-const client = new A2XClient(url, { preferredVersion: '1.0' });
+import { A2A_TRANSPORTS, A2XClient } from '@a2x/sdk/client';
+
+const client = new A2XClient(url, {
+  preferredTransports: [
+    A2A_TRANSPORTS.HTTP_JSON,
+    A2A_TRANSPORTS.JSONRPC,
+  ],
+});
 ```
 
 ## Recommendation
 
 - **Serve v1.0 as primary** — the constructor default. New clients should target v1.0.
-- **Pin your own clients to v1.0** when calling agents that support both. Future-facing.
+- **Prefer the v1.0 binding you operate best** when a card advertises both JSON-RPC and HTTP+JSON.
 - **Spin up a dedicated v0.3 instance** only when a deployment target needs it. Configure it with `protocolVersion: '0.3'` rather than trying to coax a v1.0 agent into pretending.
 
 ## Beyond the AgentCard: push notification authentication

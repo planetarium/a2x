@@ -11,6 +11,8 @@ import type { AddressInfo } from 'node:net';
 import { LlmAgent } from '../agent/llm-agent.js';
 import { BaseLlmProvider } from '../provider/base.js';
 import { toA2x, createA2xRequestListener } from '../transport/to-a2x.js';
+import { A2A_TRANSPORTS } from '../types/transport.js';
+import type { AgentCardV10 } from '../types/agent-card.js';
 
 // Side-effect import to register response mappers (v0.3 / v1.0).
 import '../a2x/index.js';
@@ -55,6 +57,23 @@ describe('toA2x() HTTP wrapper — JSON-RPC over HTTP error convention', () => {
     await stop?.();
   });
 
+  it('echoes requested CORS headers for configured authentication schemes', async () => {
+    const res = await fetch(`${baseUrl}/a2a`, {
+      method: 'OPTIONS',
+      headers: {
+        Origin: 'https://client.example.com',
+        'Access-Control-Request-Method': 'POST',
+        'Access-Control-Request-Headers': 'content-type, x-api-key',
+      },
+    });
+
+    expect(res.status).toBe(204);
+    expect(res.headers.get('access-control-allow-headers')).toBe(
+      'content-type, x-api-key',
+    );
+    expect(res.headers.get('vary')).toContain('Access-Control-Request-Headers');
+  });
+
   it('returns HTTP 200 with -32700 body for malformed JSON', async () => {
     const res = await fetch(`${baseUrl}/a2a`, {
       method: 'POST',
@@ -73,6 +92,24 @@ describe('toA2x() HTTP wrapper — JSON-RPC over HTTP error convention', () => {
     expect(body.error.code).toBe(-32700);
   });
 
+  it('rejects JSON-RPC request bodies larger than 1 MiB', async () => {
+    const res = await fetch(`${baseUrl}/a2a`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ padding: 'x'.repeat(1024 * 1024) }),
+    });
+
+    expect(res.status).toBe(413);
+    await expect(res.json()).resolves.toMatchObject({
+      jsonrpc: '2.0',
+      id: null,
+      error: {
+        code: -32600,
+        message: 'Request body exceeds the 1048576-byte limit',
+      },
+    });
+  });
+
   // Both `/.well-known/agent.json` (v0.3 spec) and
   // `/.well-known/agent-card.json` (modern spec / our own client tries
   // this first) must serve the AgentCard. Issue #142 fix 3.
@@ -83,6 +120,8 @@ describe('toA2x() HTTP wrapper — JSON-RPC over HTTP error convention', () => {
     const res = await fetch(`${baseUrl}${path}`);
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toContain('application/json');
+    expect(res.headers.get('vary')).toBeNull();
+    expect(res.headers.get('access-control-allow-headers')).toBeNull();
     const card = (await res.json()) as { name: string };
     expect(card.name).toBe('noop-agent');
   });
@@ -111,5 +150,30 @@ describe('toA2x() HTTP wrapper — JSON-RPC over HTTP error convention', () => {
     };
     expect(body.id).toBe(7);
     expect(body.error.code).toBeLessThan(0);
+  });
+
+  it('advertises and mounts only explicitly configured transports', () => {
+    const agent = new LlmAgent({
+      name: 'multi-transport-agent',
+      provider: new NoopProvider(),
+      instruction: 'noop',
+    });
+    const jsonRpcOnly = toA2x(agent, {
+      defaultUrl: 'http://localhost/a2a',
+    });
+    expect(jsonRpcOnly.httpJsonHandler).toBeUndefined();
+    expect((jsonRpcOnly.handler.getAgentCard() as AgentCardV10).supportedInterfaces)
+      .toHaveLength(1);
+
+    const both = toA2x(agent, {
+      defaultUrl: 'http://localhost/a2a',
+      transports: [A2A_TRANSPORTS.HTTP_JSON, A2A_TRANSPORTS.JSONRPC],
+    });
+    expect(both.httpJsonHandler).toBeDefined();
+    expect(
+      (both.handler.getAgentCard() as AgentCardV10).supportedInterfaces.map(
+        (iface) => iface.protocolBinding,
+      ),
+    ).toEqual(['HTTP+JSON', 'JSONRPC']);
   });
 });

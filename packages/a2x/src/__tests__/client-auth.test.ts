@@ -1189,9 +1189,43 @@ describe('A2XClient auth integration', () => {
     expect(mockFetch).not.toHaveBeenCalled();
   });
 
+  it.each([
+    [
+      'unary calls',
+      async (client: A2XClient) => client.sendMessage({
+        message: { role: 'user', parts: [{ text: 'Hello' }] },
+      }),
+    ],
+    [
+      'message streams',
+      async (client: A2XClient) => client.sendMessageStream({
+        message: { role: 'user', parts: [{ text: 'Hello' }] },
+      }).next(),
+    ],
+    [
+      'task subscriptions',
+      async (client: A2XClient) => client.subscribeTask('task-1').next(),
+    ],
+  ])('rejects auth that overwrites A2A-Version for %s', async (_name, invoke) => {
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const client = new A2XClient(cardWithHeaderApiKey('a2a-version'), {
+      fetch: mockFetch,
+      authProvider: {
+        async provide(requirements) {
+          return [requirements[0]![0]!.setCredential('0.3')];
+        },
+      },
+    });
+
+    await expect(invoke(client)).rejects.toBeInstanceOf(
+      UnsupportedOperationError,
+    );
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
   it('rejects auth that overwrites extension activation', async () => {
     const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
-    const client = new A2XClient(cardWithHeaderApiKey('x-a2a-extensions'), {
+    const client = new A2XClient(cardWithHeaderApiKey('a2a-extensions'), {
       fetch: mockFetch,
       authProvider: {
         async provide(requirements) {
@@ -1978,6 +2012,55 @@ describe('A2XClient auth integration', () => {
     await expect(client.sendMessage({
       message: { role: 'user', parts: [{ text: 'outer' }] },
     })).rejects.toThrow(
+      'AuthProvider.provide() cannot call an authenticated operation on the same A2XClient; ' +
+        'use a separate client or transport for credential acquisition.',
+    );
+    expect(provide).toHaveBeenCalledTimes(1);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['listTasks', (client: A2XClient) => client.listTasks()],
+    ['subscribeTask', (client: A2XClient) => client.subscribeTask('bootstrap').next()],
+    [
+      'createTaskPushNotificationConfig',
+      (client: A2XClient) => client.createTaskPushNotificationConfig({
+        taskId: 'bootstrap',
+        pushNotificationConfig: {
+          id: 'config',
+          url: 'https://client.example.com/push',
+        },
+      }),
+    ],
+    [
+      'getTaskPushNotificationConfig',
+      (client: A2XClient) =>
+        client.getTaskPushNotificationConfig('bootstrap', 'config'),
+    ],
+    [
+      'listTaskPushNotificationConfigs',
+      (client: A2XClient) => client.listTaskPushNotificationConfigs('bootstrap'),
+    ],
+    [
+      'deleteTaskPushNotificationConfig',
+      (client: A2XClient) =>
+        client.deleteTaskPushNotificationConfig('bootstrap', 'config'),
+    ],
+    ['getExtendedAgentCard', (client: A2XClient) => client.getExtendedAgentCard()],
+  ])('rejects provide re-entry through %s', async (_name, nestedCall) => {
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    let client!: A2XClient;
+    const provide = vi.fn(async (requirements: AuthScheme[][]) => {
+      await Promise.resolve();
+      await nestedCall(client);
+      return [requirements[0]![0]!.setCredential('key')];
+    });
+    client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      authProvider: { provide },
+    });
+
+    await expect(client.getTask('outer')).rejects.toThrow(
       'AuthProvider.provide() cannot call an authenticated operation on the same A2XClient; ' +
         'use a separate client or transport for credential acquisition.',
     );
