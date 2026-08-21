@@ -120,6 +120,8 @@ describe('toA2x() HTTP wrapper — JSON-RPC over HTTP error convention', () => {
     const res = await fetch(`${baseUrl}${path}`);
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toContain('application/json');
+    expect(res.headers.get('vary')).toBeNull();
+    expect(res.headers.get('access-control-allow-headers')).toBeNull();
     const card = (await res.json()) as { name: string };
     expect(card.name).toBe('noop-agent');
   });
