@@ -1,5 +1,33 @@
 # @a2x/sdk
 
+## 0.24.0
+
+### Minor Changes
+
+- [#251](https://github.com/planetarium/a2x/pull/251) [`9917242`](https://github.com/planetarium/a2x/commit/9917242fb9f70a2cf6d0bdaea5bba514c2b71431) Thanks [@longfin](https://github.com/longfin)! - Add A2A v1.0 HTTP+JSON client and server transport support, including REST task operations, SSE streaming and resubscription, push-notification configuration CRUD, authenticated extended cards, deterministic AgentCard binding selection, and reusable manual-wiring handlers.
+
+### Patch Changes
+
+- [#251](https://github.com/planetarium/a2x/pull/251) [`17c466d`](https://github.com/planetarium/a2x/commit/17c466dafee8905ca7a74eff41cec158c8f6aac5) Thanks [@longfin](https://github.com/longfin)! - Allow configured authentication headers in standalone server CORS preflight responses.
+
+- [#245](https://github.com/planetarium/a2x/pull/245) [`b035fd5`](https://github.com/planetarium/a2x/commit/b035fd5e51a5b25dd5a94129634d05dd9735c1db) Thanks [@longfin](https://github.com/longfin)! - Apply client authentication headers case-insensitively so caller-provided case variants cannot be combined with resolved credentials, preserve every caller Cookie variant, and reject attempts to overwrite transport-owned headers such as `A2A-Version` before sending.
+
+- [#244](https://github.com/planetarium/a2x/pull/244) [`590c4e9`](https://github.com/planetarium/a2x/commit/590c4e943f16877253291d17c9eb7e095a28a9cf) Thanks [@longfin](https://github.com/longfin)! - Deduplicate concurrent AgentCard resolution, authentication initialization, and credential refresh so shared clients atomically publish successful credential generations, wait for newer in-flight refreshes, and close rejected SSE responses before retrying.
+
+- [#244](https://github.com/planetarium/a2x/pull/244) [`590c4e9`](https://github.com/planetarium/a2x/commit/590c4e943f16877253291d17c9eb7e095a28a9cf) Thanks [@longfin](https://github.com/longfin)! - Reject v1.0 AgentCards that advertise no JSON-RPC interface instead of posting JSON-RPC payloads to an unrelated transport binding, while keeping a failed URL discovery retryable.
+
+- [#245](https://github.com/planetarium/a2x/pull/245) [`b035fd5`](https://github.com/planetarium/a2x/commit/b035fd5e51a5b25dd5a94129634d05dd9735c1db) Thanks [@longfin](https://github.com/longfin)! - Preserve requirement-specific OAuth and OpenID Connect scopes on normalized client schemes as `params.requiredScopes` so providers request only the privileges selected by the AgentCard requirement.
+
+- [#249](https://github.com/planetarium/a2x/pull/249) [`4a16c6a`](https://github.com/planetarium/a2x/commit/4a16c6a36529714669cd1d17fefbd8f88cae0e12) Thanks [@longfin](https://github.com/longfin)! - Reject same-client authenticated re-entry from `AuthProvider` callbacks instead of waiting forever on the callback's own initialization or refresh promise.
+
+- [#245](https://github.com/planetarium/a2x/pull/245) [`b035fd5`](https://github.com/planetarium/a2x/commit/b035fd5e51a5b25dd5a94129634d05dd9735c1db) Thanks [@longfin](https://github.com/longfin)! - Reject incomplete, malformed, or destination-colliding client authentication alternatives; preserve explicit anonymous alternatives and special map-key scheme names; match HTTP schemes case-insensitively; compose distinct cookie API keys while replacing stale same-name cookies; and cap eager OAuth-flow expansion from untrusted AgentCards.
+
+- [#243](https://github.com/planetarium/a2x/pull/243) [`22c4fca`](https://github.com/planetarium/a2x/commit/22c4fcaf4c3f00cf6a1089783d369345d75e65b3) Thanks [@longfin](https://github.com/longfin)! - Keep `A2XClient` x402 spending caps and offer identity authoritative when payment hooks retain, mutate, insert, or reorder payment requirements, reject ambiguous cross-version amount fields, accept unchanged structural copies returned by existing selectors, and release batch attempts cleanly when streams are cancelled before transport submission.
+
+- [#251](https://github.com/planetarium/a2x/pull/251) [`b2023ca`](https://github.com/planetarium/a2x/commit/b2023ca52bc9d842dc0122c418a06cd8e50dbefb) Thanks [@longfin](https://github.com/longfin)! - Limit JSON-RPC request bodies handled by the standalone Node.js listener to 1 MiB and return HTTP 413 for oversized payloads.
+
+- [#245](https://github.com/planetarium/a2x/pull/245) [`b035fd5`](https://github.com/planetarium/a2x/commit/b035fd5e51a5b25dd5a94129634d05dd9735c1db) Thanks [@longfin](https://github.com/longfin)! - Emit and consume the A2A v1.0 `StringList.list` field for security requirement scopes while continuing to accept the legacy a2x `values` spelling as an exclusive runtime and TypeScript input, rejecting ambiguous or unknown wrapper fields.
+
 ## 0.23.0
 
 ### Minor Changes
