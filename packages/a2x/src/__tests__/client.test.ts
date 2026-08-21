@@ -736,6 +736,39 @@ describe('A2XClient', () => {
       expect(JSON.parse(String(request.body))).not.toHaveProperty('tenant');
     });
 
+    it('omits Content-Type from bodyless REST requests', async () => {
+      const card: AgentCardV10 = {
+        ...V10_CARD,
+        supportedInterfaces: [
+          {
+            url: 'http://localhost:4000/rest',
+            protocolBinding: 'HTTP+JSON',
+            protocolVersion: '1.0',
+          },
+        ],
+      };
+      const mockFetch = createMockFetch({ tasks: [] });
+      const client = new A2XClient(card, { fetch: mockFetch });
+
+      await client.listTasks();
+      await client.deleteTaskPushNotificationConfig('task-1', 'config-1');
+
+      expect(mockFetch.mock.calls.map((call) => call[1].method)).toEqual([
+        'GET',
+        'DELETE',
+      ]);
+      for (const call of mockFetch.mock.calls) {
+        const headers = call[1].headers as Record<string, string>;
+        expect(
+          Object.keys(headers).some(
+            (name) => name.toLowerCase() === 'content-type',
+          ),
+        ).toBe(false);
+        expect(headers.Accept).toBe('application/a2a+json');
+        expect(headers['A2A-Version']).toBe('1.0');
+      }
+    });
+
     it('maps a bare REST 404 to MethodNotFoundError', async () => {
       const card: AgentCardV10 = {
         ...V10_CARD,

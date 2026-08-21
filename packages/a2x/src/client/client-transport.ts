@@ -164,12 +164,18 @@ export class HttpJsonClientTransport implements A2XClientTransport {
     const body = target.body === undefined ? undefined : JSON.stringify(target.body);
     request.signal?.throwIfAborted();
     await request.onTransport?.();
+    const headers: Record<string, string> = {
+      ...request.headers,
+      Accept: stream ? 'text/event-stream' : 'application/a2a+json',
+    };
+    if (body === undefined) {
+      for (const name of Object.keys(headers)) {
+        if (name.toLowerCase() === 'content-type') delete headers[name];
+      }
+    }
     return this.fetchImpl(target.url, {
       method: target.httpMethod,
-      headers: {
-        ...request.headers,
-        Accept: stream ? 'text/event-stream' : 'application/a2a+json',
-      },
+      headers,
       ...(body !== undefined ? { body } : {}),
       signal: request.signal,
     });
