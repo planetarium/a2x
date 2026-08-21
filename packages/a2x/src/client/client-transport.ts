@@ -216,7 +216,7 @@ function buildRestRequest(
         url: withQuery(route(`/tasks/${taskId}`), omitKeys(resourceParams, ['id'])),
         httpMethod: 'GET',
       };
-    case 'tasks/list':
+    case A2A_METHODS.LIST_TASKS:
       return {
         url: withQuery(route('/tasks'), resourceParams),
         httpMethod: 'GET',

@@ -139,7 +139,7 @@ export class HttpJsonRequestHandler {
     }
     if (httpMethod === 'GET' && path === '/tasks') {
       return {
-        operation: 'tasks/list',
+        operation: A2A_METHODS.LIST_TASKS,
         params: withTenant(queryParams(url)),
       };
     }
