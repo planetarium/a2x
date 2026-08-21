@@ -367,10 +367,9 @@ export interface A2XClientOptions {
    */
   preferredTransports?: readonly A2ATransport[];
   /**
-   * A2A extension URIs the client wants to activate. Emitted as a
-   * comma-separated `X-A2A-Extensions` HTTP header on every JSON-RPC
-   * request per a2a-x402 v0.2 §8 and the A2A core extension activation
-   * convention.
+   * A2A extension URIs the client wants to activate. Emitted on every
+   * request in the protocol-version-appropriate activation header:
+   * `X-A2A-Extensions` for v0.3 or `A2A-Extensions` for v1.0.
    *
    * You can also register extensions at runtime via `registerExtension()`.
    *
@@ -507,10 +506,10 @@ export class A2XClient {
       A2A_TRANSPORTS.HTTP_JSON,
     ];
     if (this._x402 && !this._extensions.has(X402_EXTENSION_URI)) {
-      // Spec a2a-x402 v0.2 §8: clients MUST activate the extension via
-      // `X-A2A-Extensions`. Auto-register so callers don't have to — but only
-      // when the caller didn't already register it explicitly, so a deliberate
-      // V1-only declaration is not later dropped by the card-based upgrade.
+      // Auto-register so callers don't have to activate x402 manually — but
+      // only when the caller didn't already register it explicitly, so a
+      // deliberate V1-only declaration is not later dropped by the card-based
+      // upgrade.
       this._extensions.add(X402_EXTENSION_URI);
       this._x402UriAutoSeeded = true;
     }
@@ -520,8 +519,9 @@ export class A2XClient {
   private _x402UriAutoSeeded = false;
 
   /**
-   * Register an A2A extension URI to be included in the
-   * `X-A2A-Extensions` header on subsequent requests. Idempotent.
+   * Register an A2A extension URI to be included in the activation header on
+   * subsequent requests. Uses `X-A2A-Extensions` for v0.3 and
+   * `A2A-Extensions` for v1.0. Idempotent.
    */
   registerExtension(uri: string): void {
     this._extensions.add(uri);
@@ -536,7 +536,7 @@ export class A2XClient {
 
   /**
    * Send a message and wait for the complete response.
-   * Uses JSON-RPC method `message/send`.
+   * Dispatches through the protocol binding selected from the AgentCard.
    *
    * When `options.x402` is set on this client and the agent responds with
    * `payment-required`, the dance is run transparently — the returned
@@ -645,7 +645,7 @@ export class A2XClient {
 
   /**
    * Send a message and stream the response via SSE.
-   * Uses JSON-RPC method `message/stream`.
+   * Dispatches through the protocol binding selected from the AgentCard.
    *
    * When `options.x402` is set on this client and the first stream emits
    * `payment-required`, the dance runs transparently: that event is
@@ -1187,7 +1187,7 @@ export class A2XClient {
 
   /**
    * Retrieve the current state of a task.
-   * Uses JSON-RPC method `tasks/get`.
+   * Dispatches through the protocol binding selected from the AgentCard.
    *
    * Spec a2a-v0.3 §TaskQueryParams: pass `historyLength` to bound the
    * size of the `history` slice the server returns. Useful for polling
@@ -1213,7 +1213,7 @@ export class A2XClient {
 
   /**
    * Request cancellation of a task.
-   * Uses JSON-RPC method `tasks/cancel`.
+   * Dispatches through the protocol binding selected from the AgentCard.
    */
   async cancelTask(taskId: string): Promise<Task> {
     this._assertNotAuthProviderReentry();
@@ -1818,9 +1818,8 @@ export class A2XClient {
       headers['A2A-Version'] = '1.0';
     }
     if (this._extensions.size > 0) {
-      // Spec a2a-x402 v0.2 §8: clients MUST request activation via
-      // `X-A2A-Extensions`. Multiple active extensions are comma-separated
-      // per standard HTTP list-header convention.
+      // Multiple active extensions are comma-separated per standard HTTP
+      // list-header convention. A2A v1.0 renamed the activation header.
       headers[
         this._resolved?.version === '1.0'
           ? 'A2A-Extensions'
@@ -1876,7 +1875,7 @@ export class A2XClient {
   /**
    * Per A2A spec, an auth failure on a task-creating call surfaces as a
    * Task in `auth-required` state — not as a transport error and not as a
-   * JSON-RPC error code. When the AuthProvider supports `refresh()`, the
+   * binding-level error. When the AuthProvider supports `refresh()`, the
    * client refreshes credentials once and retries the same call.
    */
   private async _refreshAuth(expectedGeneration: number): Promise<boolean> {

@@ -15,7 +15,7 @@ import { ApiKeyAuthScheme } from '../client/auth-scheme.js';
 import { A2A_TRANSPORTS } from '../client/client-transport.js';
 import { selectAgentInterface } from '../client/agent-card-resolver.js';
 import { createA2xRequestListener } from '../transport/to-a2x.js';
-import { TaskNotFoundError } from '../types/errors.js';
+import { InvalidRequestError, TaskNotFoundError } from '../types/errors.js';
 import type { AgentCardV10 } from '../types/agent-card.js';
 import { A2XServer } from '../a2x/a2x-agent.js';
 import { AgentExecutor, StreamingMode } from '../a2x/agent-executor.js';
@@ -59,6 +59,50 @@ function message(text = 'hello') {
       role: 'user' as const,
       parts: [{ text }],
     },
+  };
+}
+
+const REQUIRED_EXTENSION_URI = 'https://example.com/extensions/rest-required';
+
+async function startRequiredExtensionServer(): Promise<{
+  baseUrl: string;
+  close: () => Promise<void>;
+}> {
+  const agent = new RestTestAgent();
+  const runner = new InMemoryRunner({ agent, appName: 'rest-extension-test' });
+  const executor = new AgentExecutor({
+    runner,
+    runConfig: { streamingMode: StreamingMode.SSE },
+  });
+  const a2xServer = new A2XServer({
+    taskStore: new InMemoryTaskStore(),
+    executor,
+    protocolVersion: '1.0',
+  })
+    .setDefaultUrl('http://127.0.0.1/a2a')
+    .setDefaultTransport(A2A_TRANSPORTS.HTTP_JSON)
+    .addExtension({ uri: REQUIRED_EXTENSION_URI, required: true });
+  const handler = new DefaultRequestHandler(a2xServer);
+  const httpJsonHandler = new HttpJsonRequestHandler(handler, {
+    basePath: '/a2a',
+  });
+  const server = createServer(
+    createA2xRequestListener(handler, 'http://localhost', {
+      httpJsonHandler,
+      jsonRpcEnabled: false,
+    }),
+  );
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as AddressInfo).port;
+  const baseUrl = `http://127.0.0.1:${port}`;
+  a2xServer.setDefaultUrl(`${baseUrl}/a2a`);
+  return {
+    baseUrl,
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+        server.closeAllConnections();
+      }),
   };
 }
 
@@ -268,6 +312,55 @@ describe('A2A v1.0 HTTP+JSON transport', () => {
     expect(body.error.code).toBe(404);
     expect(body.error.status).toBe('NOT_FOUND');
     expect(body.error.details[0]?.reason).toBe('TASK_NOT_FOUND');
+  });
+
+  it('enforces required extension activation over REST', async () => {
+    const extensionServer = await startRequiredExtensionServer();
+    try {
+      const unactivatedClient = new A2XClient(extensionServer.baseUrl);
+      await expect(
+        unactivatedClient.sendMessage(message('missing extension')),
+      ).rejects.toBeInstanceOf(InvalidRequestError);
+
+      const response = await fetch(
+        `${extensionServer.baseUrl}/a2a/message:send`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/a2a+json',
+            'A2A-Version': '1.0',
+          },
+          body: JSON.stringify(message('missing extension status')),
+        },
+      );
+      expect(response.status).toBe(400);
+      const errorBody = (await response.json()) as {
+        error: {
+          code: number;
+          status: string;
+          message: string;
+          details: Array<{ reason: string }>;
+        };
+      };
+      expect(errorBody).toMatchObject({
+        error: {
+          code: 400,
+          status: 'INVALID_ARGUMENT',
+          message: expect.stringContaining('A2A-Extensions'),
+          details: [expect.objectContaining({ reason: 'INVALID_REQUEST' })],
+        },
+      });
+      expect(errorBody.error.message).toContain(REQUIRED_EXTENSION_URI);
+
+      const activatedClient = new A2XClient(extensionServer.baseUrl, {
+        extensions: [REQUIRED_EXTENSION_URI],
+      });
+      await expect(
+        activatedClient.sendMessage(message('activated extension')),
+      ).resolves.toMatchObject({ status: { state: 'completed' } });
+    } finally {
+      await extensionServer.close();
+    }
   });
 
   it('drains unexpected bodies on non-POST REST requests', async () => {

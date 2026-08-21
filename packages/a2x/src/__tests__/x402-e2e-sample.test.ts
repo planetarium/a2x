@@ -26,13 +26,16 @@ import { privateKeyToAccount } from 'viem/accounts';
 
 import {
   AgentExecutor,
+  A2A_TRANSPORTS,
   A2XServer,
   BaseAgent,
   DefaultRequestHandler,
+  HttpJsonRequestHandler,
   InMemoryRunner,
   InMemoryTaskStore,
   StreamingMode,
   createA2xRequestListener,
+  type A2ATransport,
   type AgentEvent,
   type InvocationContext,
 } from '../index.js';
@@ -76,7 +79,10 @@ const ACCEPTS: X402Accept[] = [
  * remote one. `baseUrl` is the actual server URL so the AgentCard the
  * client resolves points at the right port.
  */
-function buildSampleStack(baseUrl: string): {
+function buildSampleStack(
+  baseUrl: string,
+  transport: A2ATransport = A2A_TRANSPORTS.JSONRPC,
+): {
   handler: DefaultRequestHandler;
   x402: X402Context;
 } {
@@ -171,6 +177,7 @@ function buildSampleStack(baseUrl: string): {
     .setName('Paid Echo')
     .setDescription('Charges per call')
     .setDefaultUrl(`${baseUrl}/a2a`)
+    .setDefaultTransport(transport)
     .addSkill({
       id: 'echo',
       name: 'Paid Echo',
@@ -186,9 +193,11 @@ function buildSampleStack(baseUrl: string): {
  * Listen on an ephemeral port first to discover it, then build the
  * agent stack with the right URL, then attach the handler. The
  * AgentCard must advertise the actual server URL so the A2XClient's
- * resolution lands the JSON-RPC requests on the right port.
+ * resolution lands binding-specific requests on the right port.
  */
-async function startServerWithStack(): Promise<{
+async function startServerWithStack(
+  transport: A2ATransport = A2A_TRANSPORTS.JSONRPC,
+): Promise<{
   server: Server;
   baseUrl: string;
   x402: X402Context;
@@ -200,8 +209,16 @@ async function startServerWithStack(): Promise<{
   const baseUrl = `http://127.0.0.1:${port}`;
 
   // Phase 2: build the stack with the right URL.
-  const { handler, x402 } = buildSampleStack(baseUrl);
-  const listener = createA2xRequestListener(handler);
+  const { handler, x402 } = buildSampleStack(baseUrl, transport);
+  const listener =
+    transport === A2A_TRANSPORTS.HTTP_JSON
+      ? createA2xRequestListener(handler, baseUrl, {
+          httpJsonHandler: new HttpJsonRequestHandler(handler, {
+            basePath: '/a2a',
+          }),
+          jsonRpcEnabled: false,
+        })
+      : createA2xRequestListener(handler);
   server.on('request', listener);
 
   return { server, baseUrl, x402 };
@@ -213,7 +230,7 @@ async function stopServer(server: Server): Promise<void> {
   });
 }
 
-describe('x402 e2e — sample agent + real A2XClient over HTTP', () => {
+describe('x402 e2e — JSON-RPC binding', () => {
   let serverHandle: { server: Server; baseUrl: string };
   let x402Ctx: X402Context;
 
@@ -423,5 +440,49 @@ describe('x402 e2e — sample agent + real A2XClient over HTTP', () => {
     } finally {
       await stopServer(placeholderServer);
     }
+  });
+});
+
+describe('x402 e2e — HTTP+JSON binding', () => {
+  let serverHandle: { server: Server; baseUrl: string };
+  let x402Ctx: X402Context;
+
+  beforeEach(async () => {
+    const { server, baseUrl, x402 } = await startServerWithStack(
+      A2A_TRANSPORTS.HTTP_JSON,
+    );
+    serverHandle = { server, baseUrl };
+    x402Ctx = x402;
+  });
+
+  afterEach(async () => {
+    await stopServer(serverHandle.server);
+  });
+
+  it('completes the payment-required follow-up over REST', async () => {
+    const client = new A2XClient(serverHandle.baseUrl, {
+      x402: { signer: PAYER },
+    });
+
+    const card = await client.getAgentCard();
+    expect('supportedInterfaces' in card && card.supportedInterfaces).toEqual([
+      expect.objectContaining({ protocolBinding: A2A_TRANSPORTS.HTTP_JSON }),
+    ]);
+
+    const task = await client.sendMessage({
+      message: {
+        messageId: crypto.randomUUID(),
+        role: 'user',
+        parts: [{ text: 'hello over REST' }],
+      },
+    });
+
+    expect(task.status.state).toBe('completed');
+    expect(task.status.message?.metadata).toMatchObject({
+      [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.COMPLETED,
+    });
+    const entry = await x402Ctx.store.get(task.id);
+    expect(entry?.status).toBe('completed');
+    expect(entry?.receipt?.transaction).toBe('0xmocktx');
   });
 });
