@@ -16,11 +16,14 @@ import { createSSEStream } from './sse-handler.js';
 import type { RequestContext } from '../types/auth.js';
 import { JSONParseError } from '../types/errors.js';
 import {
+  A2A_HTTP_JSON_MEDIA_TYPE,
   HttpJsonRequestHandler,
   toHttpJsonErrorResponse,
 } from './http-json-handler.js';
 import type { A2ATransport } from '../types/transport.js';
 import { A2A_TRANSPORTS } from '../types/transport.js';
+
+const HTTP_JSON_REQUEST_BODY_LIMIT_BYTES = 1024 * 1024;
 
 export interface ToA2xOptions {
   port?: number;
@@ -231,8 +234,12 @@ export function createA2xRequestListener(
     if (restHandler?.canHandle(req.method ?? 'GET', parsedUrl)) {
       let parsedBody: unknown;
       if (req.method === 'POST') {
-        let body = '';
-        for await (const chunk of req) body += chunk;
+        const requestBody = await readHttpJsonRequestBody(req);
+        if (!requestBody.ok) {
+          writeHttpJsonPayloadTooLarge(res);
+          return;
+        }
+        const body = requestBody.body;
         if (body.length > 0) {
           try {
             parsedBody = JSON.parse(body);
@@ -370,6 +377,78 @@ export function createA2xRequestListener(
 
 function isAsyncGenerator(value: unknown): value is AsyncGenerator<unknown> {
   return Boolean(value && typeof value === 'object' && Symbol.asyncIterator in value);
+}
+
+async function readHttpJsonRequestBody(
+  req: import('node:http').IncomingMessage,
+): Promise<{ ok: true; body: string } | { ok: false }> {
+  const contentLength = Number(req.headers['content-length']);
+  if (
+    Number.isFinite(contentLength) &&
+    contentLength > HTTP_JSON_REQUEST_BODY_LIMIT_BYTES
+  ) {
+    req.resume();
+    return { ok: false };
+  }
+
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let byteLength = 0;
+
+    const cleanup = () => {
+      req.off('data', onData);
+      req.off('end', onEnd);
+      req.off('error', onError);
+    };
+    const onData = (chunk: Buffer | string) => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      byteLength += buffer.byteLength;
+      if (byteLength > HTTP_JSON_REQUEST_BODY_LIMIT_BYTES) {
+        cleanup();
+        req.resume();
+        resolve({ ok: false });
+        return;
+      }
+      chunks.push(buffer);
+    };
+    const onEnd = () => {
+      cleanup();
+      resolve({ ok: true, body: Buffer.concat(chunks).toString('utf8') });
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+
+    req.on('data', onData);
+    req.once('end', onEnd);
+    req.once('error', onError);
+  });
+}
+
+function writeHttpJsonPayloadTooLarge(
+  res: import('node:http').ServerResponse,
+): void {
+  res.writeHead(413, { 'Content-Type': A2A_HTTP_JSON_MEDIA_TYPE });
+  res.end(
+    JSON.stringify({
+      error: {
+        code: 413,
+        status: 'RESOURCE_EXHAUSTED',
+        message: `Request body exceeds the ${HTTP_JSON_REQUEST_BODY_LIMIT_BYTES}-byte limit`,
+        details: [
+          {
+            '@type': 'type.googleapis.com/google.rpc.ErrorInfo',
+            reason: 'REQUEST_BODY_TOO_LARGE',
+            domain: 'a2a-protocol.org',
+            metadata: {
+              maxBytes: String(HTTP_JSON_REQUEST_BODY_LIMIT_BYTES),
+            },
+          },
+        ],
+      },
+    }),
+  );
 }
 
 async function writeSseResponse(

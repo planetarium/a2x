@@ -270,6 +270,48 @@ describe('A2A v1.0 HTTP+JSON transport', () => {
     });
   });
 
+  it('rejects REST request bodies larger than 1 MiB', async () => {
+    const response = await fetch(`${baseUrl}/a2a/message:send`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/a2a+json',
+        'A2A-Version': '1.0',
+      },
+      body: JSON.stringify({ padding: 'x'.repeat(1024 * 1024) }),
+    });
+    expect(response.status).toBe(413);
+    await expect(response.json()).resolves.toMatchObject({
+      error: {
+        code: 413,
+        status: 'RESOURCE_EXHAUSTED',
+        details: [
+          expect.objectContaining({ reason: 'REQUEST_BODY_TOO_LARGE' }),
+        ],
+      },
+    });
+  });
+
+  it('enforces the REST request-body limit without Content-Length', async () => {
+    const chunk = new TextEncoder().encode('x'.repeat(600 * 1024));
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(chunk);
+        controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+    const response = await fetch(`${baseUrl}/a2a/message:send`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/a2a+json',
+        'A2A-Version': '1.0',
+      },
+      body,
+      duplex: 'half',
+    } as RequestInit & { duplex: 'half' });
+    expect(response.status).toBe(413);
+  });
+
   it('round-trips push-notification configuration CRUD over REST', async () => {
     const task = await client.sendMessage(message('push config'));
     const config = {
