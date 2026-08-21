@@ -336,6 +336,28 @@ describe('A2A v1.0 HTTP+JSON transport', () => {
     });
   });
 
+  it('validates Content-Type before parsing a non-empty REST body', async () => {
+    const response = await fetch(`${baseUrl}/a2a/message:send`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/plain',
+        'A2A-Version': '1.0',
+      },
+      body: '{',
+    });
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: {
+        status: 'INVALID_ARGUMENT',
+        message:
+          'HTTP+JSON requests require application/a2a+json or application/json',
+        details: [
+          expect.objectContaining({ reason: 'CONTENT_TYPE_NOT_SUPPORTED' }),
+        ],
+      },
+    });
+  });
+
   it('rejects REST request bodies larger than 1 MiB', async () => {
     const response = await fetch(`${baseUrl}/a2a/message:send`, {
       method: 'POST',

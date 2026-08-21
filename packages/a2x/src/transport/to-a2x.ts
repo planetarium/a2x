@@ -19,6 +19,7 @@ import {
   A2A_HTTP_JSON_MEDIA_TYPE,
   HttpJsonRequestHandler,
   toHttpJsonErrorResponse,
+  validateHttpJsonContentType,
 } from './http-json-handler.js';
 import type { A2ATransport } from '../types/transport.js';
 import { A2A_TRANSPORTS } from '../types/transport.js';
@@ -253,6 +254,18 @@ export function createA2xRequestListener(
           return;
         }
         const body = requestBody.body;
+        try {
+          validateHttpJsonContentType({
+            method: req.method,
+            url: parsedUrl,
+            context,
+          });
+        } catch (error) {
+          const errorResponse = toHttpJsonErrorResponse(error);
+          res.writeHead(errorResponse.status, errorResponse.headers);
+          res.end(JSON.stringify(errorResponse.body));
+          return;
+        }
         if (body.length > 0) {
           try {
             parsedBody = JSON.parse(body);

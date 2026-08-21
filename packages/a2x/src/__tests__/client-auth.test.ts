@@ -1189,6 +1189,40 @@ describe('A2XClient auth integration', () => {
     expect(mockFetch).not.toHaveBeenCalled();
   });
 
+  it.each([
+    [
+      'unary calls',
+      async (client: A2XClient) => client.sendMessage({
+        message: { role: 'user', parts: [{ text: 'Hello' }] },
+      }),
+    ],
+    [
+      'message streams',
+      async (client: A2XClient) => client.sendMessageStream({
+        message: { role: 'user', parts: [{ text: 'Hello' }] },
+      }).next(),
+    ],
+    [
+      'task subscriptions',
+      async (client: A2XClient) => client.subscribeTask('task-1').next(),
+    ],
+  ])('rejects auth that overwrites A2A-Version for %s', async (_name, invoke) => {
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    const client = new A2XClient(cardWithHeaderApiKey('a2a-version'), {
+      fetch: mockFetch,
+      authProvider: {
+        async provide(requirements) {
+          return [requirements[0]![0]!.setCredential('0.3')];
+        },
+      },
+    });
+
+    await expect(invoke(client)).rejects.toBeInstanceOf(
+      UnsupportedOperationError,
+    );
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
   it('rejects auth that overwrites extension activation', async () => {
     const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
     const client = new A2XClient(cardWithHeaderApiKey('a2a-extensions'), {

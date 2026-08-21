@@ -884,6 +884,7 @@ export class A2XClient {
       [
         'Content-Type',
         'Accept',
+        ...(this._resolved?.version === '1.0' ? ['A2A-Version'] : []),
         ...(this._extensions.size > 0
           ? [this._extensionHeaderName()]
           : []),
@@ -1259,6 +1260,7 @@ export class A2XClient {
       [
         'Content-Type',
         'Accept',
+        ...(this._resolved?.version === '1.0' ? ['A2A-Version'] : []),
         ...(this._extensions.size > 0
           ? [this._extensionHeaderName()]
           : []),
@@ -1841,6 +1843,7 @@ export class A2XClient {
       { headers, url },
       [
         'Content-Type',
+        ...(this._resolved?.version === '1.0' ? ['A2A-Version'] : []),
         ...(this._extensions.size > 0
           ? [this._extensionHeaderName()]
           : []),

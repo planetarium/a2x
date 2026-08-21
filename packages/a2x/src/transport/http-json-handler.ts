@@ -81,7 +81,7 @@ export class HttpJsonRequestHandler {
           'HTTP+JSON is supported only by A2A v1.0 servers',
         );
       }
-      validateContentType(request);
+      validateHttpJsonContentType(request);
       const url = toUrl(request.url);
       const route = this._resolve(request.method, url, request.body);
       if (!route) throw new MethodNotFoundError('HTTP+JSON route not found');
@@ -228,7 +228,7 @@ export class HttpJsonRequestHandler {
   }
 }
 
-function validateContentType(request: HttpJsonRequest): void {
+export function validateHttpJsonContentType(request: HttpJsonRequest): void {
   if (request.method.toUpperCase() !== 'POST') return;
   const headers = request.context?.headers ?? {};
   const entry = Object.entries(headers).find(
