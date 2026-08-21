@@ -1,6 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { AddressInfo } from 'node:net';
-import { createServer } from 'node:http';
+import {
+  createServer,
+  type IncomingMessage,
+  type ServerResponse,
+} from 'node:http';
+import { Readable } from 'node:stream';
 import { BaseAgent } from '../agent/base-agent.js';
 import type { AgentEvent } from '../agent/base-agent.js';
 import type { InvocationContext } from '../runner/context.js';
@@ -62,6 +67,7 @@ describe('A2A v1.0 HTTP+JSON transport', () => {
   let client: A2XClient;
   let close: () => Promise<void>;
   let testAgent: RestTestAgent;
+  let requestListener: ReturnType<typeof createA2xRequestListener>;
 
   beforeAll(async () => {
     testAgent = new RestTestAgent();
@@ -94,12 +100,11 @@ describe('A2A v1.0 HTTP+JSON transport', () => {
     const httpJsonHandler = new HttpJsonRequestHandler(handler, {
       basePath: '/a2a',
     });
-    const server = createServer(
-      createA2xRequestListener(handler, 'http://localhost', {
-        httpJsonHandler,
-        jsonRpcEnabled: false,
-      }),
-    );
+    requestListener = createA2xRequestListener(handler, 'http://localhost', {
+      httpJsonHandler,
+      jsonRpcEnabled: false,
+    });
+    const server = createServer(requestListener);
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
     const port = (server.address() as AddressInfo).port;
     baseUrl = `http://127.0.0.1:${port}`;
@@ -310,6 +315,44 @@ describe('A2A v1.0 HTTP+JSON transport', () => {
       duplex: 'half',
     } as RequestInit & { duplex: 'half' });
     expect(response.status).toBe(413);
+  });
+
+  it('maps REST request stream errors to a structured response', async () => {
+    const request = new Readable({
+      read() {
+        this.destroy(new Error('request read failed'));
+      },
+    }) as unknown as IncomingMessage;
+    request.method = 'POST';
+    request.url = '/a2a/message:send';
+    request.headers = { 'content-type': 'application/a2a+json' };
+
+    let status = 0;
+    let responseBody = '';
+    const response = {
+      setHeader() {
+        return this;
+      },
+      writeHead(statusCode: number) {
+        status = statusCode;
+        return this;
+      },
+      end(body: unknown) {
+        responseBody = String(body);
+        return this;
+      },
+    } as unknown as ServerResponse;
+
+    await requestListener(request, response);
+
+    expect(status).toBe(500);
+    expect(JSON.parse(responseBody)).toMatchObject({
+      error: {
+        code: 500,
+        status: 'INTERNAL',
+        message: 'request read failed',
+      },
+    });
   });
 
   it('round-trips push-notification configuration CRUD over REST', async () => {

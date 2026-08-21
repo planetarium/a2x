@@ -234,7 +234,15 @@ export function createA2xRequestListener(
     if (restHandler?.canHandle(req.method ?? 'GET', parsedUrl)) {
       let parsedBody: unknown;
       if (req.method === 'POST') {
-        const requestBody = await readHttpJsonRequestBody(req);
+        let requestBody: Awaited<ReturnType<typeof readHttpJsonRequestBody>>;
+        try {
+          requestBody = await readHttpJsonRequestBody(req);
+        } catch (error) {
+          const errorResponse = toHttpJsonErrorResponse(error);
+          res.writeHead(errorResponse.status, errorResponse.headers);
+          res.end(JSON.stringify(errorResponse.body));
+          return;
+        }
         if (!requestBody.ok) {
           writeHttpJsonPayloadTooLarge(res);
           return;
