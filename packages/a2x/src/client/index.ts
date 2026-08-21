@@ -28,13 +28,22 @@ export {
   resolveAgentCard,
   detectProtocolVersion,
   getAgentEndpointUrl,
+  selectAgentInterface,
   AGENT_CARD_WELL_KNOWN_PATH,
   AGENT_CARD_WELL_KNOWN_PATH_ALT,
 } from './agent-card-resolver.js';
 export type {
   AgentCardResolverOptions,
   ResolvedAgentCard,
+  SelectedAgentInterface,
 } from './agent-card-resolver.js';
+
+export { A2A_TRANSPORTS } from './client-transport.js';
+export type {
+  A2ATransport,
+  A2XClientTransport,
+  ClientTransportRequest,
+} from './client-transport.js';
 
 export { getResponseParser } from './response-parser.js';
 export type { ResponseParser } from './response-parser.js';

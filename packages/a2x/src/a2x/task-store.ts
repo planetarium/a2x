@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import type { Artifact, Message } from '../types/common.js';
 import type { Task, TaskArtifactUpdateEvent, TaskStatus } from '../types/task.js';
 import { TaskState, TERMINAL_STATES } from '../types/task.js';
+import type { ListTasksParams, ListTasksResult } from '../types/jsonrpc.js';
 
 // ─── TaskStore Types ───
 
@@ -45,6 +46,8 @@ export interface TaskStore {
   getTask(taskId: string): Promise<Task | null>;
   updateTask(taskId: string, update: TaskUpdate): Promise<Task>;
   deleteTask(taskId: string): Promise<void>;
+  /** A2A v1.0 task listing. Optional for existing custom stores. */
+  listTasks?(params: ListTasksParams): Promise<ListTasksResult>;
 }
 
 /**
@@ -258,6 +261,54 @@ export class InMemoryTaskStore implements TaskStore {
     this.terminalTimestamps.delete(taskId);
   }
 
+  async listTasks(params: ListTasksParams): Promise<ListTasksResult> {
+    this._evictExpired();
+    const pageSize = Math.min(Math.max(params.pageSize ?? 50, 1), 100);
+    const offset = decodePageToken(params.pageToken);
+    const after = params.statusTimestampAfter
+      ? Date.parse(params.statusTimestampAfter)
+      : undefined;
+    let tasks = [...this.tasks.values()].filter((task) => {
+      if (params.contextId !== undefined && task.contextId !== params.contextId) {
+        return false;
+      }
+      if (params.status !== undefined) {
+        const normalized = params.status
+          .toLowerCase()
+          .replace(/^task_state_/, '')
+          .replaceAll('_', '-');
+        if (task.status.state !== normalized) return false;
+      }
+      if (after !== undefined) {
+        const timestamp = task.status.timestamp
+          ? Date.parse(task.status.timestamp)
+          : Number.NEGATIVE_INFINITY;
+        if (!Number.isFinite(after) || timestamp < after) return false;
+      }
+      return true;
+    });
+    const totalSize = tasks.length;
+    tasks = tasks.slice(offset, offset + pageSize).map((task) => ({
+      ...task,
+      ...(params.historyLength !== undefined
+        ? {
+            history:
+              params.historyLength === 0
+                ? []
+                : (task.history ?? []).slice(-params.historyLength),
+          }
+        : {}),
+      ...(!params.includeArtifacts ? { artifacts: undefined } : {}),
+    }));
+    const nextOffset = offset + tasks.length;
+    return {
+      tasks,
+      nextPageToken: nextOffset < totalSize ? String(nextOffset) : '',
+      pageSize,
+      totalSize,
+    };
+  }
+
   /** Number of tasks currently stored. */
   get size(): number {
     return this.tasks.size;
@@ -301,4 +352,10 @@ export class InMemoryTaskStore implements TaskStore {
       this.terminalTimestamps.delete(taskId);
     }
   }
+}
+
+function decodePageToken(token?: string): number {
+  if (!token) return 0;
+  const value = Number(token);
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }

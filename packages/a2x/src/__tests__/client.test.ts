@@ -4,8 +4,10 @@ import {
   resolveAgentCard,
   detectProtocolVersion,
   getAgentEndpointUrl,
+  selectAgentInterface,
   AGENT_CARD_WELL_KNOWN_PATH,
 } from '../client/agent-card-resolver.js';
+import { A2A_TRANSPORTS } from '../client/client-transport.js';
 import { getResponseParser } from '../client/response-parser.js';
 import { parseSSEStream } from '../client/sse-parser.js';
 import { TaskState } from '../types/task.js';
@@ -161,22 +163,96 @@ describe('AgentCardResolver', () => {
       expect(getAgentEndpointUrl(card, '1.0')).toBe('http://localhost/jsonrpc');
     });
 
-    it('should reject a v1.0 card without a JSONRPC interface', () => {
+    it('should fail closed if no implemented interface exists in v1.0', () => {
       const card: AgentCardV10 = {
         ...V10_CARD,
         supportedInterfaces: [
           { url: 'http://localhost/grpc', protocolBinding: 'GRPC', protocolVersion: '1.0' },
-          { url: 'http://localhost/http', protocolBinding: 'HTTP+JSON', protocolVersion: '1.0' },
         ],
       };
       expect(() => getAgentEndpointUrl(card, '1.0')).toThrow(
-        'no JSONRPC interface',
+        'no supported A2A transport interface',
       );
+    });
+
+    it('should reject an installed binding with an unsupported interface version', () => {
+      const card: AgentCardV10 = {
+        ...V10_CARD,
+        supportedInterfaces: [
+          {
+            url: 'http://localhost/future',
+            protocolBinding: 'HTTP+JSON',
+            protocolVersion: '2.0',
+          },
+        ],
+      };
+      expect(() => selectAgentInterface(card, '1.0')).toThrow(
+        'HTTP+JSON@2.0',
+      );
+    });
+
+    it('should select HTTP+JSON when JSONRPC is absent', () => {
+      const card: AgentCardV10 = {
+        ...V10_CARD,
+        supportedInterfaces: [
+          {
+            url: 'http://localhost/rest',
+            protocolBinding: 'HTTP+JSON',
+            protocolVersion: '1.0',
+          },
+        ],
+      };
+      expect(getAgentEndpointUrl(card, '1.0')).toBe('http://localhost/rest');
+    });
+
+    it('should honor an explicit installed-transport preference', () => {
+      const card: AgentCardV10 = {
+        ...V10_CARD,
+        supportedInterfaces: [
+          { url: 'http://localhost/jsonrpc', protocolBinding: 'JSONRPC', protocolVersion: '1.0' },
+          { url: 'http://localhost/rest', protocolBinding: 'HTTP+JSON', protocolVersion: '1.0' },
+        ],
+      };
+      expect(
+        selectAgentInterface(card, '1.0', [
+          A2A_TRANSPORTS.HTTP_JSON,
+          A2A_TRANSPORTS.JSONRPC,
+        ]),
+      ).toEqual({
+        url: 'http://localhost/rest',
+        binding: A2A_TRANSPORTS.HTTP_JSON,
+        protocolVersion: '1.0',
+      });
+    });
+
+    it('returns the selected interface tenant service parameter', () => {
+      const card: AgentCardV10 = {
+        ...V10_CARD,
+        supportedInterfaces: [
+          {
+            url: 'http://localhost/rest',
+            protocolBinding: 'HTTP+JSON',
+            protocolVersion: '1.0',
+            tenant: 'acme',
+          },
+        ],
+      };
+      expect(selectAgentInterface(card, '1.0')).toMatchObject({ tenant: 'acme' });
     });
 
     it('should throw for v0.3 card without url', () => {
       const card = { ...V03_CARD, url: '' };
       expect(() => getAgentEndpointUrl(card, '0.3')).toThrow('missing required "url"');
+    });
+
+    it('should reject a v0.3 non-JSON-RPC preferred transport', () => {
+      const card: AgentCardV03 = {
+        ...V03_CARD,
+        preferredTransport: 'HTTP+JSON',
+      };
+      expect(() => getAgentEndpointUrl(card, '0.3')).toThrow(
+        'Only JSONRPC is implemented for v0.3 cards',
+      );
     });
 
     it('should throw for v1.0 card with empty supportedInterfaces', () => {
@@ -533,9 +609,24 @@ describe('A2XClient', () => {
         .mockReturnValueOnce(createMockFetch(V10_CARD)());
       const client = new A2XClient('http://localhost:4000', { fetch: mockFetch });
 
-      await expect(client.getAgentCard()).rejects.toThrow('no JSONRPC interface');
+      await expect(client.getAgentCard()).rejects.toThrow(
+        'no supported A2A transport interface',
+      );
       await expect(client.getAgentCard()).resolves.toEqual(V10_CARD);
       expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('should coalesce concurrent AgentCard resolution', async () => {
+      const mockFetch = createMockFetch(V10_CARD);
+      const client = new A2XClient('http://localhost:4000', { fetch: mockFetch });
+
+      await Promise.all([
+        client.getAgentCard(),
+        client.getAgentCard(),
+        client.getAgentCard(),
+      ]);
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
     });
 
     it('should return pre-provided AgentCard without fetch', async () => {
@@ -564,7 +655,7 @@ describe('A2XClient', () => {
       });
 
       await expect(client.sendMessage(createSendMessageParams('Hi')))
-        .rejects.toThrow('no JSONRPC interface');
+        .rejects.toThrow('no supported A2A transport interface');
       expect(provide).not.toHaveBeenCalled();
       expect(mockFetch).not.toHaveBeenCalled();
     });
@@ -600,6 +691,43 @@ describe('A2XClient', () => {
       const task = await client.sendMessage(createSendMessageParams('Hi'));
       expect(task.id).toBe('task-1');
       expect(task.status.state).toBe(TaskState.COMPLETED);
+    });
+
+    it('should send REST requests with media types, v1 roles, and tenant', async () => {
+      const card: AgentCardV10 = {
+        ...V10_CARD,
+        supportedInterfaces: [
+          {
+            url: 'http://localhost:4000/rest',
+            protocolBinding: 'HTTP+JSON',
+            protocolVersion: '1.0',
+            tenant: 'acme',
+          },
+        ],
+      };
+      const mockFetch = createMockFetch({
+        task: { id: 'task-1', status: { state: 'TASK_STATE_COMPLETED' } },
+      });
+      const client = new A2XClient(card, { fetch: mockFetch });
+
+      await client.sendMessage(createSendMessageParams('Hi'));
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        'http://localhost:4000/rest/acme/message:send',
+        expect.objectContaining({
+          method: 'POST',
+          headers: expect.objectContaining({
+            Accept: 'application/a2a+json',
+            'Content-Type': 'application/a2a+json',
+            'A2A-Version': '1.0',
+          }),
+        }),
+      );
+      const request = mockFetch.mock.calls[0]?.[1] as RequestInit;
+      expect(JSON.parse(String(request.body))).toMatchObject({
+        message: { role: 'ROLE_USER' },
+      });
+      expect(JSON.parse(String(request.body))).not.toHaveProperty('tenant');
     });
 
     it('should build correct JSON-RPC request', async () => {

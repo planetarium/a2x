@@ -1191,7 +1191,7 @@ describe('A2XClient auth integration', () => {
 
   it('rejects auth that overwrites extension activation', async () => {
     const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
-    const client = new A2XClient(cardWithHeaderApiKey('x-a2a-extensions'), {
+    const client = new A2XClient(cardWithHeaderApiKey('a2a-extensions'), {
       fetch: mockFetch,
       authProvider: {
         async provide(requirements) {

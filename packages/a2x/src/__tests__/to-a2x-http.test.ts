@@ -11,6 +11,8 @@ import type { AddressInfo } from 'node:net';
 import { LlmAgent } from '../agent/llm-agent.js';
 import { BaseLlmProvider } from '../provider/base.js';
 import { toA2x, createA2xRequestListener } from '../transport/to-a2x.js';
+import { A2A_TRANSPORTS } from '../types/transport.js';
+import type { AgentCardV10 } from '../types/agent-card.js';
 
 // Side-effect import to register response mappers (v0.3 / v1.0).
 import '../a2x/index.js';
@@ -111,5 +113,30 @@ describe('toA2x() HTTP wrapper — JSON-RPC over HTTP error convention', () => {
     };
     expect(body.id).toBe(7);
     expect(body.error.code).toBeLessThan(0);
+  });
+
+  it('advertises and mounts only explicitly configured transports', () => {
+    const agent = new LlmAgent({
+      name: 'multi-transport-agent',
+      provider: new NoopProvider(),
+      instruction: 'noop',
+    });
+    const jsonRpcOnly = toA2x(agent, {
+      defaultUrl: 'http://localhost/a2a',
+    });
+    expect(jsonRpcOnly.httpJsonHandler).toBeUndefined();
+    expect((jsonRpcOnly.handler.getAgentCard() as AgentCardV10).supportedInterfaces)
+      .toHaveLength(1);
+
+    const both = toA2x(agent, {
+      defaultUrl: 'http://localhost/a2a',
+      transports: [A2A_TRANSPORTS.HTTP_JSON, A2A_TRANSPORTS.JSONRPC],
+    });
+    expect(both.httpJsonHandler).toBeDefined();
+    expect(
+      (both.handler.getAgentCard() as AgentCardV10).supportedInterfaces.map(
+        (iface) => iface.protocolBinding,
+      ),
+    ).toEqual(['HTTP+JSON', 'JSONRPC']);
   });
 });

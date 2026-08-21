@@ -18,6 +18,7 @@ import type {
   DeletePushNotificationConfigParams,
   GetPushNotificationConfigParams,
   ListPushNotificationConfigsParams,
+  ListTasksParams,
   PushNotificationAuthenticationInfo,
   PushNotificationConfig,
   TaskPushNotificationConfig,
@@ -35,6 +36,7 @@ import {
   InvalidParamsError,
   InvalidRequestError,
   JSONParseError,
+  MethodNotFoundError,
   PushNotificationNotSupportedError,
   TaskNotCancelableError,
   TaskNotFoundError,
@@ -52,12 +54,20 @@ import type { ResponseMapper } from '../a2x/response-mapper.js';
 import { ResponseMapperFactory } from '../a2x/response-mapper.js';
 import type { RequestContext, AuthResult } from '../types/auth.js';
 import type { Task } from '../types/task.js';
-import { TaskState } from '../types/task.js';
+import { TaskState, TaskStateV10 } from '../types/task.js';
 
 /** Return type of `handle()`. */
 export type HandleResult =
   | JSONRPCResponse
   | AsyncGenerator<unknown>;
+
+/** Raw operation result before a protocol binding adds its envelope. */
+export type OperationResult = unknown | AsyncGenerator<unknown>;
+
+export interface OperationOptions {
+  /** HTTP+JSON streams begin with a Task snapshot before update events. */
+  includeInitialTask?: boolean;
+}
 
 /**
  * v1.0 method name → canonical (v0.3) method name used by the dispatch
@@ -69,6 +79,11 @@ const V10_METHOD_TO_CANONICAL: ReadonlyMap<string, string> = new Map(
     (key) => [A2A_METHODS_V10[key], A2A_METHODS[key]],
   ),
 );
+
+const LIST_TASK_STATES = new Set<string>([
+  ...Object.values(TaskState),
+  ...Object.values(TaskStateV10),
+]);
 
 export class DefaultRequestHandler {
   private readonly a2xServer: A2XServer;
@@ -177,103 +192,106 @@ export class DefaultRequestHandler {
       }
     }
 
-    // Authenticate if context is provided and security requirements exist.
-    // Capture authResult so special-case handlers (e.g. the authenticated
-    // extended card) can consume the resolved principal/scopes.
-    //
-    // Spec a2a-v0.3 / v1.0 model auth failure as a Task lifecycle state
-    // (`TaskState.AUTH_REQUIRED`), not as a JSON-RPC error. For methods
-    // whose response shape is a Task (`message/send`, `message/stream`),
-    // emit an auth-required task. Other methods don't have a task-shaped
-    // response, so they fall back to `-32600 InvalidRequest`.
+    try {
+      const result = await this.handleOperation(
+        request.method,
+        request.params,
+        context,
+      );
+      if (isAsyncGenerator(result)) {
+        return this._wrapStreamInJsonRpc(request.id, result);
+      }
+      return { jsonrpc: '2.0', id: request.id, result };
+    } catch (err) {
+      return this._toErrorResponse(request.id, err);
+    }
+  }
+
+  /**
+   * Execute an A2A operation without JSON-RPC framing.
+   *
+   * JSON-RPC, HTTP+JSON, and future bindings share authentication,
+   * extension activation, validation, and task behavior through this method.
+   */
+  async handleOperation(
+    method: string,
+    params?: unknown,
+    context?: RequestContext,
+    options?: OperationOptions,
+  ): Promise<OperationResult> {
+    this._validateRequestedVersion(context);
+    if (
+      method === A2A_METHODS.LIST_TASKS &&
+      this.a2xServer.protocolVersion !== '1.0'
+    ) {
+      throw new MethodNotFoundError(`Method '${method}' not found`);
+    }
+
     let authResult: AuthResult | undefined;
     if (context && this.a2xServer.securityRequirements.length > 0) {
       authResult = await this._authenticate(context);
       if (!authResult.authenticated) {
         const reason = authResult.error ?? 'Authentication required';
-        if (request.method === A2A_METHODS.SEND_MESSAGE) {
-          return this._buildAuthRequiredResponse(request, reason);
-        }
-        if (request.method === A2A_METHODS.STREAM_MESSAGE) {
-          return this._wrapStreamInJsonRpc(
-            request.id,
-            this._buildAuthRequiredStream(request, reason),
+        const request = operationRequest(method, params);
+        if (method === A2A_METHODS.SEND_MESSAGE) {
+          const task = this._buildAuthRequiredTask(request, reason);
+          const userMessage = (params as { message?: unknown } | undefined)?.message;
+          return this.responseMapper.mapTask(
+            task,
+            userMessage as Parameters<ResponseMapper['mapTask']>[1],
           );
         }
-        const error = new InvalidRequestError(reason);
-        return {
-          jsonrpc: '2.0',
-          id: request.id,
-          error: error.toJSONRPCError(),
-        };
+        if (method === A2A_METHODS.STREAM_MESSAGE) {
+          return this._buildAuthRequiredStream(
+            request,
+            reason,
+            options?.includeInitialTask,
+          );
+        }
+        throw new InvalidRequestError(reason);
       }
     }
 
-    // Enforce `required: true` extension activation per spec a2a-x402 v0.2
-    // §3.1 / §8. Clients must list the extension URI in the
-    // `X-A2A-Extensions` (v0.3) / `A2A-Extensions` (v1.0) header;
-    // unactivated clients get a -32600
-    // InvalidRequest. Skipped when no request context is provided
-    // (in-process / test invocations without HTTP framing).
     if (context) {
       const activationError = this._validateExtensionActivation(context);
-      if (activationError) {
-        return {
-          jsonrpc: '2.0',
-          id: request.id,
-          error: activationError.toJSONRPCError(),
-        };
-      }
+      if (activationError) throw activationError;
     }
 
-    // Special-case: authenticated extended card needs authResult; do not
-    // route via JsonRpcRouter because that layer has no access to auth.
-    if (request.method === A2A_METHODS.GET_EXTENDED_CARD) {
-      try {
-        if (!this.a2xServer.hasAuthenticatedExtendedCardProvider) {
-          throw new AuthenticatedExtendedCardNotConfiguredError();
-        }
-        if (!authResult || !authResult.authenticated) {
-          throw new InvalidRequestError(
-            'Authentication is required for the authenticated extended card',
-          );
-        }
-        const card = await this.a2xServer.getAuthenticatedExtendedCard(authResult);
-        return {
-          jsonrpc: '2.0',
-          id: request.id,
-          result: card,
-        };
-      } catch (err) {
-        return this._toErrorResponse(request.id, err);
+    if (method === A2A_METHODS.GET_EXTENDED_CARD) {
+      if (!this.a2xServer.hasAuthenticatedExtendedCardProvider) {
+        throw new AuthenticatedExtendedCardNotConfiguredError();
       }
+      if (!authResult || !authResult.authenticated) {
+        throw new InvalidRequestError(
+          'Authentication is required for the authenticated extended card',
+        );
+      }
+      return this.a2xServer.getAuthenticatedExtendedCard(authResult);
     }
 
-    // Streaming method → return AsyncGenerator. Each chunk is wrapped
-    // in a JSON-RPC success envelope keyed by `request.id`, per spec
-    // a2a-v0.3 §SendStreamingMessageSuccessResponse — every frame on
-    // the stream is a full JSONRPCResponse, not a bare event object.
-    const routeContext: RouteContext | undefined = context
-      ? { activatedExtensions: [...parseActivatedExtensions(context.headers)] }
-      : undefined;
-
-    if (this.router.isStreamMethod(request.method)) {
-      try {
-        const inner = this.router.routeStream(
-          request,
-          routeContext,
-        ) as AsyncGenerator<unknown>;
-        return this._wrapStreamInJsonRpc(request.id, inner);
-      } catch (err) {
-        return this._toErrorResponse(request.id, err);
-      }
+    const request = operationRequest(method, params);
+    const routeContext: RouteContext = {
+      ...(context
+        ? { activatedExtensions: [...parseActivatedExtensions(context.headers)] }
+        : {}),
+      ...(options?.includeInitialTask ? { includeInitialTask: true } : {}),
+    };
+    if (this.router.isStreamMethod(method)) {
+      return this.router.routeStreamResult(request, routeContext);
     }
+    return this.router.routeResult(request, routeContext);
+  }
 
-    // Synchronous method → return JSONRPCResponse
-    try {
-      return await this.router.route(request, routeContext);
-    } catch (err) {
-      return this._toErrorResponse(request.id, err);
+  private _validateRequestedVersion(context?: RequestContext): void {
+    if (!context) return;
+    const requested = readA2AVersionHeader(context.headers);
+    if (
+      requested !== undefined &&
+      toMajorMinor(requested) !== this.a2xServer.protocolVersion
+    ) {
+      throw new VersionNotSupportedError(
+        `A2A protocol version '${requested}' is not supported; this endpoint serves '${this.a2xServer.protocolVersion}'`,
+      );
     }
   }
 
@@ -296,34 +314,24 @@ export class DefaultRequestHandler {
    * store — unauthenticated callers must not be able to allocate task
    * IDs at will.
    */
-  private _buildAuthRequiredResponse(
-    request: JSONRPCRequest,
-    reason: string,
-  ): JSONRPCResponse {
-    const userMessage = (request.params as { message?: unknown } | undefined)
-      ?.message;
-    const task = this._buildAuthRequiredTask(request, reason);
-    return {
-      jsonrpc: '2.0',
-      id: request.id,
-      result: this.responseMapper.mapTask(
-        task,
-        userMessage as Parameters<ResponseMapper['mapTask']>[1],
-      ),
-    };
-  }
-
   /**
-   * Streaming counterpart to `_buildAuthRequiredResponse`. Emits a single
-   * `TaskStatusUpdateEvent` carrying `auth-required` and closes — clients
-   * react to the state and refresh their credentials before retrying via
-   * a fresh `message/stream`.
+   * Emit the binding-specific initial auth-required stream value and close.
    */
   private async *_buildAuthRequiredStream(
     request: JSONRPCRequest,
     reason: string,
+    includeInitialTask = false,
   ): AsyncGenerator<unknown> {
     const task = this._buildAuthRequiredTask(request, reason);
+    if (includeInitialTask) {
+      const userMessage = (request.params as { message?: unknown } | undefined)
+        ?.message;
+      yield this.responseMapper.mapTask(
+        task,
+        userMessage as Parameters<ResponseMapper['mapTask']>[1],
+      );
+      return;
+    }
     yield this.responseMapper.mapStatusUpdateEvent({
       taskId: task.id,
       contextId: task.contextId ?? '',
@@ -536,6 +544,10 @@ export class DefaultRequestHandler {
         return this._handleGetTask(taskParams);
       },
     );
+
+    this.router.registerMethod(A2A_METHODS.LIST_TASKS, async (params) => {
+      return this._handleListTasks(this._validateListTasksParams(params));
+    });
 
     // tasks/cancel
     this.router.registerMethod(
@@ -810,6 +822,10 @@ export class DefaultRequestHandler {
     let observedTaskArtifacts = task.artifacts;
     let artifacts: Artifact[] = [...priorArtifacts];
 
+    if (context?.includeInitialTask) {
+      yield this.responseMapper.mapTask(task, params.message);
+    }
+
     // finally closes the bus so resubscribers see the stream end regardless
     // of how the primary stream terminates (normal, error, cancel via return).
     try {
@@ -1021,6 +1037,20 @@ export class DefaultRequestHandler {
     return this.responseMapper.mapTask(sliced);
   }
 
+  private async _handleListTasks(params: ListTasksParams): Promise<unknown> {
+    const list = this.a2xServer.taskStore.listTasks;
+    if (!list) {
+      throw new UnsupportedOperationError(
+        'Task listing is not supported by the configured TaskStore',
+      );
+    }
+    const result = await list.call(this.a2xServer.taskStore, params);
+    return {
+      ...result,
+      tasks: result.tasks.map((task) => this.responseMapper.mapTask(task)),
+    };
+  }
+
   private async _handleCancelTask(params: TaskIdParams): Promise<unknown> {
     const task = await this.a2xServer.taskStore.getTask(params.id);
     if (!task) {
@@ -1201,6 +1231,37 @@ export class DefaultRequestHandler {
       if (internalRole !== undefined) {
         message.role = internalRole;
       }
+      const configuration = p.configuration as
+        | Record<string, unknown>
+        | undefined;
+      if (configuration) {
+        if (typeof configuration.returnImmediately === 'boolean') {
+          configuration.blocking = !configuration.returnImmediately;
+        }
+        const flat = configuration.taskPushNotificationConfig as
+          | Record<string, unknown>
+          | undefined;
+        if (flat) {
+          const auth = flat.authentication as
+            | { scheme?: string; credentials?: string }
+            | undefined;
+          configuration.pushNotificationConfig = {
+            id: typeof flat.id === 'string' ? flat.id : '',
+            url: flat.url,
+            ...(flat.token !== undefined ? { token: flat.token } : {}),
+            ...(auth?.scheme
+              ? {
+                  authentication: {
+                    schemes: [auth.scheme],
+                    ...(auth.credentials !== undefined
+                      ? { credentials: auth.credentials }
+                      : {}),
+                  },
+                }
+              : {}),
+          };
+        }
+      }
     }
 
     return params as SendMessageParams;
@@ -1247,6 +1308,55 @@ export class DefaultRequestHandler {
       historyLength: p.historyLength as number | undefined,
       metadata: p.metadata as Record<string, unknown> | undefined,
     };
+  }
+
+  private _validateListTasksParams(params: unknown): ListTasksParams {
+    if (params === undefined) return {};
+    if (!params || typeof params !== 'object') {
+      throw new InvalidParamsError('ListTasks parameters must be an object');
+    }
+    const p = params as Record<string, unknown>;
+    if (p.pageSize !== undefined) {
+      if (
+        typeof p.pageSize !== 'number' ||
+        !Number.isInteger(p.pageSize) ||
+        p.pageSize < 1 ||
+        p.pageSize > 100
+      ) {
+        throw new InvalidParamsError('ListTasks "pageSize" must be an integer from 1 to 100');
+      }
+    }
+    if (p.historyLength !== undefined) {
+      if (
+        typeof p.historyLength !== 'number' ||
+        !Number.isInteger(p.historyLength) ||
+        p.historyLength < 0
+      ) {
+        throw new InvalidParamsError(
+          'ListTasks "historyLength" must be a non-negative integer',
+        );
+      }
+    }
+    if (p.includeArtifacts !== undefined && typeof p.includeArtifacts !== 'boolean') {
+      throw new InvalidParamsError('ListTasks "includeArtifacts" must be a boolean');
+    }
+    for (const field of ['contextId', 'status', 'pageToken', 'statusTimestampAfter']) {
+      if (p[field] !== undefined && typeof p[field] !== 'string') {
+        throw new InvalidParamsError(`ListTasks "${field}" must be a string`);
+      }
+    }
+    if (
+      typeof p.statusTimestampAfter === 'string' &&
+      !Number.isFinite(Date.parse(p.statusTimestampAfter))
+    ) {
+      throw new InvalidParamsError(
+        'ListTasks "statusTimestampAfter" must be an ISO 8601 timestamp',
+      );
+    }
+    if (typeof p.status === 'string' && !LIST_TASK_STATES.has(p.status)) {
+      throw new InvalidParamsError(`ListTasks "status" is not a valid task state`);
+    }
+    return p as ListTasksParams;
   }
 
   /**
@@ -1699,4 +1809,19 @@ function readA2AVersionHeader(
 function toMajorMinor(version: string): string {
   const match = /^(\d+)\.(\d+)/.exec(version);
   return match ? `${match[1]}.${match[2]}` : version;
+}
+
+function operationRequest(method: string, params?: unknown): JSONRPCRequest {
+  return {
+    jsonrpc: '2.0',
+    id: 0,
+    method,
+    ...(params !== undefined ? { params } : {}),
+  };
+}
+
+function isAsyncGenerator(value: unknown): value is AsyncGenerator<unknown> {
+  return Boolean(
+    value && typeof value === 'object' && Symbol.asyncIterator in value,
+  );
 }

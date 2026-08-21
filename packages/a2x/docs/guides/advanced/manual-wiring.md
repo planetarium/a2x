@@ -56,11 +56,32 @@ const a2xServer = new A2XServer({ taskStore, executor })
     tags: ['chat'],
   });
 
-// 6. Request handler — the thing your HTTP layer calls.
+// 6. Transport-neutral domain handler plus JSON-RPC adapter.
 const handler = new DefaultRequestHandler(a2xServer);
 ```
 
-`handler.getAgentCard()` returns the AgentCard JSON. `handler.handle(body, context)` processes a JSON-RPC request and returns either a plain object or an async iterable (for streams).
+`handler.getAgentCard()` returns the AgentCard JSON. `handler.handle(body, context)` processes a JSON-RPC request and returns either a plain object or an async iterable (for streams). `handler.handleOperation()` is the transport-neutral boundary used by protocol adapters; most applications should mount an adapter rather than call it directly.
+
+### HTTP+JSON transport
+
+The v1.0 HTTP+JSON binding uses REST resources and `application/a2a+json` instead of JSON-RPC envelopes:
+
+```ts
+import {
+  A2A_TRANSPORTS,
+  HttpJsonRequestHandler,
+} from '@a2x/sdk';
+
+a2xServer.setDefaultTransport(A2A_TRANSPORTS.HTTP_JSON);
+
+const httpJsonHandler = new HttpJsonRequestHandler(handler, {
+  basePath: '/a2a',
+});
+```
+
+Call `httpJsonHandler.handle({ method, url, body, context })` from your framework route. The result contains an HTTP `status`, response `headers`, and either a JSON `body` or an async generator for SSE. `HttpJsonRequestHandler` covers the complete A2A v1.0 REST operation surface and returns structured `google.rpc.Status` JSON errors.
+
+Changing AgentCard metadata alone does not mount routes. Construct and mount `HttpJsonRequestHandler` whenever you advertise `HTTP+JSON`. Conversely, do not add an `HTTP+JSON` interface with `addInterface()` unless that URL is actually backed by the handler.
 
 ## Customizing each piece
 
@@ -218,3 +239,20 @@ If you don't need any of the customizations above, don't bother with manual wiri
 const app = toA2x(agent, { port: 4000, defaultUrl: '...' });
 // app gives you the running server; access .handler if you need it.
 ```
+
+The standalone helper enables configured transports and advertises exactly those bindings:
+
+```ts
+import { A2A_TRANSPORTS, toA2x } from '@a2x/sdk';
+
+const app = toA2x(agent, {
+  port: 4000,
+  defaultUrl: 'http://localhost:4000/a2a',
+  transports: [
+    A2A_TRANSPORTS.HTTP_JSON,
+    A2A_TRANSPORTS.JSONRPC,
+  ],
+});
+```
+
+The first entry is the primary AgentCard interface. Omitting `transports` preserves the existing JSON-RPC-only behavior. HTTP+JSON is v1.0-only; configuring it with `protocolVersion: '0.3'` throws during setup.

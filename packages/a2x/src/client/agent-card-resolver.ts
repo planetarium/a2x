@@ -4,6 +4,9 @@
 
 import type { AgentCardV03, AgentCardV10 } from '../types/agent-card.js';
 import type { ProtocolVersion } from '../a2x/a2x-agent.js';
+import type { AgentInterfaceV10 } from '../types/agent-card.js';
+import type { A2ATransport } from '../types/transport.js';
+import { A2A_TRANSPORTS } from '../types/transport.js';
 
 export type { ProtocolVersion };
 
@@ -29,6 +32,13 @@ export interface ResolvedAgentCard {
   card: AgentCardV03 | AgentCardV10;
   version: ProtocolVersion;
   baseUrl: string;
+}
+
+export interface SelectedAgentInterface {
+  url: string;
+  binding: A2ATransport;
+  protocolVersion: ProtocolVersion;
+  tenant?: string;
 }
 
 // ─── Protocol Version Detection ───
@@ -66,18 +76,33 @@ export function detectProtocolVersion(card: Record<string, unknown>): ProtocolVe
 // ─── Endpoint URL Extraction ───
 
 /**
- * Extract the JSON-RPC endpoint URL from a resolved AgentCard.
+ * Select an endpoint whose binding the client actually implements.
  */
-export function getAgentEndpointUrl(
+export function selectAgentInterface(
   card: AgentCardV03 | AgentCardV10,
   version: ProtocolVersion,
-): string {
+  preferredTransports: readonly A2ATransport[] = [
+    A2A_TRANSPORTS.JSONRPC,
+    A2A_TRANSPORTS.HTTP_JSON,
+  ],
+): SelectedAgentInterface {
   if (version === '0.3') {
     const v03 = card as AgentCardV03;
     if (!v03.url) {
       throw new Error('v0.3 AgentCard missing required "url" field');
     }
-    return v03.url;
+    const preferred = (v03.preferredTransport ?? 'JSONRPC').toUpperCase();
+    if (preferred !== A2A_TRANSPORTS.JSONRPC) {
+      throw new Error(
+        `Unsupported v0.3 A2A transport '${v03.preferredTransport}'. ` +
+          'Only JSONRPC is implemented for v0.3 cards.',
+      );
+    }
+    return {
+      url: v03.url,
+      binding: A2A_TRANSPORTS.JSONRPC,
+      protocolVersion: '0.3',
+    };
   }
 
   const v10 = card as AgentCardV10;
@@ -85,15 +110,55 @@ export function getAgentEndpointUrl(
     throw new Error('v1.0 AgentCard has no supportedInterfaces');
   }
 
-  // Prefer JSONRPC binding
-  const jsonRpcInterface = v10.supportedInterfaces.find(
-    (i) => i.protocolBinding?.toUpperCase() === 'JSONRPC',
-  );
-  if (jsonRpcInterface) {
-    return jsonRpcInterface.url;
+  for (const binding of preferredTransports) {
+    const iface = v10.supportedInterfaces.find(
+      (candidate) =>
+        normalizeBinding(candidate) === binding &&
+        normalizeProtocolVersion(candidate.protocolVersion) === '1.0',
+    );
+    if (iface) {
+      return {
+        url: iface.url,
+        binding,
+        protocolVersion: '1.0',
+        ...(iface.tenant ? { tenant: iface.tenant } : {}),
+      };
+    }
   }
 
-  throw new Error('v1.0 AgentCard has no JSONRPC interface');
+  const advertised = v10.supportedInterfaces
+    .map((i) => `${i.protocolBinding}@${i.protocolVersion}`)
+    .join(', ');
+  throw new Error(
+    `AgentCard has no supported A2A transport interface. ` +
+      `Client supports: ${preferredTransports.join(', ')}; agent advertises: ${advertised}`,
+  );
+}
+
+function normalizeProtocolVersion(value: string | undefined): ProtocolVersion | undefined {
+  if (value?.startsWith('0.3')) return '0.3';
+  if (value?.startsWith('1.')) return '1.0';
+  return undefined;
+}
+
+/**
+ * Extract an endpoint URL using the default client transport preference.
+ * Kept for compatibility; use selectAgentInterface() when the binding matters.
+ */
+export function getAgentEndpointUrl(
+  card: AgentCardV03 | AgentCardV10,
+  version: ProtocolVersion,
+): string {
+  return selectAgentInterface(card, version).url;
+}
+
+function normalizeBinding(iface: AgentInterfaceV10): A2ATransport | undefined {
+  const value = iface.protocolBinding?.toUpperCase();
+  if (value === A2A_TRANSPORTS.JSONRPC) return A2A_TRANSPORTS.JSONRPC;
+  if (value === A2A_TRANSPORTS.HTTP_JSON || value === 'REST') {
+    return A2A_TRANSPORTS.HTTP_JSON;
+  }
+  return undefined;
 }
 
 // ─── AgentCard Resolution ───

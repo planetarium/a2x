@@ -9,3 +9,4 @@ export * from './agent-card.js';
 export * from './task.js';
 export * from './jsonrpc.js';
 export * from './errors.js';
+export * from './transport.js';

@@ -10,6 +10,7 @@ import { ApiKeyAuthorization } from '../security/api-key.js';
 import { HttpBearerAuthorization } from '../security/http-bearer.js';
 import { OAuth2DeviceCodeAuthorization } from '../security/oauth2-device-code.js';
 import type { AgentCardV03, AgentCardV10 } from '../types/agent-card.js';
+import { A2A_TRANSPORTS } from '../types/transport.js';
 
 // Ensure mappers are registered
 import '../a2x/index.js';
@@ -229,6 +230,23 @@ describe('Layer 3: A2XServer', () => {
       const card = a2x.getAgentCard() as AgentCardV10;
       expect(card.supportedInterfaces).toHaveLength(2);
       expect(card.supportedInterfaces[1].protocolBinding).toBe('GRPC');
+    });
+
+    it('should advertise HTTP+JSON as the configured default transport', () => {
+      const a2x = createA2XAgent();
+      a2x
+        .setDefaultUrl('https://example.com/a2a')
+        .setDefaultTransport(A2A_TRANSPORTS.HTTP_JSON);
+
+      const card = a2x.getAgentCard() as AgentCardV10;
+      expect(card.supportedInterfaces[0]?.protocolBinding).toBe('HTTP+JSON');
+    });
+
+    it('should reject HTTP+JSON on a v0.3 server', () => {
+      const a2x = createA2XAgent(undefined, StreamingMode.SSE, '0.3');
+      expect(() =>
+        a2x.setDefaultTransport(A2A_TRANSPORTS.HTTP_JSON),
+      ).toThrow('v0.3 servers support JSONRPC only');
     });
 
     it('should include security schemes', () => {

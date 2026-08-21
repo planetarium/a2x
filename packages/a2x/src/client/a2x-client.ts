@@ -1,8 +1,8 @@
 /**
  * A2XClient — Client for communicating with remote A2A agents.
  *
- * Supports both v0.3 and v1.0 protocol versions with auto-detection.
- * Protocol version is determined from the AgentCard structure.
+ * Supports v0.3 JSON-RPC plus v1.0 JSON-RPC and HTTP+JSON with
+ * protocol and binding selection driven by the AgentCard.
  */
 
 import type { LocalAccount } from 'viem';
@@ -12,7 +12,12 @@ import type {
   TaskStatusUpdateEvent,
   TaskArtifactUpdateEvent,
 } from '../types/task.js';
-import type { SendMessageParams, JSONRPCRequest } from '../types/jsonrpc.js';
+import type {
+  SendMessageParams,
+  TaskPushNotificationConfig,
+  ListTasksParams,
+  ListTasksResult,
+} from '../types/jsonrpc.js';
 import type { JSONRPCResponse } from '../types/jsonrpc.js';
 import { A2A_METHODS } from '../types/jsonrpc.js';
 import type { A2AError } from '../types/errors.js';
@@ -33,11 +38,12 @@ import {
   A2A_ERROR_CODES,
 } from '../types/errors.js';
 import { TaskState } from '../types/task.js';
+import { ROLE_TO_V10 } from '../types/common.js';
 import type { ResolvedAgentCard } from './agent-card-resolver.js';
 import {
   resolveAgentCard,
   detectProtocolVersion,
-  getAgentEndpointUrl,
+  selectAgentInterface,
 } from './agent-card-resolver.js';
 import { getResponseParser } from './response-parser.js';
 import type { ResponseParser } from './response-parser.js';
@@ -48,6 +54,12 @@ import {
   type AuthProviderInvocation,
 } from './auth-provider-context.js';
 import type { AuthScheme, AuthRequestContext } from './auth-scheme.js';
+import type { A2ATransport, A2XClientTransport } from './client-transport.js';
+import {
+  A2A_TRANSPORTS,
+  HttpJsonClientTransport,
+  JsonRpcClientTransport,
+} from './client-transport.js';
 import { normalizeRequirements } from './auth-normalizer.js';
 import {
   X402_EXTENSION_URI,
@@ -350,6 +362,11 @@ export interface A2XClientOptions {
   headers?: Record<string, string>;
   authProvider?: AuthProvider;
   /**
+   * Ordered protocol bindings to negotiate from a v1.0 AgentCard.
+   * Defaults to JSON-RPC first, then HTTP+JSON. v0.3 remains JSON-RPC-only.
+   */
+  preferredTransports?: readonly A2ATransport[];
+  /**
    * A2A extension URIs the client wants to activate. Emitted as a
    * comma-separated `X-A2A-Extensions` HTTP header on every JSON-RPC
    * request per a2a-x402 v0.2 §8 and the A2A core extension activation
@@ -463,15 +480,17 @@ export class A2XClient {
   private readonly _authProvider?: AuthProvider;
   private readonly _extensions: Set<string>;
   private readonly _x402?: A2XClientX402Options;
+  private readonly _preferredTransports: readonly A2ATransport[];
   private _resolved: ResolvedAgentCard | null = null;
   private _parser: ResponseParser | null = null;
   private _endpointUrl: string | null = null;
+  private _tenant: string | undefined;
+  private _transport: A2XClientTransport | null = null;
   private _resolvedSchemes?: AuthScheme[];
   private _resolutionPromise?: Promise<void>;
   private _authInitializationPromise?: Promise<void>;
   private _authRefreshPromise?: Promise<boolean>;
   private _authGeneration = 0;
-  private _requestId = 0;
 
   constructor(
     urlOrAgentCard: string | AgentCardV03 | AgentCardV10,
@@ -483,6 +502,10 @@ export class A2XClient {
     this._authProvider = options?.authProvider;
     this._extensions = new Set(options?.extensions ?? []);
     this._x402 = options?.x402;
+    this._preferredTransports = options?.preferredTransports ?? [
+      A2A_TRANSPORTS.JSONRPC,
+      A2A_TRANSPORTS.HTTP_JSON,
+    ];
     if (this._x402 && !this._extensions.has(X402_EXTENSION_URI)) {
       // Spec a2a-x402 v0.2 §8: clients MUST activate the extension via
       // `X-A2A-Extensions`. Auto-register so callers don't have to — but only
@@ -815,9 +838,9 @@ export class A2XClient {
     await this._ensureAuthenticated();
     let authGeneration = this._authGeneration;
     const formatted = this._formatParams(params);
-    const request = this._buildJsonRpcRequest(A2A_METHODS.SEND_MESSAGE, formatted);
-    const result = await this._postJsonRpc(
-      request,
+    const result = await this._callTransport(
+      A2A_METHODS.SEND_MESSAGE,
+      formatted,
       onTransport,
       (generation) => { authGeneration = generation; },
     );
@@ -828,8 +851,11 @@ export class A2XClient {
     // second response is propagated to the caller as-is.
     if (task.status.state !== TaskState.AUTH_REQUIRED) return task;
     if (!(await this._refreshAuth(authGeneration))) return task;
-    const retryRequest = this._buildJsonRpcRequest(A2A_METHODS.SEND_MESSAGE, formatted);
-    const retryResult = await this._postJsonRpc(retryRequest, onTransport);
+    const retryResult = await this._callTransport(
+      A2A_METHODS.SEND_MESSAGE,
+      formatted,
+      onTransport,
+    );
     return this._parser!.parseTask(retryResult);
   }
 
@@ -850,14 +876,7 @@ export class A2XClient {
     onTransport?: () => void | Promise<void>,
   ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
     const formatted = this._formatParams(params);
-    const request = this._buildJsonRpcRequest(
-      A2A_METHODS.STREAM_MESSAGE,
-      formatted,
-    );
-
-    const headers = this._buildHeaders({
-      Accept: 'text/event-stream',
-    });
+    const headers = this._buildHeaders({ Accept: 'text/event-stream' });
     const url = new URL(this._endpointUrl!);
 
     this._applyAuth(
@@ -865,69 +884,70 @@ export class A2XClient {
       [
         'Content-Type',
         'Accept',
-        ...(this._extensions.size > 0 ? ['X-A2A-Extensions'] : []),
+        ...(this._extensions.size > 0
+          ? [this._extensionHeaderName()]
+          : []),
       ],
     );
     const authGeneration = this._authGeneration;
 
-    // Everything above ran locally; serialize the body before declaring the
-    // request submitted, so a payload that cannot even be encoded never
-    // counts as having possibly reached the merchant.
-    const body = JSON.stringify(request);
     // An already-aborted fetch cannot receive the serialized voucher. Check
     // before persisting batch submission so cancellation remains a clean,
     // recoverable pre-transport exit.
     signal?.throwIfAborted();
-    await onTransport?.();
-    const response = await this._fetchImpl(url.toString(), {
-      method: 'POST',
-      headers,
-      body,
-      signal,
-    });
+    const streamController = new AbortController();
+    const transportSignal = signal
+      ? AbortSignal.any([signal, streamController.signal])
+      : streamController.signal;
+    try {
+      const response = await this._transport!.stream({
+        method: A2A_METHODS.STREAM_MESSAGE,
+        params: this._withServiceParams(formatted),
+        endpointUrl: url.toString(),
+        headers,
+        signal: transportSignal,
+        onTransport,
+      });
 
-    if (!response.ok) {
-      throw new InternalError(
-        `HTTP ${response.status}: ${response.statusText}`,
-      );
-    }
-
-    // Server may return a JSON-RPC error instead of SSE
-    // (e.g., unsupported operation, invalid params).
-    const contentType = response.headers.get('content-type') ?? '';
-    if (!contentType.includes('text/event-stream')) {
-      const jsonRpcResponse = (await response.json()) as JSONRPCResponse;
-      if ('error' in jsonRpcResponse && jsonRpcResponse.error) {
-        const { code, message, data } = jsonRpcResponse.error;
-        const ErrorClass = ERROR_CODE_MAP[code] ?? InternalError;
-        throw new ErrorClass(message, data);
-      }
-      return;
-    }
-
-    // Buffer the first event so we can inspect for auth-required without
-    // surfacing it to the caller before deciding to refresh+retry.
-    const events = parseSSEStream(response, this._parser!);
-    const firstResult = await events.next();
-    if (firstResult.done) return;
-    const firstEvent = firstResult.value;
-    if (
-      !isRetry &&
-      'status' in firstEvent &&
-      firstEvent.status?.state === TaskState.AUTH_REQUIRED &&
-      this._authProvider?.refresh &&
-      this._resolvedSchemes
-    ) {
-      // Close the rejected response before refreshing and opening another SSE
-      // connection. parseSSEStream() cancels its reader on early return.
-      await events.return(undefined);
-      if (await this._refreshAuth(authGeneration)) {
-        yield* this._streamWithAuthRetry(params, signal, true, onTransport);
+      // A JSON-RPC server may return a unary error instead of SSE.
+      // (e.g., unsupported operation, invalid params).
+      const contentType = response.headers.get('content-type') ?? '';
+      if (!contentType.includes('text/event-stream')) {
+        const jsonRpcResponse = (await response.json()) as JSONRPCResponse;
+        if ('error' in jsonRpcResponse && jsonRpcResponse.error) {
+          const { code, message, data } = jsonRpcResponse.error;
+          const ErrorClass = ERROR_CODE_MAP[code] ?? InternalError;
+          throw new ErrorClass(message, data);
+        }
         return;
       }
+
+      // Buffer the first event so we can inspect for auth-required without
+      // surfacing it to the caller before deciding to refresh+retry.
+      const events = parseSSEStream(response, this._parser!);
+      const firstResult = await events.next();
+      if (firstResult.done) return;
+      const firstEvent = firstResult.value;
+      if (
+        !isRetry &&
+        'status' in firstEvent &&
+        firstEvent.status?.state === TaskState.AUTH_REQUIRED &&
+        this._authProvider?.refresh &&
+        this._resolvedSchemes
+      ) {
+        // Close the rejected response before refreshing and opening another SSE
+        // connection. parseSSEStream() cancels its reader on early return.
+        await events.return(undefined);
+        if (await this._refreshAuth(authGeneration)) {
+          yield* this._streamWithAuthRetry(params, signal, true, onTransport);
+          return;
+        }
+      }
+      yield firstEvent;
+      yield* events;
+    } finally {
+      streamController.abort();
     }
-    yield firstEvent;
-    yield* events;
   }
 
   /**
@@ -1186,8 +1206,7 @@ export class A2XClient {
     if (options?.metadata !== undefined) {
       params.metadata = options.metadata;
     }
-    const request = this._buildJsonRpcRequest(A2A_METHODS.GET_TASK, params);
-    const result = await this._postJsonRpc(request);
+    const result = await this._callTransport(A2A_METHODS.GET_TASK, params);
     return this._parser!.parseTask(result);
   }
 
@@ -1199,11 +1218,132 @@ export class A2XClient {
     this._assertNotAuthProviderReentry();
     await this._ensureResolved();
     await this._ensureAuthenticated();
-    const request = this._buildJsonRpcRequest(A2A_METHODS.CANCEL_TASK, {
+    const result = await this._callTransport(A2A_METHODS.CANCEL_TASK, {
       id: taskId,
     });
-    const result = await this._postJsonRpc(request);
     return this._parser!.parseTask(result);
+  }
+
+  /** List tasks exposed by an A2A v1.0 agent. */
+  async listTasks(options: ListTasksParams = {}): Promise<ListTasksResult> {
+    await this._ensureResolved();
+    if (this._resolved!.version !== '1.0') {
+      throw new VersionNotSupportedError('ListTasks requires A2A v1.0');
+    }
+    await this._ensureAuthenticated();
+    const raw = (await this._callTransport(
+      A2A_METHODS.LIST_TASKS,
+      options,
+    )) as Omit<ListTasksResult, 'tasks'> & { tasks?: unknown[] };
+    return {
+      tasks: (raw.tasks ?? []).map((task) => this._parser!.parseTask(task)),
+      nextPageToken: raw.nextPageToken ?? '',
+      pageSize: raw.pageSize ?? 0,
+      totalSize: raw.totalSize ?? 0,
+    };
+  }
+
+  /** Subscribe to updates for an existing task. */
+  async *subscribeTask(
+    taskId: string,
+    signal?: AbortSignal,
+  ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
+    await this._ensureResolved();
+    await this._ensureAuthenticated();
+    const headers = this._buildHeaders({ Accept: 'text/event-stream' });
+    const url = new URL(this._endpointUrl!);
+    this._applyAuth(
+      { headers, url },
+      [
+        'Content-Type',
+        'Accept',
+        ...(this._extensions.size > 0
+          ? [this._extensionHeaderName()]
+          : []),
+      ],
+    );
+    const streamController = new AbortController();
+    const transportSignal = signal
+      ? AbortSignal.any([signal, streamController.signal])
+      : streamController.signal;
+    try {
+      const response = await this._transport!.stream({
+        method: A2A_METHODS.RESUBSCRIBE,
+        params: this._withServiceParams({ id: taskId }),
+        endpointUrl: url.toString(),
+        headers,
+        signal: transportSignal,
+      });
+      yield* parseSSEStream(response, this._parser!);
+    } finally {
+      streamController.abort();
+    }
+  }
+
+  /** Create or replace a task push-notification configuration. */
+  async createTaskPushNotificationConfig(
+    config: TaskPushNotificationConfig,
+  ): Promise<TaskPushNotificationConfig> {
+    await this._ensureResolved();
+    await this._ensureAuthenticated();
+    const result = await this._callTransport(
+      A2A_METHODS.SET_PUSH_CONFIG,
+      this._formatPushConfig(config),
+    );
+    return this._parsePushConfig(result);
+  }
+
+  async getTaskPushNotificationConfig(
+    taskId: string,
+    configId?: string,
+  ): Promise<TaskPushNotificationConfig> {
+    await this._ensureResolved();
+    await this._ensureAuthenticated();
+    if (this._resolved!.version === '1.0' && !configId) {
+      throw new InvalidParamsError(
+        'A push-notification config ID is required by A2A v1.0',
+      );
+    }
+    const params = this._resolved!.version === '0.3'
+      ? { id: taskId, ...(configId ? { pushNotificationConfigId: configId } : {}) }
+      : { taskId, id: configId };
+    const result = await this._callTransport(A2A_METHODS.GET_PUSH_CONFIG, params);
+    return this._parsePushConfig(result);
+  }
+
+  async listTaskPushNotificationConfigs(
+    taskId: string,
+  ): Promise<TaskPushNotificationConfig[]> {
+    await this._ensureResolved();
+    await this._ensureAuthenticated();
+    const params = this._resolved!.version === '0.3' ? { id: taskId } : { taskId };
+    const result = await this._callTransport(A2A_METHODS.LIST_PUSH_CONFIGS, params);
+    const list = Array.isArray(result)
+      ? result
+      : ((result as { configs?: unknown[] }).configs ?? []);
+    return list.map((config) => this._parsePushConfig(config));
+  }
+
+  async deleteTaskPushNotificationConfig(
+    taskId: string,
+    configId: string,
+  ): Promise<void> {
+    await this._ensureResolved();
+    await this._ensureAuthenticated();
+    const params = this._resolved!.version === '0.3'
+      ? { id: taskId, pushNotificationConfigId: configId }
+      : { taskId, id: configId };
+    await this._callTransport(A2A_METHODS.DELETE_PUSH_CONFIG, params);
+  }
+
+  /** Retrieve the authenticated extended AgentCard. */
+  async getExtendedAgentCard(): Promise<AgentCardV03 | AgentCardV10> {
+    await this._ensureResolved();
+    await this._ensureAuthenticated();
+    return (await this._callTransport(
+      A2A_METHODS.GET_EXTENDED_CARD,
+      {},
+    )) as AgentCardV03 | AgentCardV10;
   }
 
   /**
@@ -1440,7 +1580,6 @@ export class A2XClient {
 
   private async _ensureResolved(): Promise<void> {
     if (this._resolved) return;
-
     if (!this._resolutionPromise) {
       this._resolutionPromise = this._resolveOnce();
     }
@@ -1456,7 +1595,6 @@ export class A2XClient {
 
   private async _resolveOnce(): Promise<void> {
     if (this._resolved) return;
-
     let resolved: ResolvedAgentCard;
     if (typeof this._urlOrCard === 'string') {
       resolved = await resolveAgentCard(this._urlOrCard, {
@@ -1469,22 +1607,35 @@ export class A2XClient {
       const version = detectProtocolVersion(
         card as unknown as Record<string, unknown>,
       );
-      const endpointUrl = getAgentEndpointUrl(card, version);
-
+      const selected = selectAgentInterface(
+        card,
+        version,
+        this._preferredTransports,
+      );
       resolved = {
         card,
         version,
-        baseUrl: new URL(endpointUrl).origin,
+        baseUrl: new URL(selected.url).origin,
       };
     }
 
     // Validate every derived value before publishing any resolved state. A
     // failed discovery must remain retryable on the next request.
     const parser = getResponseParser(resolved.version);
-    const endpointUrl = getAgentEndpointUrl(resolved.card, resolved.version);
+    const selected = selectAgentInterface(
+      resolved.card,
+      resolved.version,
+      this._preferredTransports,
+    );
+    const transport: A2XClientTransport =
+      selected.binding === A2A_TRANSPORTS.HTTP_JSON
+        ? new HttpJsonClientTransport(this._fetchImpl)
+        : new JsonRpcClientTransport(this._fetchImpl, resolved.version);
     this._resolved = resolved;
     this._parser = parser;
-    this._endpointUrl = endpointUrl;
+    this._endpointUrl = selected.url;
+    this._tenant = selected.tenant;
+    this._transport = transport;
     this._activateX402Extension();
   }
 
@@ -1524,7 +1675,46 @@ export class A2XClient {
    * v0.3 servers expect `kind` discriminators and different field structures.
    */
   private _formatParams(params: SendMessageParams): unknown {
-    if (this._resolved?.version !== '0.3') return params;
+    if (this._resolved?.version === '1.0') {
+      const formatted = JSON.parse(JSON.stringify(params)) as Record<string, unknown>;
+      const message = formatted.message as Record<string, unknown>;
+      if (typeof message.role === 'string') {
+        message.role = ROLE_TO_V10.get(message.role as 'user' | 'agent') ?? message.role;
+      }
+      const configuration = formatted.configuration as
+        | Record<string, unknown>
+        | undefined;
+      if (configuration) {
+        if (typeof configuration.blocking === 'boolean') {
+          configuration.returnImmediately = !configuration.blocking;
+          delete configuration.blocking;
+        }
+        const push = configuration.pushNotificationConfig as
+          | Record<string, unknown>
+          | undefined;
+        if (push) {
+          configuration.taskPushNotificationConfig = {
+            taskId: '',
+            ...push,
+            ...(push.authentication && typeof push.authentication === 'object'
+              ? {
+                  authentication: {
+                    scheme: (push.authentication as { schemes?: string[] }).schemes?.[0],
+                    ...((push.authentication as { credentials?: string }).credentials
+                      ? {
+                          credentials: (push.authentication as { credentials?: string })
+                            .credentials,
+                        }
+                      : {}),
+                  },
+                }
+              : {}),
+          };
+          delete configuration.pushNotificationConfig;
+        }
+      }
+      return formatted;
+    }
 
     // Deep clone to avoid mutating the original
     const formatted = JSON.parse(JSON.stringify(params)) as Record<string, unknown>;
@@ -1544,37 +1734,85 @@ export class A2XClient {
     return formatted;
   }
 
+  private _formatPushConfig(config: TaskPushNotificationConfig): unknown {
+    if (this._resolved?.version === '0.3') return config;
+    const inner = config.pushNotificationConfig;
+    return {
+      taskId: config.taskId,
+      id: inner.id,
+      url: inner.url,
+      ...(inner.token !== undefined ? { token: inner.token } : {}),
+      ...(inner.authentication !== undefined
+        ? {
+            authentication: {
+              scheme: inner.authentication.schemes[0],
+              ...(inner.authentication.credentials !== undefined
+                ? { credentials: inner.authentication.credentials }
+                : {}),
+            },
+          }
+        : {}),
+    };
+  }
+
+  private _parsePushConfig(raw: unknown): TaskPushNotificationConfig {
+    const value = raw as Record<string, unknown>;
+    if (value.pushNotificationConfig) {
+      return value as unknown as TaskPushNotificationConfig;
+    }
+    const authentication = value.authentication as
+      | { scheme?: string; credentials?: string }
+      | undefined;
+    return {
+      taskId: String(value.taskId ?? ''),
+      pushNotificationConfig: {
+        id: String(value.id ?? ''),
+        url: String(value.url ?? ''),
+        ...(value.token !== undefined ? { token: String(value.token) } : {}),
+        ...(authentication?.scheme
+          ? {
+              authentication: {
+                schemes: [authentication.scheme],
+                ...(authentication.credentials !== undefined
+                  ? { credentials: authentication.credentials }
+                  : {}),
+              },
+            }
+          : {}),
+      },
+    };
+  }
+
   private _buildHeaders(
     extra?: Record<string, string>,
   ): Record<string, string> {
     const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
+      'Content-Type':
+        this._transport?.binding === A2A_TRANSPORTS.HTTP_JSON
+          ? 'application/a2a+json'
+          : 'application/json',
       ...extra,
       ...this._headers,
     };
+    if (this._resolved?.version === '1.0') {
+      headers['A2A-Version'] = '1.0';
+    }
     if (this._extensions.size > 0) {
       // Spec a2a-x402 v0.2 §8: clients MUST request activation via
       // `X-A2A-Extensions`. Multiple active extensions are comma-separated
       // per standard HTTP list-header convention.
-      headers['X-A2A-Extensions'] = [...this._extensions].join(', ');
+      headers[
+        this._resolved?.version === '1.0'
+          ? 'A2A-Extensions'
+          : 'X-A2A-Extensions'
+      ] = [...this._extensions].join(', ');
     }
     return headers;
   }
 
-  private _buildJsonRpcRequest(
+  private async _callTransport(
     method: string,
     params: unknown,
-  ): JSONRPCRequest {
-    return {
-      jsonrpc: '2.0',
-      id: ++this._requestId,
-      method,
-      params,
-    };
-  }
-
-  private async _postJsonRpc(
-    request: JSONRPCRequest,
     onTransport?: () => void | Promise<void>,
     onAuthApplied?: (generation: number) => void,
   ): Promise<unknown> {
@@ -1585,37 +1823,33 @@ export class A2XClient {
       { headers, url },
       [
         'Content-Type',
-        ...(this._extensions.size > 0 ? ['X-A2A-Extensions'] : []),
+        ...(this._extensions.size > 0
+          ? [this._extensionHeaderName()]
+          : []),
       ],
     );
     onAuthApplied?.(this._authGeneration);
-
-    // Everything above ran locally; serialize the body before declaring the
-    // request submitted, so a payload that cannot even be encoded never
-    // counts as having possibly reached the merchant.
-    const body = JSON.stringify(request);
-    await onTransport?.();
-    const response = await this._fetchImpl(url.toString(), {
-      method: 'POST',
+    return this._transport!.call({
+      method,
+      params: this._withServiceParams(params),
+      endpointUrl: url.toString(),
       headers,
-      body,
+      onTransport,
     });
+  }
 
-    if (!response.ok) {
-      throw new InternalError(
-        `HTTP ${response.status}: ${response.statusText}`,
-      );
+  private _extensionHeaderName(): string {
+    return this._resolved?.version === '1.0'
+      ? 'A2A-Extensions'
+      : 'X-A2A-Extensions';
+  }
+
+  private _withServiceParams(params: unknown): unknown {
+    if (!this._tenant || this._resolved?.version !== '1.0') return params;
+    if (!params || typeof params !== 'object' || Array.isArray(params)) {
+      return { tenant: this._tenant };
     }
-
-    const jsonRpcResponse = (await response.json()) as JSONRPCResponse;
-
-    if ('error' in jsonRpcResponse && jsonRpcResponse.error) {
-      const { code, message, data } = jsonRpcResponse.error;
-      const ErrorClass = ERROR_CODE_MAP[code] ?? InternalError;
-      throw new ErrorClass(message, data);
-    }
-
-    return (jsonRpcResponse as { result: unknown }).result;
+    return { ...(params as Record<string, unknown>), tenant: this._tenant };
   }
 
   /**

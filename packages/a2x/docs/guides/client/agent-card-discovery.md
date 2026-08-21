@@ -8,7 +8,7 @@ Useful fields at a glance:
 
 - `name`, `description` — human-readable identity.
 - `url` — the v0.3 JSON-RPC endpoint.
-- `supportedInterfaces[]` — v1.0 transport endpoints. `A2XClient` requires an entry whose `protocolBinding` is `JSONRPC`.
+- `supportedInterfaces[]` — v1.0 binding-specific endpoints. A2X selects a supported interface for you.
 - `capabilities.streaming` — whether `message/stream` is supported.
 - `skills[]` — declared capabilities (ids, tags).
 - `securityRequirements` / `securitySchemes` — what auth the agent expects.
@@ -32,16 +32,31 @@ console.log(resolved.card);     // parsed AgentCard for that version
 
 ## Version negotiation
 
-A2A has two spec versions in the wild. You don't pick — the remote agent declares, and the client adapts:
+A2A has two spec versions in the wild. The remote card declares the version and the client adapts:
 
 - A recognized top-level `protocolVersion` is authoritative (notably v0.3 cards).
 - Otherwise, a non-empty v1.0 `supportedInterfaces` array selects v1.0; a top-level `url` selects v0.3.
 
-For v1.0, the card must advertise a `JSONRPC` interface. Cards that expose only gRPC or HTTP+JSON are rejected before authentication or transport begins. There is no `preferredVersion` client option; use the card document published for the desired protocol when a peer exposes multiple version-specific cards.
+
+## Transport selection
+
+For v1.0, `A2XClient` considers only interfaces for installed adapters. The default order is `JSONRPC`, then `HTTP+JSON`, independent of the order in the AgentCard. Set an explicit order when needed:
+
+```ts
+import { A2A_TRANSPORTS, A2XClient } from '@a2x/sdk/client';
+
+const client = new A2XClient(url, {
+  preferredTransports: [A2A_TRANSPORTS.HTTP_JSON],
+});
+```
+
+This example requires HTTP+JSON and refuses to fall back to JSON-RPC. A card that advertises only `GRPC` is rejected before authentication or network transport. For v0.3, A2X currently supports JSON-RPC only and rejects a different `preferredTransport` explicitly.
+
+For lower-level discovery, `selectAgentInterface(card, version, preferredTransports)` returns the selected URL, binding, and protocol version.
 
 ## Calling non-A2X agents
 
-`A2XClient` is a protocol-level client, not an A2X-only one. It works with A2A agents produced by any SDK when their card advertises a supported JSON-RPC interface.
+`A2XClient` is a protocol-level client, not an A2X-only one. It works with A2A agents produced by any SDK when their card advertises a supported JSON-RPC or HTTP+JSON interface.
 
 ## Caching and refreshing
 

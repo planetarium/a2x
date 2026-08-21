@@ -39,6 +39,7 @@ export const A2A_METHODS = {
   SEND_MESSAGE: 'message/send',
   STREAM_MESSAGE: 'message/stream',
   GET_TASK: 'tasks/get',
+  LIST_TASKS: 'tasks/list',
   CANCEL_TASK: 'tasks/cancel',
   RESUBSCRIBE: 'tasks/resubscribe',
   SET_PUSH_CONFIG: 'tasks/pushNotificationConfig/set',
@@ -51,13 +52,14 @@ export const A2A_METHODS = {
 /**
  * Spec a2a-v1.0 §9.4: the v1.0 JSON-RPC binding renames every method.
  * Keys mirror `A2A_METHODS` so the two tables stay in one-to-one
- * correspondence. `ListTasks` (§9.4.4) has no v0.3 counterpart and is
- * not implemented, so it is deliberately absent.
+ * correspondence. `ListTasks` (§9.4.4) has no v0.3 counterpart; the server
+ * registers it only for v1.0 operation dispatch.
  */
 export const A2A_METHODS_V10 = {
   SEND_MESSAGE: 'SendMessage',
   STREAM_MESSAGE: 'SendStreamingMessage',
   GET_TASK: 'GetTask',
+  LIST_TASKS: 'ListTasks',
   CANCEL_TASK: 'CancelTask',
   RESUBSCRIBE: 'SubscribeToTask',
   SET_PUSH_CONFIG: 'CreateTaskPushNotificationConfig',
@@ -107,6 +109,23 @@ export interface TaskQueryParams {
   id: string;
   historyLength?: number;
   metadata?: Record<string, unknown>;
+}
+
+export interface ListTasksParams {
+  contextId?: string;
+  status?: import('./task.js').TaskState | import('./task.js').TaskStateV10;
+  pageSize?: number;
+  pageToken?: string;
+  historyLength?: number;
+  statusTimestampAfter?: string;
+  includeArtifacts?: boolean;
+}
+
+export interface ListTasksResult {
+  tasks: import('./task.js').Task[];
+  nextPageToken: string;
+  pageSize: number;
+  totalSize: number;
 }
 
 // ─── Push Notification Config Types ───
