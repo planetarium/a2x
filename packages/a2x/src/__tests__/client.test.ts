@@ -13,7 +13,9 @@ import { parseSSEStream } from '../client/sse-parser.js';
 import { TaskState } from '../types/task.js';
 import {
   A2A_ERROR_CODES,
+  InvalidRequestError,
   MethodNotFoundError,
+  TaskNotFoundError,
   VersionNotSupportedError,
 } from '../types/errors.js';
 import type { AgentCardV03, AgentCardV10 } from '../types/agent-card.js';
@@ -758,6 +760,40 @@ describe('A2XClient', () => {
       ).rejects.toBeInstanceOf(MethodNotFoundError);
     });
 
+    it('maps a REST request-body limit response to InvalidRequestError', async () => {
+      const card: AgentCardV10 = {
+        ...V10_CARD,
+        supportedInterfaces: [
+          {
+            url: 'http://localhost:4000/rest',
+            protocolBinding: 'HTTP+JSON',
+            protocolVersion: '1.0',
+          },
+        ],
+      };
+      const mockFetch = createMockFetch(
+        {
+          error: {
+            code: 413,
+            status: 'RESOURCE_EXHAUSTED',
+            message: 'Request body too large',
+            details: [
+              {
+                '@type': 'type.googleapis.com/google.rpc.ErrorInfo',
+                reason: 'REQUEST_BODY_TOO_LARGE',
+              },
+            ],
+          },
+        },
+        { status: 413 },
+      );
+      const client = new A2XClient(card, { fetch: mockFetch });
+
+      await expect(
+        client.sendMessage(createSendMessageParams('Hi')),
+      ).rejects.toBeInstanceOf(InvalidRequestError);
+    });
+
     it('should build correct JSON-RPC request', async () => {
       const mockFetch = createMockFetch(createJsonRpcSuccess({ id: 't1', status: { state: 'completed' } }));
       const client = new A2XClient(V03_CARD, { fetch: mockFetch });
@@ -845,6 +881,19 @@ describe('A2XClient', () => {
 
       const callArgs = mockFetch.mock.calls[0];
       expect(callArgs[1].headers.Accept).toBe('text/event-stream');
+    });
+  });
+
+  describe('subscribeTask', () => {
+    it('maps a unary JSON-RPC error response to a typed error', async () => {
+      const mockFetch = createMockFetch(
+        createJsonRpcError(A2A_ERROR_CODES.TASK_NOT_FOUND, 'Task not found'),
+      );
+      const client = new A2XClient(V10_CARD, { fetch: mockFetch });
+
+      await expect(client.subscribeTask('missing').next()).rejects.toBeInstanceOf(
+        TaskNotFoundError,
+      );
     });
   });
 

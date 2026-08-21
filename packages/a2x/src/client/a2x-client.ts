@@ -1276,6 +1276,17 @@ export class A2XClient {
         headers,
         signal: transportSignal,
       });
+      // JSON-RPC servers may return a unary error instead of opening SSE.
+      const contentType = response.headers.get('content-type') ?? '';
+      if (!contentType.includes('text/event-stream')) {
+        const jsonRpcResponse = (await response.json()) as JSONRPCResponse;
+        if ('error' in jsonRpcResponse && jsonRpcResponse.error) {
+          const { code, message, data } = jsonRpcResponse.error;
+          const ErrorClass = ERROR_CODE_MAP[code] ?? InternalError;
+          throw new ErrorClass(message, data);
+        }
+        return;
+      }
       yield* parseSSEStream(response, this._parser!);
     } finally {
       streamController.abort();

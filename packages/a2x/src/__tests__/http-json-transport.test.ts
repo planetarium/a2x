@@ -255,6 +255,23 @@ describe('A2A v1.0 HTTP+JSON transport', () => {
     expect(body.error.details[0]?.reason).toBe('TASK_NOT_FOUND');
   });
 
+  it('returns a structured error for invalid resource percent-encoding', async () => {
+    const response = await fetch(`${baseUrl}/a2a/tasks/%E0`, {
+      headers: {
+        Accept: 'application/a2a+json',
+        'A2A-Version': '1.0',
+      },
+    });
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: {
+        status: 'INVALID_ARGUMENT',
+        message: 'Invalid percent-encoding in resource ID',
+        details: [expect.objectContaining({ reason: 'INVALID_PARAMS' })],
+      },
+    });
+  });
+
   it('rejects malformed REST JSON with google.rpc.Status', async () => {
     const response = await fetch(`${baseUrl}/a2a/message:send`, {
       method: 'POST',

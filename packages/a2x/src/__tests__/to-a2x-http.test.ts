@@ -75,6 +75,24 @@ describe('toA2x() HTTP wrapper — JSON-RPC over HTTP error convention', () => {
     expect(body.error.code).toBe(-32700);
   });
 
+  it('rejects JSON-RPC request bodies larger than 1 MiB', async () => {
+    const res = await fetch(`${baseUrl}/a2a`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ padding: 'x'.repeat(1024 * 1024) }),
+    });
+
+    expect(res.status).toBe(413);
+    await expect(res.json()).resolves.toMatchObject({
+      jsonrpc: '2.0',
+      id: null,
+      error: {
+        code: -32600,
+        message: 'Request body exceeds the 1048576-byte limit',
+      },
+    });
+  });
+
   // Both `/.well-known/agent.json` (v0.3 spec) and
   // `/.well-known/agent-card.json` (modern spec / our own client tries
   // this first) must serve the AgentCard. Issue #142 fix 3.

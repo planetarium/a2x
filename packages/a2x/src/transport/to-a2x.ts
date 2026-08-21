@@ -23,7 +23,7 @@ import {
 import type { A2ATransport } from '../types/transport.js';
 import { A2A_TRANSPORTS } from '../types/transport.js';
 
-const HTTP_JSON_REQUEST_BODY_LIMIT_BYTES = 1024 * 1024;
+const REQUEST_BODY_LIMIT_BYTES = 1024 * 1024;
 
 export interface ToA2xOptions {
   port?: number;
@@ -234,9 +234,9 @@ export function createA2xRequestListener(
     if (restHandler?.canHandle(req.method ?? 'GET', parsedUrl)) {
       let parsedBody: unknown;
       if (req.method === 'POST') {
-        let requestBody: Awaited<ReturnType<typeof readHttpJsonRequestBody>>;
+        let requestBody: Awaited<ReturnType<typeof readRequestBody>>;
         try {
-          requestBody = await readHttpJsonRequestBody(req);
+          requestBody = await readRequestBody(req);
         } catch (error) {
           const errorResponse = toHttpJsonErrorResponse(error);
           res.writeHead(errorResponse.status, errorResponse.headers);
@@ -278,10 +278,38 @@ export function createA2xRequestListener(
 
     // POST /a2a (JSON-RPC)
     if (req.method === 'POST' && options?.jsonRpcEnabled !== false) {
-      let body = '';
-      for await (const chunk of req) {
-        body += chunk;
+      let requestBody: Awaited<ReturnType<typeof readRequestBody>>;
+      try {
+        requestBody = await readRequestBody(req);
+      } catch (error) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: null,
+            error: {
+              code: -32603,
+              message: error instanceof Error ? error.message : 'Internal error',
+            },
+          }),
+        );
+        return;
       }
+      if (!requestBody.ok) {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: null,
+            error: {
+              code: -32600,
+              message: `Request body exceeds the ${REQUEST_BODY_LIMIT_BYTES}-byte limit`,
+            },
+          }),
+        );
+        return;
+      }
+      const body = requestBody.body;
 
       // JSON-RPC over HTTP convention: parse and handler errors are
       // surfaced as JSON-RPC error responses with HTTP 200, not as
@@ -387,13 +415,13 @@ function isAsyncGenerator(value: unknown): value is AsyncGenerator<unknown> {
   return Boolean(value && typeof value === 'object' && Symbol.asyncIterator in value);
 }
 
-async function readHttpJsonRequestBody(
+async function readRequestBody(
   req: import('node:http').IncomingMessage,
 ): Promise<{ ok: true; body: string } | { ok: false }> {
   const contentLength = Number(req.headers['content-length']);
   if (
     Number.isFinite(contentLength) &&
-    contentLength > HTTP_JSON_REQUEST_BODY_LIMIT_BYTES
+    contentLength > REQUEST_BODY_LIMIT_BYTES
   ) {
     drainRequest(req);
     return { ok: false };
@@ -412,7 +440,7 @@ async function readHttpJsonRequestBody(
     const onData = (chunk: Buffer | string) => {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       byteLength += buffer.byteLength;
-      if (byteLength > HTTP_JSON_REQUEST_BODY_LIMIT_BYTES) {
+      if (byteLength > REQUEST_BODY_LIMIT_BYTES) {
         cleanup();
         drainRequest(req);
         resolve({ ok: false });
@@ -460,14 +488,14 @@ function writeHttpJsonPayloadTooLarge(
       error: {
         code: 413,
         status: 'RESOURCE_EXHAUSTED',
-        message: `Request body exceeds the ${HTTP_JSON_REQUEST_BODY_LIMIT_BYTES}-byte limit`,
+        message: `Request body exceeds the ${REQUEST_BODY_LIMIT_BYTES}-byte limit`,
         details: [
           {
             '@type': 'type.googleapis.com/google.rpc.ErrorInfo',
             reason: 'REQUEST_BODY_TOO_LARGE',
             domain: 'a2a-protocol.org',
             metadata: {
-              maxBytes: String(HTTP_JSON_REQUEST_BODY_LIMIT_BYTES),
+              maxBytes: String(REQUEST_BODY_LIMIT_BYTES),
             },
           },
         ],

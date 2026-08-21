@@ -59,10 +59,17 @@ export class HttpJsonRequestHandler {
   }
 
   canHandle(method: string, url: string | URL): boolean {
+    let parsedUrl: URL;
     try {
-      return this._resolve(method, toUrl(url)) !== null;
+      parsedUrl = toUrl(url);
     } catch {
       return false;
+    }
+    try {
+      return this._resolve(method, parsedUrl) !== null;
+    } catch {
+      const rawPath = stripBasePath(parsedUrl.pathname, this.basePath);
+      return rawPath !== null && matchesHttpJsonRoute(method, rawPath);
     }
   }
 
@@ -405,6 +412,35 @@ function splitTenantPath(path: string): { path: string; tenant?: string } {
   return match
     ? { tenant: decode(match[1]!), path: match[2]! }
     : { path };
+}
+
+function matchesHttpJsonRoute(method: string, rawPath: string): boolean {
+  const httpMethod = method.toUpperCase();
+  const tenantMatch = /^\/[^/]+(\/.*)$/.exec(rawPath);
+  const paths = tenantMatch ? [rawPath, tenantMatch[1]!] : [rawPath];
+
+  return paths.some((path) => {
+    if (httpMethod === 'POST') {
+      return (
+        path === '/message:send' ||
+        path === '/message:stream' ||
+        /^\/tasks\/[^/]+:(?:cancel|subscribe)$/.test(path) ||
+        /^\/tasks\/[^/]+\/pushNotificationConfigs$/.test(path)
+      );
+    }
+    if (httpMethod === 'GET') {
+      return (
+        path === '/tasks' ||
+        path === '/extendedAgentCard' ||
+        /^\/tasks\/[^/]+(?::subscribe)?$/.test(path) ||
+        /^\/tasks\/[^/]+\/pushNotificationConfigs(?:\/[^/]+)?$/.test(path)
+      );
+    }
+    return (
+      httpMethod === 'DELETE' &&
+      /^\/tasks\/[^/]+\/pushNotificationConfigs\/[^/]+$/.test(path)
+    );
+  });
 }
 
 function toUrl(value: string | URL): URL {
