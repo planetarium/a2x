@@ -222,19 +222,19 @@ export class HttpJsonRequestHandler {
 }
 
 function validateContentType(request: HttpJsonRequest): void {
-  if (request.method.toUpperCase() !== 'POST' || request.body === undefined) return;
+  if (request.method.toUpperCase() !== 'POST') return;
   const headers = request.context?.headers ?? {};
   const entry = Object.entries(headers).find(
     ([name]) => name.toLowerCase() === 'content-type',
   )?.[1];
   const value = Array.isArray(entry) ? entry[0] : entry;
+  const mediaType = value?.split(';', 1)[0]?.trim().toLowerCase();
   if (
-    value &&
-    !value.toLowerCase().includes(A2A_HTTP_JSON_MEDIA_TYPE) &&
-    !value.toLowerCase().includes('application/json')
+    mediaType !== A2A_HTTP_JSON_MEDIA_TYPE &&
+    mediaType !== 'application/json'
   ) {
     throw new ContentTypeNotSupportedError(
-      `HTTP+JSON requests require ${A2A_HTTP_JSON_MEDIA_TYPE}`,
+      `HTTP+JSON requests require ${A2A_HTTP_JSON_MEDIA_TYPE} or application/json`,
     );
   }
 }

@@ -330,7 +330,7 @@ function throwA2AError(code: number, message: string, data?: unknown): never {
 
 const HTTP_STATUS_TO_A2A_CODE: Record<number, number> = {
   400: A2A_ERROR_CODES.INVALID_REQUEST,
-  404: A2A_ERROR_CODES.TASK_NOT_FOUND,
+  404: A2A_ERROR_CODES.METHOD_NOT_FOUND,
   500: A2A_ERROR_CODES.INTERNAL_ERROR,
 };
 

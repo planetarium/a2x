@@ -395,7 +395,7 @@ async function readHttpJsonRequestBody(
     Number.isFinite(contentLength) &&
     contentLength > HTTP_JSON_REQUEST_BODY_LIMIT_BYTES
   ) {
-    req.resume();
+    drainRequest(req);
     return { ok: false };
   }
 
@@ -407,13 +407,14 @@ async function readHttpJsonRequestBody(
       req.off('data', onData);
       req.off('end', onEnd);
       req.off('error', onError);
+      req.off('aborted', onAborted);
     };
     const onData = (chunk: Buffer | string) => {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       byteLength += buffer.byteLength;
       if (byteLength > HTTP_JSON_REQUEST_BODY_LIMIT_BYTES) {
         cleanup();
-        req.resume();
+        drainRequest(req);
         resolve({ ok: false });
         return;
       }
@@ -427,11 +428,27 @@ async function readHttpJsonRequestBody(
       cleanup();
       reject(error);
     };
+    const onAborted = () => {
+      cleanup();
+      // Node may emit ECONNRESET after `aborted`; keep it from becoming an
+      // unhandled EventEmitter error after this promise has already settled.
+      req.once('error', () => {});
+      reject(new Error('Request aborted while reading body'));
+    };
 
-    req.on('data', onData);
     req.once('end', onEnd);
     req.once('error', onError);
+    req.once('aborted', onAborted);
+    // Register data last because it switches the request into flowing mode.
+    req.on('data', onData);
   });
+}
+
+function drainRequest(req: import('node:http').IncomingMessage): void {
+  // An oversized client may disconnect while the unread remainder is being
+  // discarded. Consume that error so the server process stays alive.
+  req.once('error', () => {});
+  req.resume();
 }
 
 function writeHttpJsonPayloadTooLarge(

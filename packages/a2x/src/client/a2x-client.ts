@@ -1226,6 +1226,7 @@ export class A2XClient {
 
   /** List tasks exposed by an A2A v1.0 agent. */
   async listTasks(options: ListTasksParams = {}): Promise<ListTasksResult> {
+    this._assertNotAuthProviderReentry();
     await this._ensureResolved();
     if (this._resolved!.version !== '1.0') {
       throw new VersionNotSupportedError('ListTasks requires A2A v1.0');
@@ -1248,6 +1249,7 @@ export class A2XClient {
     taskId: string,
     signal?: AbortSignal,
   ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
+    this._assertNotAuthProviderReentry();
     await this._ensureResolved();
     await this._ensureAuthenticated();
     const headers = this._buildHeaders({ Accept: 'text/event-stream' });
@@ -1284,6 +1286,7 @@ export class A2XClient {
   async createTaskPushNotificationConfig(
     config: TaskPushNotificationConfig,
   ): Promise<TaskPushNotificationConfig> {
+    this._assertNotAuthProviderReentry();
     await this._ensureResolved();
     await this._ensureAuthenticated();
     const result = await this._callTransport(
@@ -1297,6 +1300,7 @@ export class A2XClient {
     taskId: string,
     configId?: string,
   ): Promise<TaskPushNotificationConfig> {
+    this._assertNotAuthProviderReentry();
     await this._ensureResolved();
     await this._ensureAuthenticated();
     if (this._resolved!.version === '1.0' && !configId) {
@@ -1314,6 +1318,7 @@ export class A2XClient {
   async listTaskPushNotificationConfigs(
     taskId: string,
   ): Promise<TaskPushNotificationConfig[]> {
+    this._assertNotAuthProviderReentry();
     await this._ensureResolved();
     await this._ensureAuthenticated();
     const params = this._resolved!.version === '0.3' ? { id: taskId } : { taskId };
@@ -1328,6 +1333,7 @@ export class A2XClient {
     taskId: string,
     configId: string,
   ): Promise<void> {
+    this._assertNotAuthProviderReentry();
     await this._ensureResolved();
     await this._ensureAuthenticated();
     const params = this._resolved!.version === '0.3'
@@ -1338,6 +1344,7 @@ export class A2XClient {
 
   /** Retrieve the authenticated extended AgentCard. */
   async getExtendedAgentCard(): Promise<AgentCardV03 | AgentCardV10> {
+    this._assertNotAuthProviderReentry();
     await this._ensureResolved();
     await this._ensureAuthenticated();
     return (await this._callTransport(

@@ -11,7 +11,11 @@ import { A2A_TRANSPORTS } from '../client/client-transport.js';
 import { getResponseParser } from '../client/response-parser.js';
 import { parseSSEStream } from '../client/sse-parser.js';
 import { TaskState } from '../types/task.js';
-import { A2A_ERROR_CODES, VersionNotSupportedError } from '../types/errors.js';
+import {
+  A2A_ERROR_CODES,
+  MethodNotFoundError,
+  VersionNotSupportedError,
+} from '../types/errors.js';
 import type { AgentCardV03, AgentCardV10 } from '../types/agent-card.js';
 
 // ─── Test Fixtures ───
@@ -728,6 +732,30 @@ describe('A2XClient', () => {
         message: { role: 'ROLE_USER' },
       });
       expect(JSON.parse(String(request.body))).not.toHaveProperty('tenant');
+    });
+
+    it('maps a bare REST 404 to MethodNotFoundError', async () => {
+      const card: AgentCardV10 = {
+        ...V10_CARD,
+        supportedInterfaces: [
+          {
+            url: 'http://localhost:4000/rest',
+            protocolBinding: 'HTTP+JSON',
+            protocolVersion: '1.0',
+          },
+        ],
+      };
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 404,
+        statusText: 'Not Found',
+        json: () => Promise.reject(new SyntaxError('not JSON')),
+      });
+      const client = new A2XClient(card, { fetch: mockFetch });
+
+      await expect(
+        client.sendMessage(createSendMessageParams('Hi')),
+      ).rejects.toBeInstanceOf(MethodNotFoundError);
     });
 
     it('should build correct JSON-RPC request', async () => {

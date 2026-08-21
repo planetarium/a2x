@@ -275,6 +275,27 @@ describe('A2A v1.0 HTTP+JSON transport', () => {
     });
   });
 
+  it('validates Content-Type for an empty REST POST', async () => {
+    const response = await fetch(`${baseUrl}/a2a/message:send`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/plain',
+        'A2A-Version': '1.0',
+      },
+    });
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: {
+        status: 'INVALID_ARGUMENT',
+        message:
+          'HTTP+JSON requests require application/a2a+json or application/json',
+        details: [
+          expect.objectContaining({ reason: 'CONTENT_TYPE_NOT_SUPPORTED' }),
+        ],
+      },
+    });
+  });
+
   it('rejects REST request bodies larger than 1 MiB', async () => {
     const response = await fetch(`${baseUrl}/a2a/message:send`, {
       method: 'POST',
@@ -317,10 +338,24 @@ describe('A2A v1.0 HTTP+JSON transport', () => {
     expect(response.status).toBe(413);
   });
 
-  it('maps REST request stream errors to a structured response', async () => {
+  it.each([
+    {
+      name: 'request stream errors',
+      fail: (stream: Readable) => stream.destroy(new Error('request read failed')),
+      message: 'request read failed',
+    },
+    {
+      name: 'aborted uploads',
+      fail: (stream: Readable) => {
+        stream.emit('aborted');
+        stream.push(null);
+      },
+      message: 'Request aborted while reading body',
+    },
+  ])('maps REST $name to a structured response', async ({ fail, message }) => {
     const request = new Readable({
       read() {
-        this.destroy(new Error('request read failed'));
+        fail(this);
       },
     }) as unknown as IncomingMessage;
     request.method = 'POST';
@@ -350,7 +385,7 @@ describe('A2A v1.0 HTTP+JSON transport', () => {
       error: {
         code: 500,
         status: 'INTERNAL',
-        message: 'request read failed',
+        message,
       },
     });
   });

@@ -1985,6 +1985,55 @@ describe('A2XClient auth integration', () => {
     expect(mockFetch).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['listTasks', (client: A2XClient) => client.listTasks()],
+    ['subscribeTask', (client: A2XClient) => client.subscribeTask('bootstrap').next()],
+    [
+      'createTaskPushNotificationConfig',
+      (client: A2XClient) => client.createTaskPushNotificationConfig({
+        taskId: 'bootstrap',
+        pushNotificationConfig: {
+          id: 'config',
+          url: 'https://client.example.com/push',
+        },
+      }),
+    ],
+    [
+      'getTaskPushNotificationConfig',
+      (client: A2XClient) =>
+        client.getTaskPushNotificationConfig('bootstrap', 'config'),
+    ],
+    [
+      'listTaskPushNotificationConfigs',
+      (client: A2XClient) => client.listTaskPushNotificationConfigs('bootstrap'),
+    ],
+    [
+      'deleteTaskPushNotificationConfig',
+      (client: A2XClient) =>
+        client.deleteTaskPushNotificationConfig('bootstrap', 'config'),
+    ],
+    ['getExtendedAgentCard', (client: A2XClient) => client.getExtendedAgentCard()],
+  ])('rejects provide re-entry through %s', async (_name, nestedCall) => {
+    const mockFetch = createMockFetch(createJsonRpcSuccess(TASK_RESULT));
+    let client!: A2XClient;
+    const provide = vi.fn(async (requirements: AuthScheme[][]) => {
+      await Promise.resolve();
+      await nestedCall(client);
+      return [requirements[0]![0]!.setCredential('key')];
+    });
+    client = new A2XClient(V10_CARD_WITH_AUTH, {
+      fetch: mockFetch,
+      authProvider: { provide },
+    });
+
+    await expect(client.getTask('outer')).rejects.toThrow(
+      'AuthProvider.provide() cannot call an authenticated operation on the same A2XClient; ' +
+        'use a separate client or transport for credential acquisition.',
+    );
+    expect(provide).toHaveBeenCalledTimes(1);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
   it('rejects refresh re-entry when the nested call would refresh again', async () => {
     const authRequiredTask = {
       id: 'task-auth',
