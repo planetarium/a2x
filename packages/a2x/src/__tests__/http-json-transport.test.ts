@@ -235,6 +235,21 @@ describe('A2A v1.0 HTTP+JSON transport', () => {
     expect(result.tasks[0]?.status.state).toBe('completed');
   });
 
+  it('rejects invalid REST boolean query parameters', async () => {
+    const response = await fetch(
+      `${baseUrl}/a2a/tasks?includeArtifacts=maybe`,
+      { headers: { 'x-api-key': 'secret-123' } },
+    );
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: {
+        status: 'INVALID_ARGUMENT',
+        message: 'ListTasks "includeArtifacts" must be a boolean',
+        details: [expect.objectContaining({ reason: 'INVALID_PARAMS' })],
+      },
+    });
+  });
+
   it('maps google.rpc.Status errors back to typed A2A errors', async () => {
     await expect(client.getTask('missing-task')).rejects.toBeInstanceOf(
       TaskNotFoundError,

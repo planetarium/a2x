@@ -367,7 +367,9 @@ function queryParams(url: URL): Record<string, unknown> {
     if (key === 'pageSize' || key === 'historyLength') {
       result[key] = Number(value);
     } else if (key === 'includeArtifacts') {
-      result[key] = value === 'true';
+      result[key] = value === 'true' || value === 'false'
+        ? value === 'true'
+        : value;
     } else {
       result[key] = value;
     }
