@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { AddressInfo } from 'node:net';
 import {
   createServer,
@@ -253,6 +253,29 @@ describe('A2A v1.0 HTTP+JSON transport', () => {
     expect(body.error.code).toBe(404);
     expect(body.error.status).toBe('NOT_FOUND');
     expect(body.error.details[0]?.reason).toBe('TASK_NOT_FOUND');
+  });
+
+  it('drains unexpected bodies on non-POST REST requests', async () => {
+    const request = Readable.from(['unexpected body']) as IncomingMessage;
+    request.method = 'GET';
+    request.url = '/a2a/tasks/missing-task';
+    request.headers = { 'x-api-key': 'secret-123' };
+    const resume = vi.spyOn(request, 'resume');
+    const response = {
+      setHeader() {
+        return this;
+      },
+      writeHead() {
+        return this;
+      },
+      end() {
+        return this;
+      },
+    } as unknown as ServerResponse;
+
+    await requestListener(request, response);
+
+    expect(resume).toHaveBeenCalledOnce();
   });
 
   it('returns a structured error for invalid resource percent-encoding', async () => {

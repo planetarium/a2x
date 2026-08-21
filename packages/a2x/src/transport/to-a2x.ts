@@ -265,6 +265,10 @@ export function createA2xRequestListener(
             return;
           }
         }
+      } else {
+        // A body is not part of any HTTP+JSON GET or DELETE operation, but it
+        // still has to be consumed so the socket remains reusable.
+        drainRequest(req);
       }
       const response = await restHandler.handle({
         method: req.method ?? 'GET',
