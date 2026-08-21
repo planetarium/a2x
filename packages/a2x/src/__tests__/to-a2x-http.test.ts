@@ -57,6 +57,23 @@ describe('toA2x() HTTP wrapper — JSON-RPC over HTTP error convention', () => {
     await stop?.();
   });
 
+  it('echoes requested CORS headers for configured authentication schemes', async () => {
+    const res = await fetch(`${baseUrl}/a2a`, {
+      method: 'OPTIONS',
+      headers: {
+        Origin: 'https://client.example.com',
+        'Access-Control-Request-Method': 'POST',
+        'Access-Control-Request-Headers': 'content-type, x-api-key',
+      },
+    });
+
+    expect(res.status).toBe(204);
+    expect(res.headers.get('access-control-allow-headers')).toBe(
+      'content-type, x-api-key',
+    );
+    expect(res.headers.get('vary')).toContain('Access-Control-Request-Headers');
+  });
+
   it('returns HTTP 200 with -32700 body for malformed JSON', async () => {
     const res = await fetch(`${baseUrl}/a2a`, {
       method: 'POST',

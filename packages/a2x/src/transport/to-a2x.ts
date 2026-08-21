@@ -187,10 +187,15 @@ export function createA2xRequestListener(
     // CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    const requestedHeaders = req.headers['access-control-request-headers'];
     res.setHeader(
       'Access-Control-Allow-Headers',
-      'Content-Type, Authorization, A2A-Version, A2A-Extensions, X-A2A-Extensions',
+      Array.isArray(requestedHeaders)
+        ? requestedHeaders.join(', ')
+        : (requestedHeaders ??
+          'Content-Type, Authorization, A2A-Version, A2A-Extensions, X-A2A-Extensions'),
     );
+    res.setHeader('Vary', 'Access-Control-Request-Headers');
 
     if (req.method === 'OPTIONS') {
       res.writeHead(204);

@@ -258,3 +258,5 @@ const app = toA2x(agent, {
 The first entry is the primary AgentCard interface. Omitting `transports` preserves the existing JSON-RPC-only behavior. HTTP+JSON is v1.0-only; configuring it with `protocolVersion: '0.3'` throws during setup.
 
 The Node.js listener used by `toA2x().listen()` rejects JSON-RPC and HTTP+JSON request bodies larger than 1 MiB with `413 Payload Too Large`. When mounting `HttpJsonRequestHandler` in another framework, configure the equivalent request-body limit in that framework before parsing JSON.
+
+For browser clients, the standalone listener answers CORS preflight requests by echoing `Access-Control-Request-Headers`, so custom authentication headers such as `x-api-key` are allowed. Apply the equivalent CORS policy when mounting the handlers in another framework.
