@@ -59,11 +59,18 @@ See [Consuming Streams](../client/streaming.md) for the client-side iteration pa
 
 An SSE connection is a subscription to a Task, not ownership of its execution. When a client disconnects mid-stream — tab closed, network drop, process killed — A2X stops writing to that response but continues consuming the agent's event generator. Task-store persistence, push notifications, and task event-bus publication continue through the interaction-ending or terminal state, and other subscribers remain attached.
 
-A disconnect does not abort `context.signal` or change the Task to `canceled`. To stop the underlying work, send an explicit `tasks/cancel` request. Execution deadlines and process-shutdown policies can also abort work independently of an SSE connection.
+A disconnect aborts the transport-facing `RequestContext.signal` to release that response subscription. It does not abort the agent's `InvocationContext.signal` or change the Task to `canceled`. To stop the underlying work through A2X, send an explicit `tasks/cancel` request. Host-enforced execution deadlines, orphan limits, and process-shutdown handling remain deployment policies; they must cancel Tasks explicitly instead of treating a network disconnect as cancellation intent.
 
-`toA2x()` wires detachment and background draining automatically. If you mount the handler into your own HTTP stack (Express, Next.js, Fastify, …), wire a `res.on('close')` → `reader.cancel()` on the SSE branch. `createSSEStream()` then stops response delivery while continuing to drain its source. `IncomingMessage.close` fires when the request body is consumed (too early) and misses the later TCP close, so use `res.close`:
+`DefaultRequestHandler` runs Task execution in a background pump and exposes each SSE response as an event-bus subscription. `toA2x()` wires subscriber detachment automatically. If you mount the handler into your own HTTP stack (Express, Next.js, Fastify, …), pass an `AbortSignal` through `RequestContext` and abort it from `res.close`; also cancel the SSE reader to release its wrapper. `IncomingMessage.close` fires when the request body is consumed (too early) and misses the later TCP close, so use `res.close`:
 
 ```ts
+const subscription = new AbortController();
+res.on('close', () => subscription.abort());
+
+const result = await handler.handle(body, {
+  headers: req.headers,
+  signal: subscription.signal,
+});
 const stream = createSSEStream(result);
 const reader = stream.getReader();
 

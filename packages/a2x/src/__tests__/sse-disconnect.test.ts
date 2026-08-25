@@ -40,27 +40,6 @@ class HangingAgent extends BaseAgent {
   }
 }
 
-class GatedCompletionAgent extends BaseAgent {
-  readonly started = Promise.withResolvers<void>();
-  readonly release = Promise.withResolvers<void>();
-  readonly completed = Promise.withResolvers<void>();
-  capturedSignal: AbortSignal | undefined;
-
-  constructor() {
-    super({ name: 'gated-agent', description: 'Completes after release' });
-  }
-
-  async *run(context: InvocationContext): AsyncGenerator<AgentEvent> {
-    this.capturedSignal = context.signal;
-    this.started.resolve();
-    yield { type: 'text', text: 'before-disconnect', role: 'agent' };
-    await this.release.promise;
-    yield { type: 'text', text: 'after-disconnect', role: 'agent' };
-    this.completed.resolve();
-    yield { type: 'done' };
-  }
-}
-
 function createTask(): Task {
   return {
     id: 'test-task-sse-disconnect',
@@ -97,8 +76,8 @@ async function waitUntil(
 }
 
 describe('SSE client disconnect lifecycle (Issue #255)', () => {
-  it('createSSEStream.cancel() stops delivery but drains the source to completion', async () => {
-    const agent = new GatedCompletionAgent();
+  it('createSSEStream.cancel() detaches its source generator', async () => {
+    const agent = new HangingAgent();
     const executor = createExecutor(agent);
     const task = createTask();
 
@@ -111,15 +90,15 @@ describe('SSE client disconnect lifecycle (Issue #255)', () => {
     expect(first.done).toBe(false);
     expect(first.value).toBeDefined();
 
-    await agent.started.promise;
-
-    // Simulate client disconnect before reading any artifact update.
+    // The transport source is a subscription in production. Returning a
+    // direct executor here proves that createSSEStream still detaches its
+    // own source instead of retaining passive subscribers.
     await reader.cancel();
-    expect(agent.capturedSignal?.aborted).toBe(false);
-
-    agent.release.resolve();
-    await agent.completed.promise;
-    expect(agent.capturedSignal?.aborted).toBe(false);
+    const aborted = await waitUntil(
+      () => agent.state.capturedSignal?.aborted === true,
+      200,
+    );
+    expect(aborted).toBe(true);
 
     // Natural completion still cleans up the executor controller.
     const controllers = (executor as unknown as {
@@ -129,7 +108,7 @@ describe('SSE client disconnect lifecycle (Issue #255)', () => {
     expect(cleaned).toBe(true);
   });
 
-  it('silently drains a source failure after the reader disconnects', async () => {
+  it('suppresses a pending source failure after the reader disconnects', async () => {
     const release = Promise.withResolvers<void>();
     const finished = Promise.withResolvers<void>();
     async function* events(): AsyncGenerator<unknown> {

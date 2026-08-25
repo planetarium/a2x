@@ -34,15 +34,11 @@ export function createSSEStream(
     async start(controller) {
       try {
         for await (const event of events) {
-          if (canceled) continue;
           const data = JSON.stringify(event);
           controller.enqueue(encoder.encode(`data: ${data}\n\n`));
         }
         if (!canceled) controller.close();
       } catch (error) {
-        // A canceled reader is detached from the response, but this pump
-        // keeps consuming the source so task persistence and publication
-        // can finish. There is no reader left to receive an error frame.
         if (canceled) return;
 
         // Mid-stream errors are spec-undefined for SSE A2A streaming.
@@ -60,10 +56,11 @@ export function createSSEStream(
     },
 
     cancel() {
-      // An SSE connection is only a subscription to a task. Stop enqueuing
-      // response bytes, but keep draining the execution generator so store
-      // writes and event-bus publication continue for other subscribers.
+      // The source returned by DefaultRequestHandler is only a Task event
+      // subscription. Returning it detaches this response while the handler's
+      // independent execution pump keeps the Task running.
       canceled = true;
+      void events.return(undefined).catch(() => {});
     },
   });
 }

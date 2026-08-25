@@ -18,6 +18,8 @@ export interface RouteContext {
   activatedExtensions?: readonly string[];
   /** Emit an initial Task snapshot for bindings whose stream schema requires it. */
   includeInitialTask?: boolean;
+  /** Ends only this response subscription when its transport disconnects. */
+  subscriptionSignal?: AbortSignal;
 }
 
 export type MethodHandler = (

@@ -239,8 +239,8 @@ export class AgentExecutor {
       };
       completedNormally = true;
     } finally {
-      // Abort any in-flight work if the awaiter exited abnormally
-      // (e.g. generator was .return()ed by an SSE client disconnect).
+      // Abort any in-flight work if the runner unwinds before producing a
+      // lifecycle result.
       // On normal completion / error / cancel this is a no-op.
       if (!completedNormally && !abortController.signal.aborted) {
         abortController.abort();

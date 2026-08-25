@@ -26,6 +26,8 @@ export interface RequestContext {
   query?: Record<string, string | string[] | undefined>;
   cookies?: Record<string, string | undefined>;
   clientCertificate?: ClientCertificate;
+  /** Abort to detach this response subscriber; never used as Task cancellation. */
+  signal?: AbortSignal;
 }
 
 // ─── ClientCertificate ───
