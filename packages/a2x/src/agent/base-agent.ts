@@ -6,13 +6,41 @@ import type { InvocationContext } from '../runner/context.js';
 
 // ─── AgentEvent (events yielded by agents to the Runner) ───
 
+/**
+ * Describes the durable logical output that receives content from an agent
+ * event. The executor owns its identity and content aggregation, then maps
+ * this descriptor to the active protocol representation.
+ */
+export interface AgentArtifactDescriptor {
+  name?: string;
+  description?: string;
+  metadata?: Record<string, unknown>;
+  extensions?: string[];
+}
+
+interface ContentProducingEvent {
+  /** Descriptor for the durable logical output receiving this content. */
+  artifact?: AgentArtifactDescriptor;
+  /**
+   * Ephemeral metadata describing this particular content delivery. The
+   * default A2A executor maps it to TaskArtifactUpdateEvent metadata during
+   * streaming. Non-streaming execution has no individual delivery event.
+   */
+  deliveryMetadata?: Record<string, unknown>;
+}
+
 export type AgentEvent =
-  | { type: 'text'; text: string; role?: 'user' | 'agent'; mediaType?: string }
-  | {
-    type: 'file';
-    file: { raw?: string; url?: string; mediaType?: string; filename?: string };
-  }
-  | { type: 'data'; data: unknown; mediaType?: string }
+  | ({
+      type: 'text';
+      text: string;
+      role?: 'user' | 'agent';
+      mediaType?: string;
+    } & ContentProducingEvent)
+  | ({
+      type: 'file';
+      file: { raw?: string; url?: string; mediaType?: string; filename?: string };
+    } & ContentProducingEvent)
+  | ({ type: 'data'; data: unknown; mediaType?: string } & ContentProducingEvent)
   | { type: 'toolCall'; toolName: string; args: Record<string, unknown>; toolCallId?: string }
   | { type: 'toolResult'; toolName: string; result: unknown; toolCallId?: string }
   | {

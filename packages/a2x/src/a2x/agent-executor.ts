@@ -17,6 +17,8 @@
  * x402 settlement receipts) without needing a dedicated event type.
  */
 
+import { isDeepStrictEqual } from 'node:util';
+import type { AgentArtifactDescriptor } from '../agent/base-agent.js';
 import type { Message, Artifact } from '../types/common.js';
 import type {
   Task,
@@ -25,6 +27,7 @@ import type {
 } from '../types/task.js';
 import { TaskState } from '../types/task.js';
 import { Runner } from '../runner/runner.js';
+import { cloneSnapshotValue } from './task-store.js';
 
 // ─── RunConfig ───
 
@@ -79,6 +82,7 @@ export class AgentExecutor {
 
     const artifacts: Artifact[] = [];
     const textParts: string[] = [];
+    let textArtifact: AgentArtifactDescriptor | undefined;
     const artifactIds = new ArtifactIdAllocator(task.id, task.artifacts);
     let completedNormally = false;
     let inputRequested = false;
@@ -95,17 +99,23 @@ export class AgentExecutor {
       })) {
         switch (event.type) {
           case 'text':
+            textArtifact = mergeTextArtifactDescriptor(
+              textArtifact,
+              event.artifact,
+            );
             textParts.push(event.text);
             break;
           case 'file':
             artifacts.push({
               artifactId: artifactIds.next('file'),
+              ...copyArtifactDescriptor(event.artifact),
               parts: [{ ...event.file }],
             });
             break;
           case 'data':
             artifacts.push({
               artifactId: artifactIds.next('data'),
+              ...copyArtifactDescriptor(event.artifact),
               parts: [
                 {
                   data: event.data,
@@ -119,7 +129,13 @@ export class AgentExecutor {
             // Content produced before the halt is part of the task
             // document. `executeStream` emits it as artifact events, so
             // dropping it here would lose it on `message/send` only.
-            attachArtifacts(task, artifacts, textParts, artifactIds);
+            attachArtifacts(
+              task,
+              artifacts,
+              textParts,
+              artifactIds,
+              textArtifact,
+            );
             applyInputRequired(task, event.metadata, event.message);
             // Halt the agent's generator without raising — the for-await
             // unwinds via the explicit return below, and the finally
@@ -128,7 +144,13 @@ export class AgentExecutor {
             return task;
           }
           case 'done':
-            attachArtifacts(task, artifacts, textParts, artifactIds);
+            attachArtifacts(
+              task,
+              artifacts,
+              textParts,
+              artifactIds,
+              textArtifact,
+            );
             task.status = {
               state: TaskState.COMPLETED,
               timestamp: new Date().toISOString(),
@@ -146,7 +168,13 @@ export class AgentExecutor {
             completedNormally = true;
             return task;
           case 'error':
-            attachArtifacts(task, artifacts, textParts, artifactIds);
+            attachArtifacts(
+              task,
+              artifacts,
+              textParts,
+              artifactIds,
+              textArtifact,
+            );
             task.status = {
               state: TaskState.FAILED,
               message: {
@@ -171,7 +199,13 @@ export class AgentExecutor {
       // completed status. This matches the legacy behavior for agents that
       // simply return from run() after emitting text.
       if (!abortController.signal.aborted) {
-        attachArtifacts(task, artifacts, textParts, artifactIds);
+        attachArtifacts(
+          task,
+          artifacts,
+          textParts,
+          artifactIds,
+          textArtifact,
+        );
         task.status = {
           state: TaskState.COMPLETED,
           timestamp: new Date().toISOString(),
@@ -180,7 +214,13 @@ export class AgentExecutor {
       completedNormally = true;
     } catch (error) {
       if (abortController.signal.aborted) return task;
-      attachArtifacts(task, artifacts, textParts, artifactIds);
+      attachArtifacts(
+        task,
+        artifacts,
+        textParts,
+        artifactIds,
+        textArtifact,
+      );
       task.status = {
         state: TaskState.FAILED,
         message: {
@@ -228,6 +268,7 @@ export class AgentExecutor {
     let completedNormally = false;
     let inputRequested = false;
     const textParts: string[] = [];
+    let textArtifact: AgentArtifactDescriptor | undefined;
     const nonTextArtifacts: Artifact[] = [];
 
     try {
@@ -258,16 +299,22 @@ export class AgentExecutor {
         switch (event.type) {
           case 'text': {
             const append = textParts.length > 0;
+            textArtifact = mergeTextArtifactDescriptor(
+              textArtifact,
+              event.artifact,
+            );
             textParts.push(event.text);
             yield {
               taskId: task.id,
               contextId,
               artifact: {
                 artifactId: artifactIds.text(),
+                ...copyArtifactDescriptor(textArtifact),
                 parts: [{ text: event.text }],
               },
               append,
               lastChunk: false,
+              ...copyDeliveryMetadata(event.deliveryMetadata),
             } satisfies TaskArtifactUpdateEvent;
             break;
           }
@@ -275,6 +322,7 @@ export class AgentExecutor {
           case 'file': {
             const artifact: Artifact = {
               artifactId: artifactIds.next('file'),
+              ...copyArtifactDescriptor(event.artifact),
               parts: [{ ...event.file }],
             };
             nonTextArtifacts.push(artifact);
@@ -284,6 +332,7 @@ export class AgentExecutor {
               artifact,
               append: false,
               lastChunk: true,
+              ...copyDeliveryMetadata(event.deliveryMetadata),
             } satisfies TaskArtifactUpdateEvent;
             break;
           }
@@ -291,6 +340,7 @@ export class AgentExecutor {
           case 'data': {
             const artifact: Artifact = {
               artifactId: artifactIds.next('data'),
+              ...copyArtifactDescriptor(event.artifact),
               parts: [
                 {
                   data: event.data,
@@ -305,13 +355,20 @@ export class AgentExecutor {
               artifact,
               append: false,
               lastChunk: true,
+              ...copyDeliveryMetadata(event.deliveryMetadata),
             } satisfies TaskArtifactUpdateEvent;
             break;
           }
 
           case 'request-input': {
             inputRequested = true;
-            attachArtifacts(task, nonTextArtifacts, textParts, artifactIds);
+            attachArtifacts(
+              task,
+              nonTextArtifacts,
+              textParts,
+              artifactIds,
+              textArtifact,
+            );
             applyInputRequired(task, event.metadata, event.message);
             yield {
               taskId: task.id,
@@ -329,6 +386,7 @@ export class AgentExecutor {
             if (textParts.length > 0) {
               const artifact: Artifact = {
                 artifactId: artifactIds.text(),
+                ...copyArtifactDescriptor(textArtifact),
                 parts: [{ text: textParts.join('') }],
               };
               finalArtifacts.push(artifact);
@@ -370,7 +428,13 @@ export class AgentExecutor {
           }
 
           case 'error':
-            attachArtifacts(task, nonTextArtifacts, textParts, artifactIds);
+            attachArtifacts(
+              task,
+              nonTextArtifacts,
+              textParts,
+              artifactIds,
+              textArtifact,
+            );
             task.status = {
               state: TaskState.FAILED,
               message: {
@@ -400,7 +464,13 @@ export class AgentExecutor {
 
       // Agents may finish by returning instead of yielding `done`. Finalize
       // the same artifact set and status that the blocking path synthesizes.
-      attachArtifacts(task, nonTextArtifacts, textParts, artifactIds);
+      attachArtifacts(
+        task,
+        nonTextArtifacts,
+        textParts,
+        artifactIds,
+        textArtifact,
+      );
       if (textParts.length > 0) {
         yield {
           taskId: task.id,
@@ -423,7 +493,13 @@ export class AgentExecutor {
       completedNormally = true;
     } catch (error) {
       if (abortController.signal.aborted) return;
-      attachArtifacts(task, nonTextArtifacts, textParts, artifactIds);
+      attachArtifacts(
+        task,
+        nonTextArtifacts,
+        textParts,
+        artifactIds,
+        textArtifact,
+      );
       task.status = {
         state: TaskState.FAILED,
         message: {
@@ -558,6 +634,7 @@ function attachArtifacts(
   artifacts: Artifact[],
   textParts: string[],
   artifactIds: ArtifactIdAllocator,
+  textArtifact?: AgentArtifactDescriptor,
 ): void {
   const collected =
     textParts.length > 0
@@ -565,6 +642,7 @@ function attachArtifacts(
           ...artifacts,
           {
             artifactId: artifactIds.text(),
+            ...copyArtifactDescriptor(textArtifact),
             parts: [{ text: textParts.join('') }],
           },
         ]
@@ -573,6 +651,85 @@ function attachArtifacts(
   if (collected.length > 0) {
     task.artifacts = collected;
   }
+}
+
+function copyArtifactDescriptor(
+  descriptor?: AgentArtifactDescriptor,
+): AgentArtifactDescriptor {
+  if (!descriptor) return {};
+  return {
+    ...(descriptor.name !== undefined ? { name: descriptor.name } : {}),
+    ...(descriptor.description !== undefined
+      ? { description: descriptor.description }
+      : {}),
+    ...(descriptor.metadata !== undefined
+      ? { metadata: cloneSnapshotValue(descriptor.metadata) }
+      : {}),
+    ...(descriptor.extensions !== undefined
+      ? { extensions: [...descriptor.extensions] }
+      : {}),
+  };
+}
+
+function copyDeliveryMetadata(
+  metadata: Record<string, unknown> | undefined,
+): Pick<TaskArtifactUpdateEvent, 'metadata'> {
+  return metadata === undefined
+    ? {}
+    : { metadata: cloneSnapshotValue(metadata) };
+}
+
+/**
+ * Text chunks form one durable artifact, so descriptor fields accumulate
+ * across the run. Scalar fields cannot change, extensions form a stable
+ * union, and metadata keys may only be repeated with deeply equal values.
+ */
+function mergeTextArtifactDescriptor(
+  current: AgentArtifactDescriptor | undefined,
+  incoming: AgentArtifactDescriptor | undefined,
+): AgentArtifactDescriptor | undefined {
+  if (!incoming) return current;
+  if (!current) return copyArtifactDescriptor(incoming);
+
+  const merged = copyArtifactDescriptor(current);
+
+  for (const field of ['name', 'description'] as const) {
+    const next = incoming[field];
+    if (next === undefined) continue;
+    const previous = merged[field];
+    if (previous !== undefined && previous !== next) {
+      throw new Error(`Conflicting text artifact ${field}`);
+    }
+    merged[field] = next;
+  }
+
+  if (incoming.extensions !== undefined) {
+    merged.extensions = [
+      ...new Set([...(merged.extensions ?? []), ...incoming.extensions]),
+    ];
+  }
+
+  if (incoming.metadata !== undefined) {
+    const metadata = { ...(merged.metadata ?? {}) };
+    const incomingMetadata = cloneSnapshotValue(incoming.metadata);
+    for (const [key, value] of Object.entries(incomingMetadata)) {
+      if (Object.prototype.hasOwnProperty.call(metadata, key)) {
+        if (!isDeepStrictEqual(metadata[key], value)) {
+          throw new Error(`Conflicting text artifact metadata key: ${key}`);
+        }
+        continue;
+      }
+      Object.defineProperty(metadata, key, {
+        value,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+    merged.metadata = metadata;
+  }
+
+  return merged;
 }
 
 /**
