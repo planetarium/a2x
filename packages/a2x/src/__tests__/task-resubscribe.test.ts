@@ -33,6 +33,30 @@ class SlowTextAgent extends BaseAgent {
   }
 }
 
+class MutatingMetadataAgent extends BaseAgent {
+  readonly mutated = Promise.withResolvers<void>();
+
+  constructor() {
+    super({ name: 'mutating-metadata-agent' });
+  }
+
+  async *run(): AsyncGenerator<AgentEvent> {
+    const artifactDetails = { version: 1 };
+    const updateDetails = { sequence: 1 };
+    yield {
+      type: 'text',
+      text: 'first',
+      artifact: { metadata: { details: artifactDetails } },
+      updateMetadata: { details: updateDetails },
+    };
+    artifactDetails.version = 2;
+    updateDetails.sequence = 2;
+    this.mutated.resolve();
+    yield { type: 'text', text: 'second' };
+    yield { type: 'done' };
+  }
+}
+
 function createSlowHandler(
   chunks: string[],
   delayMs: number,
@@ -209,6 +233,77 @@ describe('tasks/resubscribe', () => {
     const lastStatus = resubStatus[resubStatus.length - 1];
     const status = lastStatus.status as Record<string, unknown>;
     expect(status.state).toBe('TASK_STATE_COMPLETED');
+  });
+
+  it('isolates queued live events from later agent metadata mutation', async () => {
+    const agent = new MutatingMetadataAgent();
+    const runner = new InMemoryRunner({ agent, appName: 'test' });
+    const executor = new AgentExecutor({
+      runner,
+      runConfig: { streamingMode: StreamingMode.SSE },
+    });
+    const a2xServer = new A2XServer({
+      taskStore: new InMemoryTaskStore(),
+      executor,
+      protocolVersion: '0.3',
+    });
+    a2xServer.setDefaultUrl('https://example.com/a2a');
+    const handler = new DefaultRequestHandler(a2xServer);
+
+    const originalIter = (await handler.handle({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'message/stream',
+      params: {
+        message: {
+          messageId: 'msg-metadata',
+          role: 'user',
+          parts: [{ text: 'Hello' }],
+        },
+      },
+    })) as AsyncGenerator<StreamEnvelope>;
+
+    const working = await originalIter.next();
+    const taskId = unwrapResult(working.value).taskId as string;
+    const resubIter = (await handler.handle({
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tasks/resubscribe',
+      params: { id: taskId },
+    })) as AsyncGenerator<StreamEnvelope>;
+    const resubFirstPromise = resubIter.next();
+    while (!a2xServer.taskEventBus.hasSubscribers(taskId)) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    const originalFirst = await originalIter.next();
+    const originalFirstEvent = unwrapResult(originalFirst.value);
+    const originalSecondPromise = originalIter.next();
+    await agent.mutated.promise;
+
+    const resubFirst = await resubFirstPromise;
+    const resubFirstEvent = unwrapResult(resubFirst.value);
+    for (const event of [originalFirstEvent, resubFirstEvent]) {
+      const artifact = event.artifact as {
+        metadata: { details: { version: number } };
+      };
+      expect(artifact.metadata.details.version).toBe(1);
+      expect(event.metadata).toEqual({ details: { sequence: 1 } });
+    }
+
+    await originalSecondPromise;
+    await Promise.all([
+      (async () => {
+        for await (const _ of originalIter) {
+          // Drain until the publisher closes the task bus.
+        }
+      })(),
+      (async () => {
+        for await (const _ of resubIter) {
+          // Drain queued updates and the terminal status.
+        }
+      })(),
+    ]);
   });
 
   it('ends when the publishing stream ends', async () => {

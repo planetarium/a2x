@@ -125,6 +125,8 @@ yield {
 - `artifact` is an `AgentArtifactDescriptor`. Its `name`, `description`, `metadata`, and `extensions` become durable fields on the generated A2A `Artifact` and are returned by `tasks/get`. The executor continues to assign `artifactId` and `parts`.
 - `updateMetadata` is copied to the `TaskArtifactUpdateEvent.metadata` generated for that event. It describes one streamed delivery, is not part of the Artifact, and is ignored by non-streaming `message/send` execution because that path produces no artifact-update events.
 
+The executor snapshots both metadata maps when it receives the event. Reusing and later mutating an object that was already yielded cannot change an emitted update or the durable Artifact.
+
 All text events in one run contribute to one Artifact. Descriptor fields therefore accumulate across text chunks: `name` and `description` cannot change, extensions form an ordered union, and metadata keys merge when their values do not conflict. Repeating a metadata key with a deeply unequal value, or changing a scalar descriptor field, fails the task. The executor-generated final consolidated text update retains the merged Artifact descriptor but has no `updateMetadata` of its own.
 
 ## Next

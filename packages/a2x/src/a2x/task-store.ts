@@ -62,10 +62,19 @@ export interface TaskStore {
  * instances may be normalized to plain objects by `structuredClone`.
  */
 export function cloneTask(task: Task): Task {
+  return cloneSnapshotValue(task);
+}
+
+/**
+ * Deeply detach standard containers while retaining only exotic leaves that
+ * the platform clone algorithm cannot copy. Internal async boundaries use
+ * this to keep later caller mutation from changing an accepted value.
+ */
+export function cloneSnapshotValue<T>(value: T): T {
   try {
-    return structuredClone(task);
+    return structuredClone(value);
   } catch {
-    return cloneFallbackValue(task);
+    return cloneFallbackValue(value);
   }
 }
 

@@ -27,6 +27,7 @@ import type {
 } from '../types/task.js';
 import { TaskState } from '../types/task.js';
 import { Runner } from '../runner/runner.js';
+import { cloneSnapshotValue } from './task-store.js';
 
 // ─── RunConfig ───
 
@@ -313,9 +314,7 @@ export class AgentExecutor {
               },
               append,
               lastChunk: false,
-              ...(event.updateMetadata !== undefined
-                ? { metadata: { ...event.updateMetadata } }
-                : {}),
+              ...copyUpdateMetadata(event.updateMetadata),
             } satisfies TaskArtifactUpdateEvent;
             break;
           }
@@ -333,9 +332,7 @@ export class AgentExecutor {
               artifact,
               append: false,
               lastChunk: true,
-              ...(event.updateMetadata !== undefined
-                ? { metadata: { ...event.updateMetadata } }
-                : {}),
+              ...copyUpdateMetadata(event.updateMetadata),
             } satisfies TaskArtifactUpdateEvent;
             break;
           }
@@ -358,9 +355,7 @@ export class AgentExecutor {
               artifact,
               append: false,
               lastChunk: true,
-              ...(event.updateMetadata !== undefined
-                ? { metadata: { ...event.updateMetadata } }
-                : {}),
+              ...copyUpdateMetadata(event.updateMetadata),
             } satisfies TaskArtifactUpdateEvent;
             break;
           }
@@ -668,12 +663,20 @@ function copyArtifactDescriptor(
       ? { description: descriptor.description }
       : {}),
     ...(descriptor.metadata !== undefined
-      ? { metadata: { ...descriptor.metadata } }
+      ? { metadata: cloneSnapshotValue(descriptor.metadata) }
       : {}),
     ...(descriptor.extensions !== undefined
       ? { extensions: [...descriptor.extensions] }
       : {}),
   };
+}
+
+function copyUpdateMetadata(
+  metadata: Record<string, unknown> | undefined,
+): Pick<TaskArtifactUpdateEvent, 'metadata'> {
+  return metadata === undefined
+    ? {}
+    : { metadata: cloneSnapshotValue(metadata) };
 }
 
 /**
@@ -708,14 +711,20 @@ function mergeTextArtifactDescriptor(
 
   if (incoming.metadata !== undefined) {
     const metadata = { ...(merged.metadata ?? {}) };
-    for (const [key, value] of Object.entries(incoming.metadata)) {
-      if (
-        Object.prototype.hasOwnProperty.call(metadata, key) &&
-        !isDeepStrictEqual(metadata[key], value)
-      ) {
-        throw new Error(`Conflicting text artifact metadata key: ${key}`);
+    const incomingMetadata = cloneSnapshotValue(incoming.metadata);
+    for (const [key, value] of Object.entries(incomingMetadata)) {
+      if (Object.prototype.hasOwnProperty.call(metadata, key)) {
+        if (!isDeepStrictEqual(metadata[key], value)) {
+          throw new Error(`Conflicting text artifact metadata key: ${key}`);
+        }
+        continue;
       }
-      metadata[key] = value;
+      Object.defineProperty(metadata, key, {
+        value,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
     }
     merged.metadata = metadata;
   }
