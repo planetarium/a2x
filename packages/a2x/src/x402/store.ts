@@ -95,6 +95,21 @@ export interface X402EntryFailure {
   indeterminate?: boolean;
 }
 
+/** Merchant-side delivery audit attached to the retained payment lifecycle. */
+export interface X402MerchantDeliveryAudit {
+  timing: 'after-settlement' | 'after-verification';
+  /** Write-ahead marker set before content delivery is handed to a transport. */
+  publicationStartedAt?: Date;
+  /** Set when resource work finishes successfully and settlement begins. */
+  workCompletedAt?: Date;
+  /** Set when resource work fails after verification. */
+  workFailedAt?: Date;
+  /** Set when settlement fails after content publication may have started. */
+  settlementFailedAt?: Date;
+}
+
+export type X402MerchantDeliveryAuditPatch = Partial<X402MerchantDeliveryAudit>;
+
 export interface X402StoreEntry {
   taskId: string;
   /** Offering the merchant advertised on turn 1. Immutable once set. */
@@ -125,6 +140,8 @@ export interface X402StoreEntry {
   receipt?: X402EntryReceipt;
   /** Populated when `status === 'failed'` or `'rejected'`. */
   failure?: X402EntryFailure;
+  /** Host-neutral delivery timing and audit evidence recorded by MerchantGate. */
+  merchantDelivery?: X402MerchantDeliveryAudit;
 }
 
 /**
@@ -138,6 +155,7 @@ export interface X402StoreEntryPatch {
   verifiedAt?: Date;
   receipt?: X402EntryReceipt;
   failure?: X402EntryFailure;
+  merchantDelivery?: X402MerchantDeliveryAudit;
 }
 
 /**
@@ -209,6 +227,28 @@ export abstract class BaseX402Store {
     const current = await this.get(taskId);
     if (!current || !expected.includes(current.status)) return false;
     await this.update(taskId, patch);
+    return true;
+  }
+  /**
+   * Merge merchant delivery evidence without replacing fields written by a
+   * concurrent publisher or settlement. Shared stores MUST override this with
+   * one backend-level atomic merge.
+   */
+  async updateMerchantDelivery(
+    taskId: string,
+    patch: X402MerchantDeliveryAuditPatch,
+  ): Promise<boolean> {
+    const current = await this.get(taskId);
+    if (!current) return false;
+    const timing = patch.timing ?? current.merchantDelivery?.timing;
+    if (!timing) return false;
+    await this.update(taskId, {
+      merchantDelivery: {
+        ...current.merchantDelivery,
+        ...patch,
+        timing,
+      },
+    });
     return true;
   }
   /** Remove the entry (best-effort; no-op if absent). */
@@ -307,6 +347,32 @@ export class InMemoryX402Store extends BaseX402Store {
       return false;
     }
     await this.update(taskId, patch);
+    return true;
+  }
+
+  override async updateMerchantDelivery(
+    taskId: string,
+    patch: X402MerchantDeliveryAuditPatch,
+  ): Promise<boolean> {
+    const cur = this._entries.get(taskId);
+    if (!cur) return false;
+    if (cur.expiresAt && cur.expiresAt.getTime() <= Date.now()) {
+      this._entries.delete(taskId);
+      return false;
+    }
+    const timing = patch.timing ?? cur.merchantDelivery?.timing;
+    if (!timing) return false;
+    const next: X402StoreEntry = {
+      ...cur,
+      merchantDelivery: {
+        ...cur.merchantDelivery,
+        ...patch,
+        timing,
+      },
+      updatedAt: new Date(),
+    };
+    this._entries.delete(taskId);
+    this._entries.set(taskId, next);
     return true;
   }
 

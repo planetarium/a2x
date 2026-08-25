@@ -6,6 +6,8 @@ import {
   MerchantGate,
   merchantPricingToAccept,
   type MerchantBatchSettlementPricing,
+  type MerchantDeliveryMetadataBuilder,
+  type MerchantDeliveryTiming,
   type MerchantExactPricing,
   type MerchantGateErrorContext,
   type MerchantOffer,
@@ -188,6 +190,7 @@ function batchFixture(options: {
   pricing?: MerchantBatchSettlementPricing;
   skipHandler?: boolean;
   settleSuccess?: boolean;
+  deliveryTiming?: MerchantDeliveryTiming;
 } = {}) {
   const pricing = options.pricing ?? BATCH;
   const cancel = vi.fn(async () => undefined);
@@ -244,6 +247,7 @@ function batchFixture(options: {
     x402,
     pricing: async () => ({ accepts: [pricing] }),
     exactTiming: 'after-work',
+    deliveryTiming: options.deliveryTiming ?? 'after-settlement',
   });
   return { gate, x402, resourceServer, cancel, settlePayment };
 }
@@ -252,6 +256,8 @@ function fixture(
   offer: MerchantOffer,
   exactTiming: 'before-work' | 'after-work',
   onError?: (error: unknown, context: MerchantGateErrorContext) => void | Promise<void>,
+  deliveryTiming: MerchantDeliveryTiming = 'after-settlement',
+  deliveryMetadata?: MerchantDeliveryMetadataBuilder,
 ) {
   const settledRequirements: X402PaymentRequirements[] = [];
   const facilitator: X402Facilitator = {
@@ -272,12 +278,26 @@ function fixture(
     x402,
     pricing: resolver,
     exactTiming,
+    deliveryTiming,
+    ...(deliveryMetadata ? { deliveryMetadata } : {}),
     ...(onError ? { onError } : {}),
   });
   return { gate, facilitator, resolver, settledRequirements, x402 };
 }
 
 describe('MerchantGate', () => {
+  it('requires an explicit delivery timing policy', () => {
+    expect(
+      () =>
+        new MerchantGate({
+          x402: new X402Context({ x402Version: 2 }),
+          pricing: async () => null,
+          exactTiming: 'after-work',
+          deliveryTiming: undefined as never,
+        }),
+    ).toThrow("deliveryTiming must be 'after-settlement' or 'after-verification'");
+  });
+
   it('treats an explicitly undefined message as a first-turn request', async () => {
     const { gate } = fixture({ accepts: [EXACT] }, 'after-work');
 
@@ -314,6 +334,7 @@ describe('MerchantGate', () => {
       x402: new X402Context({ x402Version: 2 }),
       pricing: async () => null,
       exactTiming: 'after-work',
+      deliveryTiming: 'after-settlement',
     });
     await expect(gate.open({ taskId: 't-free', message: message() })).resolves.toEqual({
       kind: 'proceed',
@@ -329,6 +350,7 @@ describe('MerchantGate', () => {
         throw infrastructureError;
       },
       exactTiming: 'after-work',
+      deliveryTiming: 'after-settlement',
       onError,
     });
     await expect(gate.open({ taskId: 't-error', message: message() })).resolves.toEqual({
@@ -381,6 +403,239 @@ describe('MerchantGate', () => {
     });
   });
 
+  it('blocks fail-closed delivery until settlement and then authorizes final metadata', async () => {
+    const deliveryMetadata = vi.fn(
+      ({ provisional }: { provisional: boolean }) => ({
+        'merchant.example/delivery': provisional ? 'provisional' : 'final',
+      }),
+    );
+    const { gate, x402 } = fixture(
+      { accepts: [EXACT] },
+      'after-work',
+      undefined,
+      'after-settlement',
+      deliveryMetadata,
+    );
+    await gate.open({ taskId: 't-buffered', message: message() });
+    const opened = await gate.open({
+      taskId: 't-buffered',
+      message: submitted(exactPayload()),
+    });
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+
+    await expect(gate.authorizeDelivery({ taskId: 't-buffered' })).resolves.toEqual({
+      kind: 'blocked',
+      reason: 'settlement-required',
+    });
+    await gate.settle({ taskId: 't-buffered', obligation: opened.obligation });
+    await expect(gate.authorizeDelivery({ taskId: 't-buffered' })).resolves.toEqual({
+      kind: 'authorized',
+      provisional: false,
+      metadata: { 'merchant.example/delivery': 'final' },
+    });
+    expect(deliveryMetadata).toHaveBeenCalledWith({
+      taskId: 't-buffered',
+      timing: 'after-settlement',
+      provisional: false,
+      paymentStatus: 'settled',
+    });
+    await expect(x402.store.get('t-buffered')).resolves.toMatchObject({
+      status: 'completed',
+      merchantDelivery: {
+        timing: 'after-settlement',
+        publicationStartedAt: expect.any(Date),
+        workCompletedAt: expect.any(Date),
+      },
+    });
+  });
+
+  it('authorizes provisional delivery after verification and records it before publication', async () => {
+    const { gate, x402 } = fixture(
+      { accepts: [EXACT] },
+      'after-work',
+      undefined,
+      'after-verification',
+      ({ provisional }) => ({ provisional }),
+    );
+    await gate.open({ taskId: 't-progressive', message: message() });
+    const opened = await gate.open({
+      taskId: 't-progressive',
+      message: submitted(exactPayload()),
+    });
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+
+    await expect(gate.authorizeDelivery({ taskId: 't-progressive' })).resolves.toEqual({
+      kind: 'authorized',
+      provisional: true,
+      metadata: { provisional: true },
+    });
+    await expect(x402.store.get('t-progressive')).resolves.toMatchObject({
+      status: 'verified',
+      merchantDelivery: {
+        timing: 'after-verification',
+        publicationStartedAt: expect.any(Date),
+      },
+    });
+  });
+
+  it('blocks delivery when the publication boundary cannot be persisted', async () => {
+    const { gate, x402 } = fixture(
+      { accepts: [EXACT] },
+      'after-work',
+      undefined,
+      'after-verification',
+    );
+    await gate.open({ taskId: 't-delivery-store-failure', message: message() });
+    await gate.open({
+      taskId: 't-delivery-store-failure',
+      message: submitted(exactPayload()),
+    });
+    vi.spyOn(x402.store, 'updateMerchantDelivery').mockResolvedValueOnce(false);
+
+    await expect(
+      gate.authorizeDelivery({ taskId: 't-delivery-store-failure' }),
+    ).resolves.toEqual({
+      kind: 'blocked',
+      reason: 'payment-state-unavailable',
+    });
+    await expect(gate.publicationStarted('t-delivery-store-failure')).resolves.toBe(false);
+  });
+
+  it('merges concurrent publication and settlement audit fields', async () => {
+    const { gate, x402 } = fixture(
+      { accepts: [EXACT] },
+      'after-work',
+      undefined,
+      'after-verification',
+    );
+    await gate.open({ taskId: 't-delivery-settle-race', message: message() });
+    const opened = await gate.open({
+      taskId: 't-delivery-settle-race',
+      message: submitted(exactPayload()),
+    });
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+
+    const [delivery, settlement] = await Promise.all([
+      gate.authorizeDelivery({ taskId: 't-delivery-settle-race' }),
+      gate.settle({ taskId: 't-delivery-settle-race', obligation: opened.obligation }),
+    ]);
+
+    expect(delivery).toMatchObject({ kind: 'authorized' });
+    expect(settlement).toMatchObject({ kind: 'settled' });
+    await expect(x402.store.get('t-delivery-settle-race')).resolves.toMatchObject({
+      status: 'completed',
+      merchantDelivery: {
+        publicationStartedAt: expect.any(Date),
+        workCompletedAt: expect.any(Date),
+      },
+    });
+  });
+
+  it('settles exact work that fails after provisional content was published', async () => {
+    const { gate, facilitator, x402 } = fixture(
+      { accepts: [EXACT] },
+      'after-work',
+      undefined,
+      'after-verification',
+    );
+    await gate.open({ taskId: 't-partial-exact-failure', message: message() });
+    const opened = await gate.open({
+      taskId: 't-partial-exact-failure',
+      message: submitted(exactPayload()),
+    });
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+    await gate.authorizeDelivery({ taskId: 't-partial-exact-failure' });
+
+    await expect(
+      gate.abort({
+        taskId: 't-partial-exact-failure',
+        obligation: opened.obligation,
+        reason: 'handler_threw',
+        error: new Error('upstream failed'),
+      }),
+    ).resolves.toMatchObject({
+      kind: 'settled',
+      charge: { requestedAtomic: '1000', basis: 'exact' },
+    });
+    expect(facilitator.settle).toHaveBeenCalledOnce();
+    await expect(x402.store.get('t-partial-exact-failure')).resolves.toMatchObject({
+      status: 'completed',
+      merchantDelivery: {
+        publicationStartedAt: expect.any(Date),
+        workFailedAt: expect.any(Date),
+      },
+    });
+  });
+
+  it('settles metered usage when upto work fails after provisional delivery', async () => {
+    const { gate } = fixture(
+      { accepts: [UPTO] },
+      'after-work',
+      undefined,
+      'after-verification',
+    );
+    await gate.open({ taskId: 't-partial-upto-failure', message: message() });
+    const opened = await gate.open({
+      taskId: 't-partial-upto-failure',
+      message: submitted(uptoPayload()),
+    });
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+    await gate.authorizeDelivery({ taskId: 't-partial-upto-failure' });
+
+    await expect(
+      gate.abort({
+        taskId: 't-partial-upto-failure',
+        obligation: opened.obligation,
+        reason: 'handler_threw',
+        usage: { kind: 'total', totalTokens: 1_500 },
+      }),
+    ).resolves.toMatchObject({
+      kind: 'settled',
+      charge: { requestedAtomic: '150', basis: 'metered' },
+    });
+  });
+
+  it('does not settle failed after-work execution when no content was published', async () => {
+    const { gate, facilitator, x402 } = fixture(
+      { accepts: [EXACT] },
+      'after-work',
+      undefined,
+      'after-verification',
+    );
+    await gate.open({ taskId: 't-undelivered-failure', message: message() });
+    const opened = await gate.open({
+      taskId: 't-undelivered-failure',
+      message: submitted(exactPayload()),
+    });
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+
+    await expect(
+      gate.abort({
+        taskId: 't-undelivered-failure',
+        obligation: opened.obligation,
+        reason: 'handler_threw',
+      }),
+    ).resolves.toEqual({ kind: 'aborted' });
+    expect(facilitator.settle).not.toHaveBeenCalled();
+    await expect(x402.store.get('t-undelivered-failure')).resolves.toBeUndefined();
+  });
+
+  it('refuses to lapse an authorization after publication', async () => {
+    const { gate } = fixture(
+      { accepts: [UPTO] },
+      'after-work',
+      undefined,
+      'after-verification',
+    );
+    await gate.open({ taskId: 't-published-lapse', message: message() });
+    await gate.open({ taskId: 't-published-lapse', message: submitted(uptoPayload()) });
+    await gate.authorizeDelivery({ taskId: 't-published-lapse' });
+
+    await expect(gate.lapse('t-published-lapse')).rejects.toThrow(
+      'cannot lapse an authorization after content publication',
+    );
+  });
+
   it('reuses frozen pricing for unpaid retries without calling the resolver again', async () => {
     const { gate, resolver } = fixture(
       { accepts: [EXACT], expiresInSeconds: 600 },
@@ -408,6 +663,27 @@ describe('MerchantGate', () => {
 
     await gate.settle({ taskId: 't-before', obligation: opened.obligation });
     expect(facilitator.settle).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats before-work exact delivery as final under either delivery policy', async () => {
+    const { gate } = fixture(
+      { accepts: [EXACT] },
+      'before-work',
+      undefined,
+      'after-verification',
+    );
+    await gate.open({ taskId: 't-before-progressive', message: message() });
+    await gate.open({
+      taskId: 't-before-progressive',
+      message: submitted(exactPayload()),
+    });
+
+    await expect(
+      gate.authorizeDelivery({ taskId: 't-before-progressive' }),
+    ).resolves.toMatchObject({
+      kind: 'authorized',
+      provisional: false,
+    });
   });
 
   it('lapses a held authorization without settlement', async () => {
@@ -528,6 +804,7 @@ describe('MerchantGate', () => {
       offerStore: gate.offerStore,
       pricing: async () => ({ accepts: [EXACT] }),
       exactTiming: 'after-work',
+      deliveryTiming: 'after-settlement',
     });
     await expect(
       restarted.open({ taskId: 't-claimed-restart', message: submitted(exactPayload()) }),
@@ -811,6 +1088,7 @@ describe('MerchantGate', () => {
       offerStore: store,
       pricing: async () => ({ accepts: [EXACT] }),
       exactTiming: 'after-work',
+      deliveryTiming: 'after-settlement',
       onError,
     });
     await gate.open({ taskId: 't-shared-store-cleanup', message: message() });
@@ -1019,6 +1297,48 @@ describe('MerchantGate', () => {
     ).resolves.toMatchObject({ kind: 'proceed' });
   });
 
+  it('retains a batch claim when settlement fails after provisional delivery', async () => {
+    const { gate, x402, cancel, resourceServer } = batchFixture({
+      settleSuccess: false,
+      deliveryTiming: 'after-verification',
+    });
+    await gate.open({ taskId: 't-batch-delivered-failure', message: message() });
+    const accepted = (await x402.store.get('t-batch-delivered-failure'))!.accepts[0]!;
+    const opened = await gate.open({
+      taskId: 't-batch-delivered-failure',
+      message: submitted(batchPayload('voucher', accepted)),
+    });
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+    await gate.authorizeDelivery({ taskId: 't-batch-delivered-failure' });
+
+    await expect(
+      gate.settle({
+        taskId: 't-batch-delivered-failure',
+        obligation: opened.obligation,
+        usage: { kind: 'total', totalTokens: 1_500 },
+      }),
+    ).resolves.toMatchObject({ kind: 'failed' });
+    expect(cancel).not.toHaveBeenCalled();
+    await expect(x402.store.get('t-batch-delivered-failure')).resolves.toMatchObject({
+      status: 'failed',
+      merchantDelivery: {
+        publicationStartedAt: expect.any(Date),
+        workCompletedAt: expect.any(Date),
+        settlementFailedAt: expect.any(Date),
+      },
+    });
+    await expect(
+      gate.open({
+        taskId: 't-batch-delivered-failure',
+        message: submitted(batchPayload('voucher', accepted)),
+      }),
+    ).resolves.toMatchObject({
+      kind: 'refuse',
+      code: X402_ERROR_CODES.DUPLICATE_NONCE,
+    });
+    expect(resourceServer.verifyPayment).toHaveBeenCalledOnce();
+  });
+
   it('settles a batch refund without allowing resource work to run', async () => {
     const { gate, x402, settlePayment, resourceServer } = batchFixture({ skipHandler: true });
     await gate.open({ taskId: 't-batch-refund', message: message() });
@@ -1106,6 +1426,7 @@ describe('MerchantGate', () => {
       x402: new X402Context({ x402Version: 2 }),
       pricing: async () => ({ accepts: [BATCH] }),
       exactTiming: 'after-work',
+      deliveryTiming: 'after-settlement',
       onError,
     });
 

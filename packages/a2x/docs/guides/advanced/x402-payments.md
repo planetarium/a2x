@@ -448,6 +448,11 @@ import { MerchantGate, X402Context } from '@a2x/sdk/x402';
 const gate = new MerchantGate({
   x402: new X402Context({ x402Version: 2 }),
   exactTiming: 'after-work', // required: the SDK does not choose the risk allocation
+  deliveryTiming: 'after-settlement', // required: buffer until payment is final
+  deliveryMetadata: ({ provisional }) => ({
+    // Application-owned vocabulary. x402 does not standardize a delivery key.
+    'merchant.example/delivery': provisional ? 'provisional' : 'final',
+  }),
   onError: (error, { operation, taskId }) => {
     logger.error({ error, operation, taskId }, 'x402 merchant operation failed');
   },
@@ -540,13 +545,105 @@ if (settled.kind === 'failed') {
   yield x402.failedEvent(settled);
   return;
 }
-yield { type: 'text', role: 'agent', text: result.text };
+const delivery = await gate.authorizeDelivery({ taskId: ctx.taskId! });
+if (delivery.kind === 'blocked') {
+  yield { type: 'error', error: new Error(`Delivery blocked: ${delivery.reason}`) };
+  return;
+}
+yield {
+  type: 'text',
+  role: 'agent',
+  text: result.text,
+  deliveryMetadata: delivery.metadata,
+};
 yield { type: 'done', metadata: settled.receiptMetadata };
 ```
 
+`deliveryTiming` is required and independent of `exactTiming`. `after-settlement` is fail-closed: the host buffers work, settles it, calls `authorizeDelivery()`, and only then publishes. `after-verification` allows progressive publication while settlement is deferred. `authorizeDelivery()` writes `publicationStartedAt` to the x402 lifecycle before returning an authorization, so later failure handling conservatively distinguishes work that remained private from content that may have escaped. Once authorization returns, the host must treat publication as irreversible even if its transport disconnects before confirming every byte.
+
+The metadata callback is intentionally application-owned. Neither the a2a-x402 extension nor x402 defines a provisional-delivery metadata key. A host can map the returned record to `AgentEvent.deliveryMetadata`, as above, and declare its own versioned A2A extension URI on the artifact when clients need interoperable semantics. The gate never imports or emits `AgentEvent`s.
+
+#### Buffered after-work delivery
+
+```mermaid
+sequenceDiagram
+    participant P as Payer
+    participant G as MerchantGate
+    participant W as Resource work
+    G->>G: verify and claim
+    G->>W: run work
+    W-->>G: complete output (buffered)
+    G->>G: settle
+    G->>G: authorizeDelivery (final)
+    G-->>P: publish output and receipt
+```
+
+With `deliveryTiming: 'after-settlement'`, calling `authorizeDelivery()` while the lifecycle is only `verified` returns `{ kind: 'blocked', reason: 'settlement-required' }`. A failed work attempt that published nothing is canceled or lapsed without an after-work charge.
+
+#### Progressive after-verification delivery
+
+```mermaid
+sequenceDiagram
+    participant P as Payer
+    participant G as MerchantGate
+    participant W as Resource work
+    G->>G: verify and claim
+    G->>G: authorizeDelivery (provisional)
+    loop resource chunks
+        W-->>P: publish provisional artifact update
+    end
+    W-->>G: complete or fail with usage
+    G->>G: settle
+    G-->>P: terminal receipt or payment failure
+```
+
+```ts
+let delivery;
+try {
+  for await (const chunk of runStreamingWork()) {
+    if (!delivery) {
+      const authorization = await gate.authorizeDelivery({ taskId: ctx.taskId! });
+      if (authorization.kind === 'blocked') {
+        throw new Error(`Delivery blocked: ${authorization.reason}`);
+      }
+      delivery = authorization;
+    }
+    meter.observe(chunk.usage);
+    yield {
+      type: 'text',
+      role: 'agent',
+      text: chunk.text,
+      deliveryMetadata: delivery.metadata,
+    };
+  }
+
+  const settled = await gate.settle({
+    taskId: ctx.taskId!,
+    obligation: opened.obligation,
+    usage: meter.snapshot(),
+  });
+  yield renderSettlement(settled);
+} catch (error) {
+  const outcome = await gate.abort({
+    taskId: ctx.taskId!,
+    obligation: opened.obligation,
+    reason: 'handler_threw',
+    usage: meter.snapshot(),
+    error,
+  });
+  yield {
+    type: 'error',
+    error: error instanceof Error ? error : new Error(String(error)),
+    ...(outcome.kind === 'settled' ? { metadata: outcome.receiptMetadata } : {}),
+  };
+}
+```
+
+Once `authorizeDelivery()` has recorded publication, `abort()` settles instead of lapsing: exact charges the signed amount, while `upto` and `batch-settlement` charge the supplied partial usage and apply the frozen `unreportedUsage` policy when it cannot be priced. The A2A Task still ends in `failed`; a successful payment receipt belongs on that terminal error metadata. If settlement itself fails after publication, the gate retains the claim, records `settlementFailedAt`, and refuses automatic replay for operator reconciliation. It never cancels a batch reservation after content has escaped.
+
 The pricing callback runs only on the unpaid turn. Its complete `MerchantOffer` is frozen by the offer store and the submitted turn settles against that snapshot, not live rates. When `expiresInSeconds` is omitted, `MerchantGate` applies a 10-minute TTL to both the offer-store snapshot and the underlying x402 offering; set `expiresInSeconds` on the offer to override it. The default `InMemoryMerchantOfferStore` independently defaults to the same TTL and caps itself at 10,000 live entries. Standalone store users can override those limits with `defaultTtlSeconds` and `maxEntries`. It also grants an execution claim. Multi-replica deployments must inject a durable `MerchantOfferStore` whose publication, claim, and release operations are atomic and whose claim status is shared across replicas.
 
-Verification happens before the execution claim is consumed, so a transient verification failure can be retried on the same task. Once verification succeeds, only one concurrent caller receives the claim and may execute work. Exact and `upto` remain one-shot after that claim. A canceled `batch-settlement` obligation releases both the task claim and the official scheme's channel reservation, so the same voucher can retry after failed work. Cleanup failures do not turn a completed payment into a failure; they are reported through `onError` with `operation: 'cleanup'`.
+Verification happens before the execution claim is consumed, so a transient verification failure can be retried on the same task. Once verification succeeds, only one concurrent caller receives the claim and may execute work. Exact and `upto` remain one-shot after that claim. A canceled `batch-settlement` obligation releases both the task claim and the official scheme's channel reservation only when no content was published, so the same voucher can retry after an undelivered failure. Cleanup failures do not turn a completed payment into a failure; they are reported through `onError` with `operation: 'cleanup'`.
 
 Successful settlement now removes the frozen merchant offer but retains the completed `X402StoreEntry` until its configured TTL. This gives every scheme a durable completed-replay answer and keeps its reconciliation receipt available. The lifecycle store must therefore have a bounded TTL and an operational expiry sweep when its backend does not expire rows natively.
 
@@ -568,6 +665,8 @@ If one object implements both `MerchantOfferStore` and the x402 lifecycle store,
 | `completed` | either/absent | Terminal; the retained receipt proves settlement and verification is skipped. |
 | expired/absent | absent | A submitted payment has no stored offering; an unpaid turn may create a new offer. |
 
+Delivery audit is orthogonal to the payment status. `X402StoreEntry.merchantDelivery` records the configured timing plus `publicationStartedAt`, `workCompletedAt` or `workFailedAt`, and `settlementFailedAt` when applicable. Together with the existing `verifiedAt` and retained receipt's `settledAt`, these fields distinguish verified, possibly partially delivered, work-finished, settled, and delivered-but-unsettled tasks without adding wire-level payment states. Shared lifecycle stores must override `updateMerchantDelivery()` with an atomic field merge so a concurrent publication boundary and settlement cannot erase each other's evidence.
+
 Two concurrent submissions can both observe `available` and both verify. Exactly one wins the later atomic `claim()`; every loser cancels any scheme reservation and receives `DUPLICATE_NONCE`. This is why `getClaimStatus()` is never a lock.
 
 A facilitator response with `success: false` is a definitive settlement refusal. In `before-work` mode the gate can delete both records and allow the task to restart. A thrown settlement transport/schema error is different: the transfer may already have been broadcast. `X402EntryFailure.indeterminate` is then `true`, and the claim is kept until expiry or explicit operator reconciliation. Only call `offerStore.release(taskId)` after proving that neither resource side effects nor settlement occurred. Batch abort remains the normal automatic release path because it also cancels the scheme reservation.
@@ -576,7 +675,7 @@ Unexpected exceptions that escape pricing, storage, or x402 operations are never
 
 Usage is semantic rather than inferred. A trusted zero reading is `{ kind: 'total', totalTokens: 0 }` and charges zero; a runtime that uses zero counters as an “accounting unavailable” sentinel must normalize them to `{ kind: 'unreported' }`. Each `rates` object must use exactly one form: detailed input/output rates or `totalPerThousand`. Detailed rates cannot price a total-only reading, so that combination also follows the offer's required `unreportedUsage` policy. A `totalPerThousand` rate can price either usage shape.
 
-`exactTiming` is required because `before-work` protects the merchant from delivering work whose authorization later fails, while `after-work` protects the payer from being charged for work that fails. For `before-work`, `open()` returns an already-settled obligation; calling `settle()` after the work reuses its receipt and never charges twice. If the facilitator definitively refuses settlement before work, the gate clears the frozen offer and execution claim so the payer can restart the payment flow on the same task. An indeterminate transport failure keeps the claim, as described above.
+`exactTiming` is required because `before-work` protects the merchant from delivering work whose authorization later fails, while `after-work` protects the payer from being charged for work that fails before publication. `deliveryTiming` is independently required because progressive content transfers the risk back to the payer once content escapes. For `before-work`, `open()` returns an already-settled obligation; calling `settle()` after the work reuses its receipt and never charges twice, and either delivery policy authorizes non-provisional output. If the facilitator definitively refuses settlement before work, the gate clears the frozen offer and execution claim so the payer can restart the payment flow on the same task. An indeterminate transport failure keeps the claim, as described above.
 
 On success, `settled.charge.requestedAtomic` is the amount the gate asked the facilitator to settle. `settled.charge.amountAtomic` is the facilitator-reported `receipt.amount` when it is a decimal amount, or the requested amount when the receipt omits it. Comparing the two surfaces settlement reconciliation mismatches without discarding the facilitator's authoritative value.
 
@@ -601,6 +700,7 @@ let sessions!: UptoSessionManager;
 const gate = new MerchantGate({
   x402,
   exactTiming: 'after-work',
+  deliveryTiming: 'after-verification',
   pricing: async (turn) => {
     // Active conversations already hold a verified authorization.
     if (turn.contextId && await sessions.active(turn.contextId)) return null;
@@ -648,6 +748,8 @@ for (const unresolved of recovery.unresolved) {
   }
 }
 ```
+
+`UptoSessionManager` requires `deliveryTiming: 'after-verification'`. Waiting for settlement would prevent each conversational turn from reaching the payer until the authorization closes, so `after-settlement` is rejected as a contradictory session configuration. Before the first output of an active or reserved session, call `await sessions.authorizeDelivery(contextId)` and map its metadata to the content delivery just as with `gate.authorizeDelivery()`.
 
 Reserve an already-active session before starting work. The stable `turnId` makes completion idempotent, and the lease stops idle/deadline triggers from settling between the active-session check and usage recording:
 
@@ -756,7 +858,9 @@ if (sessionOutcome?.settlement?.kind === 'settled') {
 
 Use `reserveOpen` / `commitOpen` around the first turn's real resource work. The reservation performs the atomic context claim before work, so concurrent verified opening payments receive `unavailable` and are lapsed before they can spend upstream resources. Its reason distinguishes `active`, `settling`, `closed-unreconciled`, and `deadline`; a retained failed settlement requires operator reconciliation instead of an ordinary payer retry. A same-task retry returns `duplicate` with `pending` or `completed`; reuse durable host output instead of running it again. A mismatched task passed to `commitOpen` throws because it is a host logic error, not an expected race.
 
-A reserved opener arms no idle or deadline timer until `commitOpen` records trusted usage. This prevents an automatic trigger from charging an unreported-usage floor or ceiling before work completes. If resource work throws after a successful reservation, the host **must** call `cancelOpen({ contextId, taskId })`; it atomically closes and lapses the reservation only while that opening task still owns it. Omitting the cancellation leaves an unresolved authorization for recovery. A reservation whose guarded authorization deadline has already passed returns `unavailable` without creating a session.
+A reserved opener arms no idle or deadline timer until `commitOpen` records trusted usage. This prevents an automatic trigger from charging an unreported-usage floor or ceiling before work completes. If resource work throws before publication after a successful reservation, the host **must** call `cancelOpen({ contextId, taskId })`; it atomically closes and lapses the reservation only while that opening task still owns it. Omitting the cancellation leaves an unresolved authorization for recovery. A reservation whose guarded authorization deadline has already passed returns `unavailable` without creating a session.
+
+`cancelOpen()` and `cancelTurn()` are only for work that published nothing. After `authorizeDelivery()` succeeds and any content escapes, record the partial usage with `commitOpen()` or `finishTurn()`, then close the session so it settles immediately; surface the work error separately on the A2A Task. Even a trusted zero reading settles zero after publication instead of lapsing, preserving completed payment evidence and the no-replay invariant.
 
 `recordTurn({ contextId, usage })` remains available when usage is already complete and there is no asynchronous work gap. Use the `beginTurn` / `finishTurn` pair around later resource work. A start result distinguishes `inactive`, a new `started` lease, and duplicate `pending` or `completed` turn ids; duplicate turns must reuse the host's durable result and never execute again. `cancelTurn` releases a later-turn lease that produced no billable work. Once a close is requested, new leases are refused; the last finishing or canceled lease performs the single settlement. An opening reservation is not reported by `active()` and does not admit later turn leases until `commitOpen` records its first trusted usage.
 
@@ -863,6 +967,7 @@ const x402 = new X402Context({
 const gate = new MerchantGate({
   x402,
   exactTiming: 'after-work',
+  deliveryTiming: 'after-settlement',
   pricing: async () => ({
     accepts: [{
       scheme: 'batch-settlement',

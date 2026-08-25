@@ -72,6 +72,8 @@ function fixture(options: {
   idleSeconds?: number;
   maxDurationSeconds?: number;
   deadlineGuardSeconds?: number;
+  deliveryTiming?: 'after-settlement' | 'after-verification';
+  publicationStarted?: boolean;
 } = {}) {
   const settle = vi.fn(
     options.settle ??
@@ -87,7 +89,19 @@ function fixture(options: {
       }),
   );
   const lapse = vi.fn(async () => undefined);
-  const gate = { settle, lapse } as unknown as MerchantGate;
+  const publicationStarted = vi.fn(async () => options.publicationStarted ?? false);
+  const authorizeDelivery = vi.fn(async () => ({
+    kind: 'authorized' as const,
+    provisional: true,
+    metadata: {},
+  }));
+  const gate = {
+    settle,
+    lapse,
+    deliveryTiming: options.deliveryTiming ?? 'after-verification',
+    publicationStarted,
+    authorizeDelivery,
+  } as unknown as MerchantGate;
   const manager = new UptoSessionManager({
     gate,
     store: options.store,
@@ -95,7 +109,7 @@ function fixture(options: {
     maxDurationSeconds: options.maxDurationSeconds ?? 600,
     deadlineGuardSeconds: options.deadlineGuardSeconds ?? 30,
   });
-  return { gate, lapse, manager, settle };
+  return { authorizeDelivery, gate, lapse, manager, publicationStarted, settle };
 }
 
 afterEach(() => {
@@ -103,6 +117,49 @@ afterEach(() => {
 });
 
 describe('UptoSessionManager', () => {
+  it('requires progressive after-verification delivery', () => {
+    expect(() => fixture({ deliveryTiming: 'after-settlement' })).toThrow(
+      "requires MerchantGate.deliveryTiming to be 'after-verification'",
+    );
+  });
+
+  it('authorizes delivery against the payment held by the active session', async () => {
+    const { authorizeDelivery, manager } = fixture();
+    await manager.open({
+      contextId: 'c-delivery',
+      taskId: 't-delivery',
+      obligation: obligation(),
+      usage: { kind: 'total', totalTokens: 100 },
+    });
+
+    await expect(manager.authorizeDelivery('c-delivery')).resolves.toMatchObject({
+      kind: 'authorized',
+      provisional: true,
+    });
+    expect(authorizeDelivery).toHaveBeenCalledWith({ taskId: 't-delivery' });
+    manager.stop();
+  });
+
+  it('settles reported-zero usage when content was published', async () => {
+    const { lapse, manager, settle } = fixture({ publicationStarted: true });
+    await manager.open({
+      contextId: 'c-zero-delivered',
+      taskId: 't-zero-delivered',
+      obligation: obligation(),
+      usage: { kind: 'total', totalTokens: 0 },
+    });
+
+    await manager.close('c-zero-delivered');
+
+    expect(lapse).not.toHaveBeenCalled();
+    expect(settle).toHaveBeenCalledWith({
+      taskId: 't-zero-delivered',
+      obligation: expect.objectContaining({ scheme: 'upto' }),
+      usage: { kind: 'total', totalTokens: 0 },
+    });
+    manager.stop();
+  });
+
   it('accumulates usage across turns and settles once on manual close', async () => {
     const { manager, settle } = fixture();
     const opened = await manager.open({

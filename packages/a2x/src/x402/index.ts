@@ -246,6 +246,8 @@ export type {
   X402EntryStatus,
   X402EntryReceipt,
   X402EntryFailure,
+  X402MerchantDeliveryAudit,
+  X402MerchantDeliveryAuditPatch,
   InMemoryX402StoreOptions,
 } from './store.js';
 
@@ -269,8 +271,14 @@ export type {
   MerchantDetailedRates,
   MerchantExactPricing,
   MerchantExactTiming,
+  MerchantDeliveryTiming,
+  MerchantDeliveryMetadataBuilder,
+  MerchantDeliveryMetadataContext,
   MerchantGateErrorContext,
   MerchantGateAbortInput,
+  MerchantGateAbortOutcome,
+  MerchantGateAuthorizeDeliveryInput,
+  MerchantGateAuthorizeDeliveryOutcome,
   MerchantGateOpenInput,
   MerchantGateOpenOutcome,
   MerchantGateOptions,

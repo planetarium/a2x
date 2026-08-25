@@ -166,7 +166,7 @@ async *run(ctx) {
 
 For production deployments that need offering state to survive restarts, plug an external store implementing `X402Store` (Postgres / Redis / Durable Object / …).
 
-`MerchantGate` deployments also need their frozen `MerchantOffer`, execution claim, and x402 lifecycle entry to survive restarts. Multi-replica implementations must make publication, claims, and lifecycle compare-and-set updates atomic. Completed lifecycle entries are retained until their TTL for replay detection and reconciliation; size the backend and expiry sweep accordingly.
+`MerchantGate` deployments also need their frozen `MerchantOffer`, execution claim, and x402 lifecycle entry to survive restarts. Configure both `exactTiming` and `deliveryTiming` explicitly. Before publishing paid content, call `authorizeDelivery()` so the lifecycle records whether work escaped before settlement; `abort()` settles rather than lapses after that point. Multi-replica implementations must make offer publication, claims, and lifecycle compare-and-set updates atomic, and override `BaseX402Store.updateMerchantDelivery()` with an atomic field merge. Completed lifecycle entries are retained until their TTL for replay detection and reconciliation; size the backend and expiry sweep accordingly.
 
 ### Detecting client rejection
 

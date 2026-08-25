@@ -26,8 +26,13 @@ import type {
   MerchantGateOpenInput,
   MerchantGateOpenOutcome,
   MerchantGateAbortInput,
+  MerchantGateAbortOutcome,
+  MerchantGateAuthorizeDeliveryInput,
+  MerchantGateAuthorizeDeliveryOutcome,
   MerchantGateSettleInput,
   MerchantGateSettleOutcome,
+  MerchantDeliveryMetadataBuilder,
+  MerchantDeliveryTiming,
   MerchantExactTiming,
   MerchantExactPricing,
   MerchantBatchSettlementPricing,
@@ -44,12 +49,16 @@ export interface MerchantGateOptions {
   offerStore?: MerchantOfferStore;
   /** Required: before/after work intentionally allocate failure risk differently. */
   exactTiming: MerchantExactTiming;
+  /** Required: verification and settlement allocate delivery risk differently. */
+  deliveryTiming: MerchantDeliveryTiming;
+  /** Maps host-neutral delivery state to application-owned metadata. */
+  deliveryMetadata?: MerchantDeliveryMetadataBuilder;
   /** Receives infrastructure errors that are intentionally hidden from payer-facing outcomes. */
   onError?: (error: unknown, context: MerchantGateErrorContext) => void | Promise<void>;
 }
 
 export interface MerchantGateErrorContext {
-  operation: 'open' | 'settle' | 'abort' | 'cleanup';
+  operation: 'open' | 'authorize-delivery' | 'settle' | 'abort' | 'cleanup';
   taskId: string;
 }
 
@@ -120,7 +129,19 @@ export class MerchantGate {
   readonly offerStore: MerchantOfferStore;
 
   constructor(private readonly options: MerchantGateOptions) {
+    if (
+      options.deliveryTiming !== 'after-settlement' &&
+      options.deliveryTiming !== 'after-verification'
+    ) {
+      throw new Error(
+        "MerchantGate.deliveryTiming must be 'after-settlement' or 'after-verification'.",
+      );
+    }
     this.offerStore = options.offerStore ?? new InMemoryMerchantOfferStore();
+  }
+
+  get deliveryTiming(): MerchantDeliveryTiming {
+    return this.options.deliveryTiming;
   }
 
   async open(turn: MerchantGateOpenInput): Promise<MerchantGateOpenOutcome> {
@@ -228,6 +249,8 @@ export class MerchantGate {
         };
       }
 
+      await this.initializeDeliveryAudit(turn.taskId);
+
       if ((pricing.scheme ?? 'exact') === 'exact' && this.options.exactTiming === 'before-work') {
         const receipt = await this.options.x402.settle(turn, classified);
         if (!receipt.success) {
@@ -302,10 +325,114 @@ export class MerchantGate {
     }
   }
 
-  async settle(input: MerchantGateSettleInput): Promise<MerchantGateSettleOutcome> {
+  /** Persist publication intent before the host exposes paid content. */
+  async authorizeDelivery(
+    input: MerchantGateAuthorizeDeliveryInput,
+  ): Promise<MerchantGateAuthorizeDeliveryOutcome> {
     try {
+      const entry = await this.options.x402.store.get(input.taskId);
+      if (!entry?.merchantDelivery) {
+        return { kind: 'blocked', reason: 'payment-state-unavailable' };
+      }
+      if (entry.status === 'failed' || entry.status === 'rejected') {
+        return { kind: 'blocked', reason: 'payment-failed' };
+      }
+      if (entry.status !== 'verified' && entry.status !== 'completed') {
+        return { kind: 'blocked', reason: 'payment-not-verified' };
+      }
+      if (
+        entry.merchantDelivery.timing === 'after-settlement' &&
+        entry.status !== 'completed'
+      ) {
+        return { kind: 'blocked', reason: 'settlement-required' };
+      }
+
+      const provisional = entry.status !== 'completed';
+      const metadata = structuredClone(
+        (await this.options.deliveryMetadata?.({
+          taskId: input.taskId,
+          timing: entry.merchantDelivery.timing,
+          provisional,
+          paymentStatus: provisional ? 'verified' : 'settled',
+        })) ?? {},
+      );
+      const publicationStartedAt =
+        entry.merchantDelivery.publicationStartedAt ?? new Date();
+      const updated = await this.options.x402.store.updateMerchantDelivery(input.taskId, {
+        publicationStartedAt,
+      });
+      if (!updated) throw new Error('Delivery publication intent was not persisted.');
+      const recorded = await this.options.x402.store.get(input.taskId);
+      if (recorded?.merchantDelivery?.publicationStartedAt === undefined) {
+        throw new Error('Delivery publication intent was not persisted.');
+      }
+      return { kind: 'authorized', provisional, metadata };
+    } catch (error) {
+      await this.reportError(error, {
+        operation: 'authorize-delivery',
+        taskId: input.taskId,
+      });
+      return { kind: 'blocked', reason: 'payment-state-unavailable' };
+    }
+  }
+
+  /** Read whether the write-ahead publication boundary has been crossed. */
+  async publicationStarted(taskId: string): Promise<boolean> {
+    const entry = await this.options.x402.store.get(taskId);
+    return entry?.merchantDelivery?.publicationStartedAt !== undefined;
+  }
+
+  async settle(input: MerchantGateSettleInput): Promise<MerchantGateSettleOutcome> {
+    return await this.finishSettlement(input, 'completed');
+  }
+
+  /**
+   * Finish failed work. Once publication was authorized, settlement still runs;
+   * otherwise the verified authorization is canceled or lapsed without charge.
+   */
+  async abort(input: MerchantGateAbortInput): Promise<MerchantGateAbortOutcome> {
+    try {
+      const published = await this.publicationStarted(input.taskId);
+      if (input.obligation.kind === 'settled' || published) {
+        return await this.finishSettlement(
+          {
+            taskId: input.taskId,
+            obligation: input.obligation,
+            ...(input.usage === undefined ? {} : { usage: input.usage }),
+          },
+          'failed',
+        );
+      }
+
+      await this.recordWorkOutcome(input.taskId, 'failed');
+      if (
+        input.obligation.kind === 'deferred' &&
+        input.obligation.scheme === 'batch-settlement'
+      ) {
+        await this.abortBatch(input);
+      } else {
+        await this.cleanup(input.taskId);
+      }
+      return { kind: 'aborted' };
+    } catch (error) {
+      await this.reportError(error, { operation: 'abort', taskId: input.taskId });
+      return {
+        kind: 'failed',
+        code: X402_ERROR_CODES.SETTLEMENT_FAILED,
+        reason: 'Payment delivery state is unavailable.',
+      };
+    }
+  }
+
+  private async finishSettlement(
+    input: MerchantGateSettleInput,
+    workOutcome: 'completed' | 'failed',
+  ): Promise<MerchantGateSettleOutcome> {
+    try {
+      await this.recordWorkOutcome(input.taskId, workOutcome);
       const outcome = await this.settleObligation(input);
       let hasCompletedLifecycle = false;
+      let hasPublished = false;
       const isBatch =
         input.obligation.kind === 'deferred' &&
         input.obligation.scheme === 'batch-settlement';
@@ -314,6 +441,8 @@ export class MerchantGate {
       } else {
         const lifecycle = await this.options.x402.store.get(input.taskId);
         hasCompletedLifecycle = lifecycle?.status === 'completed';
+        hasPublished = lifecycle?.merchantDelivery?.publicationStartedAt !== undefined;
+        if (hasPublished) await this.recordSettlementFailure(input.taskId);
         if (lifecycle?.failure?.indeterminate === true) {
           await this.reportError(new Error(lifecycle.failure.reason), {
             operation: 'settle',
@@ -326,8 +455,8 @@ export class MerchantGate {
           };
         }
       }
-      if (outcome.kind === 'failed' && isBatch && !hasCompletedLifecycle) {
-        await this.abort({
+      if (outcome.kind === 'failed' && isBatch && !hasCompletedLifecycle && !hasPublished) {
+        await this.abortBatch({
           taskId: input.taskId,
           obligation: input.obligation,
           reason: 'handler_failed',
@@ -348,9 +477,12 @@ export class MerchantGate {
     }
   }
 
-  /** Release retryable state after verified resource work does not complete. */
-  async abort(input: MerchantGateAbortInput): Promise<void> {
-    if (input.obligation.kind !== 'deferred' || input.obligation.scheme !== 'batch-settlement') {
+  /** Release retryable batch state only when no content escaped. */
+  private async abortBatch(input: MerchantGateAbortInput): Promise<void> {
+    if (
+      input.obligation.kind !== 'deferred' ||
+      input.obligation.scheme !== 'batch-settlement'
+    ) {
       return;
     }
     try {
@@ -374,7 +506,59 @@ export class MerchantGate {
 
   /** Let an unused held authorization expire without attempting settlement. */
   async lapse(taskId: string): Promise<void> {
+    if (await this.publicationStarted(taskId)) {
+      throw new Error(
+        'MerchantGate cannot lapse an authorization after content publication; settle or abort it.',
+      );
+    }
     await this.cleanup(taskId);
+  }
+
+  private async initializeDeliveryAudit(taskId: string): Promise<void> {
+    const entry = await this.options.x402.store.get(taskId);
+    if (!entry) throw new Error('Verified payment lifecycle is unavailable.');
+    const updated = await this.options.x402.store.updateMerchantDelivery(taskId, {
+      timing: this.options.deliveryTiming,
+    });
+    if (!updated) throw new Error('Merchant delivery policy was not persisted.');
+    const recorded = await this.options.x402.store.get(taskId);
+    if (recorded?.merchantDelivery?.timing !== this.options.deliveryTiming) {
+      throw new Error('Merchant delivery policy was not persisted.');
+    }
+  }
+
+  private async recordWorkOutcome(
+    taskId: string,
+    outcome: 'completed' | 'failed',
+  ): Promise<void> {
+    const entry = await this.options.x402.store.get(taskId);
+    if (!entry?.merchantDelivery) return;
+    const updated = await this.options.x402.store.updateMerchantDelivery(
+      taskId,
+      outcome === 'completed'
+        ? { workCompletedAt: new Date() }
+        : { workFailedAt: new Date() },
+    );
+    if (!updated) throw new Error('Merchant work outcome was not persisted.');
+    const recorded = await this.options.x402.store.get(taskId);
+    const recordedAt =
+      outcome === 'completed'
+        ? recorded?.merchantDelivery?.workCompletedAt
+        : recorded?.merchantDelivery?.workFailedAt;
+    if (recordedAt === undefined) throw new Error('Merchant work outcome was not persisted.');
+  }
+
+  private async recordSettlementFailure(taskId: string): Promise<void> {
+    const entry = await this.options.x402.store.get(taskId);
+    if (!entry?.merchantDelivery) return;
+    const updated = await this.options.x402.store.updateMerchantDelivery(taskId, {
+      settlementFailedAt: new Date(),
+    });
+    if (!updated) throw new Error('Merchant settlement failure was not persisted.');
+    const recorded = await this.options.x402.store.get(taskId);
+    if (recorded?.merchantDelivery?.settlementFailedAt === undefined) {
+      throw new Error('Merchant settlement failure was not persisted.');
+    }
   }
 
   private async settleObligation(

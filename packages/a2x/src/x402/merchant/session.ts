@@ -2,6 +2,7 @@ import type { MerchantGate } from './gate.js';
 import { meterMerchantUsage } from './pricing.js';
 import type {
   MerchantDeferredObligation,
+  MerchantGateAuthorizeDeliveryOutcome,
   MerchantGateSettleOutcome,
   MerchantMeterableUsage,
   MerchantUptoPricing,
@@ -481,6 +482,11 @@ export class UptoSessionManager {
   private readonly deadlineGuardMs: number;
 
   constructor(private readonly options: UptoSessionManagerOptions) {
+    if (options.gate.deliveryTiming !== 'after-verification') {
+      throw new Error(
+        "UptoSessionManager requires MerchantGate.deliveryTiming to be 'after-verification'.",
+      );
+    }
     if (!Number.isFinite(options.idleSeconds) || options.idleSeconds <= 0) {
       throw new Error('UptoSessionManager.idleSeconds must be greater than zero.');
     }
@@ -543,6 +549,15 @@ export class UptoSessionManager {
       record.closeRequestedReason === undefined &&
       Date.now() < Date.parse(record.settleBy)
     );
+  }
+
+  /** Authorize provisional delivery against the authorization held by a live session. */
+  async authorizeDelivery(contextId: string): Promise<MerchantGateAuthorizeDeliveryOutcome> {
+    const record = await this.store.get(contextId);
+    if (!record || record.state !== 'active') {
+      return { kind: 'blocked', reason: 'payment-state-unavailable' };
+    }
+    return await this.options.gate.authorizeDelivery({ taskId: record.taskId });
   }
 
   /** Remove a reconciled closed record without racing a newer session. */
@@ -843,10 +858,12 @@ export class UptoSessionManager {
 
         const charge = projectedCharge(settling);
         let settlement: UptoSessionSettlement;
+        const published = await this.options.gate.publicationStarted(settling.taskId);
         if (
           charge === 0n &&
           settling.pendingTurnIds.length === 0 &&
-          !settling.usageIncomplete
+          !settling.usageIncomplete &&
+          !published
         ) {
           await this.options.gate.lapse(settling.taskId);
           settlement = { kind: 'lapsed' };
