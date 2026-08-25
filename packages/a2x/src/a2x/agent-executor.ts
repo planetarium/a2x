@@ -314,7 +314,7 @@ export class AgentExecutor {
               },
               append,
               lastChunk: false,
-              ...copyUpdateMetadata(event.updateMetadata),
+              ...copyDeliveryMetadata(event.deliveryMetadata),
             } satisfies TaskArtifactUpdateEvent;
             break;
           }
@@ -332,7 +332,7 @@ export class AgentExecutor {
               artifact,
               append: false,
               lastChunk: true,
-              ...copyUpdateMetadata(event.updateMetadata),
+              ...copyDeliveryMetadata(event.deliveryMetadata),
             } satisfies TaskArtifactUpdateEvent;
             break;
           }
@@ -355,7 +355,7 @@ export class AgentExecutor {
               artifact,
               append: false,
               lastChunk: true,
-              ...copyUpdateMetadata(event.updateMetadata),
+              ...copyDeliveryMetadata(event.deliveryMetadata),
             } satisfies TaskArtifactUpdateEvent;
             break;
           }
@@ -671,7 +671,7 @@ function copyArtifactDescriptor(
   };
 }
 
-function copyUpdateMetadata(
+function copyDeliveryMetadata(
   metadata: Record<string, unknown> | undefined,
 ): Pick<TaskArtifactUpdateEvent, 'metadata'> {
   return metadata === undefined

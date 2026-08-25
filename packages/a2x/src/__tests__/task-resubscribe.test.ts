@@ -47,7 +47,7 @@ class MutatingMetadataAgent extends BaseAgent {
       type: 'text',
       text: 'first',
       artifact: { metadata: { details: artifactDetails } },
-      updateMetadata: { details: updateDetails },
+      deliveryMetadata: { details: updateDetails },
     };
     artifactDetails.version = 2;
     updateDetails.sequence = 2;

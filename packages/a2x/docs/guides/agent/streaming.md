@@ -99,7 +99,7 @@ class ImageAgent extends BaseAgent {
         description: 'Generated image',
         metadata: { model: 'image-model-v1' },
       },
-      updateMetadata: { 'example.delivery': 'preview' },
+      deliveryMetadata: { 'example.delivery': 'preview' },
     };
     yield {
       type: 'data',
@@ -121,7 +121,7 @@ How the default `AgentExecutor` maps each event to a `TaskArtifactUpdateEvent`:
 
 The "one logical output = one artifact" mapping matches A2A's intuition and lets clients render each non-text result independently. Mixed runs work as expected: text accumulates into a single artifact, while each `file` / `data` event spawns its own.
 
-`artifact` and `updateMetadata` have deliberately different lifetimes. The Artifact descriptor is durable: the same fields appear on the terminal task and in later `tasks/get` responses for both streaming and non-streaming execution. `updateMetadata` belongs only to the individual `artifact-update` generated from that AgentEvent. It is delivered to the primary stream and live resubscribers, but is not persisted on the Artifact. The consolidated text update synthesized at completion has no update metadata.
+`artifact` and `deliveryMetadata` describe different agent intents and have deliberately different lifetimes. The artifact descriptor belongs to the durable logical output: the default A2A executor maps it onto the terminal Artifact returned by both streaming and non-streaming execution and by later `tasks/get` calls. Delivery metadata describes only that occurrence of the content; the A2A executor maps it onto the individual `artifact-update` sent to the primary stream and live resubscribers, without persisting it on the Artifact. The consolidated text update synthesized at completion has no delivery metadata.
 
 For streamed text, `name` and `description` are fixed once provided, `extensions` form an ordered union, and non-conflicting `metadata` keys accumulate. A repeated metadata key must have a deeply equal value. Conflicting descriptor values fail the task instead of silently replacing durable Artifact information.
 

@@ -7,8 +7,9 @@ import type { InvocationContext } from '../runner/context.js';
 // ─── AgentEvent (events yielded by agents to the Runner) ───
 
 /**
- * Agent-controlled fields for the Artifact produced by a content event.
- * The default executor continues to own `artifactId` and `parts`.
+ * Describes the durable logical output that receives content from an agent
+ * event. The executor owns its identity and content aggregation, then maps
+ * this descriptor to the active protocol representation.
  */
 export interface AgentArtifactDescriptor {
   name?: string;
@@ -17,15 +18,15 @@ export interface AgentArtifactDescriptor {
   extensions?: string[];
 }
 
-interface ArtifactProducingEvent {
-  /** Durable fields copied onto the produced Artifact. */
+interface ContentProducingEvent {
+  /** Descriptor for the durable logical output receiving this content. */
   artifact?: AgentArtifactDescriptor;
   /**
-   * Per-delivery metadata copied onto the corresponding streamed
-   * TaskArtifactUpdateEvent. Non-streaming execution has no artifact-update
-   * event, so this field is intentionally ignored by `execute()`.
+   * Ephemeral metadata describing this particular content delivery. The
+   * default A2A executor maps it to TaskArtifactUpdateEvent metadata during
+   * streaming. Non-streaming execution has no individual delivery event.
    */
-  updateMetadata?: Record<string, unknown>;
+  deliveryMetadata?: Record<string, unknown>;
 }
 
 export type AgentEvent =
@@ -34,12 +35,12 @@ export type AgentEvent =
       text: string;
       role?: 'user' | 'agent';
       mediaType?: string;
-    } & ArtifactProducingEvent)
+    } & ContentProducingEvent)
   | ({
       type: 'file';
       file: { raw?: string; url?: string; mediaType?: string; filename?: string };
-    } & ArtifactProducingEvent)
-  | ({ type: 'data'; data: unknown; mediaType?: string } & ArtifactProducingEvent)
+    } & ContentProducingEvent)
+  | ({ type: 'data'; data: unknown; mediaType?: string } & ContentProducingEvent)
   | { type: 'toolCall'; toolName: string; args: Record<string, unknown>; toolCallId?: string }
   | { type: 'toolResult'; toolName: string; result: unknown; toolCallId?: string }
   | {

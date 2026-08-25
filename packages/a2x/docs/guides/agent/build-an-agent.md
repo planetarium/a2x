@@ -90,19 +90,19 @@ The fields that matter most for everyday agent code:
 
 ## AgentEvent variants
 
-Custom agents that extend `BaseAgent` directly express their output by yielding `AgentEvent`s. The default `AgentExecutor` knows how to map each variant onto an A2A artifact or task status update.
+Custom agents that extend `BaseAgent` directly express their intent by yielding `AgentEvent`s: produce content, request input, or finish the run. The executor owns protocol details such as output identity, chunk aggregation, persistence, and wire mapping. This follows the intent-oriented [Option B contract proposed in #151](https://github.com/planetarium/a2x/issues/151).
 
 | Variant | Use it for |
 |---|---|
-| `text` | Streaming or final text output. Multiple `text` events accumulate into one text artifact. Accepts an optional artifact descriptor and per-update metadata. |
-| `file` | An attached file (URL or base64 raw). One artifact per event. Accepts an optional artifact descriptor and per-update metadata. |
-| `data` | A structured non-text payload (`mediaType` indicates the shape). One artifact per event. Accepts an optional artifact descriptor and per-update metadata. |
+| `text` | Streaming or final text output. Multiple `text` events accumulate into one durable output. Accepts an optional artifact descriptor and delivery metadata. |
+| `file` | An attached file (URL or base64 raw). One durable output per event. Accepts an optional artifact descriptor and delivery metadata. |
+| `data` | A structured non-text payload (`mediaType` indicates the shape). One durable output per event. Accepts an optional artifact descriptor and delivery metadata. |
 | `toolCall` / `toolResult` | LLM-style tool turns (consumed by `LlmAgent` plumbing; surface only when you're modeling the round-trip yourself). |
 | `request-input` | Halt the agent and ask the client for input — most often a payment (via `x402RequestPayment`) or an approval. The executor sets the task to `input-required` and merges the agent-supplied metadata onto the status message. The SDK keeps **no** cross-turn bookkeeping — on the resume turn the agent re-derives what it asked for from `context.message` (and any state it persisted itself, keyed by `taskId`). See [Protocol Extensions](../advanced/extensions.md) and [x402 Payments](../advanced/x402-payments.md). |
 | `done` | Mark the run finished. Recommended at the end of every successful run; if the generator returns without it, the executor synthesizes a completed status. |
 | `error` | Mark the task failed with the given `Error`. Text, file, and data artifacts emitted before the error remain attached to the failed task. |
 
-### Describe artifacts and their delivery
+### Describe durable outputs and their delivery
 
 The content-producing variants accept two separate metadata surfaces:
 
@@ -116,18 +116,18 @@ yield {
     metadata: { format: 'solution-package' },
     extensions: ['https://example.com/extensions/solution-package'],
   },
-  updateMetadata: {
+  deliveryMetadata: {
     'example.delivery': 'provisional',
   },
 };
 ```
 
-- `artifact` is an `AgentArtifactDescriptor`. Its `name`, `description`, `metadata`, and `extensions` become durable fields on the generated A2A `Artifact` and are returned by `tasks/get`. The executor continues to assign `artifactId` and `parts`.
-- `updateMetadata` is copied to the `TaskArtifactUpdateEvent.metadata` generated for that event. It describes one streamed delivery, is not part of the Artifact, and is ignored by non-streaming `message/send` execution because that path produces no artifact-update events.
+- `artifact` is an `AgentArtifactDescriptor` for the durable logical output receiving the content. The default A2A executor maps its `name`, `description`, `metadata`, and `extensions` onto an `Artifact`, while retaining ownership of `artifactId` and `parts`. The durable result is returned by `tasks/get`.
+- `deliveryMetadata` describes this particular content delivery. The default A2A executor maps it to `TaskArtifactUpdateEvent.metadata` during streaming. It is not part of the durable output, and non-streaming `message/send` has no individual delivery event to carry it.
 
 The executor snapshots both metadata maps when it receives the event. Reusing and later mutating an object that was already yielded cannot change an emitted update or the durable Artifact.
 
-All text events in one run contribute to one Artifact. Descriptor fields therefore accumulate across text chunks: `name` and `description` cannot change, extensions form an ordered union, and metadata keys merge when their values do not conflict. Repeating a metadata key with a deeply unequal value, or changing a scalar descriptor field, fails the task. The executor-generated final consolidated text update retains the merged Artifact descriptor but has no `updateMetadata` of its own.
+All text events in one run contribute to one durable output. Descriptor fields therefore accumulate across text chunks: `name` and `description` cannot change, extensions form an ordered union, and metadata keys merge when their values do not conflict. Repeating a metadata key with a deeply unequal value, or changing a scalar descriptor field, fails the task. The default A2A executor maps the consolidated output to one Artifact; its synthesized final delivery retains the descriptor but has no `deliveryMetadata` of its own.
 
 ## Next
 

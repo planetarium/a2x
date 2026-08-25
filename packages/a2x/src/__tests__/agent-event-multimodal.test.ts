@@ -78,7 +78,7 @@ class DescribedMixedAgent extends BaseAgent {
         metadata: { format: 'plain', schema: { version: 1 } },
         extensions: ['https://example.com/extensions/base'],
       },
-      updateMetadata: { delivery: 'first' },
+      deliveryMetadata: { delivery: 'first' },
     };
     yield {
       type: 'text',
@@ -91,7 +91,7 @@ class DescribedMixedAgent extends BaseAgent {
           'https://example.com/extensions/confidence',
         ],
       },
-      updateMetadata: { delivery: 'second' },
+      deliveryMetadata: { delivery: 'second' },
     };
     yield {
       type: 'file',
@@ -100,7 +100,7 @@ class DescribedMixedAgent extends BaseAgent {
         name: 'result.json',
         metadata: { format: 'json' },
       },
-      updateMetadata: { delivery: 'file' },
+      deliveryMetadata: { delivery: 'file' },
     };
     yield {
       type: 'data',
@@ -109,7 +109,7 @@ class DescribedMixedAgent extends BaseAgent {
         name: 'summary',
         metadata: { format: 'summary' },
       },
-      updateMetadata: { delivery: 'data' },
+      deliveryMetadata: { delivery: 'data' },
     };
     yield { type: 'done' };
   }
@@ -446,7 +446,7 @@ describe('AgentExecutor.executeStream — content AgentEvents', () => {
           type: 'text',
           text: 'first',
           artifact: { metadata: { details: artifactDetails } },
-          updateMetadata: { details: updateDetails },
+          deliveryMetadata: { details: updateDetails },
         };
         artifactDetails.version = 2;
         updateDetails.sequence = 2;

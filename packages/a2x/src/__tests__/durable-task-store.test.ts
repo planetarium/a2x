@@ -216,7 +216,7 @@ class DescribedArtifactAgent extends BaseAgent {
         metadata: { format: 'plain' },
         extensions: ['https://example.com/extensions/result'],
       },
-      updateMetadata: { delivery: 'partial' },
+      deliveryMetadata: { delivery: 'partial' },
     };
     yield {
       type: 'text',
@@ -225,7 +225,7 @@ class DescribedArtifactAgent extends BaseAgent {
         description: 'Durably stored result',
         metadata: { confidence: 0.95 },
       },
-      updateMetadata: { delivery: 'complete' },
+      deliveryMetadata: { delivery: 'complete' },
     };
     yield { type: 'done' };
   }
