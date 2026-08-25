@@ -391,8 +391,10 @@ export function createA2xRequestListener(
         const stream = createSSEStream(result as AsyncGenerator<never>);
         const reader = stream.getReader();
 
-        // On client TCP close, cancel the reader so the source generator
-        // terminates and aborts in-flight LLM calls. Use res.on('close')
+        // On client TCP close, cancel the response reader. createSSEStream
+        // stops enqueuing bytes but keeps draining the source generator so
+        // task execution, persistence, and other subscribers continue. Use
+        // res.on('close')
         // — req.on('close') fires when the request body stream is
         // consumed (before response writing), so it misses the later
         // disconnect during streaming. res.close also fires after a
@@ -535,16 +537,10 @@ async function writeSseResponse(
     closed = true;
   };
   res.on('close', markClosed);
-  try {
-    for await (const event of events) {
-      if (closed) break;
+  for await (const event of events) {
+    if (!closed) {
       res.write(`data: ${JSON.stringify(event)}\n\n`);
     }
-  } finally {
-    if (closed) {
-      await events.return(undefined).catch(() => {});
-    } else {
-      res.end();
-    }
   }
+  if (!closed) res.end();
 }

@@ -40,6 +40,27 @@ class HangingAgent extends BaseAgent {
   }
 }
 
+class GatedCompletionAgent extends BaseAgent {
+  readonly started = Promise.withResolvers<void>();
+  readonly release = Promise.withResolvers<void>();
+  readonly completed = Promise.withResolvers<void>();
+  capturedSignal: AbortSignal | undefined;
+
+  constructor() {
+    super({ name: 'gated-agent', description: 'Completes after release' });
+  }
+
+  async *run(context: InvocationContext): AsyncGenerator<AgentEvent> {
+    this.capturedSignal = context.signal;
+    this.started.resolve();
+    yield { type: 'text', text: 'before-disconnect', role: 'agent' };
+    await this.release.promise;
+    yield { type: 'text', text: 'after-disconnect', role: 'agent' };
+    this.completed.resolve();
+    yield { type: 'done' };
+  }
+}
+
 function createTask(): Task {
   return {
     id: 'test-task-sse-disconnect',
@@ -75,9 +96,9 @@ async function waitUntil(
   return predicate();
 }
 
-describe('SSE client disconnect termination (Issue #20)', () => {
-  it('createSSEStream.cancel() aborts the source generator and the underlying AbortSignal', async () => {
-    const agent = new HangingAgent();
+describe('SSE client disconnect lifecycle (Issue #255)', () => {
+  it('createSSEStream.cancel() stops delivery but drains the source to completion', async () => {
+    const agent = new GatedCompletionAgent();
     const executor = createExecutor(agent);
     const task = createTask();
 
@@ -90,23 +111,43 @@ describe('SSE client disconnect termination (Issue #20)', () => {
     expect(first.done).toBe(false);
     expect(first.value).toBeDefined();
 
-    // Simulate client disconnect.
+    await agent.started.promise;
+
+    // Simulate client disconnect before reading any artifact update.
     await reader.cancel();
+    expect(agent.capturedSignal?.aborted).toBe(false);
 
-    // The captured signal should become aborted once the finally block runs.
-    const aborted = await waitUntil(
-      () => agent.state.capturedSignal?.aborted === true,
-      200,
-    );
-    expect(aborted).toBe(true);
-    expect(agent.state.capturedSignal).toBeInstanceOf(AbortSignal);
+    agent.release.resolve();
+    await agent.completed.promise;
+    expect(agent.capturedSignal?.aborted).toBe(false);
 
-    // The controller for this task should have been cleaned up.
+    // Natural completion still cleans up the executor controller.
     const controllers = (executor as unknown as {
       _abortControllers: Map<string, AbortController>;
     })._abortControllers;
     const cleaned = await waitUntil(() => !controllers.has(task.id), 200);
     expect(cleaned).toBe(true);
+  });
+
+  it('silently drains a source failure after the reader disconnects', async () => {
+    const release = Promise.withResolvers<void>();
+    const finished = Promise.withResolvers<void>();
+    async function* events(): AsyncGenerator<unknown> {
+      try {
+        yield { status: 'working' };
+        await release.promise;
+        throw new Error('failed after disconnect');
+      } finally {
+        finished.resolve();
+      }
+    }
+
+    const reader = createSSEStream(events()).getReader();
+    expect((await reader.read()).done).toBe(false);
+    await reader.cancel();
+    release.resolve();
+
+    await finished.promise;
   });
 
   it('AgentExecutor cleanup aborts controller when the outer generator is .return()ed mid-stream', async () => {

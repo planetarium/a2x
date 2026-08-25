@@ -9,6 +9,7 @@ import { BaseAgent } from '../agent/base-agent.js';
 import type { AgentEvent } from '../agent/base-agent.js';
 import type { InvocationContext } from '../runner/context.js';
 import { TaskState } from '../types/task.js';
+import { createSSEStream } from '../transport/sse-handler.js';
 
 // Ensure mappers are registered
 import '../a2x/index.js';
@@ -57,12 +58,32 @@ class MutatingMetadataAgent extends BaseAgent {
   }
 }
 
-function createSlowHandler(
-  chunks: string[],
-  delayMs: number,
+class GatedTextAgent extends BaseAgent {
+  readonly release = Promise.withResolvers<void>();
+  capturedSignal: AbortSignal | undefined;
+
+  constructor() {
+    super({ name: 'gated-text-agent', description: 'Waits between chunks' });
+  }
+
+  async *run(context: InvocationContext): AsyncGenerator<AgentEvent> {
+    this.capturedSignal = context.signal;
+    yield { type: 'text', text: 'before-disconnect', role: 'agent' };
+    await this.release.promise;
+    if (context.signal?.aborted) return;
+    yield { type: 'text', text: 'after-disconnect', role: 'agent' };
+    yield { type: 'done' };
+  }
+}
+
+function createHandler(
+  agent: BaseAgent,
   protocolVersion?: ProtocolVersion,
-): { handler: DefaultRequestHandler; taskStore: InMemoryTaskStore } {
-  const agent = new SlowTextAgent(chunks, delayMs);
+): {
+  handler: DefaultRequestHandler;
+  taskStore: InMemoryTaskStore;
+  a2xServer: A2XServer;
+} {
   const runner = new InMemoryRunner({ agent, appName: 'test' });
   const executor = new AgentExecutor({
     runner,
@@ -71,7 +92,19 @@ function createSlowHandler(
   const taskStore = new InMemoryTaskStore();
   const a2xServer = new A2XServer({ taskStore, executor, protocolVersion });
   a2xServer.setDefaultUrl('https://example.com/a2a');
-  return { handler: new DefaultRequestHandler(a2xServer), taskStore };
+  return {
+    handler: new DefaultRequestHandler(a2xServer),
+    taskStore,
+    a2xServer,
+  };
+}
+
+function createSlowHandler(
+  chunks: string[],
+  delayMs: number,
+  protocolVersion?: ProtocolVersion,
+): { handler: DefaultRequestHandler; taskStore: InMemoryTaskStore } {
+  return createHandler(new SlowTextAgent(chunks, delayMs), protocolVersion);
 }
 
 // Each chunk in a streaming response is a JSON-RPC success envelope per
@@ -304,6 +337,128 @@ describe('tasks/resubscribe', () => {
         }
       })(),
     ]);
+  });
+
+  it('keeps publishing to a resubscriber after the primary SSE disconnects', async () => {
+    const agent = new GatedTextAgent();
+    const { handler, taskStore, a2xServer } = createHandler(agent, '1.0');
+    const streamResult = await handler.handle({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'message/stream',
+      params: {
+        message: {
+          messageId: 'msg-drain',
+          role: 'user',
+          parts: [{ text: 'Hello' }],
+        },
+      },
+    });
+
+    const primaryReader = createSSEStream(
+      streamResult as AsyncGenerator<unknown>,
+    ).getReader();
+    const first = await primaryReader.read();
+    expect(first.done).toBe(false);
+    const firstEnvelope = JSON.parse(
+      new TextDecoder()
+        .decode(first.value)
+        .replace(/^data: /, '')
+        .trim(),
+    ) as StreamEnvelope;
+    const taskId = unwrapResult(firstEnvelope).taskId as string;
+    const artifact = await primaryReader.read();
+    expect(artifact.done).toBe(false);
+    const artifactEnvelope = JSON.parse(
+      new TextDecoder()
+        .decode(artifact.value)
+        .replace(/^data: /, '')
+        .trim(),
+    ) as StreamEnvelope;
+    expect(unwrapResult(artifactEnvelope).artifact).toBeDefined();
+
+    await primaryReader.cancel();
+    expect(agent.capturedSignal?.aborted).toBe(false);
+
+    const resubResult = await handler.handle({
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tasks/resubscribe',
+      params: { id: taskId },
+    });
+    const resubIter = resubResult as AsyncGenerator<StreamEnvelope>;
+    const resubEvents: Record<string, unknown>[] = [];
+    const firstResubEvent = resubIter.next();
+    while (!a2xServer.taskEventBus.hasSubscribers(taskId)) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    const resubConsumer = (async () => {
+      const firstEvent = await firstResubEvent;
+      if (!firstEvent.done) {
+        resubEvents.push(unwrapResult(firstEvent.value));
+      }
+      for await (const envelope of resubIter) {
+        resubEvents.push(unwrapResult(envelope));
+      }
+    })();
+
+    agent.release.resolve();
+    await resubConsumer;
+
+    expect(agent.capturedSignal?.aborted).toBe(false);
+    expect(resubEvents.some((event) => event.artifact !== undefined)).toBe(true);
+    expect(resubEvents.at(-1)?.status).toMatchObject({
+      state: 'TASK_STATE_COMPLETED',
+    });
+    await expect(taskStore.getTask(taskId)).resolves.toMatchObject({
+      status: { state: TaskState.COMPLETED },
+    });
+  });
+
+  it('still aborts drained execution through an explicit tasks/cancel request', async () => {
+    const agent = new GatedTextAgent();
+    const { handler, taskStore } = createHandler(agent, '1.0');
+    const streamResult = await handler.handle({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'message/stream',
+      params: {
+        message: {
+          messageId: 'msg-cancel-drain',
+          role: 'user',
+          parts: [{ text: 'Hello' }],
+        },
+      },
+    });
+    const primaryReader = createSSEStream(
+      streamResult as AsyncGenerator<unknown>,
+    ).getReader();
+    const first = await primaryReader.read();
+    const firstEnvelope = JSON.parse(
+      new TextDecoder()
+        .decode(first.value)
+        .replace(/^data: /, '')
+        .trim(),
+    ) as StreamEnvelope;
+    const taskId = unwrapResult(firstEnvelope).taskId as string;
+
+    await primaryReader.cancel();
+    const canceled = await handler.handle({
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tasks/cancel',
+      params: { id: taskId },
+    });
+
+    expect(canceled).toMatchObject({
+      result: { status: { state: 'TASK_STATE_CANCELED' } },
+    });
+    expect(agent.capturedSignal?.aborted).toBe(true);
+    agent.release.resolve();
+    await expect(taskStore.getTask(taskId)).resolves.toMatchObject({
+      status: { state: TaskState.CANCELED },
+    });
   });
 
   it('ends when the publishing stream ends', async () => {

@@ -28,16 +28,23 @@ export function createSSEStream(
   events: AsyncGenerator<unknown>,
 ): ReadableStream {
   const encoder = new TextEncoder();
+  let canceled = false;
 
   return new ReadableStream({
     async start(controller) {
       try {
         for await (const event of events) {
+          if (canceled) continue;
           const data = JSON.stringify(event);
           controller.enqueue(encoder.encode(`data: ${data}\n\n`));
         }
-        controller.close();
+        if (!canceled) controller.close();
       } catch (error) {
+        // A canceled reader is detached from the response, but this pump
+        // keeps consuming the source so task persistence and publication
+        // can finish. There is no reader left to receive an error frame.
+        if (canceled) return;
+
         // Mid-stream errors are spec-undefined for SSE A2A streaming.
         // We emit a single transport-level error chunk (data-only, not
         // a JSON-RPC envelope — we no longer hold the request id at
@@ -53,9 +60,10 @@ export function createSSEStream(
     },
 
     cancel() {
-      // Propagate client disconnect up the for-await chain so each finally
-      // block runs and the shared AbortController is aborted.
-      void events.return(undefined).catch(() => {});
+      // An SSE connection is only a subscription to a task. Stop enqueuing
+      // response bytes, but keep draining the execution generator so store
+      // writes and event-bus publication continue for other subscribers.
+      canceled = true;
     },
   });
 }

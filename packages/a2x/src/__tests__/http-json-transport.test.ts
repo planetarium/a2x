@@ -255,16 +255,26 @@ describe('A2A v1.0 HTTP+JSON transport', () => {
     await stream.return(undefined);
   });
 
-  it('propagates an early REST stream exit to the agent AbortSignal', async () => {
+  it('continues a REST task after its stream subscriber disconnects', async () => {
+    const priorSignal = testAgent.lastSignal;
     const stream = client.sendMessageStream(message('disconnect'));
-    await stream.next();
+    const first = await stream.next();
+    const taskId = first.value?.taskId;
+    expect(taskId).toEqual(expect.any(String));
+    await expect(
+      waitUntil(() => testAgent.lastSignal !== priorSignal, 500),
+    ).resolves.toBe(true);
     const signal = testAgent.lastSignal;
     expect(signal?.aborted).toBe(false);
 
     await stream.return(undefined);
     await expect(
-      waitUntil(() => signal?.aborted === true, 500),
+      waitUntil(async () => {
+        const task = await client.getTask(taskId!);
+        return task.status.state === 'completed';
+      }, 1_000),
     ).resolves.toBe(true);
+    expect(signal?.aborted).toBe(false);
   });
 
   it('surfaces a REST mid-stream error and terminates the subscription', async () => {
@@ -613,12 +623,12 @@ describe('A2A v1.0 HTTP+JSON transport', () => {
 });
 
 async function waitUntil(
-  predicate: () => boolean,
+  predicate: () => boolean | Promise<boolean>,
   timeoutMs: number,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (predicate()) return true;
+    if (await predicate()) return true;
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   return predicate();

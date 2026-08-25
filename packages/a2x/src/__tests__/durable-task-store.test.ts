@@ -913,7 +913,7 @@ describe('durable TaskStore persistence (issue #233)', () => {
       expect(textOf(fetched)).toEqual(['echo:hi']);
     });
 
-    it('persists delivered artifacts and cancels when the client disconnects', async () => {
+    it('persists delivered artifacts when the handler stream is explicitly returned', async () => {
       const { handler, taskStore } = createServerWithStore(
         new EchoAgent({ name: 'echo' }),
       );
@@ -926,8 +926,9 @@ describe('durable TaskStore persistence (issue #233)', () => {
       })) as AsyncGenerator<unknown>;
 
       // Consume the `working` status and the first artifact chunk, then
-      // walk away. The delivered chunk must already be durable, and the
-      // abandoned execution must not remain a WORKING zombie.
+      // explicitly return the framework-agnostic handler generator. This
+      // lower-level cancellation must retain delivered content and avoid a
+      // WORKING zombie; HTTP disconnects are detached by the SSE transport.
       const first = (await stream.next()).value as { result: WireTask };
       await stream.next();
       await stream.return(undefined);
