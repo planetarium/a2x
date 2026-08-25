@@ -55,13 +55,22 @@ data: {"jsonrpc":"2.0","id":1,"result":{"kind":"status-update", …}}
 
 See [Consuming Streams](../client/streaming.md) for the client-side iteration pattern.
 
-## Client disconnect stops the work
+## Client disconnect detaches the stream
 
-When an SSE client disconnects mid-stream — tab closed, network drop, process killed — A2X propagates the cancellation all the way into the agent's `AbortSignal`. In-flight LLM calls are aborted, long-running tool calls see `context.signal.aborted === true`, and the durable task becomes `canceled` instead of remaining stuck in `working`. Artifacts already delivered to the client are persisted before delivery and remain attached to the canceled task.
+An SSE connection is a subscription to a Task, not ownership of its execution. When a client disconnects mid-stream — tab closed, network drop, process killed — A2X stops writing to that response but continues consuming the agent's event generator. Task-store persistence, push notifications, and task event-bus publication continue through the interaction-ending or terminal state, and other subscribers remain attached.
 
-`toA2x()` wires this automatically. If you mount the handler into your own HTTP stack (Express, Next.js, Fastify, …), wire a `res.on('close')` → `reader.cancel()` on the SSE branch — `IncomingMessage.close` fires when the request body is consumed (too early) and misses the later TCP close, so use `res.close`:
+A disconnect aborts the transport-facing `RequestContext.signal` to release that response subscription. It does not abort the agent's `InvocationContext.signal` or change the Task to `canceled`. To stop the underlying work through A2X, send an explicit `tasks/cancel` request. Host-enforced execution deadlines, orphan limits, and process-shutdown handling remain deployment policies; they must cancel Tasks explicitly instead of treating a network disconnect as cancellation intent.
+
+`DefaultRequestHandler` runs Task execution in a background pump and exposes each SSE response as an event-bus subscription. `toA2x()` wires subscriber detachment automatically. If you mount the handler into your own HTTP stack (Express, Next.js, Fastify, …), pass an `AbortSignal` through `RequestContext` and abort it from `res.close`; also cancel the SSE reader to release its wrapper. `IncomingMessage.close` fires when the request body is consumed (too early) and misses the later TCP close, so use `res.close`:
 
 ```ts
+const subscription = new AbortController();
+res.on('close', () => subscription.abort());
+
+const result = await handler.handle(body, {
+  headers: req.headers,
+  signal: subscription.signal,
+});
 const stream = createSSEStream(result);
 const reader = stream.getReader();
 
@@ -152,7 +161,7 @@ Semantics:
 
 - **Forward-only while active.** Events that fired before a live resubscribe call are not replayed.
 - **Interaction-ending replay.** Resubscribing after the current interaction ended yields one status update, then ends. This covers terminal states plus `input-required` and `auth-required`.
-- **Disconnected primary streams are canceled.** If the original HTTP connection closed and its reader was canceled, resubscribe replays `canceled`; it does not restart the agent.
+- **Disconnected primary streams keep running.** Closing the original HTTP connection does not cancel the Task. A live resubscriber receives subsequent events, and a later resubscribe replays the interaction-ending status.
 - **Unknown task.** Returns `TaskNotFoundError` (JSON-RPC error code `-32001`).
 
 The bus is on by default. For custom storage or multi-process deployments you can inject your own implementation — see [Manual Wiring](../advanced/manual-wiring.md#task-event-bus).

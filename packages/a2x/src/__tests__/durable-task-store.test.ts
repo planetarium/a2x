@@ -292,6 +292,18 @@ class GatedAgent extends BaseAgent {
   }
 }
 
+class ArtifactThenGatedAgent extends BaseAgent {
+  readonly release = Promise.withResolvers<void>();
+
+  async *run(context: InvocationContext): AsyncGenerator<AgentEvent> {
+    yield { type: 'text', role: 'agent', text: 'before-cancel' };
+    await this.release.promise;
+    if (context.signal?.aborted) return;
+    yield { type: 'data', data: { late: true } };
+    yield { type: 'done' };
+  }
+}
+
 class CountingAgent extends BaseAgent {
   runs = 0;
 
@@ -396,6 +408,20 @@ class NonFinalInputExecutor extends AgentExecutor {
       status: { state: TaskState.INPUT_REQUIRED },
       final: false,
     };
+  }
+}
+
+class ThrowingStreamExecutor extends AgentExecutor {
+  override async *executeStream(
+    task: Task,
+  ): AsyncGenerator<TaskStatusUpdateEvent> {
+    yield {
+      taskId: task.id,
+      contextId: task.contextId ?? task.id,
+      status: { state: TaskState.WORKING },
+      final: false,
+    };
+    throw new Error('custom executor failed');
   }
 }
 
@@ -525,6 +551,18 @@ async function drain(
     events.push(result);
   }
   return events;
+}
+
+async function waitUntil(
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs = 500,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return predicate();
 }
 
 function expectUniqueArtifactIds(task: WireTask): void {
@@ -913,7 +951,7 @@ describe('durable TaskStore persistence (issue #233)', () => {
       expect(textOf(fetched)).toEqual(['echo:hi']);
     });
 
-    it('persists delivered artifacts and cancels when the client disconnects', async () => {
+    it('persists delivered artifacts when the handler stream is explicitly returned', async () => {
       const { handler, taskStore } = createServerWithStore(
         new EchoAgent({ name: 'echo' }),
       );
@@ -926,16 +964,22 @@ describe('durable TaskStore persistence (issue #233)', () => {
       })) as AsyncGenerator<unknown>;
 
       // Consume the `working` status and the first artifact chunk, then
-      // walk away. The delivered chunk must already be durable, and the
-      // abandoned execution must not remain a WORKING zombie.
+      // detach the primary subscriber. The independent execution pump must
+      // still persist the complete terminal Task.
       const first = (await stream.next()).value as { result: WireTask };
       await stream.next();
       await stream.return(undefined);
 
       const taskId = (first.result as unknown as { taskId: string }).taskId;
+      expect(
+        await waitUntil(async () => {
+          const current = await taskStore.getTask(taskId);
+          return current?.status.state === TaskState.COMPLETED;
+        }),
+      ).toBe(true);
       const stored = await taskStore.getTask(taskId);
-      expect(stored!.status.state).toBe(TaskState.CANCELED);
-      expect(stored!.artifacts).toHaveLength(1);
+      expect(stored!.status.state).toBe(TaskState.COMPLETED);
+      expect(stored!.artifacts).toHaveLength(2);
 
       const replay = await drain(
         (await handler.handle({
@@ -946,7 +990,7 @@ describe('durable TaskStore persistence (issue #233)', () => {
         })) as AsyncGenerator<unknown>,
       );
       expect(replay).toHaveLength(1);
-      expect(replay[0]!.status).toMatchObject({ state: TaskState.CANCELED });
+      expect(replay[0]!.status).toMatchObject({ state: TaskState.COMPLETED });
       expect(replay[0]!.final).toBe(true);
     });
 
@@ -1055,8 +1099,9 @@ describe('durable TaskStore persistence (issue #233)', () => {
 
     it('retains an artifact delivered before strict-store cancellation', async () => {
       const store = new CloneTaskStore(true);
+      const agent = new ArtifactThenGatedAgent({ name: 'gated-artifact' });
       const { handler } = createServerWithStore(
-        new EchoAgent({ name: 'echo' }),
+        agent,
         store,
       );
       const stream = (await handler.handle({
@@ -1079,11 +1124,14 @@ describe('durable TaskStore persistence (issue #233)', () => {
         params: { id: taskId },
       })) as JSONRPCResponse;
       expect('result' in canceled).toBe(true);
+      agent.release.resolve();
       await stream.return(undefined);
 
       const stored = await store.getTask(taskId);
       expect(stored!.status.state).toBe(TaskState.CANCELED);
-      expect(textOf(stored as unknown as WireTask)).toEqual(['echo:hi']);
+      expect(textOf(stored as unknown as WireTask)).toEqual([
+        'before-cancel',
+      ]);
     });
 
     it('keeps custom executor artifacts added after a canonical snapshot', async () => {
@@ -1188,7 +1236,7 @@ describe('durable TaskStore persistence (issue #233)', () => {
       expect(stored!.status.state).toBe(TaskState.SUBMITTED);
     });
 
-    it('does not retry a failed WORKING write into a zombie state', async () => {
+    it('turns a failed WORKING write into a terminal failed task', async () => {
       const store = new WorkingWriteFailsOnceStore();
       const { handler } = createServerWithStore(
         new EchoAgent({ name: 'echo' }),
@@ -1202,11 +1250,58 @@ describe('durable TaskStore persistence (issue #233)', () => {
       })) as AsyncGenerator<unknown>;
 
       const envelope = (await stream.next()).value as JSONRPCResponse;
-      expect('error' in envelope).toBe(true);
+      expect(envelope).toMatchObject({
+        result: { status: { state: TaskState.FAILED }, final: true },
+      });
 
       const stored = await store.getTask(store.ids[0]!);
-      expect(stored!.status.state).toBe(TaskState.SUBMITTED);
-      expect(store.writes).toHaveLength(0);
+      expect(stored!.status.state).toBe(TaskState.FAILED);
+      expect(store.writes).toHaveLength(1);
+    });
+
+    it('persists and replays failed when a custom stream executor throws', async () => {
+      const store = new CloneTaskStore();
+      const agent = new CountingAgent({ name: 'counting' });
+      const runner = new InMemoryRunner({ agent, appName: 'durable-test' });
+      const server = new A2XServer({
+        taskStore: store,
+        executor: new ThrowingStreamExecutor({
+          runner,
+          runConfig: { streamingMode: StreamingMode.SSE },
+        }),
+        protocolVersion: '0.3',
+      });
+      server.setDefaultUrl('https://example.com/a2a');
+      const handler = new DefaultRequestHandler(server);
+
+      const events = await drain(
+        (await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'message/stream',
+          params: { message: userMessage('hi') },
+        })) as AsyncGenerator<unknown>,
+      );
+      const taskId = events[0]!.taskId as string;
+
+      expect(events.at(-1)?.status).toMatchObject({ state: TaskState.FAILED });
+      await expect(store.getTask(taskId)).resolves.toMatchObject({
+        status: {
+          state: TaskState.FAILED,
+          message: { parts: [{ text: 'custom executor failed' }] },
+        },
+      });
+
+      const replay = await drain(
+        (await handler.handle({
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'tasks/resubscribe',
+          params: { id: taskId },
+        })) as AsyncGenerator<unknown>,
+      );
+      expect(replay).toHaveLength(1);
+      expect(replay[0]!.status).toMatchObject({ state: TaskState.FAILED });
     });
   });
 

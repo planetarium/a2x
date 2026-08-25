@@ -82,7 +82,13 @@ app.get('/.well-known/agent.json', (_req, res) => {
 });
 
 app.post('/a2a', async (req, res) => {
-  const context: RequestContext = { headers: req.headers, query: req.query };
+  const subscription = new AbortController();
+  res.on('close', () => subscription.abort());
+  const context: RequestContext = {
+    headers: req.headers,
+    query: req.query,
+    signal: subscription.signal,
+  };
   const result = await handler.handle(req.body, context);
 
   if (result && typeof result === 'object' && Symbol.asyncIterator in result) {
@@ -91,9 +97,9 @@ app.post('/a2a', async (req, res) => {
     const stream = createSSEStream(result);
     const reader = stream.getReader();
 
-    // Cancel the reader on client disconnect so the agent aborts in-flight
-    // LLM calls. Use `res.close` — `req.close` fires when the body is
-    // consumed, before streaming begins.
+    // Detach this response on client disconnect. The handler execution
+    // pump keeps Task execution and persistence running independently.
+    // Use `res.close` — `req.close` fires before streaming begins.
     res.on('close', () => {
       void reader.cancel().catch(() => {});
     });
@@ -116,7 +122,7 @@ Three things to notice:
 
 1. `handler.handle()` returns either a plain object (regular response) or an async iterable (streaming response). Branch on `Symbol.asyncIterator`.
 2. `createSSEStream()` wraps the async iterable as an SSE-formatted `ReadableStream`.
-3. Wiring `res.on('close') → reader.cancel()` is what makes client disconnects propagate into the agent's `AbortSignal`. Without it, the LLM loop keeps running after the TCP connection dies. See [Streaming Responses](./streaming.md#client-disconnect-stops-the-work) for the why.
+3. Passing an aborted `RequestContext.signal` detaches a pending event-bus subscription immediately, including one currently waiting for its next event. `reader.cancel()` releases the SSE wrapper. Task execution belongs to the handler's independent pump, so it can finish and keep publishing to other subscribers. See [Streaming Responses](./streaming.md#client-disconnect-detaches-the-stream) for the lifecycle details.
 
 ### Express with HTTP+JSON
 
@@ -124,11 +130,17 @@ Mount the REST adapter at the same base path advertised in the AgentCard. It res
 
 ```ts
 app.use('/a2a', async (req, res) => {
+  const subscription = new AbortController();
+  res.on('close', () => subscription.abort());
   const response = await httpJsonHandler.handle({
     method: req.method,
     url: new URL(req.originalUrl, 'https://my-agent.example.com'),
     body: req.body,
-    context: { headers: req.headers, query: req.query },
+    context: {
+      headers: req.headers,
+      query: req.query,
+      signal: subscription.signal,
+    },
   });
 
   res.status(response.status).set(response.headers);
@@ -162,7 +174,10 @@ export async function GET() {
 // app/a2a/route.ts
 export async function POST(request: Request) {
   const body = await request.json();
-  const result = await handler.handle(body, { headers: request.headers });
+  const result = await handler.handle(body, {
+    headers: request.headers,
+    signal: request.signal,
+  });
 
   if (result && typeof result === 'object' && Symbol.asyncIterator in result) {
     const stream = createSSEStream(result);
@@ -185,7 +200,7 @@ export async function POST(request: Request) {
 For JSON-RPC, the recipe is always the same:
 
 1. Expose `GET /.well-known/agent.json` → `handler.getAgentCard()`.
-2. Expose `POST /a2a` → `handler.handle(body, { headers, query })`.
+2. Expose `POST /a2a` → `handler.handle(body, { headers, query, signal })`, using the response/request disconnect signal supplied by the framework.
 3. Detect async iterable → stream with `createSSEStream()`; otherwise respond with JSON.
 
 The only framework-specific bit is how the framework reads bodies and writes streams.

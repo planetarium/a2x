@@ -75,8 +75,8 @@ async function waitUntil(
   return predicate();
 }
 
-describe('SSE client disconnect termination (Issue #20)', () => {
-  it('createSSEStream.cancel() aborts the source generator and the underlying AbortSignal', async () => {
+describe('SSE client disconnect lifecycle (Issue #255)', () => {
+  it('createSSEStream.cancel() detaches its source generator', async () => {
     const agent = new HangingAgent();
     const executor = createExecutor(agent);
     const task = createTask();
@@ -90,23 +90,43 @@ describe('SSE client disconnect termination (Issue #20)', () => {
     expect(first.done).toBe(false);
     expect(first.value).toBeDefined();
 
-    // Simulate client disconnect.
+    // The transport source is a subscription in production. Returning a
+    // direct executor here proves that createSSEStream still detaches its
+    // own source instead of retaining passive subscribers.
     await reader.cancel();
-
-    // The captured signal should become aborted once the finally block runs.
     const aborted = await waitUntil(
       () => agent.state.capturedSignal?.aborted === true,
       200,
     );
     expect(aborted).toBe(true);
-    expect(agent.state.capturedSignal).toBeInstanceOf(AbortSignal);
 
-    // The controller for this task should have been cleaned up.
+    // Natural completion still cleans up the executor controller.
     const controllers = (executor as unknown as {
       _abortControllers: Map<string, AbortController>;
     })._abortControllers;
     const cleaned = await waitUntil(() => !controllers.has(task.id), 200);
     expect(cleaned).toBe(true);
+  });
+
+  it('suppresses a pending source failure after the reader disconnects', async () => {
+    const release = Promise.withResolvers<void>();
+    const finished = Promise.withResolvers<void>();
+    async function* events(): AsyncGenerator<unknown> {
+      try {
+        yield { status: 'working' };
+        await release.promise;
+        throw new Error('failed after disconnect');
+      } finally {
+        finished.resolve();
+      }
+    }
+
+    const reader = createSSEStream(events()).getReader();
+    expect((await reader.read()).done).toBe(false);
+    await reader.cancel();
+    release.resolve();
+
+    await finished.promise;
   });
 
   it('AgentExecutor cleanup aborts controller when the outer generator is .return()ed mid-stream', async () => {

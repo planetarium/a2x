@@ -62,6 +62,8 @@ const handler = new DefaultRequestHandler(a2xServer);
 
 `handler.getAgentCard()` returns the AgentCard JSON. `handler.handle(body, context)` processes a JSON-RPC request and returns either a plain object or an async iterable (for streams). `handler.handleOperation()` is the transport-neutral boundary used by protocol adapters; most applications should mount an adapter rather than call it directly.
 
+For a manually mounted streaming route, pass the response connection's `AbortSignal` as `RequestContext.signal`. Aborting it detaches only that response's event-bus subscription; it does not cancel the Task or abort the agent. Use an explicit `tasks/cancel` request for Task cancellation. See [Framework Integration](../agent/framework-integration.md) for complete wiring examples.
+
 ### HTTP+JSON transport
 
 The v1.0 HTTP+JSON binding uses REST resources and `application/a2a+json` instead of JSON-RPC envelopes:

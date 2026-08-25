@@ -185,6 +185,9 @@ export function createA2xRequestListener(
   options?: A2xRequestListenerOptions,
 ): (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void> {
   return async (req, res) => {
+    const subscriptionController = new AbortController();
+    res.on?.('close', () => subscriptionController.abort());
+
     // CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
@@ -208,6 +211,7 @@ export function createA2xRequestListener(
     const context: RequestContext = {
       headers: req.headers as Record<string, string | string[] | undefined>,
       query: Object.fromEntries(parsedUrl.searchParams.entries()),
+      signal: subscriptionController.signal,
     };
 
     // GET /.well-known/agent.json or /.well-known/agent-card.json.
@@ -391,8 +395,9 @@ export function createA2xRequestListener(
         const stream = createSSEStream(result as AsyncGenerator<never>);
         const reader = stream.getReader();
 
-        // On client TCP close, cancel the reader so the source generator
-        // terminates and aborts in-flight LLM calls. Use res.on('close')
+        // On client TCP close, cancel this response subscription. Task
+        // execution runs in an independent handler pump, so persistence and
+        // other subscribers continue. Use res.on('close')
         // — req.on('close') fires when the request body stream is
         // consumed (before response writing), so it misses the later
         // disconnect during streaming. res.close also fires after a

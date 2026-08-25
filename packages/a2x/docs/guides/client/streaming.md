@@ -58,13 +58,11 @@ for await (const event of stream) {
 }
 ```
 
-If you want the agent itself to stop doing work (not just your client to stop listening), call `client.cancelTask(taskId)` using the `id` from the first `task` event.
-
-Breaking out of the loop is enough on its own: when the underlying HTTP connection closes the server aborts the in-flight agent execution and records the task as `canceled`. You don't need to call `cancelTask` just to save tokens on abandoned streams.
+Breaking out of the loop stops this client from listening but does not stop the Task. The server continues execution, persistence, and publication for other subscribers. If you want the agent itself to stop doing work, call `client.cancelTask(taskId)` using the `id` from the first `task` event.
 
 ## Resuming a dropped stream
 
-Use the A2A `tasks/resubscribe` method to attach another consumer while the original task stream is still active. If the original HTTP reader has already been canceled, the server aborts that execution and resubscribe returns its persisted `canceled` state rather than restarting it.
+Use the A2A `tasks/resubscribe` method to attach another consumer while the task is still active. Closing the original HTTP reader only detaches that subscriber; the server keeps executing the Task, so a new subscriber can receive the remaining tail without restarting it.
 
 Use `subscribeTask()` to reattach through whichever binding the client selected. Both JSON-RPC and HTTP+JSON deliver the response as SSE:
 
@@ -78,7 +76,7 @@ Behavior to know:
 
 - **Forward-only while active.** Events that fired before a live resubscribe call are not replayed — you see what the server publishes from that point on.
 - **Interaction-ending replay.** If the interaction already ended, you receive one `status-update`, then the stream ends. This includes terminal states plus `input-required` and `auth-required`.
-- **Disconnected primary streams are canceled.** After the original reader closes, resubscribe returns `canceled`; it cannot resume the aborted agent invocation.
+- **Disconnected streams do not cancel Tasks.** A new subscriber receives subsequent live events, or the persisted interaction-ending status if execution already ended.
 - **Unknown task.** The stream ends with the binding-specific error envelope: JSON-RPC error for `JSONRPC`, or `google.rpc.Status` JSON for `HTTP+JSON`.
 
 ### SSE wire shape

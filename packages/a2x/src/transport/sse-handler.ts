@@ -28,6 +28,7 @@ export function createSSEStream(
   events: AsyncGenerator<unknown>,
 ): ReadableStream {
   const encoder = new TextEncoder();
+  let canceled = false;
 
   return new ReadableStream({
     async start(controller) {
@@ -36,8 +37,10 @@ export function createSSEStream(
           const data = JSON.stringify(event);
           controller.enqueue(encoder.encode(`data: ${data}\n\n`));
         }
-        controller.close();
+        if (!canceled) controller.close();
       } catch (error) {
+        if (canceled) return;
+
         // Mid-stream errors are spec-undefined for SSE A2A streaming.
         // We emit a single transport-level error chunk (data-only, not
         // a JSON-RPC envelope — we no longer hold the request id at
@@ -53,8 +56,10 @@ export function createSSEStream(
     },
 
     cancel() {
-      // Propagate client disconnect up the for-await chain so each finally
-      // block runs and the shared AbortController is aborted.
+      // The source returned by DefaultRequestHandler is only a Task event
+      // subscription. Returning it detaches this response while the handler's
+      // independent execution pump keeps the Task running.
+      canceled = true;
       void events.return(undefined).catch(() => {});
     },
   });

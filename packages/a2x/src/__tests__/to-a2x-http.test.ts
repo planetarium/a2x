@@ -13,6 +13,15 @@ import { BaseLlmProvider } from '../provider/base.js';
 import { toA2x, createA2xRequestListener } from '../transport/to-a2x.js';
 import { A2A_TRANSPORTS } from '../types/transport.js';
 import type { AgentCardV10 } from '../types/agent-card.js';
+import { BaseAgent } from '../agent/base-agent.js';
+import type { AgentEvent } from '../agent/base-agent.js';
+import type { InvocationContext } from '../runner/context.js';
+import { AgentExecutor, StreamingMode } from '../a2x/agent-executor.js';
+import { InMemoryRunner } from '../runner/in-memory-runner.js';
+import { InMemoryTaskStore } from '../a2x/task-store.js';
+import { A2XServer } from '../a2x/a2x-agent.js';
+import { DefaultRequestHandler } from '../transport/request-handler.js';
+import { TaskState } from '../types/task.js';
 
 // Side-effect import to register response mappers (v0.3 / v1.0).
 import '../a2x/index.js';
@@ -24,6 +33,23 @@ class NoopProvider extends BaseLlmProvider {
   }
   async generateContent() {
     return { content: [], finishReason: 'stop' as const };
+  }
+}
+
+class GatedHttpAgent extends BaseAgent {
+  readonly release = Promise.withResolvers<void>();
+  capturedSignal: AbortSignal | undefined;
+
+  constructor() {
+    super({ name: 'gated-http-agent', description: 'Waits during streaming' });
+  }
+
+  async *run(context: InvocationContext): AsyncGenerator<AgentEvent> {
+    this.capturedSignal = context.signal;
+    yield { type: 'text', text: 'before-disconnect', role: 'agent' };
+    await this.release.promise;
+    yield { type: 'text', text: 'after-disconnect', role: 'agent' };
+    yield { type: 'done' };
   }
 }
 
@@ -176,4 +202,81 @@ describe('toA2x() HTTP wrapper — JSON-RPC over HTTP error convention', () => {
       ),
     ).toEqual(['HTTP+JSON', 'JSONRPC']);
   });
+
+  it('keeps a JSON-RPC task running after a real TCP disconnect', async () => {
+    const agent = new GatedHttpAgent();
+    const taskStore = new InMemoryTaskStore();
+    const a2xServer = new A2XServer({
+      taskStore,
+      executor: new AgentExecutor({
+        runner: new InMemoryRunner({ agent, appName: 'tcp-test' }),
+        runConfig: { streamingMode: StreamingMode.SSE },
+      }),
+      protocolVersion: '1.0',
+    }).setDefaultUrl('http://127.0.0.1/a2a');
+    const handler = new DefaultRequestHandler(a2xServer);
+    const { createServer } = await import('node:http');
+    const server = createServer(createA2xRequestListener(handler));
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as AddressInfo).port;
+    const controller = new AbortController();
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/a2a`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'message/stream',
+          params: {
+            message: {
+              messageId: 'tcp-disconnect',
+              role: 'user',
+              parts: [{ text: 'Hello' }],
+            },
+          },
+        }),
+        signal: controller.signal,
+      });
+      const reader = response.body!.getReader();
+      const first = await reader.read();
+      const envelope = JSON.parse(
+        new TextDecoder()
+          .decode(first.value)
+          .split('\n\n', 1)[0]!
+          .replace(/^data: /, '')
+          .trim(),
+      ) as { result: { taskId: string } };
+      const taskId = envelope.result.taskId;
+
+      controller.abort();
+      agent.release.resolve();
+
+      expect(
+        await waitUntil(async () => {
+          const task = await taskStore.getTask(taskId);
+          return task?.status.state === TaskState.COMPLETED;
+        }),
+      ).toBe(true);
+      expect(agent.capturedSignal?.aborted).toBe(false);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+  });
 });
+
+async function waitUntil(
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs = 1_000,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return predicate();
+}
