@@ -94,13 +94,38 @@ Custom agents that extend `BaseAgent` directly express their output by yielding 
 
 | Variant | Use it for |
 |---|---|
-| `text` | Streaming or final text output. Multiple `text` events accumulate into one text artifact. |
-| `file` | An attached file (URL or base64 raw). One artifact per event. |
-| `data` | A structured non-text payload (`mediaType` indicates the shape). One artifact per event. |
+| `text` | Streaming or final text output. Multiple `text` events accumulate into one text artifact. Accepts an optional artifact descriptor and per-update metadata. |
+| `file` | An attached file (URL or base64 raw). One artifact per event. Accepts an optional artifact descriptor and per-update metadata. |
+| `data` | A structured non-text payload (`mediaType` indicates the shape). One artifact per event. Accepts an optional artifact descriptor and per-update metadata. |
 | `toolCall` / `toolResult` | LLM-style tool turns (consumed by `LlmAgent` plumbing; surface only when you're modeling the round-trip yourself). |
 | `request-input` | Halt the agent and ask the client for input — most often a payment (via `x402RequestPayment`) or an approval. The executor sets the task to `input-required` and merges the agent-supplied metadata onto the status message. The SDK keeps **no** cross-turn bookkeeping — on the resume turn the agent re-derives what it asked for from `context.message` (and any state it persisted itself, keyed by `taskId`). See [Protocol Extensions](../advanced/extensions.md) and [x402 Payments](../advanced/x402-payments.md). |
 | `done` | Mark the run finished. Recommended at the end of every successful run; if the generator returns without it, the executor synthesizes a completed status. |
 | `error` | Mark the task failed with the given `Error`. Text, file, and data artifacts emitted before the error remain attached to the failed task. |
+
+### Describe artifacts and their delivery
+
+The content-producing variants accept two separate metadata surfaces:
+
+```ts
+yield {
+  type: 'text',
+  text: chunk,
+  artifact: {
+    name: 'result.json',
+    description: 'Progressively generated result',
+    metadata: { format: 'solution-package' },
+    extensions: ['https://example.com/extensions/solution-package'],
+  },
+  updateMetadata: {
+    'example.delivery': 'provisional',
+  },
+};
+```
+
+- `artifact` is an `AgentArtifactDescriptor`. Its `name`, `description`, `metadata`, and `extensions` become durable fields on the generated A2A `Artifact` and are returned by `tasks/get`. The executor continues to assign `artifactId` and `parts`.
+- `updateMetadata` is copied to the `TaskArtifactUpdateEvent.metadata` generated for that event. It describes one streamed delivery, is not part of the Artifact, and is ignored by non-streaming `message/send` execution because that path produces no artifact-update events.
+
+All text events in one run contribute to one Artifact. Descriptor fields therefore accumulate across text chunks: `name` and `description` cannot change, extensions form an ordered union, and metadata keys merge when their values do not conflict. Repeating a metadata key with a deeply unequal value, or changing a scalar descriptor field, fails the task. The executor-generated final consolidated text update retains the merged Artifact descriptor but has no `updateMetadata` of its own.
 
 ## Next
 

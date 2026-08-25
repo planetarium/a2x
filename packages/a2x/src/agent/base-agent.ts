@@ -6,13 +6,40 @@ import type { InvocationContext } from '../runner/context.js';
 
 // ─── AgentEvent (events yielded by agents to the Runner) ───
 
+/**
+ * Agent-controlled fields for the Artifact produced by a content event.
+ * The default executor continues to own `artifactId` and `parts`.
+ */
+export interface AgentArtifactDescriptor {
+  name?: string;
+  description?: string;
+  metadata?: Record<string, unknown>;
+  extensions?: string[];
+}
+
+interface ArtifactProducingEvent {
+  /** Durable fields copied onto the produced Artifact. */
+  artifact?: AgentArtifactDescriptor;
+  /**
+   * Per-delivery metadata copied onto the corresponding streamed
+   * TaskArtifactUpdateEvent. Non-streaming execution has no artifact-update
+   * event, so this field is intentionally ignored by `execute()`.
+   */
+  updateMetadata?: Record<string, unknown>;
+}
+
 export type AgentEvent =
-  | { type: 'text'; text: string; role?: 'user' | 'agent'; mediaType?: string }
-  | {
-    type: 'file';
-    file: { raw?: string; url?: string; mediaType?: string; filename?: string };
-  }
-  | { type: 'data'; data: unknown; mediaType?: string }
+  | ({
+      type: 'text';
+      text: string;
+      role?: 'user' | 'agent';
+      mediaType?: string;
+    } & ArtifactProducingEvent)
+  | ({
+      type: 'file';
+      file: { raw?: string; url?: string; mediaType?: string; filename?: string };
+    } & ArtifactProducingEvent)
+  | ({ type: 'data'; data: unknown; mediaType?: string } & ArtifactProducingEvent)
   | { type: 'toolCall'; toolName: string; args: Record<string, unknown>; toolCallId?: string }
   | { type: 'toolResult'; toolName: string; result: unknown; toolCallId?: string }
   | {

@@ -94,6 +94,12 @@ class ImageAgent extends BaseAgent {
         mediaType: 'image/png',
         filename: 'out.png',
       },
+      artifact: {
+        name: 'out.png',
+        description: 'Generated image',
+        metadata: { model: 'image-model-v1' },
+      },
+      updateMetadata: { 'example.delivery': 'preview' },
     };
     yield {
       type: 'data',
@@ -109,11 +115,15 @@ How the default `AgentExecutor` maps each event to a `TaskArtifactUpdateEvent`:
 
 | Event | Mapping |
 |---|---|
-| `text` | Accumulated in one text artifact (`artifact-${taskId}-text`). The first chunk establishes it with `append: false`; later chunks use `append: true`; `done` replaces it with the consolidated value and `lastChunk: true`. |
-| `file` | A new artifact (`artifact-${taskId}-file-${n}`) carrying a single `FilePart`. Emitted inline with `append: false`, `lastChunk: true`. |
-| `data` | A new artifact (`artifact-${taskId}-data-${n}`) carrying a single `DataPart`. Emitted inline with `append: false`, `lastChunk: true`. |
+| `text` | Accumulated in one text artifact (`artifact-${taskId}-text`). The first chunk establishes it with `append: false`; later chunks use `append: true`; `done` replaces it with the consolidated value and `lastChunk: true`. Artifact descriptors merge across chunks. |
+| `file` | A new artifact (`artifact-${taskId}-file-${n}`) carrying a single `FilePart`. Emitted inline with `append: false`, `lastChunk: true`, plus any artifact descriptor. |
+| `data` | A new artifact (`artifact-${taskId}-data-${n}`) carrying a single `DataPart`. Emitted inline with `append: false`, `lastChunk: true`, plus any artifact descriptor. |
 
 The "one logical output = one artifact" mapping matches A2A's intuition and lets clients render each non-text result independently. Mixed runs work as expected: text accumulates into a single artifact, while each `file` / `data` event spawns its own.
+
+`artifact` and `updateMetadata` have deliberately different lifetimes. The Artifact descriptor is durable: the same fields appear on the terminal task and in later `tasks/get` responses for both streaming and non-streaming execution. `updateMetadata` belongs only to the individual `artifact-update` generated from that AgentEvent. It is delivered to the primary stream and live resubscribers, but is not persisted on the Artifact. The consolidated text update synthesized at completion has no update metadata.
+
+For streamed text, `name` and `description` are fixed once provided, `extensions` form an ordered union, and non-conflicting `metadata` keys accumulate. A repeated metadata key must have a deeply equal value. Conflicting descriptor values fail the task instead of silently replacing durable Artifact information.
 
 Every interaction ends with a status update. A yielded `done` produces `completed`, `error` produces `failed`, and a generator that simply returns is treated as completed. Artifacts emitted before failure or an implicit return remain on the task. In v0.3, every status update includes the required top-level `final` field: `false` while work continues and `true` on the interaction-ending status (`completed`, `failed`, or `input-required`). v1.0 omits this legacy field and relies on end-of-stream.
 

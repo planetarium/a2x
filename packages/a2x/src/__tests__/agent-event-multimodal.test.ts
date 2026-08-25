@@ -64,6 +64,57 @@ class MixedAgent extends BaseAgent {
   }
 }
 
+class DescribedMixedAgent extends BaseAgent {
+  constructor() {
+    super({ name: 'described-mixed-agent' });
+  }
+
+  async *run(): AsyncGenerator<AgentEvent> {
+    yield {
+      type: 'text',
+      text: 'hello ',
+      artifact: {
+        name: 'result.txt',
+        metadata: { format: 'plain', schema: { version: 1 } },
+        extensions: ['https://example.com/extensions/base'],
+      },
+      updateMetadata: { delivery: 'first' },
+    };
+    yield {
+      type: 'text',
+      text: 'world',
+      artifact: {
+        description: 'Consolidated result',
+        metadata: { confidence: 0.9, schema: { version: 1 } },
+        extensions: [
+          'https://example.com/extensions/base',
+          'https://example.com/extensions/confidence',
+        ],
+      },
+      updateMetadata: { delivery: 'second' },
+    };
+    yield {
+      type: 'file',
+      file: { url: 'https://example.com/result.json' },
+      artifact: {
+        name: 'result.json',
+        metadata: { format: 'json' },
+      },
+      updateMetadata: { delivery: 'file' },
+    };
+    yield {
+      type: 'data',
+      data: { ok: true },
+      artifact: {
+        name: 'summary',
+        metadata: { format: 'summary' },
+      },
+      updateMetadata: { delivery: 'data' },
+    };
+    yield { type: 'done' };
+  }
+}
+
 function makeTask(id = 'task-1'): Task {
   return {
     id,
@@ -88,7 +139,7 @@ const message = {
 
 // ─── execute() (non-streaming) path ───
 
-describe('AgentExecutor.execute — non-text AgentEvents', () => {
+describe('AgentExecutor.execute — content AgentEvents', () => {
   it('maps a file event to a FilePart artifact', async () => {
     const task = await makeExecutor(new FileEmittingAgent()).execute(
       makeTask(),
@@ -153,11 +204,84 @@ describe('AgentExecutor.execute — non-text AgentEvents', () => {
       expect(textPart.text).toBe('Here is your image: and structured data:');
     }
   });
+
+  it('preserves artifact descriptors for text, file, and data events', async () => {
+    const task = await makeExecutor(new DescribedMixedAgent()).execute(
+      makeTask(),
+      message,
+    );
+
+    const textArtifact = task.artifacts!.find((artifact) =>
+      isTextPart(artifact.parts[0]),
+    )!;
+    expect(textArtifact).toMatchObject({
+      name: 'result.txt',
+      description: 'Consolidated result',
+      metadata: {
+        format: 'plain',
+        confidence: 0.9,
+        schema: { version: 1 },
+      },
+      extensions: [
+        'https://example.com/extensions/base',
+        'https://example.com/extensions/confidence',
+      ],
+    });
+    expect(textArtifact.parts).toEqual([{ text: 'hello world' }]);
+
+    const fileArtifact = task.artifacts!.find((artifact) =>
+      isFilePart(artifact.parts[0]),
+    )!;
+    expect(fileArtifact).toMatchObject({
+      name: 'result.json',
+      metadata: { format: 'json' },
+    });
+
+    const dataArtifact = task.artifacts!.find((artifact) =>
+      isDataPart(artifact.parts[0]),
+    )!;
+    expect(dataArtifact).toMatchObject({
+      name: 'summary',
+      metadata: { format: 'summary' },
+    });
+  });
+
+  it('fails the task when text chunks provide conflicting artifact metadata', async () => {
+    class ConflictingMetadataAgent extends BaseAgent {
+      async *run(): AsyncGenerator<AgentEvent> {
+        yield {
+          type: 'text',
+          text: 'kept',
+          artifact: { metadata: { format: 'plain' } },
+        };
+        yield {
+          type: 'text',
+          text: 'discarded',
+          artifact: { metadata: { format: 'markdown' } },
+        };
+      }
+    }
+
+    const task = await makeExecutor(
+      new ConflictingMetadataAgent({ name: 'conflict' }),
+    ).execute(makeTask(), message);
+
+    expect(task.status.state).toBe(TaskState.FAILED);
+    expect(task.status.message?.parts).toEqual([
+      { text: 'Conflicting text artifact metadata key: format' },
+    ]);
+    expect(task.artifacts).toMatchObject([
+      {
+        metadata: { format: 'plain' },
+        parts: [{ text: 'kept' }],
+      },
+    ]);
+  });
 });
 
 // ─── executeStream() (SSE) path ───
 
-describe('AgentExecutor.executeStream — non-text AgentEvents', () => {
+describe('AgentExecutor.executeStream — content AgentEvents', () => {
   async function collect(
     stream: AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent>,
   ): Promise<(TaskStatusUpdateEvent | TaskArtifactUpdateEvent)[]> {
@@ -229,6 +353,90 @@ describe('AgentExecutor.executeStream — non-text AgentEvents', () => {
 
     // Final artifact set on task: 1 file + 1 data + 1 text = 3 artifacts.
     expect(task.artifacts).toHaveLength(3);
+  });
+
+  it('emits update metadata and retains merged descriptors on final artifacts', async () => {
+    const task = makeTask();
+    const events = await collect(
+      makeExecutor(new DescribedMixedAgent()).executeStream(task, message),
+    );
+    const artifactEvents = events.filter(isArtifactEvent);
+
+    const textUpdates = artifactEvents.filter((event) =>
+      isTextPart(event.artifact.parts[0]),
+    );
+    expect(textUpdates.map((event) => event.metadata)).toEqual([
+      { delivery: 'first' },
+      { delivery: 'second' },
+      undefined,
+    ]);
+    expect(textUpdates.at(-1)!.artifact).toMatchObject({
+      name: 'result.txt',
+      description: 'Consolidated result',
+      metadata: {
+        format: 'plain',
+        confidence: 0.9,
+        schema: { version: 1 },
+      },
+      extensions: [
+        'https://example.com/extensions/base',
+        'https://example.com/extensions/confidence',
+      ],
+      parts: [{ text: 'hello world' }],
+    });
+
+    const fileUpdate = artifactEvents.find((event) =>
+      isFilePart(event.artifact.parts[0]),
+    )!;
+    expect(fileUpdate.metadata).toEqual({ delivery: 'file' });
+    expect(fileUpdate.artifact.metadata).toEqual({ format: 'json' });
+
+    const dataUpdate = artifactEvents.find((event) =>
+      isDataPart(event.artifact.parts[0]),
+    )!;
+    expect(dataUpdate.metadata).toEqual({ delivery: 'data' });
+    expect(dataUpdate.artifact.metadata).toEqual({ format: 'summary' });
+
+    const terminalTextArtifact = task.artifacts!.find((artifact) =>
+      isTextPart(artifact.parts[0]),
+    );
+    expect(terminalTextArtifact).toEqual(textUpdates.at(-1)!.artifact);
+  });
+
+  it('ends a stream as failed when text artifact descriptors conflict', async () => {
+    class ConflictingDescriptorAgent extends BaseAgent {
+      async *run(): AsyncGenerator<AgentEvent> {
+        yield {
+          type: 'text',
+          text: 'kept',
+          artifact: { name: 'first.txt' },
+        };
+        yield {
+          type: 'text',
+          text: 'discarded',
+          artifact: { name: 'second.txt' },
+        };
+      }
+    }
+
+    const task = makeTask();
+    const events = await collect(
+      makeExecutor(
+        new ConflictingDescriptorAgent({ name: 'conflict' }),
+      ).executeStream(task, message),
+    );
+
+    expect(events.filter(isArtifactEvent)).toHaveLength(1);
+    const finalEvent = events.at(-1)!;
+    expect('status' in finalEvent && finalEvent.status.state).toBe(
+      TaskState.FAILED,
+    );
+    expect(task.status.message?.parts).toEqual([
+      { text: 'Conflicting text artifact name' },
+    ]);
+    expect(task.artifacts).toMatchObject([
+      { name: 'first.txt', parts: [{ text: 'kept' }] },
+    ]);
   });
 
   it('uses distinct artifactIds for multiple non-text events in a single run', async () => {

@@ -206,6 +206,31 @@ class EchoAgent extends BaseAgent {
   }
 }
 
+class DescribedArtifactAgent extends BaseAgent {
+  async *run(): AsyncGenerator<AgentEvent> {
+    yield {
+      type: 'text',
+      text: 'durable ',
+      artifact: {
+        name: 'result.txt',
+        metadata: { format: 'plain' },
+        extensions: ['https://example.com/extensions/result'],
+      },
+      updateMetadata: { delivery: 'partial' },
+    };
+    yield {
+      type: 'text',
+      text: 'metadata',
+      artifact: {
+        description: 'Durably stored result',
+        metadata: { confidence: 0.95 },
+      },
+      updateMetadata: { delivery: 'complete' },
+    };
+    yield { type: 'done' };
+  }
+}
+
 /**
  * Turn 1 asks for input; turn 2 (the continuation carrying the token in
  * message metadata) completes with a receipt — the shape the x402
@@ -433,7 +458,14 @@ function createServerWithStore(
 type WireTask = {
   id: string;
   status: { state: string; message?: { metadata?: Record<string, unknown> } };
-  artifacts?: Array<{ artifactId: string; parts: Array<Record<string, unknown>> }>;
+  artifacts?: Array<{
+    artifactId: string;
+    name?: string;
+    description?: string;
+    metadata?: Record<string, unknown>;
+    extensions?: string[];
+    parts: Array<Record<string, unknown>>;
+  }>;
 };
 
 async function send(
@@ -538,6 +570,25 @@ describe('durable TaskStore persistence (issue #233)', () => {
       expect(fetched.status.message?.metadata).toMatchObject({
         'test.receipt': 'r-1',
       });
+    });
+
+    it('persists merged artifact descriptors through tasks/get', async () => {
+      const { handler } = createServerWithStore(
+        new DescribedArtifactAgent({ name: 'described' }),
+      );
+
+      const sent = await send(handler, { message: userMessage('describe') });
+      const fetched = await getTask(handler, sent.id);
+
+      expect(fetched.artifacts).toMatchObject([
+        {
+          name: 'result.txt',
+          description: 'Durably stored result',
+          metadata: { format: 'plain', confidence: 0.95 },
+          extensions: ['https://example.com/extensions/result'],
+        },
+      ]);
+      expect(textOf(fetched)).toEqual(['durable metadata']);
     });
 
     it('returns the same task the store holds', async () => {
@@ -679,6 +730,40 @@ describe('durable TaskStore persistence (issue #233)', () => {
       // accumulating one entry per chunk.
       expect(textOf(fetched)).toEqual(['echo:hi']);
       expect(fetched.artifacts).toHaveLength(2);
+    });
+
+    it('delivers update metadata while persisting only artifact metadata', async () => {
+      const { handler } = createServerWithStore(
+        new DescribedArtifactAgent({ name: 'described' }),
+      );
+
+      const events = await drain(
+        (await handler.handle({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'message/stream',
+          params: { message: userMessage('describe') },
+        })) as AsyncGenerator<unknown>,
+      );
+      const artifactEvents = events.filter(
+        (event) => event.kind === 'artifact-update',
+      );
+      expect(artifactEvents.map((event) => event.metadata)).toEqual([
+        { delivery: 'partial' },
+        { delivery: 'complete' },
+        undefined,
+      ]);
+
+      const fetched = await getTask(handler, events[0]!.taskId as string);
+      expect(fetched.artifacts).toMatchObject([
+        {
+          name: 'result.txt',
+          description: 'Durably stored result',
+          metadata: { format: 'plain', confidence: 0.95 },
+          extensions: ['https://example.com/extensions/result'],
+        },
+      ]);
+      expect(textOf(fetched)).toEqual(['durable metadata']);
     });
 
     it('persists input-required reached mid-stream', async () => {

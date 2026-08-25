@@ -3,7 +3,7 @@
  */
 
 export { BaseAgent } from './base-agent.js';
-export type { AgentEvent } from './base-agent.js';
+export type { AgentArtifactDescriptor, AgentEvent } from './base-agent.js';
 export { LlmAgent } from './llm-agent.js';
 export type {
   LlmAgentOptions,
