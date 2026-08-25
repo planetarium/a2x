@@ -460,6 +460,38 @@ Use `MerchantGate` when more than one host needs the same payment policy but ren
 
 Protocol refusals from `X402Context.requestPayment()` remain explicit outcomes. For example, a V2 server receiving the legacy V1-only activation URI returns `refuse` with `invalid_x402_version`; the gate does not replace it with a generic infrastructure failure.
 
+Before constructing a gate, make these decisions explicitly:
+
+| Option | Required | Decision |
+|---|---|---|
+| `x402` | Yes | Protocol version, facilitator or resource server, and lifecycle store. |
+| `pricing` | Yes | Which requests are paid, the accepted schemes and networks, and their frozen prices. Return `null` for a free request. |
+| `exactTiming` | Yes | For `exact` only: settle before resource work or after it. `upto` and `batch-settlement` remain deferred until `settle()` or a published `abort()`. |
+| `deliveryTiming` | Yes | Publish only after settlement, or allow provisional publication after verification. |
+| `unreportedUsage` | For each metered price | What `upto` or `batch-settlement` charges when trusted usage is unavailable or unpriceable. |
+| `offerStore` | No | Defaults to an in-memory offer and claim store. Supply a durable atomic implementation for restarts or multiple replicas. |
+| `deliveryMetadata` | No | Maps the host-neutral provisional/final decision into application-owned metadata. |
+| `onError` | No | Receives internal storage and infrastructure errors that are hidden from payer-facing outcomes. |
+
+For an `exact` price, the two timing axes combine as follows:
+
+| `exactTiming` | `deliveryTiming` | Result and risk allocation |
+|---|---|---|
+| `before-work` | `after-settlement` | Settlement completes in `open()` before work. Published output is final; the payer bears failed-work risk. |
+| `before-work` | `after-verification` | Also final, not provisional, because verification has already advanced to settlement. This setting does not make before-work exact output progressive. |
+| `after-work` | `after-settlement` | Buffer work, settle it, then publish final output. This is the usual fail-closed choice for unary work. |
+| `after-work` | `after-verification` | Publish provisional output and settle after completion or partial failure. This is the low-latency streaming choice and accepts delivered-but-unsettled risk. |
+
+For `upto` and `batch-settlement`, `exactTiming` is required by the shared gate constructor but does not change those schemes. Choose `deliveryTiming` according to whether metered output may escape before settlement. `UptoSessionManager` requires `after-verification` because a conversation-spanning authorization cannot settle before every turn is delivered.
+
+When trusted metered usage cannot be priced, choose the payer/merchant risk explicitly:
+
+| `unreportedUsage` | Charge | Use when |
+|---|---|---|
+| `ceiling` | The authorized maximum, clamped to the signed cap. | Missing usage may hide substantial delivered work and merchant protection is the priority. |
+| `floor` | `minAmount`, or zero when no floor is configured. | A known minimum service charge is acceptable but charging the cap is not. |
+| `refuse` | No settlement request; return a failed outcome for reconciliation or retry policy. | The host would rather leave the authorization unresolved than infer a charge. |
+
 ```ts
 import { MerchantGate, X402Context } from '@a2x/sdk/x402';
 
