@@ -237,7 +237,13 @@ if (entry?.status === 'completed') {
 For either case, subclass `BaseX402Store` with a shared external backend (Redis / Postgres / Durable Object / …):
 
 ```ts
-import { BaseX402Store, type X402StoreEntry, type X402StoreEntryPatch } from '@a2x/sdk/x402';
+import {
+  BaseX402Store,
+  type X402EntryStatus,
+  type X402MerchantDeliveryAuditPatch,
+  type X402StoreEntry,
+  type X402StoreEntryPatch,
+} from '@a2x/sdk/x402';
 
 class RedisX402Store extends BaseX402Store {
   constructor(private readonly redis: Redis) { super(); }
@@ -266,6 +272,16 @@ class RedisX402Store extends BaseX402Store {
     await this.put({ ...cur, ...patch, updatedAt: new Date() });
   }
 
+  async updateMerchantDeliveryIfStatus(
+    taskId: string,
+    expected: readonly X402EntryStatus[],
+    patch: X402MerchantDeliveryAuditPatch,
+  ): Promise<X402EntryStatus | undefined> {
+    // Implement with one Redis Lua script or WATCH/MULTI transaction. It must
+    // check status and merge merchantDelivery without a read/write race.
+    return await atomicMerchantDeliveryMerge(this.redis, taskId, expected, patch);
+  }
+
   async delete(taskId: string): Promise<void> {
     await this.redis.del(`x402:${taskId}`);
   }
@@ -277,6 +293,8 @@ const x402 = new X402Context({ store: new RedisX402Store(redis) });
 Lazy expiry contract: `get(taskId)` MUST return `undefined` after `entry.expiresAt`. Backends with native TTL (Redis `EXPIRE`, Postgres `WHERE expires_at > now()`) satisfy this trivially; in-memory or file-backed stores must check on read. No background reaper required — works in serverless deployments.
 
 `BaseX402Store.updateIfStatus(taskId, expected, patch)` prevents a late concurrent verify/classify result from regressing `completed` or `rejected` state. Its base implementation is a source-compatible read-then-update fallback. Multi-replica stores MUST override it with an atomic compare-and-set.
+
+`BaseX402Store.updateMerchantDeliveryIfStatus(taskId, expected, patch)` is required for custom stores. It must atomically check the lifecycle status and merge individual `merchantDelivery` fields. `MerchantGate` uses this boundary to prevent a settlement failure from racing publication authorization. The convenience `updateMerchantDelivery()` method delegates to it without narrowing the status.
 
 `InMemoryX402Store` also accepts `{ maxEntries }` for LRU eviction when the cap is reached.
 
@@ -665,7 +683,7 @@ If one object implements both `MerchantOfferStore` and the x402 lifecycle store,
 | `completed` | either/absent | Terminal; the retained receipt proves settlement and verification is skipped. |
 | expired/absent | absent | A submitted payment has no stored offering; an unpaid turn may create a new offer. |
 
-Delivery audit is orthogonal to the payment status. `X402StoreEntry.merchantDelivery` records the configured timing plus `publicationStartedAt`, `workCompletedAt` or `workFailedAt`, and `settlementFailedAt` when applicable. Together with the existing `verifiedAt` and retained receipt's `settledAt`, these fields distinguish verified, possibly partially delivered, work-finished, settled, and delivered-but-unsettled tasks without adding wire-level payment states. Shared lifecycle stores must override `updateMerchantDelivery()` with an atomic field merge so a concurrent publication boundary and settlement cannot erase each other's evidence.
+Delivery audit is orthogonal to the payment status. `X402StoreEntry.merchantDelivery` records the configured timing plus `publicationStartedAt`, `workCompletedAt` or `workFailedAt`, and `settlementFailedAt` when applicable. Together with the existing `verifiedAt` and retained receipt's `settledAt`, these fields distinguish verified, possibly partially delivered, work-finished, settled, and delivered-but-unsettled tasks without adding wire-level payment states. Custom lifecycle stores implement `updateMerchantDeliveryIfStatus()` as an atomic status check and field merge so a concurrent publication boundary and settlement cannot authorize a failed payment or erase either operation's evidence. Audit-write failures are reported through `onError`, but after publication they never suppress the settlement attempt itself.
 
 Two concurrent submissions can both observe `available` and both verify. Exactly one wins the later atomic `claim()`; every loser cancels any scheme reservation and receives `DUPLICATE_NONCE`. This is why `getClaimStatus()` is never a lock.
 
@@ -749,7 +767,7 @@ for (const unresolved of recovery.unresolved) {
 }
 ```
 
-`UptoSessionManager` requires `deliveryTiming: 'after-verification'`. Waiting for settlement would prevent each conversational turn from reaching the payer until the authorization closes, so `after-settlement` is rejected as a contradictory session configuration. Before the first output of an active or reserved session, call `await sessions.authorizeDelivery(contextId)` and map its metadata to the content delivery just as with `gate.authorizeDelivery()`.
+`UptoSessionManager` requires `deliveryTiming: 'after-verification'`. Waiting for settlement would prevent each conversational turn from reaching the payer until the authorization closes, so `after-settlement` is rejected as a contradictory session configuration. Before the first output of an active or reserved session, call `await sessions.authorizeDelivery(contextId)` and map its metadata to the content delivery just as with `gate.authorizeDelivery()`. Authorization is blocked after `settleBy` or once a close has been requested, including for a reserved opener that has no local timer yet.
 
 Reserve an already-active session before starting work. The stable `turnId` makes completion idempotent, and the lease stops idle/deadline triggers from settling between the active-session check and usage recording:
 
@@ -860,7 +878,7 @@ Use `reserveOpen` / `commitOpen` around the first turn's real resource work. The
 
 A reserved opener arms no idle or deadline timer until `commitOpen` records trusted usage. This prevents an automatic trigger from charging an unreported-usage floor or ceiling before work completes. If resource work throws before publication after a successful reservation, the host **must** call `cancelOpen({ contextId, taskId })`; it atomically closes and lapses the reservation only while that opening task still owns it. Omitting the cancellation leaves an unresolved authorization for recovery. A reservation whose guarded authorization deadline has already passed returns `unavailable` without creating a session.
 
-`cancelOpen()` and `cancelTurn()` are only for work that published nothing. After `authorizeDelivery()` succeeds and any content escapes, record the partial usage with `commitOpen()` or `finishTurn()`, then close the session so it settles immediately; surface the work error separately on the A2A Task. Even a trusted zero reading settles zero after publication instead of lapsing, preserving completed payment evidence and the no-replay invariant.
+`cancelOpen()` and `cancelTurn()` are only for work that published nothing. `cancelOpen()` first moves the durable record to `settling`, then lapses the payment, and only then records a terminal `lapsed` result; if the gate detects prior publication, it restores the active reservation instead of leaving a false terminal record. After `authorizeDelivery()` succeeds and any content escapes, record the partial usage with `commitOpen()` or `finishTurn()`, then close the session so it settles immediately; surface the work error separately on the A2A Task. Even a trusted zero reading settles zero after publication instead of lapsing, preserving completed payment evidence and the no-replay invariant.
 
 `recordTurn({ contextId, usage })` remains available when usage is already complete and there is no asynchronous work gap. Use the `beginTurn` / `finishTurn` pair around later resource work. A start result distinguishes `inactive`, a new `started` lease, and duplicate `pending` or `completed` turn ids; duplicate turns must reuse the host's durable result and never execute again. `cancelTurn` releases a later-turn lease that produced no billable work. Once a close is requested, new leases are refused; the last finishing or canceled lease performs the single settlement. An opening reservation is not reported by `active()` and does not admit later turn leases until `commitOpen` records its first trusted usage.
 
@@ -987,7 +1005,7 @@ const gate = new MerchantGate({
 
 The resource server enriches the published requirement with server-owned fields such as `receiverAuthorizer` and `withdrawDelay`; do not duplicate them in the pricing callback. It must be initialized, and every network/scheme in an offer must be registered. `MerchantGate` rejects a batch offer before publication if the matching resource-server scheme is absent.
 
-On a charge, `open()` verifies and reserves the channel, then returns a `batch-settlement` obligation. `settle()` meters usage, passes the actual amount as the official settlement override, and commits the reservation. If work throws, call `gate.abort()` as shown in the shared gate example; it dispatches `onVerifiedPaymentCanceled` and releases the task claim so the same voucher can retry. A cooperative refund returns `kind: 'handled'`, settles immediately, and never permits resource work to run.
+On a charge, `open()` verifies and reserves the channel, then returns a `batch-settlement` obligation. `settle()` meters usage, passes the actual amount as the official settlement override, and commits the reservation. If work throws before publication, `gate.abort()` dispatches `onVerifiedPaymentCanceled` and releases the task claim so the same voucher can retry. After publication, `abort()` attempts the metered settlement instead; a failed settlement retains the claim and reservation for reconciliation because the delivered content cannot be revoked. A cooperative refund returns `kind: 'handled'`, settles immediately, and never permits resource work to run.
 
 The completed x402 store entry is retained until its configured TTL for batch operations. Its receipt contains `extra.channelState`, allowing recovery if the process stops after commit but before the terminal A2A result is durably recorded.
 

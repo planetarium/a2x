@@ -74,6 +74,7 @@ function fixture(options: {
   deadlineGuardSeconds?: number;
   deliveryTiming?: 'after-settlement' | 'after-verification';
   publicationStarted?: boolean;
+  lapse?: () => Promise<void>;
 } = {}) {
   const settle = vi.fn(
     options.settle ??
@@ -88,7 +89,7 @@ function fixture(options: {
         return settled(String(Math.ceil((tokens * 100) / 1_000)));
       }),
   );
-  const lapse = vi.fn(async () => undefined);
+  const lapse = vi.fn(options.lapse ?? (async () => undefined));
   const publicationStarted = vi.fn(async () => options.publicationStarted ?? false);
   const authorizeDelivery = vi.fn(async () => ({
     kind: 'authorized' as const,
@@ -137,6 +138,26 @@ describe('UptoSessionManager', () => {
       provisional: true,
     });
     expect(authorizeDelivery).toHaveBeenCalledWith({ taskId: 't-delivery' });
+    manager.stop();
+  });
+
+  it('blocks delivery after a reserved opener passes its guarded deadline', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-11T00:00:00Z'));
+    const { authorizeDelivery, manager } = fixture({ deadlineGuardSeconds: 30 });
+    await manager.reserveOpen({
+      contextId: 'c-expired-delivery',
+      taskId: 't-expired-delivery',
+      obligation: obligation({ deadlineSeconds: Math.floor(Date.now() / 1_000) + 40 }),
+    });
+    await vi.advanceTimersByTimeAsync(11_000);
+
+    await expect(manager.active('c-expired-delivery')).resolves.toBe(false);
+    await expect(manager.authorizeDelivery('c-expired-delivery')).resolves.toEqual({
+      kind: 'blocked',
+      reason: 'payment-state-unavailable',
+    });
+    expect(authorizeDelivery).not.toHaveBeenCalled();
     manager.stop();
   });
 
@@ -459,6 +480,33 @@ describe('UptoSessionManager', () => {
         usage: { kind: 'total', totalTokens: 100 },
       }),
     ).resolves.toBeUndefined();
+  });
+
+  it('restores an opening reservation when publication prevents it from lapsing', async () => {
+    const { manager, settle } = fixture({
+      lapse: async () => {
+        throw new Error('cannot lapse an authorization after content publication');
+      },
+    });
+    await manager.reserveOpen({
+      contextId: 'c-cancel-published-open',
+      taskId: 't-cancel-published-open',
+      obligation: obligation(),
+    });
+
+    await expect(
+      manager.cancelOpen({
+        contextId: 'c-cancel-published-open',
+        taskId: 't-cancel-published-open',
+      }),
+    ).rejects.toThrow('cannot lapse an authorization after content publication');
+    await expect(manager.lookup('c-cancel-published-open')).resolves.toMatchObject({
+      state: 'active',
+      turns: 0,
+      pendingTurnIds: ['t-cancel-published-open'],
+    });
+    expect(settle).not.toHaveBeenCalled();
+    manager.stop();
   });
 
   it('lets only one of opening commit and cancellation win its CAS race', async () => {

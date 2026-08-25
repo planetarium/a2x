@@ -191,6 +191,11 @@ export interface X402StoreEntryPatch {
  *     await this.put({ ...cur, ...patch, updatedAt: new Date() });
  *   }
  *
+ *   async updateMerchantDeliveryIfStatus(taskId, expected, patch) {
+ *     // Use one backend transaction or script to check status and merge fields.
+ *     return await atomicMerchantDeliveryMerge(this.redis, taskId, expected, patch);
+ *   }
+ *
  *   async delete(taskId: string): Promise<void> {
  *     await this.redis.del(`x402:${taskId}`);
  *   }
@@ -201,6 +206,11 @@ export interface X402StoreEntryPatch {
  * `entry.expiresAt`. Backends with native TTL (Redis EXPIRE, Postgres
  * `WHERE expires_at > now()`) satisfy this trivially; in-memory or
  * file-backed stores must check on read.
+ *
+ * Custom stores must also implement `updateMerchantDeliveryIfStatus` as an
+ * atomic status check and nested-field merge. There is deliberately no
+ * read-then-write fallback because losing `publicationStartedAt` can change
+ * whether an already delivered payment is settled or canceled.
  */
 export abstract class BaseX402Store {
   /** Replace or insert the entry for `taskId`. */
@@ -230,26 +240,30 @@ export abstract class BaseX402Store {
     return true;
   }
   /**
-   * Merge merchant delivery evidence without replacing fields written by a
-   * concurrent publisher or settlement. Shared stores MUST override this with
-   * one backend-level atomic merge.
+   * Atomically merge merchant delivery evidence when the lifecycle still has
+   * one of the expected statuses. Returns the status that won the update.
+   *
+   * Implementations MUST perform the status check and field merge in one
+   * backend operation so publication cannot race a failed settlement and audit
+   * fields cannot overwrite evidence written concurrently.
    */
+  abstract updateMerchantDeliveryIfStatus(
+    taskId: string,
+    expected: readonly X402EntryStatus[],
+    patch: X402MerchantDeliveryAuditPatch,
+  ): Promise<X402EntryStatus | undefined>;
+  /** Atomically merge merchant delivery evidence regardless of lifecycle status. */
   async updateMerchantDelivery(
     taskId: string,
     patch: X402MerchantDeliveryAuditPatch,
   ): Promise<boolean> {
-    const current = await this.get(taskId);
-    if (!current) return false;
-    const timing = patch.timing ?? current.merchantDelivery?.timing;
-    if (!timing) return false;
-    await this.update(taskId, {
-      merchantDelivery: {
-        ...current.merchantDelivery,
-        ...patch,
-        timing,
-      },
-    });
-    return true;
+    return (
+      (await this.updateMerchantDeliveryIfStatus(
+        taskId,
+        ['offered', 'verified', 'completed', 'failed', 'rejected'],
+        patch,
+      )) !== undefined
+    );
   }
   /** Remove the entry (best-effort; no-op if absent). */
   abstract delete(taskId: string): Promise<void>;
@@ -350,18 +364,19 @@ export class InMemoryX402Store extends BaseX402Store {
     return true;
   }
 
-  override async updateMerchantDelivery(
+  override async updateMerchantDeliveryIfStatus(
     taskId: string,
+    expected: readonly X402EntryStatus[],
     patch: X402MerchantDeliveryAuditPatch,
-  ): Promise<boolean> {
+  ): Promise<X402EntryStatus | undefined> {
     const cur = this._entries.get(taskId);
-    if (!cur) return false;
+    if (!cur || !expected.includes(cur.status)) return undefined;
     if (cur.expiresAt && cur.expiresAt.getTime() <= Date.now()) {
       this._entries.delete(taskId);
-      return false;
+      return undefined;
     }
     const timing = patch.timing ?? cur.merchantDelivery?.timing;
-    if (!timing) return false;
+    if (!timing) return undefined;
     const next: X402StoreEntry = {
       ...cur,
       merchantDelivery: {
@@ -373,7 +388,7 @@ export class InMemoryX402Store extends BaseX402Store {
     };
     this._entries.delete(taskId);
     this._entries.set(taskId, next);
-    return true;
+    return cur.status;
   }
 
   async delete(taskId: string): Promise<void> {

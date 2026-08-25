@@ -478,6 +478,49 @@ describe('MerchantGate', () => {
     });
   });
 
+  it('blocks delivery when settlement fails while metadata is being prepared', async () => {
+    let releaseMetadata!: () => void;
+    const metadataBlocked = new Promise<void>((resolve) => {
+      releaseMetadata = resolve;
+    });
+    const metadataStarted = vi.fn();
+    const { gate, x402 } = fixture(
+      { accepts: [EXACT] },
+      'after-work',
+      undefined,
+      'after-verification',
+      async () => {
+        metadataStarted();
+        await metadataBlocked;
+        return { provisional: true };
+      },
+    );
+    await gate.open({ taskId: 't-delivery-failed-race', message: message() });
+    await gate.open({
+      taskId: 't-delivery-failed-race',
+      message: submitted(exactPayload()),
+    });
+
+    const delivery = gate.authorizeDelivery({ taskId: 't-delivery-failed-race' });
+    await vi.waitFor(() => expect(metadataStarted).toHaveBeenCalledOnce());
+    await x402.store.updateIfStatus('t-delivery-failed-race', ['verified'], {
+      status: 'failed',
+      failure: {
+        point: 'settle',
+        code: X402_ERROR_CODES.SETTLEMENT_FAILED,
+        reason: 'settlement refused',
+        failedAt: new Date(),
+      },
+    });
+    releaseMetadata();
+
+    await expect(delivery).resolves.toEqual({ kind: 'blocked', reason: 'payment-failed' });
+    await expect(x402.store.get('t-delivery-failed-race')).resolves.toMatchObject({
+      status: 'failed',
+    });
+    await expect(gate.publicationStarted('t-delivery-failed-race')).resolves.toBe(false);
+  });
+
   it('blocks delivery when the publication boundary cannot be persisted', async () => {
     const { gate, x402 } = fixture(
       { accepts: [EXACT] },
@@ -490,7 +533,7 @@ describe('MerchantGate', () => {
       taskId: 't-delivery-store-failure',
       message: submitted(exactPayload()),
     });
-    vi.spyOn(x402.store, 'updateMerchantDelivery').mockResolvedValueOnce(false);
+    vi.spyOn(x402.store, 'updateMerchantDeliveryIfStatus').mockResolvedValue(undefined);
 
     await expect(
       gate.authorizeDelivery({ taskId: 't-delivery-store-failure' }),
@@ -564,6 +607,37 @@ describe('MerchantGate', () => {
         publicationStartedAt: expect.any(Date),
         workFailedAt: expect.any(Date),
       },
+    });
+  });
+
+  it('still settles published work when work-audit persistence fails', async () => {
+    const onError = vi.fn();
+    const { gate, facilitator, x402 } = fixture(
+      { accepts: [EXACT] },
+      'after-work',
+      onError,
+      'after-verification',
+    );
+    await gate.open({ taskId: 't-published-audit-failure', message: message() });
+    const opened = await gate.open({
+      taskId: 't-published-audit-failure',
+      message: submitted(exactPayload()),
+    });
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+    await gate.authorizeDelivery({ taskId: 't-published-audit-failure' });
+    vi.spyOn(x402.store, 'updateMerchantDelivery').mockResolvedValueOnce(false);
+
+    await expect(
+      gate.abort({
+        taskId: 't-published-audit-failure',
+        obligation: opened.obligation,
+        reason: 'handler_threw',
+      }),
+    ).resolves.toMatchObject({ kind: 'settled' });
+    expect(facilitator.settle).toHaveBeenCalledOnce();
+    expect(onError).toHaveBeenCalledWith(expect.any(Error), {
+      operation: 'settle',
+      taskId: 't-published-audit-failure',
     });
   });
 
@@ -1258,6 +1332,32 @@ describe('MerchantGate', () => {
     await expect(
       gate.open({
         taskId: 't-batch-abort',
+        message: submitted(batchPayload('voucher', accepted)),
+      }),
+    ).resolves.toMatchObject({
+      kind: 'proceed',
+      obligation: { scheme: 'batch-settlement' },
+    });
+    expect(resourceServer.verifyPayment).toHaveBeenCalledTimes(2);
+  });
+
+  it('cancels and releases a verified batch claim when delivery audit initialization fails', async () => {
+    const { gate, x402, cancel, resourceServer } = batchFixture();
+    await gate.open({ taskId: 't-batch-audit-init-failure', message: message() });
+    const accepted = (await x402.store.get('t-batch-audit-init-failure'))!.accepts[0]!;
+    vi.spyOn(x402.store, 'updateMerchantDeliveryIfStatus').mockResolvedValueOnce(undefined);
+
+    await expect(
+      gate.open({
+        taskId: 't-batch-audit-init-failure',
+        message: submitted(batchPayload('voucher', accepted)),
+      }),
+    ).resolves.toMatchObject({ kind: 'refuse' });
+    expect(cancel).toHaveBeenCalledWith({ reason: 'after_verify_aborted' });
+
+    await expect(
+      gate.open({
+        taskId: 't-batch-audit-init-failure',
         message: submitted(batchPayload('voucher', accepted)),
       }),
     ).resolves.toMatchObject({

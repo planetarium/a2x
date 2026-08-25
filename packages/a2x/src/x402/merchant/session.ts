@@ -554,7 +554,12 @@ export class UptoSessionManager {
   /** Authorize provisional delivery against the authorization held by a live session. */
   async authorizeDelivery(contextId: string): Promise<MerchantGateAuthorizeDeliveryOutcome> {
     const record = await this.store.get(contextId);
-    if (!record || record.state !== 'active') {
+    if (
+      !record ||
+      record.state !== 'active' ||
+      record.closeRequestedReason !== undefined ||
+      Date.now() >= Date.parse(record.settleBy)
+    ) {
       return { kind: 'blocked', reason: 'payment-state-unavailable' };
     }
     return await this.options.gate.authorizeDelivery({ taskId: record.taskId });
@@ -647,22 +652,50 @@ export class UptoSessionManager {
         if (!current || current.taskId !== input.taskId) return undefined;
         if (!hasPendingOpen(current)) return this.outcome(current);
 
-        const settlement: UptoSessionSettlement = { kind: 'lapsed' };
-        const closed: UptoSessionRecord = {
+        const settling: UptoSessionRecord = {
           ...current,
           revision: current.revision + 1,
-          state: 'closed',
-          pendingTurnIds: [],
+          state: 'settling',
           closeRequestedReason: undefined,
           endReason: 'manual',
-          settlement,
-          closedAt: new Date().toISOString(),
         };
-        if (!(await this.store.compareAndSet(input.contextId, current.revision, closed))) {
+        if (!(await this.store.compareAndSet(input.contextId, current.revision, settling))) {
           continue;
         }
         this.disarm(input.contextId);
-        await this.options.gate.lapse(input.taskId);
+        try {
+          await this.options.gate.lapse(input.taskId);
+        } catch (error) {
+          const observed = await this.store.get(input.contextId);
+          if (
+            observed?.state === 'settling' &&
+            observed.taskId === input.taskId &&
+            observed.settlement === undefined
+          ) {
+            const restored: UptoSessionRecord = {
+              ...current,
+              revision: observed.revision + 1,
+            };
+            if (await this.store.compareAndSet(input.contextId, observed.revision, restored)) {
+              this.arm(restored);
+            }
+          }
+          throw error;
+        }
+        const settlement: UptoSessionSettlement = { kind: 'lapsed' };
+        const closed: UptoSessionRecord = {
+          ...settling,
+          revision: settling.revision + 1,
+          state: 'closed',
+          pendingTurnIds: [],
+          settlement,
+          closedAt: new Date().toISOString(),
+        };
+        if (!(await this.store.compareAndSet(input.contextId, settling.revision, closed))) {
+          throw new Error(
+            'Upto session opening authorization lapsed but its terminal record could not be persisted.',
+          );
+        }
         return { session: this.snapshot(closed), settlement };
       }
       throw new Error('Upto session opening cancellation lost its compare-and-set race.');

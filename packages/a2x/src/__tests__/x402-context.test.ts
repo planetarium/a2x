@@ -18,6 +18,8 @@ import {
   BaseX402Store,
   InMemoryX402Store,
   X402Context,
+  type X402EntryStatus,
+  type X402MerchantDeliveryAuditPatch,
   type X402StoreEntry,
   type X402ValidClassification,
 } from '../x402/index.js';
@@ -212,6 +214,39 @@ describe('InMemoryX402Store', () => {
       storedAt: new Date(),
     });
     expect((await store.get('t1'))?.accepts[0]!.amount).toBe('99');
+  });
+
+  it('conditionally merges merchant delivery evidence against lifecycle status', async () => {
+    const store = new InMemoryX402Store();
+    const now = new Date();
+    await store.put({
+      taskId: 'delivery',
+      accepts: [ACCEPT],
+      status: 'verified',
+      storedAt: now,
+      updatedAt: now,
+      merchantDelivery: { timing: 'after-verification' },
+    });
+
+    await expect(
+      store.updateMerchantDeliveryIfStatus('delivery', ['completed'], {
+        publicationStartedAt: now,
+      }),
+    ).resolves.toBeUndefined();
+    await expect(
+      store.updateMerchantDeliveryIfStatus('delivery', ['verified'], {
+        publicationStartedAt: now,
+      }),
+    ).resolves.toBe('verified');
+    await store.updateMerchantDelivery('delivery', { workCompletedAt: now });
+
+    await expect(store.get('delivery')).resolves.toMatchObject({
+      merchantDelivery: {
+        timing: 'after-verification',
+        publicationStartedAt: now,
+        workCompletedAt: now,
+      },
+    });
   });
 });
 
@@ -946,6 +981,14 @@ describe('X402Context custom store', () => {
       }
       async update(taskId: string, patch: unknown) {
         calls.push({ method: 'update', arg: { taskId, patch } });
+      }
+      async updateMerchantDeliveryIfStatus(
+        taskId: string,
+        expected: readonly X402EntryStatus[],
+        patch: X402MerchantDeliveryAuditPatch,
+      ) {
+        calls.push({ method: 'updateMerchantDeliveryIfStatus', arg: { taskId, expected, patch } });
+        return undefined;
       }
       async delete(taskId: string) {
         calls.push({ method: 'delete', arg: taskId });

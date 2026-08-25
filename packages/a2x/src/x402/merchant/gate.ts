@@ -63,6 +63,7 @@ export interface MerchantGateErrorContext {
 }
 
 const DEFAULT_OFFER_TTL_SECONDS = 600;
+const MAX_DELIVERY_AUTHORIZATION_ATTEMPTS = 10;
 const X402_ERROR_CODE_VALUES: ReadonlySet<string> = new Set(Object.values(X402_ERROR_CODES));
 
 function eventErrorCode(metadata: Record<string, unknown> | undefined): X402ErrorCode | undefined {
@@ -249,7 +250,21 @@ export class MerchantGate {
         };
       }
 
-      await this.initializeDeliveryAudit(turn.taskId);
+      try {
+        await this.initializeDeliveryAudit(turn.taskId);
+      } catch (error) {
+        await this.cancelVerification(
+          turn.taskId,
+          verification.cancellation,
+          'after_verify_aborted',
+        );
+        try {
+          await this.offerStore.release(turn.taskId);
+        } catch (releaseError) {
+          await this.reportError(releaseError, { operation: 'cleanup', taskId: turn.taskId });
+        }
+        throw error;
+      }
 
       if ((pricing.scheme ?? 'exact') === 'exact' && this.options.exactTiming === 'before-work') {
         const receipt = await this.options.x402.settle(turn, classified);
@@ -330,43 +345,45 @@ export class MerchantGate {
     input: MerchantGateAuthorizeDeliveryInput,
   ): Promise<MerchantGateAuthorizeDeliveryOutcome> {
     try {
-      const entry = await this.options.x402.store.get(input.taskId);
-      if (!entry?.merchantDelivery) {
-        return { kind: 'blocked', reason: 'payment-state-unavailable' };
-      }
-      if (entry.status === 'failed' || entry.status === 'rejected') {
-        return { kind: 'blocked', reason: 'payment-failed' };
-      }
-      if (entry.status !== 'verified' && entry.status !== 'completed') {
-        return { kind: 'blocked', reason: 'payment-not-verified' };
-      }
-      if (
-        entry.merchantDelivery.timing === 'after-settlement' &&
-        entry.status !== 'completed'
-      ) {
-        return { kind: 'blocked', reason: 'settlement-required' };
-      }
+      for (let attempt = 0; attempt < MAX_DELIVERY_AUTHORIZATION_ATTEMPTS; attempt += 1) {
+        const entry = await this.options.x402.store.get(input.taskId);
+        if (!entry?.merchantDelivery) {
+          return { kind: 'blocked', reason: 'payment-state-unavailable' };
+        }
+        if (entry.status === 'failed' || entry.status === 'rejected') {
+          return { kind: 'blocked', reason: 'payment-failed' };
+        }
+        if (entry.status !== 'verified' && entry.status !== 'completed') {
+          return { kind: 'blocked', reason: 'payment-not-verified' };
+        }
+        if (
+          entry.merchantDelivery.timing === 'after-settlement' &&
+          entry.status !== 'completed'
+        ) {
+          return { kind: 'blocked', reason: 'settlement-required' };
+        }
 
-      const provisional = entry.status !== 'completed';
-      const metadata = structuredClone(
-        (await this.options.deliveryMetadata?.({
-          taskId: input.taskId,
-          timing: entry.merchantDelivery.timing,
-          provisional,
-          paymentStatus: provisional ? 'verified' : 'settled',
-        })) ?? {},
-      );
-      const publicationStartedAt =
-        entry.merchantDelivery.publicationStartedAt ?? new Date();
-      const updated = await this.options.x402.store.updateMerchantDelivery(input.taskId, {
-        publicationStartedAt,
-      });
-      if (!updated) throw new Error('Delivery publication intent was not persisted.');
-      const recorded = await this.options.x402.store.get(input.taskId);
-      if (recorded?.merchantDelivery?.publicationStartedAt === undefined) {
-        throw new Error('Delivery publication intent was not persisted.');
+        const provisional = entry.status !== 'completed';
+        const metadata = structuredClone(
+          (await this.options.deliveryMetadata?.({
+            taskId: input.taskId,
+            timing: entry.merchantDelivery.timing,
+            provisional,
+            paymentStatus: provisional ? 'verified' : 'settled',
+          })) ?? {},
+        );
+        const publicationStartedAt =
+          entry.merchantDelivery.publicationStartedAt ?? new Date();
+        const updatedStatus =
+          await this.options.x402.store.updateMerchantDeliveryIfStatus(
+            input.taskId,
+            [entry.status],
+            { publicationStartedAt },
+          );
+        if (updatedStatus === undefined) continue;
+        return { kind: 'authorized', provisional, metadata };
       }
-      return { kind: 'authorized', provisional, metadata };
+      throw new Error('Delivery publication intent lost repeated lifecycle races.');
     } catch (error) {
       await this.reportError(error, {
         operation: 'authorize-delivery',
@@ -429,7 +446,11 @@ export class MerchantGate {
     workOutcome: 'completed' | 'failed',
   ): Promise<MerchantGateSettleOutcome> {
     try {
-      await this.recordWorkOutcome(input.taskId, workOutcome);
+      try {
+        await this.recordWorkOutcome(input.taskId, workOutcome);
+      } catch (error) {
+        await this.reportError(error, { operation: 'settle', taskId: input.taskId });
+      }
       const outcome = await this.settleObligation(input);
       let hasCompletedLifecycle = false;
       let hasPublished = false;
@@ -442,7 +463,13 @@ export class MerchantGate {
         const lifecycle = await this.options.x402.store.get(input.taskId);
         hasCompletedLifecycle = lifecycle?.status === 'completed';
         hasPublished = lifecycle?.merchantDelivery?.publicationStartedAt !== undefined;
-        if (hasPublished) await this.recordSettlementFailure(input.taskId);
+        if (hasPublished) {
+          try {
+            await this.recordSettlementFailure(input.taskId);
+          } catch (error) {
+            await this.reportError(error, { operation: 'settle', taskId: input.taskId });
+          }
+        }
         if (lifecycle?.failure?.indeterminate === true) {
           await this.reportError(new Error(lifecycle.failure.reason), {
             operation: 'settle',
@@ -515,12 +542,15 @@ export class MerchantGate {
   }
 
   private async initializeDeliveryAudit(taskId: string): Promise<void> {
-    const entry = await this.options.x402.store.get(taskId);
-    if (!entry) throw new Error('Verified payment lifecycle is unavailable.');
-    const updated = await this.options.x402.store.updateMerchantDelivery(taskId, {
-      timing: this.options.deliveryTiming,
-    });
-    if (!updated) throw new Error('Merchant delivery policy was not persisted.');
+    const updatedStatus =
+      await this.options.x402.store.updateMerchantDeliveryIfStatus(
+        taskId,
+        ['verified'],
+        { timing: this.options.deliveryTiming },
+      );
+    if (updatedStatus !== 'verified') {
+      throw new Error('Merchant delivery policy was not persisted.');
+    }
     const recorded = await this.options.x402.store.get(taskId);
     if (recorded?.merchantDelivery?.timing !== this.options.deliveryTiming) {
       throw new Error('Merchant delivery policy was not persisted.');
