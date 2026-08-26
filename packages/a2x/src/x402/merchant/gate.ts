@@ -519,7 +519,9 @@ export class MerchantGate {
             lifecycle?.status === 'failed' &&
             lifecycle.failure?.indeterminate !== true
           ) {
-            canCancelBatch = true;
+            hasPublished =
+              (await this.closeUnpublishedDelivery(input.taskId, ['failed'])) === 'published';
+            canCancelBatch = !hasPublished;
           }
         }
         if (hasPublished) {
@@ -602,19 +604,24 @@ export class MerchantGate {
 
   private async closeUnpublishedDelivery(
     taskId: string,
+    expected: readonly ('verified' | 'failed')[] = ['verified'],
   ): Promise<'closed' | 'published'> {
     for (let attempt = 0; attempt < MAX_DELIVERY_AUTHORIZATION_ATTEMPTS; attempt += 1) {
       const entry = await this.options.x402.store.get(taskId);
       if (!entry) return 'closed';
       if (entry.merchantDelivery?.publicationStartedAt) return 'published';
       if (entry.merchantDelivery?.publicationClosedAt) return 'closed';
-      if (!entry.merchantDelivery || entry.status !== 'verified') {
+      if (
+        !entry.merchantDelivery ||
+        (entry.status !== 'verified' && entry.status !== 'failed') ||
+        !expected.includes(entry.status)
+      ) {
         throw new Error('Merchant delivery state cannot be closed from its current lifecycle.');
       }
       const closedAt = new Date();
       const updated = await this.options.x402.store.updateMerchantDeliveryIfStatus(
         taskId,
-        ['verified'],
+        expected,
         { publicationClosedAt: closedAt },
         { publicationStarted: false },
       );

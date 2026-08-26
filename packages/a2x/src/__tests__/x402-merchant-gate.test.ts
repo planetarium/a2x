@@ -1715,6 +1715,94 @@ describe('MerchantGate', () => {
     expect(resourceServer.verifyPayment).toHaveBeenCalledOnce();
   });
 
+  it('closes a definitively failed unpublished batch attempt before releasing its claim', async () => {
+    const { gate, x402, cancel, resourceServer } = batchFixture({
+      settleSuccess: false,
+      deliveryTiming: 'after-verification',
+    });
+    await gate.open({ taskId: 't-batch-unpublished-failure', message: message() });
+    const accepted = (await x402.store.get('t-batch-unpublished-failure'))!.accepts[0]!;
+    const opened = await gate.open({
+      taskId: 't-batch-unpublished-failure',
+      message: submitted(batchPayload('voucher', accepted)),
+    });
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+
+    await expect(
+      gate.settle({
+        taskId: 't-batch-unpublished-failure',
+        obligation: opened.obligation,
+        usage: { kind: 'total', totalTokens: 1_500 },
+      }),
+    ).resolves.toMatchObject({ kind: 'failed' });
+    expect(cancel).toHaveBeenCalledWith({ reason: 'handler_failed' });
+    await expect(x402.store.get('t-batch-unpublished-failure')).resolves.toMatchObject({
+      status: 'failed',
+      merchantDelivery: {
+        publicationClosedAt: expect.any(Date),
+        workCompletedAt: expect.any(Date),
+      },
+    });
+
+    await expect(
+      gate.open({
+        taskId: 't-batch-unpublished-failure',
+        message: submitted(batchPayload('voucher', accepted)),
+      }),
+    ).resolves.toMatchObject({ kind: 'refuse', code: X402_ERROR_CODES.DUPLICATE_NONCE });
+    expect(resourceServer.verifyPayment).toHaveBeenCalledOnce();
+  });
+
+  it('retains a definitively failed batch claim when terminal closure cannot be recorded', async () => {
+    const onError = vi.fn();
+    const { gate, x402, cancel, resourceServer } = batchFixture({
+      settleSuccess: false,
+      deliveryTiming: 'after-verification',
+      onError,
+    });
+    await gate.open({ taskId: 't-batch-failed-closure-error', message: message() });
+    const accepted = (await x402.store.get('t-batch-failed-closure-error'))!.accepts[0]!;
+    const opened = await gate.open({
+      taskId: 't-batch-failed-closure-error',
+      message: submitted(batchPayload('voucher', accepted)),
+    });
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+
+    const updateMerchantDeliveryIfStatus =
+      x402.store.updateMerchantDeliveryIfStatus.bind(x402.store);
+    vi.spyOn(x402.store, 'updateMerchantDeliveryIfStatus').mockImplementation(
+      async (taskId, expected, patch, condition) => {
+        if (patch.publicationClosedAt) return undefined;
+        return await updateMerchantDeliveryIfStatus(taskId, expected, patch, condition);
+      },
+    );
+
+    await expect(
+      gate.settle({
+        taskId: 't-batch-failed-closure-error',
+        obligation: opened.obligation,
+        usage: { kind: 'total', totalTokens: 1_500 },
+      }),
+    ).resolves.toMatchObject({ kind: 'failed' });
+    expect(cancel).not.toHaveBeenCalled();
+    await expect(
+      gate.offerStore.getClaimStatus?.('t-batch-failed-closure-error'),
+    ).resolves.toBe('claimed');
+    await expect(
+      gate.open({
+        taskId: 't-batch-failed-closure-error',
+        message: submitted(batchPayload('voucher', accepted)),
+      }),
+    ).resolves.toMatchObject({ kind: 'refuse', code: X402_ERROR_CODES.DUPLICATE_NONCE });
+    expect(resourceServer.verifyPayment).toHaveBeenCalledOnce();
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: 'Merchant delivery closure lost repeated lifecycle races.',
+      }),
+      { operation: 'settle', taskId: 't-batch-failed-closure-error' },
+    );
+  });
+
   it('settles a batch refund without allowing resource work to run', async () => {
     const { gate, x402, settlePayment, resourceServer } = batchFixture({ skipHandler: true });
     await gate.open({ taskId: 't-batch-refund', message: message() });
