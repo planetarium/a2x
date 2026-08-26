@@ -11,6 +11,7 @@ import {
   InMemoryUptoSessionStore,
   UptoSessionManager,
 } from '../x402/index.js';
+import { MerchantDeliveryPublishedError } from '../x402/merchant/gate.js';
 
 const PRICING: MerchantUptoPricing = {
   scheme: 'upto',
@@ -137,7 +138,10 @@ describe('UptoSessionManager', () => {
       kind: 'authorized',
       provisional: true,
     });
-    expect(authorizeDelivery).toHaveBeenCalledWith({ taskId: 't-delivery' });
+    expect(authorizeDelivery).toHaveBeenCalledWith({
+      taskId: 't-delivery',
+      notAfter: expect.any(Date),
+    });
     manager.stop();
   });
 
@@ -485,7 +489,7 @@ describe('UptoSessionManager', () => {
   it('restores an opening reservation when publication prevents it from lapsing', async () => {
     const { manager, settle } = fixture({
       lapse: async () => {
-        throw new Error('cannot lapse an authorization after content publication');
+        throw new MerchantDeliveryPublishedError();
       },
     });
     await manager.reserveOpen({
@@ -506,6 +510,32 @@ describe('UptoSessionManager', () => {
       pendingTurnIds: ['t-cancel-published-open'],
     });
     expect(settle).not.toHaveBeenCalled();
+    manager.stop();
+  });
+
+  it('keeps an opening reservation unresolved when lapse cleanup fails', async () => {
+    const { manager } = fixture({
+      lapse: async () => {
+        throw new Error('redis unavailable');
+      },
+    });
+    await manager.reserveOpen({
+      contextId: 'c-cancel-cleanup-failure',
+      taskId: 't-cancel-cleanup-failure',
+      obligation: obligation(),
+    });
+
+    await expect(
+      manager.cancelOpen({
+        contextId: 'c-cancel-cleanup-failure',
+        taskId: 't-cancel-cleanup-failure',
+      }),
+    ).rejects.toThrow('redis unavailable');
+    await expect(manager.lookup('c-cancel-cleanup-failure')).resolves.toMatchObject({
+      state: 'settling',
+      turns: 0,
+      pendingTurnIds: ['t-cancel-cleanup-failure'],
+    });
     manager.stop();
   });
 

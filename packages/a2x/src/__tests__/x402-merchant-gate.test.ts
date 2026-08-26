@@ -191,9 +191,14 @@ function batchFixture(options: {
   skipHandler?: boolean;
   settleSuccess?: boolean;
   deliveryTiming?: MerchantDeliveryTiming;
+  cancelFailure?: Error;
+  onError?: (error: unknown, context: MerchantGateErrorContext) => void | Promise<void>;
+  deliveryMetadata?: MerchantDeliveryMetadataBuilder;
 } = {}) {
   const pricing = options.pricing ?? BATCH;
-  const cancel = vi.fn(async () => undefined);
+  const cancel = vi.fn(async () => {
+    if (options.cancelFailure) throw options.cancelFailure;
+  });
   const settlePayment = vi.fn(
     async (
       _payload: X402PaymentPayload,
@@ -248,6 +253,8 @@ function batchFixture(options: {
     pricing: async () => ({ accepts: [pricing] }),
     exactTiming: 'after-work',
     deliveryTiming: options.deliveryTiming ?? 'after-settlement',
+    ...(options.onError ? { onError: options.onError } : {}),
+    ...(options.deliveryMetadata ? { deliveryMetadata: options.deliveryMetadata } : {}),
   });
   return { gate, x402, resourceServer, cancel, settlePayment };
 }
@@ -521,6 +528,122 @@ describe('MerchantGate', () => {
     await expect(gate.publicationStarted('t-delivery-failed-race')).resolves.toBe(false);
   });
 
+  it('blocks delivery when its atomic publication deadline passes during metadata work', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-08-11T00:00:00Z'));
+      let releaseMetadata!: () => void;
+      const metadataBlocked = new Promise<void>((resolve) => {
+        releaseMetadata = resolve;
+      });
+      const metadataStarted = vi.fn();
+      const { gate } = fixture(
+        { accepts: [EXACT] },
+        'after-work',
+        undefined,
+        'after-verification',
+        async () => {
+          metadataStarted();
+          await metadataBlocked;
+          return { provisional: true };
+        },
+      );
+      await gate.open({ taskId: 't-delivery-deadline', message: message() });
+      await gate.open({
+        taskId: 't-delivery-deadline',
+        message: submitted(exactPayload()),
+      });
+
+      const delivery = gate.authorizeDelivery({
+        taskId: 't-delivery-deadline',
+        notAfter: new Date('2026-08-11T00:00:01Z'),
+      });
+      await vi.waitFor(() => expect(metadataStarted).toHaveBeenCalledOnce());
+      vi.setSystemTime(new Date('2026-08-11T00:00:02Z'));
+      releaseMetadata();
+
+      await expect(delivery).resolves.toEqual({
+        kind: 'blocked',
+        reason: 'payment-state-unavailable',
+      });
+      await expect(gate.publicationStarted('t-delivery-deadline')).resolves.toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('linearizes publication against a concurrent lapse', async () => {
+    const { gate, x402 } = fixture(
+      { accepts: [EXACT] },
+      'after-work',
+      undefined,
+      'after-verification',
+    );
+    await gate.open({ taskId: 't-delivery-lapse-race', message: message() });
+    await gate.open({
+      taskId: 't-delivery-lapse-race',
+      message: submitted(exactPayload()),
+    });
+
+    let releaseClosure!: () => void;
+    let closureStarted!: () => void;
+    const closureBlocked = new Promise<void>((resolve) => {
+      releaseClosure = resolve;
+    });
+    const closureObserved = new Promise<void>((resolve) => {
+      closureStarted = resolve;
+    });
+    const updateMerchantDeliveryIfStatus =
+      x402.store.updateMerchantDeliveryIfStatus.bind(x402.store);
+    vi.spyOn(x402.store, 'updateMerchantDeliveryIfStatus').mockImplementation(
+      async (taskId, expected, patch, condition) => {
+        if (patch.publicationClosedAt) {
+          closureStarted();
+          await closureBlocked;
+        }
+        return await updateMerchantDeliveryIfStatus(taskId, expected, patch, condition);
+      },
+    );
+
+    const lapse = gate.lapse('t-delivery-lapse-race');
+    await closureObserved;
+    await expect(
+      gate.authorizeDelivery({ taskId: 't-delivery-lapse-race' }),
+    ).resolves.toMatchObject({ kind: 'authorized' });
+    releaseClosure();
+
+    await expect(lapse).rejects.toThrow(
+      'cannot lapse an authorization after content publication',
+    );
+    await expect(x402.store.get('t-delivery-lapse-race')).resolves.toMatchObject({
+      status: 'verified',
+      merchantDelivery: { publicationStartedAt: expect.any(Date) },
+    });
+  });
+
+  it('fails lapse when cleanup only partially removes durable state', async () => {
+    const { gate, x402 } = fixture(
+      { accepts: [EXACT] },
+      'after-work',
+      undefined,
+      'after-verification',
+    );
+    await gate.open({ taskId: 't-lapse-cleanup-failure', message: message() });
+    await gate.open({
+      taskId: 't-lapse-cleanup-failure',
+      message: submitted(exactPayload()),
+    });
+    vi.spyOn(gate.offerStore, 'delete').mockRejectedValueOnce(new Error('redis unavailable'));
+
+    await expect(gate.lapse('t-lapse-cleanup-failure')).rejects.toThrow(
+      'cleanup did not complete',
+    );
+    await expect(gate.offerStore.getClaimStatus?.('t-lapse-cleanup-failure')).resolves.toBe(
+      'claimed',
+    );
+    await expect(x402.store.get('t-lapse-cleanup-failure')).resolves.toBeUndefined();
+  });
+
   it('blocks delivery when the publication boundary cannot be persisted', async () => {
     const { gate, x402 } = fixture(
       { accepts: [EXACT] },
@@ -542,6 +665,28 @@ describe('MerchantGate', () => {
       reason: 'payment-state-unavailable',
     });
     await expect(gate.publicationStarted('t-delivery-store-failure')).resolves.toBe(false);
+  });
+
+  it('does not rebuild metadata for repeated races in the same payment phase', async () => {
+    const deliveryMetadata = vi.fn(() => ({ provisional: true }));
+    const { gate, x402 } = fixture(
+      { accepts: [EXACT] },
+      'after-work',
+      undefined,
+      'after-verification',
+      deliveryMetadata,
+    );
+    await gate.open({ taskId: 't-delivery-metadata-retry', message: message() });
+    await gate.open({
+      taskId: 't-delivery-metadata-retry',
+      message: submitted(exactPayload()),
+    });
+    vi.spyOn(x402.store, 'updateMerchantDeliveryIfStatus').mockResolvedValue(undefined);
+
+    await expect(
+      gate.authorizeDelivery({ taskId: 't-delivery-metadata-retry' }),
+    ).resolves.toEqual({ kind: 'blocked', reason: 'payment-state-unavailable' });
+    expect(deliveryMetadata).toHaveBeenCalledOnce();
   });
 
   it('merges concurrent publication and settlement audit fields', async () => {
@@ -1309,7 +1454,7 @@ describe('MerchantGate', () => {
     });
   });
 
-  it('cancels a batch reservation and releases the task claim for retry', async () => {
+  it('cancels a batch reservation and permits the voucher on a fresh task', async () => {
     const { gate, x402, cancel, resourceServer } = batchFixture();
     await gate.open({ taskId: 't-batch-abort', message: message() });
     const accepted = (await x402.store.get('t-batch-abort'))!.accepts[0]!;
@@ -1335,10 +1480,59 @@ describe('MerchantGate', () => {
         message: submitted(batchPayload('voucher', accepted)),
       }),
     ).resolves.toMatchObject({
+      kind: 'refuse',
+      code: X402_ERROR_CODES.DUPLICATE_NONCE,
+    });
+    await gate.open({ taskId: 't-batch-abort-retry', message: message() });
+    const retryAccepted = (await x402.store.get('t-batch-abort-retry'))!.accepts[0]!;
+    await expect(
+      gate.open({
+        taskId: 't-batch-abort-retry',
+        message: submitted(batchPayload('voucher', retryAccepted)),
+      }),
+    ).resolves.toMatchObject({
       kind: 'proceed',
       obligation: { scheme: 'batch-settlement' },
     });
     expect(resourceServer.verifyPayment).toHaveBeenCalledTimes(2);
+  });
+
+  it('retains a batch claim when reservation cancellation cannot be confirmed', async () => {
+    const onError = vi.fn();
+    const { gate, x402, cancel, resourceServer } = batchFixture({
+      cancelFailure: new Error('cancel timeout'),
+      onError,
+    });
+    await gate.open({ taskId: 't-batch-cancel-failure', message: message() });
+    const accepted = (await x402.store.get('t-batch-cancel-failure'))!.accepts[0]!;
+    const opened = await gate.open({
+      taskId: 't-batch-cancel-failure',
+      message: submitted(batchPayload('voucher', accepted)),
+    });
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+
+    await expect(
+      gate.abort({
+        taskId: 't-batch-cancel-failure',
+        obligation: opened.obligation,
+        reason: 'handler_threw',
+      }),
+    ).resolves.toMatchObject({ kind: 'failed' });
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: 'cancel timeout' }), {
+      operation: 'abort',
+      taskId: 't-batch-cancel-failure',
+    });
+    await expect(gate.offerStore.getClaimStatus?.('t-batch-cancel-failure')).resolves.toBe(
+      'claimed',
+    );
+    await expect(
+      gate.open({
+        taskId: 't-batch-cancel-failure',
+        message: submitted(batchPayload('voucher', accepted)),
+      }),
+    ).resolves.toMatchObject({ kind: 'refuse', code: X402_ERROR_CODES.DUPLICATE_NONCE });
+    expect(resourceServer.verifyPayment).toHaveBeenCalledOnce();
   });
 
   it('cancels and releases a verified batch claim when delivery audit initialization fails', async () => {
@@ -1365,6 +1559,33 @@ describe('MerchantGate', () => {
       obligation: { scheme: 'batch-settlement' },
     });
     expect(resourceServer.verifyPayment).toHaveBeenCalledTimes(2);
+  });
+
+  it('retains a verified batch claim when audit compensation cannot cancel it', async () => {
+    const { gate, x402, cancel, resourceServer } = batchFixture({
+      cancelFailure: new Error('cancel timeout'),
+    });
+    await gate.open({ taskId: 't-batch-audit-cancel-failure', message: message() });
+    const accepted = (await x402.store.get('t-batch-audit-cancel-failure'))!.accepts[0]!;
+    vi.spyOn(x402.store, 'updateMerchantDeliveryIfStatus').mockResolvedValueOnce(undefined);
+
+    await expect(
+      gate.open({
+        taskId: 't-batch-audit-cancel-failure',
+        message: submitted(batchPayload('voucher', accepted)),
+      }),
+    ).resolves.toMatchObject({ kind: 'refuse' });
+    expect(cancel).toHaveBeenCalledOnce();
+    await expect(
+      gate.offerStore.getClaimStatus?.('t-batch-audit-cancel-failure'),
+    ).resolves.toBe('claimed');
+    await expect(
+      gate.open({
+        taskId: 't-batch-audit-cancel-failure',
+        message: submitted(batchPayload('voucher', accepted)),
+      }),
+    ).resolves.toMatchObject({ kind: 'refuse', code: X402_ERROR_CODES.DUPLICATE_NONCE });
+    expect(resourceServer.verifyPayment).toHaveBeenCalledOnce();
   });
 
   it('cancels batch state when usage policy refuses settlement', async () => {
@@ -1394,7 +1615,62 @@ describe('MerchantGate', () => {
         taskId: 't-batch-unpriced',
         message: submitted(batchPayload('voucher', accepted)),
       }),
+    ).resolves.toMatchObject({ kind: 'refuse', code: X402_ERROR_CODES.DUPLICATE_NONCE });
+    await gate.open({ taskId: 't-batch-unpriced-retry', message: message() });
+    const retryAccepted = (await x402.store.get('t-batch-unpriced-retry'))!.accepts[0]!;
+    await expect(
+      gate.open({
+        taskId: 't-batch-unpriced-retry',
+        message: submitted(batchPayload('voucher', retryAccepted)),
+      }),
     ).resolves.toMatchObject({ kind: 'proceed' });
+  });
+
+  it('linearizes unpriced batch cancellation against publication authorization', async () => {
+    let releaseMetadata!: () => void;
+    let metadataStarted!: () => void;
+    const metadataBlocked = new Promise<void>((resolve) => {
+      releaseMetadata = resolve;
+    });
+    const metadataObserved = new Promise<void>((resolve) => {
+      metadataStarted = resolve;
+    });
+    const { gate, x402, cancel } = batchFixture({
+      pricing: { ...BATCH, unreportedUsage: 'refuse' },
+      deliveryTiming: 'after-verification',
+      deliveryMetadata: async () => {
+        metadataStarted();
+        await metadataBlocked;
+        return {};
+      },
+    });
+    await gate.open({ taskId: 't-batch-unpriced-race', message: message() });
+    const accepted = (await x402.store.get('t-batch-unpriced-race'))!.accepts[0]!;
+    const opened = await gate.open({
+      taskId: 't-batch-unpriced-race',
+      message: submitted(batchPayload('voucher', accepted)),
+    });
+    if (opened.kind !== 'proceed' || !opened.obligation) throw new Error('missing obligation');
+
+    const delivery = gate.authorizeDelivery({ taskId: 't-batch-unpriced-race' });
+    await metadataObserved;
+    await expect(
+      gate.settle({
+        taskId: 't-batch-unpriced-race',
+        obligation: opened.obligation,
+        usage: { kind: 'unreported' },
+      }),
+    ).resolves.toMatchObject({ kind: 'failed' });
+    releaseMetadata();
+
+    await expect(delivery).resolves.toEqual({
+      kind: 'blocked',
+      reason: 'payment-state-unavailable',
+    });
+    expect(cancel).toHaveBeenCalledWith({ reason: 'handler_failed' });
+    const lifecycle = await x402.store.get('t-batch-unpriced-race');
+    expect(lifecycle?.merchantDelivery?.publicationClosedAt).toEqual(expect.any(Date));
+    expect(lifecycle?.merchantDelivery?.publicationStartedAt).toBeUndefined();
   });
 
   it('retains a batch claim when settlement fails after provisional delivery', async () => {

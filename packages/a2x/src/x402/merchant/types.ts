@@ -95,6 +95,8 @@ export type MerchantDeliveryMetadataBuilder = (
 
 export interface MerchantGateAuthorizeDeliveryInput {
   taskId: string;
+  /** Optional publication deadline enforced atomically by the lifecycle store. */
+  notAfter?: Date;
 }
 
 export type MerchantGateAuthorizeDeliveryOutcome =

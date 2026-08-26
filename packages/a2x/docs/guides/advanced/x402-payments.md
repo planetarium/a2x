@@ -241,6 +241,7 @@ import {
   BaseX402Store,
   type X402EntryStatus,
   type X402MerchantDeliveryAuditPatch,
+  type X402MerchantDeliveryWriteCondition,
   type X402StoreEntry,
   type X402StoreEntryPatch,
 } from '@a2x/sdk/x402';
@@ -267,19 +268,30 @@ class RedisX402Store extends BaseX402Store {
   }
 
   async update(taskId: string, patch: X402StoreEntryPatch): Promise<void> {
-    const cur = await this.get(taskId);
-    if (!cur) return;
-    await this.put({ ...cur, ...patch, updatedAt: new Date() });
+    await atomicLifecyclePatch(this.redis, taskId, patch);
+  }
+
+  async updateIfStatus(
+    taskId: string,
+    expected: readonly X402EntryStatus[],
+    patch: X402StoreEntryPatch,
+  ): Promise<boolean> {
+    return await atomicLifecyclePatchIfStatus(this.redis, taskId, expected, patch);
   }
 
   async updateMerchantDeliveryIfStatus(
     taskId: string,
     expected: readonly X402EntryStatus[],
     patch: X402MerchantDeliveryAuditPatch,
+    condition?: X402MerchantDeliveryWriteCondition,
   ): Promise<X402EntryStatus | undefined> {
-    // Implement with one Redis Lua script or WATCH/MULTI transaction. It must
-    // check status and merge merchantDelivery without a read/write race.
-    return await atomicMerchantDeliveryMerge(this.redis, taskId, expected, patch);
+    return await atomicMerchantDeliveryMerge(
+      this.redis,
+      taskId,
+      expected,
+      patch,
+      condition,
+    );
   }
 
   async delete(taskId: string): Promise<void> {
@@ -292,9 +304,9 @@ const x402 = new X402Context({ store: new RedisX402Store(redis) });
 
 Lazy expiry contract: `get(taskId)` MUST return `undefined` after `entry.expiresAt`. Backends with native TTL (Redis `EXPIRE`, Postgres `WHERE expires_at > now()`) satisfy this trivially; in-memory or file-backed stores must check on read. No background reaper required — works in serverless deployments.
 
-`BaseX402Store.updateIfStatus(taskId, expected, patch)` prevents a late concurrent verify/classify result from regressing `completed` or `rejected` state. Its base implementation is a source-compatible read-then-update fallback. Multi-replica stores MUST override it with an atomic compare-and-set.
+`BaseX402Store.updateIfStatus(taskId, expected, patch)` is a required atomic primitive. It prevents a late concurrent verify/classify result from regressing `completed` or `rejected` state. Implement it with the same backend transaction or script used by other lifecycle writes; a read-then-replace implementation can erase delivery evidence written in between.
 
-`BaseX402Store.updateMerchantDeliveryIfStatus(taskId, expected, patch)` is required for custom stores. It must atomically check the lifecycle status and merge individual `merchantDelivery` fields. `MerchantGate` uses this boundary to prevent a settlement failure from racing publication authorization. The convenience `updateMerchantDelivery()` method delegates to it without narrowing the status.
+`BaseX402Store.updateMerchantDeliveryIfStatus(taskId, expected, patch, condition?)` is also required. It atomically checks lifecycle status, optional publication/deadline predicates, and merges individual `merchantDelivery` fields. `publicationStartedAt` and `publicationClosedAt` are write-once: preserve the first value. When `condition.notAfter` is present, compare it with the backend clock in that same operation. `MerchantGate` uses these predicates to make publication mutually exclusive with lapse and to enforce session deadlines at the publication boundary. The convenience `updateMerchantDelivery()` method delegates without narrowing the status.
 
 `InMemoryX402Store` also accepts `{ maxEntries }` for LRU eviction when the cap is reached.
 
@@ -609,9 +621,9 @@ yield {
 yield { type: 'done', metadata: settled.receiptMetadata };
 ```
 
-`deliveryTiming` is required and independent of `exactTiming`. `after-settlement` is fail-closed: the host buffers work, settles it, calls `authorizeDelivery()`, and only then publishes. `after-verification` allows progressive publication while settlement is deferred. `authorizeDelivery()` writes `publicationStartedAt` to the x402 lifecycle before returning an authorization, so later failure handling conservatively distinguishes work that remained private from content that may have escaped. Once authorization returns, the host must treat publication as irreversible even if its transport disconnects before confirming every byte.
+`deliveryTiming` is required and independent of `exactTiming`. `after-settlement` is fail-closed: the host buffers work, settles it, calls `authorizeDelivery()`, and only then publishes. `after-verification` allows progressive publication while settlement is deferred. `authorizeDelivery()` writes the first `publicationStartedAt` to the x402 lifecycle before returning an authorization, so later failure handling conservatively distinguishes work that remained private from content that may have escaped. Lapse and unpublished abort atomically write the mutually exclusive `publicationClosedAt` marker before cleanup. Once either marker wins, the other operation cannot succeed. Once authorization returns, the host must treat publication as irreversible even if its transport disconnects before confirming every byte.
 
-The metadata callback is intentionally application-owned. Neither the a2a-x402 extension nor x402 defines a provisional-delivery metadata key. A host can map the returned record to `AgentEvent.deliveryMetadata`, as above, and declare its own versioned A2A extension URI on the artifact when clients need interoperable semantics. The gate never imports or emits `AgentEvent`s.
+The metadata callback is intentionally application-owned. Neither the a2a-x402 extension nor x402 defines a provisional-delivery metadata key. A host can map the returned record to `AgentEvent.deliveryMetadata`, as above, and declare its own versioned A2A extension URI on the artifact when clients need interoperable semantics. The gate never imports or emits `AgentEvent`s. Keep the callback side-effect-free: one authorization call caches its result within each observed `verified` or `completed` phase, but a lifecycle transition or a separate authorization call may invoke it again.
 
 #### Buffered after-work delivery
 
@@ -693,7 +705,7 @@ Once `authorizeDelivery()` has recorded publication, `abort()` settles instead o
 
 The pricing callback runs only on the unpaid turn. Its complete `MerchantOffer` is frozen by the offer store and the submitted turn settles against that snapshot, not live rates. When `expiresInSeconds` is omitted, `MerchantGate` applies a 10-minute TTL to both the offer-store snapshot and the underlying x402 offering; set `expiresInSeconds` on the offer to override it. The default `InMemoryMerchantOfferStore` independently defaults to the same TTL and caps itself at 10,000 live entries. Standalone store users can override those limits with `defaultTtlSeconds` and `maxEntries`. It also grants an execution claim. Multi-replica deployments must inject a durable `MerchantOfferStore` whose publication, claim, and release operations are atomic and whose claim status is shared across replicas.
 
-Verification happens before the execution claim is consumed, so a transient verification failure can be retried on the same task. Once verification succeeds, only one concurrent caller receives the claim and may execute work. Exact and `upto` remain one-shot after that claim. A canceled `batch-settlement` obligation releases both the task claim and the official scheme's channel reservation only when no content was published, so the same voucher can retry after an undelivered failure. Cleanup failures do not turn a completed payment into a failure; they are reported through `onError` with `operation: 'cleanup'`.
+Verification happens before the execution claim is consumed, so a transient verification failure can be retried on the same task. Once verification succeeds, only one concurrent caller receives the claim and may execute work. Exact and `upto` remain one-shot after that claim. A canceled `batch-settlement` obligation releases the task claim only after the official scheme confirms cancellation of its channel reservation; a timeout or thrown cancellation keeps the claim for reconciliation. The closed delivery attempt remains terminal for its `taskId`, so reuse a successfully canceled voucher only through a fresh task/payment round trip. Cleanup failures do not turn a completed payment into a failure and are reported through `onError` with `operation: 'cleanup'`. Lapse is stricter: partial cleanup throws and any owning session remains `settling` instead of recording a false `lapsed` terminal result.
 
 Successful settlement now removes the frozen merchant offer but retains the completed `X402StoreEntry` until its configured TTL. This gives every scheme a durable completed-replay answer and keeps its reconciliation receipt available. The lifecycle store must therefore have a bounded TTL and an operational expiry sweep when its backend does not expire rows natively.
 
@@ -715,7 +727,7 @@ If one object implements both `MerchantOfferStore` and the x402 lifecycle store,
 | `completed` | either/absent | Terminal; the retained receipt proves settlement and verification is skipped. |
 | expired/absent | absent | A submitted payment has no stored offering; an unpaid turn may create a new offer. |
 
-Delivery audit is orthogonal to the payment status. `X402StoreEntry.merchantDelivery` records the configured timing plus `publicationStartedAt`, `workCompletedAt` or `workFailedAt`, and `settlementFailedAt` when applicable. Together with the existing `verifiedAt` and retained receipt's `settledAt`, these fields distinguish verified, possibly partially delivered, work-finished, settled, and delivered-but-unsettled tasks without adding wire-level payment states. Custom lifecycle stores implement `updateMerchantDeliveryIfStatus()` as an atomic status check and field merge so a concurrent publication boundary and settlement cannot authorize a failed payment or erase either operation's evidence. Audit-write failures are reported through `onError`, but after publication they never suppress the settlement attempt itself.
+Delivery audit is orthogonal to the payment status. `X402StoreEntry.merchantDelivery` records the configured timing plus the mutually exclusive `publicationStartedAt` or `publicationClosedAt`, `workCompletedAt` or `workFailedAt`, and `settlementFailedAt` when applicable. Together with the existing `verifiedAt` and retained receipt's `settledAt`, these fields distinguish verified, deliberately unpublished, possibly delivered, work-finished, settled, and delivered-but-unsettled tasks without adding wire-level payment states. Custom lifecycle stores serialize `updateIfStatus()` and `updateMerchantDeliveryIfStatus()` against the same record so a lifecycle replacement cannot erase either write-once publication marker. Audit-write failures are reported through `onError`, but after publication they never suppress the settlement attempt itself.
 
 Two concurrent submissions can both observe `available` and both verify. Exactly one wins the later atomic `claim()`; every loser cancels any scheme reservation and receives `DUPLICATE_NONCE`. This is why `getClaimStatus()` is never a lock.
 
@@ -799,7 +811,7 @@ for (const unresolved of recovery.unresolved) {
 }
 ```
 
-`UptoSessionManager` requires `deliveryTiming: 'after-verification'`. Waiting for settlement would prevent each conversational turn from reaching the payer until the authorization closes, so `after-settlement` is rejected as a contradictory session configuration. Before the first output of an active or reserved session, call `await sessions.authorizeDelivery(contextId)` and map its metadata to the content delivery just as with `gate.authorizeDelivery()`. Authorization is blocked after `settleBy` or once a close has been requested, including for a reserved opener that has no local timer yet.
+`UptoSessionManager` requires `deliveryTiming: 'after-verification'`. Waiting for settlement would prevent each conversational turn from reaching the payer until the authorization closes, so `after-settlement` is rejected as a contradictory session configuration. Before the first output of an active or reserved session, call `await sessions.authorizeDelivery(contextId)` and map its metadata to the content delivery just as with `gate.authorizeDelivery()`. The manager passes `settleBy` as an atomic publication deadline to the lifecycle store, so a slow metadata callback or backend operation cannot authorize after that instant. Authorization is also blocked once a close has been requested, including for a reserved opener that has no local timer yet.
 
 Reserve an already-active session before starting work. The stable `turnId` makes completion idempotent, and the lease stops idle/deadline triggers from settling between the active-session check and usage recording:
 
@@ -908,9 +920,9 @@ if (sessionOutcome?.settlement?.kind === 'settled') {
 
 Use `reserveOpen` / `commitOpen` around the first turn's real resource work. The reservation performs the atomic context claim before work, so concurrent verified opening payments receive `unavailable` and are lapsed before they can spend upstream resources. Its reason distinguishes `active`, `settling`, `closed-unreconciled`, and `deadline`; a retained failed settlement requires operator reconciliation instead of an ordinary payer retry. A same-task retry returns `duplicate` with `pending` or `completed`; reuse durable host output instead of running it again. A mismatched task passed to `commitOpen` throws because it is a host logic error, not an expected race.
 
-A reserved opener arms no idle or deadline timer until `commitOpen` records trusted usage. This prevents an automatic trigger from charging an unreported-usage floor or ceiling before work completes. If resource work throws before publication after a successful reservation, the host **must** call `cancelOpen({ contextId, taskId })`; it atomically closes and lapses the reservation only while that opening task still owns it. Omitting the cancellation leaves an unresolved authorization for recovery. A reservation whose guarded authorization deadline has already passed returns `unavailable` without creating a session.
+A reserved opener arms no idle or deadline timer until `commitOpen` records trusted usage. This prevents an automatic trigger from charging an unreported-usage floor or ceiling before work completes. If resource work throws before publication after a successful reservation, the host **must** call `cancelOpen({ contextId, taskId })`; it first atomically wins the unpublished delivery boundary, then lapses the reservation only while that opening task still owns it. Omitting the cancellation leaves an unresolved authorization for recovery. A reservation whose guarded authorization deadline has already passed returns `unavailable` without creating a session.
 
-`cancelOpen()` and `cancelTurn()` are only for work that published nothing. `cancelOpen()` first moves the durable record to `settling`, then lapses the payment, and only then records a terminal `lapsed` result; if the gate detects prior publication, it restores the active reservation instead of leaving a false terminal record. After `authorizeDelivery()` succeeds and any content escapes, record the partial usage with `commitOpen()` or `finishTurn()`, then close the session so it settles immediately; surface the work error separately on the A2A Task. Even a trusted zero reading settles zero after publication instead of lapsing, preserving completed payment evidence and the no-replay invariant.
+`cancelOpen()` and `cancelTurn()` are only for work that published nothing. `cancelOpen()` first moves the durable record to `settling`, then atomically closes publication and lapses the payment, and only then records a terminal `lapsed` result. If publication already won, it restores the active reservation; if cleanup fails after publication was closed, it retains `settling` for reconciliation rather than guessing which durable records remain. After `authorizeDelivery()` succeeds and any content escapes, record the partial usage with `commitOpen()` or `finishTurn()`, then close the session so it settles immediately; surface the work error separately on the A2A Task. Even a trusted zero reading settles zero after publication instead of lapsing, preserving completed payment evidence and the no-replay invariant.
 
 `recordTurn({ contextId, usage })` remains available when usage is already complete and there is no asynchronous work gap. Use the `beginTurn` / `finishTurn` pair around later resource work. A start result distinguishes `inactive`, a new `started` lease, and duplicate `pending` or `completed` turn ids; duplicate turns must reuse the host's durable result and never execute again. `cancelTurn` releases a later-turn lease that produced no billable work. Once a close is requested, new leases are refused; the last finishing or canceled lease performs the single settlement. An opening reservation is not reported by `active()` and does not admit later turn leases until `commitOpen` records its first trusted usage.
 

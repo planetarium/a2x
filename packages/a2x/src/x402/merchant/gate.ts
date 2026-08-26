@@ -51,7 +51,7 @@ export interface MerchantGateOptions {
   exactTiming: MerchantExactTiming;
   /** Required: verification and settlement allocate delivery risk differently. */
   deliveryTiming: MerchantDeliveryTiming;
-  /** Maps host-neutral delivery state to application-owned metadata. */
+  /** Maps delivery state to metadata. May be retried across phases; keep it side-effect-free. */
   deliveryMetadata?: MerchantDeliveryMetadataBuilder;
   /** Receives infrastructure errors that are intentionally hidden from payer-facing outcomes. */
   onError?: (error: unknown, context: MerchantGateErrorContext) => void | Promise<void>;
@@ -65,6 +65,16 @@ export interface MerchantGateErrorContext {
 const DEFAULT_OFFER_TTL_SECONDS = 600;
 const MAX_DELIVERY_AUTHORIZATION_ATTEMPTS = 10;
 const X402_ERROR_CODE_VALUES: ReadonlySet<string> = new Set(Object.values(X402_ERROR_CODES));
+
+/** Internal signal used by the session manager to settle instead of lapsing. */
+export class MerchantDeliveryPublishedError extends Error {
+  constructor() {
+    super(
+      'MerchantGate cannot lapse an authorization after content publication; settle or abort it.',
+    );
+    this.name = 'MerchantDeliveryPublishedError';
+  }
+}
 
 function eventErrorCode(metadata: Record<string, unknown> | undefined): X402ErrorCode | undefined {
   const code = metadata?.[X402_METADATA_KEYS.ERROR];
@@ -204,12 +214,12 @@ export class MerchantGate {
 
       if (verification.skipHandler) {
         if (pricing.scheme !== 'batch-settlement') {
-          await this.cancelVerification(
+          const canceled = await this.cancelVerification(
             turn.taskId,
             verification.cancellation,
             'after_verify_aborted',
           );
-          await this.offerStore.release(turn.taskId);
+          if (canceled) await this.offerStore.release(turn.taskId);
           return refusal(
             X402_ERROR_CODES.SETTLEMENT_FAILED,
             'The payment scheme requested an unsupported handler bypass.',
@@ -228,12 +238,12 @@ export class MerchantGate {
               'Payment settlement outcome is unavailable.',
             );
           }
-          await this.cancelVerification(
+          const canceled = await this.cancelVerification(
             turn.taskId,
             verification.cancellation,
             'handler_failed',
           );
-          await this.offerStore.release(turn.taskId);
+          if (canceled) await this.offerStore.release(turn.taskId);
           return refusal(
             X402_ERROR_CODES.SETTLEMENT_FAILED,
             receipt.errorReason ?? 'Payment settlement failed.',
@@ -253,15 +263,17 @@ export class MerchantGate {
       try {
         await this.initializeDeliveryAudit(turn.taskId);
       } catch (error) {
-        await this.cancelVerification(
+        const canceled = await this.cancelVerification(
           turn.taskId,
           verification.cancellation,
           'after_verify_aborted',
         );
-        try {
-          await this.offerStore.release(turn.taskId);
-        } catch (releaseError) {
-          await this.reportError(releaseError, { operation: 'cleanup', taskId: turn.taskId });
+        if (canceled) {
+          try {
+            await this.offerStore.release(turn.taskId);
+          } catch (releaseError) {
+            await this.reportError(releaseError, { operation: 'cleanup', taskId: turn.taskId });
+          }
         }
         throw error;
       }
@@ -345,9 +357,19 @@ export class MerchantGate {
     input: MerchantGateAuthorizeDeliveryInput,
   ): Promise<MerchantGateAuthorizeDeliveryOutcome> {
     try {
+      if (input.notAfter && !Number.isFinite(input.notAfter.getTime())) {
+        throw new Error('Delivery publication deadline must be a valid Date.');
+      }
+      const metadataByStatus = new Map<'verified' | 'completed', Record<string, unknown>>();
       for (let attempt = 0; attempt < MAX_DELIVERY_AUTHORIZATION_ATTEMPTS; attempt += 1) {
+        if (input.notAfter && Date.now() >= input.notAfter.getTime()) {
+          return { kind: 'blocked', reason: 'payment-state-unavailable' };
+        }
         const entry = await this.options.x402.store.get(input.taskId);
         if (!entry?.merchantDelivery) {
+          return { kind: 'blocked', reason: 'payment-state-unavailable' };
+        }
+        if (entry.merchantDelivery.publicationClosedAt) {
           return { kind: 'blocked', reason: 'payment-state-unavailable' };
         }
         if (entry.status === 'failed' || entry.status === 'rejected') {
@@ -364,14 +386,21 @@ export class MerchantGate {
         }
 
         const provisional = entry.status !== 'completed';
-        const metadata = structuredClone(
-          (await this.options.deliveryMetadata?.({
-            taskId: input.taskId,
-            timing: entry.merchantDelivery.timing,
-            provisional,
-            paymentStatus: provisional ? 'verified' : 'settled',
-          })) ?? {},
-        );
+        let metadata = metadataByStatus.get(entry.status);
+        if (!metadata) {
+          metadata = structuredClone(
+            (await this.options.deliveryMetadata?.({
+              taskId: input.taskId,
+              timing: entry.merchantDelivery.timing,
+              provisional,
+              paymentStatus: provisional ? 'verified' : 'settled',
+            })) ?? {},
+          );
+          metadataByStatus.set(entry.status, metadata);
+        }
+        if (input.notAfter && Date.now() >= input.notAfter.getTime()) {
+          return { kind: 'blocked', reason: 'payment-state-unavailable' };
+        }
         const publicationStartedAt =
           entry.merchantDelivery.publicationStartedAt ?? new Date();
         const updatedStatus =
@@ -379,6 +408,10 @@ export class MerchantGate {
             input.taskId,
             [entry.status],
             { publicationStartedAt },
+            {
+              publicationClosed: false,
+              ...(input.notAfter ? { notAfter: input.notAfter } : {}),
+            },
           );
         if (updatedStatus === undefined) continue;
         return { kind: 'authorized', provisional, metadata };
@@ -409,8 +442,19 @@ export class MerchantGate {
    */
   async abort(input: MerchantGateAbortInput): Promise<MerchantGateAbortOutcome> {
     try {
-      const published = await this.publicationStarted(input.taskId);
-      if (input.obligation.kind === 'settled' || published) {
+      if (input.obligation.kind === 'settled') {
+        return await this.finishSettlement(
+          {
+            taskId: input.taskId,
+            obligation: input.obligation,
+            ...(input.usage === undefined ? {} : { usage: input.usage }),
+          },
+          'failed',
+        );
+      }
+
+      const delivery = await this.closeUnpublishedDelivery(input.taskId);
+      if (delivery === 'published') {
         return await this.finishSettlement(
           {
             taskId: input.taskId,
@@ -426,9 +470,11 @@ export class MerchantGate {
         input.obligation.kind === 'deferred' &&
         input.obligation.scheme === 'batch-settlement'
       ) {
-        await this.abortBatch(input);
+        if (!(await this.abortBatch(input))) {
+          throw new Error('Batch reservation cancellation could not be confirmed.');
+        }
       } else {
-        await this.cleanup(input.taskId);
+        await this.cleanup(input.taskId, { failOnError: true });
       }
       return { kind: 'aborted' };
     } catch (error) {
@@ -454,6 +500,7 @@ export class MerchantGate {
       const outcome = await this.settleObligation(input);
       let hasCompletedLifecycle = false;
       let hasPublished = false;
+      let canCancelBatch = false;
       const isBatch =
         input.obligation.kind === 'deferred' &&
         input.obligation.scheme === 'batch-settlement';
@@ -463,6 +510,18 @@ export class MerchantGate {
         const lifecycle = await this.options.x402.store.get(input.taskId);
         hasCompletedLifecycle = lifecycle?.status === 'completed';
         hasPublished = lifecycle?.merchantDelivery?.publicationStartedAt !== undefined;
+        if (isBatch && !hasCompletedLifecycle && !hasPublished) {
+          if (lifecycle?.status === 'verified' && lifecycle.merchantDelivery) {
+            hasPublished =
+              (await this.closeUnpublishedDelivery(input.taskId)) === 'published';
+            canCancelBatch = !hasPublished;
+          } else if (
+            lifecycle?.status === 'failed' &&
+            lifecycle.failure?.indeterminate !== true
+          ) {
+            canCancelBatch = true;
+          }
+        }
         if (hasPublished) {
           try {
             await this.recordSettlementFailure(input.taskId);
@@ -482,7 +541,7 @@ export class MerchantGate {
           };
         }
       }
-      if (outcome.kind === 'failed' && isBatch && !hasCompletedLifecycle && !hasPublished) {
+      if (outcome.kind === 'failed' && isBatch && canCancelBatch) {
         await this.abortBatch({
           taskId: input.taskId,
           obligation: input.obligation,
@@ -505,12 +564,12 @@ export class MerchantGate {
   }
 
   /** Release retryable batch state only when no content escaped. */
-  private async abortBatch(input: MerchantGateAbortInput): Promise<void> {
+  private async abortBatch(input: MerchantGateAbortInput): Promise<boolean> {
     if (
       input.obligation.kind !== 'deferred' ||
       input.obligation.scheme !== 'batch-settlement'
     ) {
-      return;
+      return true;
     }
     try {
       await input.obligation.cancellation.cancel({
@@ -522,23 +581,46 @@ export class MerchantGate {
       });
     } catch (error) {
       await this.reportError(error, { operation: 'abort', taskId: input.taskId });
-    } finally {
-      try {
-        await this.offerStore.release(input.taskId);
-      } catch (error) {
-        await this.reportError(error, { operation: 'abort', taskId: input.taskId });
-      }
+      return false;
+    }
+    try {
+      await this.offerStore.release(input.taskId);
+      return true;
+    } catch (error) {
+      await this.reportError(error, { operation: 'abort', taskId: input.taskId });
+      return false;
     }
   }
 
   /** Let an unused held authorization expire without attempting settlement. */
   async lapse(taskId: string): Promise<void> {
-    if (await this.publicationStarted(taskId)) {
-      throw new Error(
-        'MerchantGate cannot lapse an authorization after content publication; settle or abort it.',
-      );
+    if ((await this.closeUnpublishedDelivery(taskId)) === 'published') {
+      throw new MerchantDeliveryPublishedError();
     }
-    await this.cleanup(taskId);
+    await this.cleanup(taskId, { failOnError: true });
+  }
+
+  private async closeUnpublishedDelivery(
+    taskId: string,
+  ): Promise<'closed' | 'published'> {
+    for (let attempt = 0; attempt < MAX_DELIVERY_AUTHORIZATION_ATTEMPTS; attempt += 1) {
+      const entry = await this.options.x402.store.get(taskId);
+      if (!entry) return 'closed';
+      if (entry.merchantDelivery?.publicationStartedAt) return 'published';
+      if (entry.merchantDelivery?.publicationClosedAt) return 'closed';
+      if (!entry.merchantDelivery || entry.status !== 'verified') {
+        throw new Error('Merchant delivery state cannot be closed from its current lifecycle.');
+      }
+      const closedAt = new Date();
+      const updated = await this.options.x402.store.updateMerchantDeliveryIfStatus(
+        taskId,
+        ['verified'],
+        { publicationClosedAt: closedAt },
+        { publicationStarted: false },
+      );
+      if (updated !== undefined) return 'closed';
+    }
+    throw new Error('Merchant delivery closure lost repeated lifecycle races.');
   }
 
   private async initializeDeliveryAudit(taskId: string): Promise<void> {
@@ -781,7 +863,7 @@ export class MerchantGate {
 
   private async cleanup(
     taskId: string,
-    options: { retainX402Entry?: boolean } = {},
+    options: { retainX402Entry?: boolean; failOnError?: boolean } = {},
   ): Promise<void> {
     const sharesLifecycleStore = Object.is(this.offerStore, this.options.x402.store);
     const operations = [() => {
@@ -799,12 +881,17 @@ export class MerchantGate {
     if (!options.retainX402Entry) {
       operations.push(() => this.options.x402.clearOffering({ taskId }));
     }
+    const failures: unknown[] = [];
     for (const operation of operations) {
       try {
         await operation();
       } catch (error) {
+        failures.push(error);
         await this.reportError(error, { operation: 'cleanup', taskId });
       }
+    }
+    if (options.failOnError && failures.length > 0) {
+      throw new AggregateError(failures, 'MerchantGate cleanup did not complete.');
     }
   }
 
@@ -824,6 +911,12 @@ export class MerchantGate {
         lifecycle.failure?.reason ?? 'The payment was rejected for this task.',
       );
     }
+    if (lifecycle?.merchantDelivery?.publicationClosedAt) {
+      return refusal(
+        X402_ERROR_CODES.DUPLICATE_NONCE,
+        'This task already has a closed merchant delivery attempt.',
+      );
+    }
     const claimStatus = await this.offerStore.getClaimStatus?.(taskId);
     if (claimStatus === 'claimed') {
       return refusal(
@@ -838,11 +931,13 @@ export class MerchantGate {
     taskId: string,
     cancellation: X402PaymentCancellation | undefined,
     reason: X402VerifiedPaymentCancellationReason,
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       await cancellation?.cancel({ reason });
+      return true;
     } catch (error) {
       await this.reportError(error, { operation: 'abort', taskId });
+      return false;
     }
   }
 

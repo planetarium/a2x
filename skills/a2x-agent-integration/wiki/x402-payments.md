@@ -51,7 +51,7 @@ const gate = new MerchantGate({
 
 Required inputs are `x402`, `pricing`, `exactTiming`, and `deliveryTiming`. `offerStore`, `deliveryMetadata`, and `onError` are optional, but production deployments normally need durable stores and observability.
 
-`deliveryMetadata` is application-owned. Neither A2A nor x402 defines a standard provisional-delivery key, so declare a versioned application extension when clients need to interpret it.
+`deliveryMetadata` is application-owned. Neither A2A nor x402 defines a standard provisional-delivery key, so declare a versioned application extension when clients need to interpret it. Keep the builder side-effect-free: a separate authorization call or a retry that observes a new payment phase may invoke it again.
 
 ## Preserve the execution boundary
 
@@ -77,12 +77,12 @@ Treat a successful delivery authorization as irreversible even when no transport
 
 The in-memory defaults are for one process and disposable state. A restart-safe or multi-replica host needs:
 
-- a lifecycle `BaseX402Store` implementation whose `updateIfStatus()` is an atomic compare-and-set;
-- an atomic `updateMerchantDeliveryIfStatus()` that checks lifecycle status and merges nested delivery fields in one backend transaction;
+- a lifecycle `BaseX402Store` implementation whose required `updateIfStatus()` is an atomic compare-and-set rather than read-then-replace;
+- an atomic `updateMerchantDeliveryIfStatus()` serialized with lifecycle updates; it must evaluate publication/deadline conditions with the backend clock and preserve the first `publicationStartedAt` or `publicationClosedAt` marker;
 - a durable `MerchantOfferStore` with atomic publishing, claim, release, and claim-status operations;
 - for sessions, a durable `UptoSessionStore` with atomic `create`, revision CAS, conditional delete, and recovery listing.
 
-The offer, lifecycle, task, output, and session records form one recovery domain. TTLs must outlive the longest work or session duration plus operational recovery delay. Never release a claim merely because the transport failed; settlement or resource side effects may already have escaped.
+The offer, lifecycle, task, output, and session records form one recovery domain. TTLs must outlive the longest work or session duration plus operational recovery delay. Never release a claim merely because the transport failed; settlement or resource side effects may already have escaped. For batch settlement, release only after reservation cancellation succeeds, and retry a canceled voucher through a fresh task because the old delivery attempt remains closed. Treat partial lapse cleanup as unresolved reconciliation state, not a successful `lapsed` terminal result.
 
 For `batch-settlement`, configure the official x402 resource server and durable channel storage. Raw facilitator injection does not provide reservation, cancellation, commit, refund, or channel-recovery hooks.
 

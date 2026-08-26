@@ -1,4 +1,4 @@
-import type { MerchantGate } from './gate.js';
+import { MerchantDeliveryPublishedError, type MerchantGate } from './gate.js';
 import { meterMerchantUsage } from './pricing.js';
 import type {
   MerchantDeferredObligation,
@@ -562,7 +562,10 @@ export class UptoSessionManager {
     ) {
       return { kind: 'blocked', reason: 'payment-state-unavailable' };
     }
-    return await this.options.gate.authorizeDelivery({ taskId: record.taskId });
+    return await this.options.gate.authorizeDelivery({
+      taskId: record.taskId,
+      notAfter: new Date(record.settleBy),
+    });
   }
 
   /** Remove a reconciled closed record without racing a newer session. */
@@ -666,18 +669,20 @@ export class UptoSessionManager {
         try {
           await this.options.gate.lapse(input.taskId);
         } catch (error) {
-          const observed = await this.store.get(input.contextId);
-          if (
-            observed?.state === 'settling' &&
-            observed.taskId === input.taskId &&
-            observed.settlement === undefined
-          ) {
-            const restored: UptoSessionRecord = {
-              ...current,
-              revision: observed.revision + 1,
-            };
-            if (await this.store.compareAndSet(input.contextId, observed.revision, restored)) {
-              this.arm(restored);
+          if (error instanceof MerchantDeliveryPublishedError) {
+            const observed = await this.store.get(input.contextId);
+            if (
+              observed?.state === 'settling' &&
+              observed.taskId === input.taskId &&
+              observed.settlement === undefined
+            ) {
+              const restored: UptoSessionRecord = {
+                ...current,
+                revision: observed.revision + 1,
+              };
+              if (await this.store.compareAndSet(input.contextId, observed.revision, restored)) {
+                this.arm(restored);
+              }
             }
           }
           throw error;
@@ -898,8 +903,22 @@ export class UptoSessionManager {
           !settling.usageIncomplete &&
           !published
         ) {
-          await this.options.gate.lapse(settling.taskId);
-          settlement = { kind: 'lapsed' };
+          try {
+            await this.options.gate.lapse(settling.taskId);
+            settlement = { kind: 'lapsed' };
+          } catch (error) {
+            if (!(error instanceof MerchantDeliveryPublishedError)) throw error;
+            const usage = settlementUsage(settling);
+            const outcome = await this.options.gate.settle({
+              taskId: settling.taskId,
+              obligation: settling.obligation,
+              ...(usage === undefined ? {} : { usage }),
+            });
+            settlement =
+              outcome.kind === 'settled'
+                ? { kind: 'settled', outcome }
+                : { kind: 'failed', outcome };
+          }
         } else {
           const usage = settlementUsage(settling);
           const outcome = await this.options.gate.settle({

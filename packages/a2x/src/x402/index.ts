@@ -248,6 +248,7 @@ export type {
   X402EntryFailure,
   X402MerchantDeliveryAudit,
   X402MerchantDeliveryAuditPatch,
+  X402MerchantDeliveryWriteCondition,
   InMemoryX402StoreOptions,
 } from './store.js';
 

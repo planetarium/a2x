@@ -100,6 +100,8 @@ export interface X402MerchantDeliveryAudit {
   timing: 'after-settlement' | 'after-verification';
   /** Write-ahead marker set before content delivery is handed to a transport. */
   publicationStartedAt?: Date;
+  /** Write-ahead marker that permanently prevents publication before an unused hold is removed. */
+  publicationClosedAt?: Date;
   /** Set when resource work finishes successfully and settlement begins. */
   workCompletedAt?: Date;
   /** Set when resource work fails after verification. */
@@ -109,6 +111,16 @@ export interface X402MerchantDeliveryAudit {
 }
 
 export type X402MerchantDeliveryAuditPatch = Partial<X402MerchantDeliveryAudit>;
+
+/** Additional predicates evaluated atomically with a merchant-delivery audit write. */
+export interface X402MerchantDeliveryWriteCondition {
+  /** Require the publication marker to be present (`true`) or absent (`false`). */
+  publicationStarted?: boolean;
+  /** Require the publication-closed marker to be present (`true`) or absent (`false`). */
+  publicationClosed?: boolean;
+  /** Reject the write at or after this instant, using the store/backend clock. */
+  notAfter?: Date;
+}
 
 export interface X402StoreEntry {
   taskId: string;
@@ -185,15 +197,22 @@ export interface X402StoreEntryPatch {
  *     return JSON.parse(raw) as X402StoreEntry;
  *   }
  *
- *   async update(taskId: string, patch: X402StoreEntryPatch): Promise<void> {
- *     const cur = await this.get(taskId);
- *     if (!cur) return;
- *     await this.put({ ...cur, ...patch, updatedAt: new Date() });
+ *   async update(taskId, patch) {
+ *     await atomicLifecyclePatch(this.redis, taskId, patch);
  *   }
  *
- *   async updateMerchantDeliveryIfStatus(taskId, expected, patch) {
- *     // Use one backend transaction or script to check status and merge fields.
- *     return await atomicMerchantDeliveryMerge(this.redis, taskId, expected, patch);
+ *   async updateIfStatus(taskId, expected, patch) {
+ *     return await atomicLifecyclePatchIfStatus(this.redis, taskId, expected, patch);
+ *   }
+ *
+ *   async updateMerchantDeliveryIfStatus(taskId, expected, patch, condition) {
+ *     return await atomicMerchantDeliveryMerge(
+ *       this.redis,
+ *       taskId,
+ *       expected,
+ *       patch,
+ *       condition,
+ *     );
  *   }
  *
  *   async delete(taskId: string): Promise<void> {
@@ -207,10 +226,10 @@ export interface X402StoreEntryPatch {
  * `WHERE expires_at > now()`) satisfy this trivially; in-memory or
  * file-backed stores must check on read.
  *
- * Custom stores must also implement `updateMerchantDeliveryIfStatus` as an
- * atomic status check and nested-field merge. There is deliberately no
- * read-then-write fallback because losing `publicationStartedAt` can change
- * whether an already delivered payment is settled or canceled.
+ * Custom stores must implement both conditional methods with the same atomic
+ * backend serialization as `update`. There is deliberately no read-then-write
+ * fallback because a stale lifecycle replacement can erase
+ * `publicationStartedAt` and change whether delivered work is settled.
  */
 export abstract class BaseX402Store {
   /** Replace or insert the entry for `taskId`. */
@@ -224,33 +243,25 @@ export abstract class BaseX402Store {
    * No-op when the entry is absent.
    */
   abstract update(taskId: string, patch: X402StoreEntryPatch): Promise<void>;
-  /**
-   * Apply a patch only when the current lifecycle status is one of `expected`.
-   * Stores shared across replicas MUST override this with a backend-level
-   * atomic compare-and-set operation.
-   */
-  async updateIfStatus(
+  /** Apply a patch atomically only when lifecycle status is one of `expected`. */
+  abstract updateIfStatus(
     taskId: string,
     expected: readonly X402EntryStatus[],
     patch: X402StoreEntryPatch,
-  ): Promise<boolean> {
-    const current = await this.get(taskId);
-    if (!current || !expected.includes(current.status)) return false;
-    await this.update(taskId, patch);
-    return true;
-  }
+  ): Promise<boolean>;
   /**
    * Atomically merge merchant delivery evidence when the lifecycle still has
    * one of the expected statuses. Returns the status that won the update.
    *
-   * Implementations MUST perform the status check and field merge in one
-   * backend operation so publication cannot race a failed settlement and audit
-   * fields cannot overwrite evidence written concurrently.
+   * Implementations MUST evaluate `condition`, the status check, backend time,
+   * and field merge in one operation serialized with `updateIfStatus`. Existing
+   * publication markers are write-once and MUST NOT be overwritten.
    */
   abstract updateMerchantDeliveryIfStatus(
     taskId: string,
     expected: readonly X402EntryStatus[],
     patch: X402MerchantDeliveryAuditPatch,
+    condition?: X402MerchantDeliveryWriteCondition,
   ): Promise<X402EntryStatus | undefined>;
   /** Atomically merge merchant delivery evidence regardless of lifecycle status. */
   async updateMerchantDelivery(
@@ -368,6 +379,7 @@ export class InMemoryX402Store extends BaseX402Store {
     taskId: string,
     expected: readonly X402EntryStatus[],
     patch: X402MerchantDeliveryAuditPatch,
+    condition: X402MerchantDeliveryWriteCondition = {},
   ): Promise<X402EntryStatus | undefined> {
     const cur = this._entries.get(taskId);
     if (!cur || !expected.includes(cur.status)) return undefined;
@@ -375,14 +387,35 @@ export class InMemoryX402Store extends BaseX402Store {
       this._entries.delete(taskId);
       return undefined;
     }
+    if (
+      condition.publicationStarted !== undefined &&
+      (cur.merchantDelivery?.publicationStartedAt !== undefined) !==
+        condition.publicationStarted
+    ) {
+      return undefined;
+    }
+    if (
+      condition.publicationClosed !== undefined &&
+      (cur.merchantDelivery?.publicationClosedAt !== undefined) !== condition.publicationClosed
+    ) {
+      return undefined;
+    }
+    if (condition.notAfter && Date.now() >= condition.notAfter.getTime()) return undefined;
     const timing = patch.timing ?? cur.merchantDelivery?.timing;
     if (!timing) return undefined;
+    const publicationStartedAt =
+      cur.merchantDelivery?.publicationStartedAt ?? patch.publicationStartedAt;
+    const publicationClosedAt =
+      cur.merchantDelivery?.publicationClosedAt ?? patch.publicationClosedAt;
+    if (publicationStartedAt && publicationClosedAt) return undefined;
     const next: X402StoreEntry = {
       ...cur,
       merchantDelivery: {
         ...cur.merchantDelivery,
         ...patch,
         timing,
+        ...(publicationStartedAt ? { publicationStartedAt } : {}),
+        ...(publicationClosedAt ? { publicationClosedAt } : {}),
       },
       updatedAt: new Date(),
     };
