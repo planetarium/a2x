@@ -18,7 +18,11 @@ import {
   BaseX402Store,
   InMemoryX402Store,
   X402Context,
+  type X402EntryStatus,
+  type X402MerchantDeliveryAuditPatch,
+  type X402MerchantDeliveryWriteCondition,
   type X402StoreEntry,
+  type X402StoreEntryPatch,
   type X402ValidClassification,
 } from '../x402/index.js';
 import type {
@@ -212,6 +216,81 @@ describe('InMemoryX402Store', () => {
       storedAt: new Date(),
     });
     expect((await store.get('t1'))?.accepts[0]!.amount).toBe('99');
+  });
+
+  it('conditionally merges merchant delivery evidence against lifecycle status', async () => {
+    const store = new InMemoryX402Store();
+    const now = new Date();
+    await store.put({
+      taskId: 'delivery',
+      accepts: [ACCEPT],
+      status: 'verified',
+      storedAt: now,
+      updatedAt: now,
+      merchantDelivery: { timing: 'after-verification' },
+    });
+
+    await expect(
+      store.updateMerchantDeliveryIfStatus('delivery', ['completed'], {
+        publicationStartedAt: now,
+      }),
+    ).resolves.toBeUndefined();
+    await expect(
+      store.updateMerchantDeliveryIfStatus('delivery', ['verified'], {
+        publicationStartedAt: now,
+      }),
+    ).resolves.toBe('verified');
+    await store.updateMerchantDelivery('delivery', { workCompletedAt: now });
+
+    await expect(store.get('delivery')).resolves.toMatchObject({
+      merchantDelivery: {
+        timing: 'after-verification',
+        publicationStartedAt: now,
+        workCompletedAt: now,
+      },
+    });
+  });
+
+  it('makes publication and closure mutually exclusive and preserves the first marker', async () => {
+    const store = new InMemoryX402Store();
+    const now = new Date('2026-08-11T00:00:00Z');
+    const later = new Date('2026-08-11T00:00:01Z');
+    await store.put({
+      taskId: 'delivery-race',
+      accepts: [ACCEPT],
+      status: 'verified',
+      storedAt: now,
+      updatedAt: now,
+      merchantDelivery: { timing: 'after-verification' },
+    });
+
+    await expect(
+      store.updateMerchantDeliveryIfStatus(
+        'delivery-race',
+        ['verified'],
+        { publicationStartedAt: now },
+        { publicationClosed: false },
+      ),
+    ).resolves.toBe('verified');
+    await expect(
+      store.updateMerchantDeliveryIfStatus(
+        'delivery-race',
+        ['verified'],
+        { publicationStartedAt: later },
+        { publicationClosed: false },
+      ),
+    ).resolves.toBe('verified');
+    await expect(
+      store.updateMerchantDeliveryIfStatus(
+        'delivery-race',
+        ['verified'],
+        { publicationClosedAt: later },
+        { publicationStarted: false },
+      ),
+    ).resolves.toBeUndefined();
+    const recorded = await store.get('delivery-race');
+    expect(recorded?.merchantDelivery?.publicationStartedAt).toEqual(now);
+    expect(recorded?.merchantDelivery?.publicationClosedAt).toBeUndefined();
   });
 });
 
@@ -946,6 +1025,26 @@ describe('X402Context custom store', () => {
       }
       async update(taskId: string, patch: unknown) {
         calls.push({ method: 'update', arg: { taskId, patch } });
+      }
+      async updateIfStatus(
+        taskId: string,
+        expected: readonly X402EntryStatus[],
+        patch: X402StoreEntryPatch,
+      ) {
+        calls.push({ method: 'updateIfStatus', arg: { taskId, expected, patch } });
+        return false;
+      }
+      async updateMerchantDeliveryIfStatus(
+        taskId: string,
+        expected: readonly X402EntryStatus[],
+        patch: X402MerchantDeliveryAuditPatch,
+        condition?: X402MerchantDeliveryWriteCondition,
+      ) {
+        calls.push({
+          method: 'updateMerchantDeliveryIfStatus',
+          arg: { taskId, expected, patch, condition },
+        });
+        return undefined;
       }
       async delete(taskId: string) {
         calls.push({ method: 'delete', arg: taskId });

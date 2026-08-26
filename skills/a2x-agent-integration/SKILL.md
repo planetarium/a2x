@@ -1,6 +1,6 @@
 ---
 name: a2x-integration
-description: Integrates the @a2x/sdk (A2A Agent-to-Agent protocol) into any TypeScript project. Supports Next.js App Router, Next.js Pages Router, Express, NestJS, and zero-framework quick start. Use when the user wants to add A2A agent capabilities using @a2x/sdk, or says things like "add a2x", "integrate a2x", "a2x agent", "a2x endpoint", "add a2a with a2x", "create an a2x agent".
+description: Integrates the @a2x/sdk (A2A Agent-to-Agent protocol) into TypeScript projects, including paid merchant agents using x402. Supports Next.js App Router, Next.js Pages Router, Express, NestJS, and zero-framework quick start. Use when the user wants to add A2A agent capabilities, an a2x endpoint, or MerchantGate-based payments using @a2x/sdk.
 ---
 
 # a2x-integration
@@ -33,6 +33,7 @@ This skill uses a wiki-style structure. Detailed reference material is in the `w
 | **Tools & Agents** | [wiki/tools-and-agents.md](./wiki/tools-and-agents.md) | FunctionTool, AgentTool, multi-agent patterns |
 | **Security** | [wiki/security.md](./wiki/security.md) | API Key, Bearer, OAuth2, security requirements |
 | **SSE Streaming** | [wiki/streaming.md](./wiki/streaming.md) | createSSEStream, AsyncGenerator, SSE headers |
+| **Merchant x402 Payments** | [wiki/x402-payments.md](./wiki/x402-payments.md) | MerchantGate policy decisions, delivery timing, settlement, and durable stores |
 | **Quick Start** | [wiki/quick-start.md](./wiki/quick-start.md) | `toA2x()` helper for zero-framework prototyping |
 
 ### Framework Guides
@@ -62,6 +63,7 @@ Before any implementation:
    - **None / Quick prototype** — No HTTP framework, or user wants minimal setup
 4. Check for an existing `.env.example` or `.env` file to understand environment variable conventions.
 5. Identify which LLM provider the user wants (Google Gemini, Anthropic Claude, OpenAI GPT). If unclear, ask the user.
+6. If the agent charges through x402 or streams paid output, read [wiki/x402-payments.md](./wiki/x402-payments.md) before implementing its execution lifecycle.
 
 ---
 
@@ -192,6 +194,7 @@ export const handler = new DefaultRequestHandler(a2xServer);
 - `tools` — array of tools (see [wiki/tools-and-agents.md](./wiki/tools-and-agents.md))
 - `skills` — A2A skills advertised in the AgentCard
 - Security — authentication schemes (see [wiki/security.md](./wiki/security.md))
+- Payments — merchant pricing and delivery policy (see [wiki/x402-payments.md](./wiki/x402-payments.md))
 
 ---
 

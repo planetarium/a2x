@@ -11,6 +11,7 @@ import {
   InMemoryUptoSessionStore,
   UptoSessionManager,
 } from '../x402/index.js';
+import { MerchantDeliveryPublishedError } from '../x402/merchant/gate.js';
 
 const PRICING: MerchantUptoPricing = {
   scheme: 'upto',
@@ -72,6 +73,9 @@ function fixture(options: {
   idleSeconds?: number;
   maxDurationSeconds?: number;
   deadlineGuardSeconds?: number;
+  deliveryTiming?: 'after-settlement' | 'after-verification';
+  publicationStarted?: boolean;
+  lapse?: () => Promise<void>;
 } = {}) {
   const settle = vi.fn(
     options.settle ??
@@ -86,8 +90,20 @@ function fixture(options: {
         return settled(String(Math.ceil((tokens * 100) / 1_000)));
       }),
   );
-  const lapse = vi.fn(async () => undefined);
-  const gate = { settle, lapse } as unknown as MerchantGate;
+  const lapse = vi.fn(options.lapse ?? (async () => undefined));
+  const publicationStarted = vi.fn(async () => options.publicationStarted ?? false);
+  const authorizeDelivery = vi.fn(async () => ({
+    kind: 'authorized' as const,
+    provisional: true,
+    metadata: {},
+  }));
+  const gate = {
+    settle,
+    lapse,
+    deliveryTiming: options.deliveryTiming ?? 'after-verification',
+    publicationStarted,
+    authorizeDelivery,
+  } as unknown as MerchantGate;
   const manager = new UptoSessionManager({
     gate,
     store: options.store,
@@ -95,7 +111,7 @@ function fixture(options: {
     maxDurationSeconds: options.maxDurationSeconds ?? 600,
     deadlineGuardSeconds: options.deadlineGuardSeconds ?? 30,
   });
-  return { gate, lapse, manager, settle };
+  return { authorizeDelivery, gate, lapse, manager, publicationStarted, settle };
 }
 
 afterEach(() => {
@@ -103,6 +119,72 @@ afterEach(() => {
 });
 
 describe('UptoSessionManager', () => {
+  it('requires progressive after-verification delivery', () => {
+    expect(() => fixture({ deliveryTiming: 'after-settlement' })).toThrow(
+      "requires MerchantGate.deliveryTiming to be 'after-verification'",
+    );
+  });
+
+  it('authorizes delivery against the payment held by the active session', async () => {
+    const { authorizeDelivery, manager } = fixture();
+    await manager.open({
+      contextId: 'c-delivery',
+      taskId: 't-delivery',
+      obligation: obligation(),
+      usage: { kind: 'total', totalTokens: 100 },
+    });
+
+    await expect(manager.authorizeDelivery('c-delivery')).resolves.toMatchObject({
+      kind: 'authorized',
+      provisional: true,
+    });
+    expect(authorizeDelivery).toHaveBeenCalledWith({
+      taskId: 't-delivery',
+      notAfter: expect.any(Date),
+    });
+    manager.stop();
+  });
+
+  it('blocks delivery after a reserved opener passes its guarded deadline', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-11T00:00:00Z'));
+    const { authorizeDelivery, manager } = fixture({ deadlineGuardSeconds: 30 });
+    await manager.reserveOpen({
+      contextId: 'c-expired-delivery',
+      taskId: 't-expired-delivery',
+      obligation: obligation({ deadlineSeconds: Math.floor(Date.now() / 1_000) + 40 }),
+    });
+    await vi.advanceTimersByTimeAsync(11_000);
+
+    await expect(manager.active('c-expired-delivery')).resolves.toBe(false);
+    await expect(manager.authorizeDelivery('c-expired-delivery')).resolves.toEqual({
+      kind: 'blocked',
+      reason: 'payment-state-unavailable',
+    });
+    expect(authorizeDelivery).not.toHaveBeenCalled();
+    manager.stop();
+  });
+
+  it('settles reported-zero usage when content was published', async () => {
+    const { lapse, manager, settle } = fixture({ publicationStarted: true });
+    await manager.open({
+      contextId: 'c-zero-delivered',
+      taskId: 't-zero-delivered',
+      obligation: obligation(),
+      usage: { kind: 'total', totalTokens: 0 },
+    });
+
+    await manager.close('c-zero-delivered');
+
+    expect(lapse).not.toHaveBeenCalled();
+    expect(settle).toHaveBeenCalledWith({
+      taskId: 't-zero-delivered',
+      obligation: expect.objectContaining({ scheme: 'upto' }),
+      usage: { kind: 'total', totalTokens: 0 },
+    });
+    manager.stop();
+  });
+
   it('accumulates usage across turns and settles once on manual close', async () => {
     const { manager, settle } = fixture();
     const opened = await manager.open({
@@ -402,6 +484,59 @@ describe('UptoSessionManager', () => {
         usage: { kind: 'total', totalTokens: 100 },
       }),
     ).resolves.toBeUndefined();
+  });
+
+  it('restores an opening reservation when publication prevents it from lapsing', async () => {
+    const { manager, settle } = fixture({
+      lapse: async () => {
+        throw new MerchantDeliveryPublishedError();
+      },
+    });
+    await manager.reserveOpen({
+      contextId: 'c-cancel-published-open',
+      taskId: 't-cancel-published-open',
+      obligation: obligation(),
+    });
+
+    await expect(
+      manager.cancelOpen({
+        contextId: 'c-cancel-published-open',
+        taskId: 't-cancel-published-open',
+      }),
+    ).rejects.toThrow('cannot lapse an authorization after content publication');
+    await expect(manager.lookup('c-cancel-published-open')).resolves.toMatchObject({
+      state: 'active',
+      turns: 0,
+      pendingTurnIds: ['t-cancel-published-open'],
+    });
+    expect(settle).not.toHaveBeenCalled();
+    manager.stop();
+  });
+
+  it('keeps an opening reservation unresolved when lapse cleanup fails', async () => {
+    const { manager } = fixture({
+      lapse: async () => {
+        throw new Error('redis unavailable');
+      },
+    });
+    await manager.reserveOpen({
+      contextId: 'c-cancel-cleanup-failure',
+      taskId: 't-cancel-cleanup-failure',
+      obligation: obligation(),
+    });
+
+    await expect(
+      manager.cancelOpen({
+        contextId: 'c-cancel-cleanup-failure',
+        taskId: 't-cancel-cleanup-failure',
+      }),
+    ).rejects.toThrow('redis unavailable');
+    await expect(manager.lookup('c-cancel-cleanup-failure')).resolves.toMatchObject({
+      state: 'settling',
+      turns: 0,
+      pendingTurnIds: ['t-cancel-cleanup-failure'],
+    });
+    manager.stop();
   });
 
   it('lets only one of opening commit and cancellation win its CAS race', async () => {

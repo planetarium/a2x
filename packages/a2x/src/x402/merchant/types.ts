@@ -11,6 +11,9 @@ import type { Message } from '../../types/common.js';
 
 export type MerchantExactTiming = 'before-work' | 'after-work';
 
+/** Earliest payment phase at which merchant content may be published. */
+export type MerchantDeliveryTiming = 'after-settlement' | 'after-verification';
+
 export type MerchantUnreportedUsagePolicy = 'ceiling' | 'floor' | 'refuse';
 
 export interface MerchantDetailedRates {
@@ -77,6 +80,41 @@ export interface MerchantGateOpenInput extends Omit<MerchantTurnRef, 'taskId' | 
   contextId?: string | undefined;
   activatedExtensions?: readonly string[] | undefined;
 }
+
+export interface MerchantDeliveryMetadataContext {
+  taskId: string;
+  timing: MerchantDeliveryTiming;
+  /** True after provisional publication starts but before payment settles. */
+  provisional: boolean;
+  paymentStatus: 'verified' | 'settled';
+}
+
+export type MerchantDeliveryMetadataBuilder = (
+  context: MerchantDeliveryMetadataContext,
+) => Record<string, unknown> | Promise<Record<string, unknown>>;
+
+export interface MerchantGateAuthorizeDeliveryInput {
+  taskId: string;
+  /** Optional publication deadline enforced atomically by the lifecycle store. */
+  notAfter?: Date;
+}
+
+export type MerchantGateAuthorizeDeliveryOutcome =
+  | {
+      kind: 'authorized';
+      /** Whether settlement is still pending at the publication boundary. */
+      provisional: boolean;
+      /** Application metadata produced by MerchantGateOptions.deliveryMetadata. */
+      metadata: Record<string, unknown>;
+    }
+  | {
+      kind: 'blocked';
+      reason:
+        | 'payment-state-unavailable'
+        | 'payment-not-verified'
+        | 'settlement-required'
+        | 'payment-failed';
+    };
 
 export type MerchantPricingResolver = (
   turn: MerchantGateOpenInput,
@@ -161,6 +199,8 @@ export interface MerchantGateAbortInput {
   taskId: string;
   obligation: MerchantObligation;
   reason: X402VerifiedPaymentCancellationReason;
+  /** Usage produced before a failed work attempt stopped. */
+  usage?: MerchantMeterableUsage;
   error?: unknown;
   responseStatus?: number;
 }
@@ -186,3 +226,7 @@ export type MerchantGateSettleOutcome =
       reason: string;
       failureReceipt?: X402SettleResponse;
     };
+
+export type MerchantGateAbortOutcome =
+  | { kind: 'aborted' }
+  | MerchantGateSettleOutcome;

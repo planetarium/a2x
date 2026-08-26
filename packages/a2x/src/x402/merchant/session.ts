@@ -1,7 +1,8 @@
-import type { MerchantGate } from './gate.js';
+import { MerchantDeliveryPublishedError, type MerchantGate } from './gate.js';
 import { meterMerchantUsage } from './pricing.js';
 import type {
   MerchantDeferredObligation,
+  MerchantGateAuthorizeDeliveryOutcome,
   MerchantGateSettleOutcome,
   MerchantMeterableUsage,
   MerchantUptoPricing,
@@ -481,6 +482,11 @@ export class UptoSessionManager {
   private readonly deadlineGuardMs: number;
 
   constructor(private readonly options: UptoSessionManagerOptions) {
+    if (options.gate.deliveryTiming !== 'after-verification') {
+      throw new Error(
+        "UptoSessionManager requires MerchantGate.deliveryTiming to be 'after-verification'.",
+      );
+    }
     if (!Number.isFinite(options.idleSeconds) || options.idleSeconds <= 0) {
       throw new Error('UptoSessionManager.idleSeconds must be greater than zero.');
     }
@@ -543,6 +549,23 @@ export class UptoSessionManager {
       record.closeRequestedReason === undefined &&
       Date.now() < Date.parse(record.settleBy)
     );
+  }
+
+  /** Authorize provisional delivery against the authorization held by a live session. */
+  async authorizeDelivery(contextId: string): Promise<MerchantGateAuthorizeDeliveryOutcome> {
+    const record = await this.store.get(contextId);
+    if (
+      !record ||
+      record.state !== 'active' ||
+      record.closeRequestedReason !== undefined ||
+      Date.now() >= Date.parse(record.settleBy)
+    ) {
+      return { kind: 'blocked', reason: 'payment-state-unavailable' };
+    }
+    return await this.options.gate.authorizeDelivery({
+      taskId: record.taskId,
+      notAfter: new Date(record.settleBy),
+    });
   }
 
   /** Remove a reconciled closed record without racing a newer session. */
@@ -632,22 +655,52 @@ export class UptoSessionManager {
         if (!current || current.taskId !== input.taskId) return undefined;
         if (!hasPendingOpen(current)) return this.outcome(current);
 
-        const settlement: UptoSessionSettlement = { kind: 'lapsed' };
-        const closed: UptoSessionRecord = {
+        const settling: UptoSessionRecord = {
           ...current,
           revision: current.revision + 1,
-          state: 'closed',
-          pendingTurnIds: [],
+          state: 'settling',
           closeRequestedReason: undefined,
           endReason: 'manual',
-          settlement,
-          closedAt: new Date().toISOString(),
         };
-        if (!(await this.store.compareAndSet(input.contextId, current.revision, closed))) {
+        if (!(await this.store.compareAndSet(input.contextId, current.revision, settling))) {
           continue;
         }
         this.disarm(input.contextId);
-        await this.options.gate.lapse(input.taskId);
+        try {
+          await this.options.gate.lapse(input.taskId);
+        } catch (error) {
+          if (error instanceof MerchantDeliveryPublishedError) {
+            const observed = await this.store.get(input.contextId);
+            if (
+              observed?.state === 'settling' &&
+              observed.taskId === input.taskId &&
+              observed.settlement === undefined
+            ) {
+              const restored: UptoSessionRecord = {
+                ...current,
+                revision: observed.revision + 1,
+              };
+              if (await this.store.compareAndSet(input.contextId, observed.revision, restored)) {
+                this.arm(restored);
+              }
+            }
+          }
+          throw error;
+        }
+        const settlement: UptoSessionSettlement = { kind: 'lapsed' };
+        const closed: UptoSessionRecord = {
+          ...settling,
+          revision: settling.revision + 1,
+          state: 'closed',
+          pendingTurnIds: [],
+          settlement,
+          closedAt: new Date().toISOString(),
+        };
+        if (!(await this.store.compareAndSet(input.contextId, settling.revision, closed))) {
+          throw new Error(
+            'Upto session opening authorization lapsed but its terminal record could not be persisted.',
+          );
+        }
         return { session: this.snapshot(closed), settlement };
       }
       throw new Error('Upto session opening cancellation lost its compare-and-set race.');
@@ -843,13 +896,29 @@ export class UptoSessionManager {
 
         const charge = projectedCharge(settling);
         let settlement: UptoSessionSettlement;
+        const published = await this.options.gate.publicationStarted(settling.taskId);
         if (
           charge === 0n &&
           settling.pendingTurnIds.length === 0 &&
-          !settling.usageIncomplete
+          !settling.usageIncomplete &&
+          !published
         ) {
-          await this.options.gate.lapse(settling.taskId);
-          settlement = { kind: 'lapsed' };
+          try {
+            await this.options.gate.lapse(settling.taskId);
+            settlement = { kind: 'lapsed' };
+          } catch (error) {
+            if (!(error instanceof MerchantDeliveryPublishedError)) throw error;
+            const usage = settlementUsage(settling);
+            const outcome = await this.options.gate.settle({
+              taskId: settling.taskId,
+              obligation: settling.obligation,
+              ...(usage === undefined ? {} : { usage }),
+            });
+            settlement =
+              outcome.kind === 'settled'
+                ? { kind: 'settled', outcome }
+                : { kind: 'failed', outcome };
+          }
         } else {
           const usage = settlementUsage(settling);
           const outcome = await this.options.gate.settle({
