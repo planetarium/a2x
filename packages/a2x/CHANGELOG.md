@@ -1,5 +1,15 @@
 # @a2x/sdk
 
+## 0.25.0
+
+### Minor Changes
+
+- [#258](https://github.com/planetarium/a2x/pull/258) [`73aec12`](https://github.com/planetarium/a2x/commit/73aec1215da2e2a9d6bc87252c4edb2ab9dec189) Thanks [@longfin](https://github.com/longfin)! - Let text, file, and data AgentEvents describe durable logical outputs with `artifact` and individual deliveries with `deliveryMetadata`. The default A2A executor maps those intents onto Artifact descriptors and streamed artifact-update metadata, snapshotting nested values at yield time.
+
+- [#257](https://github.com/planetarium/a2x/pull/257) [`79d39a6`](https://github.com/planetarium/a2x/commit/79d39a6fe44ae30d40033e6a1681fc9a2c4aeb39) Thanks [@longfin](https://github.com/longfin)! - Keep task execution, persistence, and event publication running when an SSE subscriber disconnects, with `RequestContext.signal` support for immediate subscriber detachment in custom transports.
+
+- [#260](https://github.com/planetarium/a2x/pull/260) [`0074578`](https://github.com/planetarium/a2x/commit/0074578db4ff8e7baf2c88a78d11fe436b9617a3) Thanks [@longfin](https://github.com/longfin)! - Require MerchantGate callers to choose buffered or progressive delivery timing, serialize publication against lapse and session deadlines with atomic lifecycle-store primitives, terminally close unpublished batch attempts before releasing canceled claims, retain uncertain cancellations for reconciliation, and settle partial work that fails after content may have been delivered.
+
 ## 0.24.0
 
 ### Minor Changes
