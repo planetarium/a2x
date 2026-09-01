@@ -29,7 +29,7 @@
     "@x402/evm": "~2.21.0",
     "chalk": "^5.4.0",
     "commander": "^13.0.0",
-    "viem": "^2.55.13"
+    "viem": "^2.56.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
