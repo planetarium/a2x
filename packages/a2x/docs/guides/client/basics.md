@@ -104,8 +104,8 @@ The extended-card call requires the server to configure an authenticated extende
 await client.sendMessage({
   message: { role: 'user', parts: [{ text: 'Hello' }] },
   configuration: {
-    // Wait for the task to reach a terminal state before resolving.
-    // false → return as soon as the agent picks the task up.
+    // Wait for the executor's result (the default when omitted).
+    // false → acknowledge a persisted task without waiting for completion.
     blocking: true,
     // Cap the history slice the server returns on the response Task.
     historyLength: 10,
@@ -125,6 +125,46 @@ await client.sendMessage({
 ```ts
 await client.getTask('task-abc123', { historyLength: 1 });
 ```
+
+## Accept long-running work and retrieve it later
+
+Set `blocking: false` to receive a Task with its actual `id`, `contextId`, and
+accepted status while the agent continues working:
+
+```ts
+const accepted = await client.sendMessage({
+  message: { role: 'user', parts: [{ text: 'Prepare the asset archive' }] },
+  configuration: { blocking: false },
+});
+if ('id' in accepted) {
+  // Keep these IDs across conversational turns. Acceptance is not completion.
+  const taskId = accepted.id;
+  const contextId = accepted.contextId;
+  const current = await client.getTask(taskId);
+}
+```
+
+Use `getTask()` to retrieve the latest persisted state and artifacts; it does not
+submit another message or start another execution. Intermediate output is visible
+when the host executor persists it; the default unary executor persists its result
+when execution finishes. A completed Task is distinct from having downloaded any
+files referenced by its artifacts. An `input-required` or `auth-required` result
+requires a continuation message using the Task ID.
+
+The SDK client translates `blocking: false` to A2A v1.0
+`configuration.returnImmediately: true` for both JSON-RPC and HTTP+JSON. Raw v0.3
+requests use `blocking`; raw v1.0 requests use `returnImmediately`. Omitting the
+flag preserves blocking behavior (`returnImmediately` defaults to false in v1.0).
+
+Closing the acknowledgement connection does not cancel accepted work. Use
+`cancelTask()` for explicit cancellation. Keep a short HTTP deadline for acceptance
+and lookup independently of the agent's execution budget. If the acknowledgement
+itself is lost, the caller may not know the Task ID: nonblocking mode does not
+provide idempotent submission or make a blind retry safe.
+
+Execution is owned by the running server process. A durable Task store alone does
+not resume execution after restart; the deployment must provide its own recovery
+and reconciliation policy. See [server lifecycle limits](../agent/streaming.md#nonblocking-unary-requests).
 
 ## Message parts
 

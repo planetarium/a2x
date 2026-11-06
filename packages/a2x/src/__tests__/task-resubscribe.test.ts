@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { DefaultRequestHandler } from '../transport/request-handler.js';
 import { A2XServer } from '../a2x/a2x-agent.js';
 import type { ProtocolVersion } from '../a2x/a2x-agent.js';
@@ -264,6 +264,48 @@ function subscriberCount(server: A2XServer, taskId: string): number {
 }
 
 describe('tasks/resubscribe', () => {
+  it.each([TaskState.AUTH_REQUIRED, TaskState.INPUT_REQUIRED])(
+    'keeps primary and new subscribers attached through non-final %s', async (state) => {
+      const { handler, taskStore, a2xServer } = createSlowHandler([], 0, '0.3');
+      const release = Promise.withResolvers<void>();
+      vi.spyOn(a2xServer.agentExecutor, 'executeStream').mockImplementation(async function* (task) {
+        const ids = { taskId: task.id, contextId: task.contextId ?? task.id };
+        yield { ...ids, status: { state: TaskState.WORKING }, final: false };
+        yield { ...ids, status: { state }, final: false };
+        await release.promise;
+        yield { ...ids, status: { state: TaskState.WORKING }, final: false };
+        yield { ...ids, artifact: { artifactId: 'after-approval', parts: [{ text: 'approved output' }] } };
+        yield { ...ids, status: { state: TaskState.COMPLETED }, final: true };
+      });
+      const primary = await handler.handle({ jsonrpc: '2.0', id: 1, method: 'message/stream',
+        params: { message: { messageId: 'approval', role: 'user', parts: [{ text: 'work' }] } },
+      }) as AsyncGenerator<StreamEnvelope>;
+      const first = unwrapResult((await primary.next()).value);
+      const taskId = first.taskId as string;
+      const paused = unwrapResult((await primary.next()).value);
+      expect(paused).toMatchObject({ status: { state }, final: false });
+      expect((await taskStore.getTask(taskId))?.status.state).toBe(state);
+      const subscriber = await handler.handle({ jsonrpc: '2.0', id: 2,
+        method: 'tasks/resubscribe', params: { id: taskId },
+      }) as AsyncGenerator<StreamEnvelope>;
+      const mainNext = primary.next();
+      const subscriberNext = subscriber.next();
+      try {
+        expect(await waitUntil(() => subscriberCount(a2xServer, taskId) === 2)).toBe(true);
+      } finally { release.resolve(); }
+      for (const [stream, pending] of [[primary, mainNext], [subscriber, subscriberNext]] as const) {
+        expect(unwrapResult((await pending).value)).toMatchObject({ status: { state: TaskState.WORKING }, final: false });
+        const remaining: Record<string, unknown>[] = [];
+        for await (const event of stream) remaining.push(unwrapResult(event));
+        expect(remaining).toEqual([
+          expect.objectContaining({ artifact: expect.objectContaining({ artifactId: 'after-approval' }) }),
+          expect.objectContaining({ status: { state: TaskState.COMPLETED }, final: true }),
+        ]);
+      }
+      expect(a2xServer.agentExecutor.executeStream).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it('emits a JSON-RPC error envelope when the task does not exist', async () => {
     const { handler } = createSlowHandler(['hi'], 5);
 

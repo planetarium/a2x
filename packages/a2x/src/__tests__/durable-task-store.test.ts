@@ -1165,7 +1165,7 @@ describe('durable TaskStore persistence (issue #233)', () => {
       ]);
     });
 
-    it('forces final on a custom interaction-ending status', async () => {
+    it('finalizes an interrupted status when the custom executor ends', async () => {
       const store = new CloneTaskStore();
       const agent = new CountingAgent({ name: 'counting' });
       const runner = new InMemoryRunner({ agent, appName: 'durable-test' });
@@ -1189,7 +1189,7 @@ describe('durable TaskStore persistence (issue #233)', () => {
         })) as AsyncGenerator<unknown>,
       );
 
-      expect(events.map((event) => event.final)).toEqual([false, true]);
+      expect(events.map((event) => event.final)).toEqual([false, false, true]);
       const stored = await store.getTask(store.ids[0]!);
       expect(stored!.status.state).toBe(TaskState.INPUT_REQUIRED);
     });
