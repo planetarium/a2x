@@ -81,8 +81,9 @@ and cancellations.
 This is process-local execution, not a durable job queue. A process crash, restart,
 or serverless runtime that freezes after returning a response can strand an
 accepted Task. Hosts must provide execution lifetime and restart recovery policies.
-The handler retries a failed final-result write once; if neither the outcome nor
-the failure can be stored, it logs the infrastructure error and the host must
+The handler retries a failed outcome write once, including failure states from
+thrown executor errors. If neither the outcome nor the failure can be stored, it
+logs the infrastructure error and the host must
 reconcile the persisted Task. Nonblocking acknowledgement does not promise
 exactly-once submission or recovery after a lost acknowledgement.
 
@@ -199,7 +200,7 @@ If a client loses connection mid-task, it can re-attach via the A2A `tasks/resub
 Semantics:
 
 - **Forward-only while active.** Events that fired before a live resubscribe call are not replayed.
-- **Interaction-ending replay.** Resubscribing after the current interaction ended yields one status update, then ends. This covers terminal states plus `input-required` and `auth-required`.
+- **Interaction-ending replay.** Resubscribing after the current interaction ended yields one status update, then ends. This covers terminal states plus final `input-required` and `auth-required` events, even while the executor is still cleaning up. A custom executor can keep an interruption live with `final: false`; resubscribers then follow subsequent events until an interaction-ending event or generator exhaustion.
 - **Disconnected primary streams keep running.** Closing the original HTTP connection does not cancel the Task. A live resubscriber receives subsequent events, and a later resubscribe replays the interaction-ending status.
 - **Unknown task.** Returns `TaskNotFoundError` (JSON-RPC error code `-32001`).
 

@@ -265,6 +265,43 @@ function subscriberCount(server: A2XServer, taskId: string): number {
 
 describe('tasks/resubscribe', () => {
   it.each([TaskState.AUTH_REQUIRED, TaskState.INPUT_REQUIRED])(
+    'replays final %s while the executor is still cleaning up', async (state) => {
+      const { handler, a2xServer } = createSlowHandler([], 0, '0.3');
+      const cleanup = Promise.withResolvers<void>();
+      vi.spyOn(a2xServer.agentExecutor, 'executeStream').mockImplementation(async function* (task) {
+        yield {
+          taskId: task.id,
+          contextId: task.contextId ?? task.id,
+          status: { state },
+          final: true,
+        };
+        await cleanup.promise;
+      });
+      const primary = await handler.handle({ jsonrpc: '2.0', id: 1, method: 'message/stream',
+        params: { message: { messageId: 'approval', role: 'user', parts: [{ text: 'work' }] } },
+      }) as AsyncGenerator<StreamEnvelope>;
+      const interrupted = unwrapResult((await primary.next()).value);
+      expect(interrupted).toMatchObject({ status: { state }, final: true });
+      const subscriber = await new DefaultRequestHandler(a2xServer).handle({
+        jsonrpc: '2.0', id: 2, method: 'tasks/resubscribe', params: { id: interrupted.taskId },
+      }) as AsyncGenerator<StreamEnvelope>;
+      let replay: IteratorResult<StreamEnvelope> | undefined;
+      const pending = subscriber.next().then((event) => { replay = event; return event; });
+      try {
+        expect(await waitUntil(() => replay !== undefined)).toBe(true);
+        expect(unwrapResult(replay!.value)).toMatchObject({ status: { state }, final: true });
+        expect((await subscriber.next()).done).toBe(true);
+      } finally {
+        cleanup.resolve();
+        await pending;
+        await primary.return(undefined);
+        await subscriber.return(undefined);
+      }
+      expect(a2xServer.agentExecutor.executeStream).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([TaskState.AUTH_REQUIRED, TaskState.INPUT_REQUIRED])(
     'keeps primary and new subscribers attached through non-final %s', async (state) => {
       const { handler, taskStore, a2xServer } = createSlowHandler([], 0, '0.3');
       const release = Promise.withResolvers<void>();

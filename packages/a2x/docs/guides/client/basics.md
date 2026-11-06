@@ -162,6 +162,10 @@ and lookup independently of the agent's execution budget. If the acknowledgement
 itself is lost, the caller may not know the Task ID: nonblocking mode does not
 provide idempotent submission or make a blind retry safe.
 
+For direct handler integrations, acceptance also snapshots the message and
+configuration: reusing or changing the original request object after the call
+returns does not change accepted work.
+
 Execution is owned by the running server process. A durable Task store alone does
 not resume execution after restart; the deployment must provide its own recovery
 and reconciliation policy. See [server lifecycle limits](../agent/streaming.md#nonblocking-unary-requests).

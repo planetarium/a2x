@@ -47,7 +47,7 @@ import {
 import type { Artifact } from '../types/common.js';
 import { V10_ROLE_TO_INTERNAL } from '../types/common.js';
 import { StreamingMode } from '../a2x/agent-executor.js';
-import { applyArtifactUpdate, type TaskUpdate } from '../a2x/task-store.js';
+import { applyArtifactUpdate, cloneSnapshotValue, type TaskUpdate } from '../a2x/task-store.js';
 import { JsonRpcRouter, type RouteContext } from './jsonrpc-router.js';
 import { isX402ExtensionUri } from '../x402/constants.js';
 import type { ResponseMapper } from '../a2x/response-mapper.js';
@@ -93,28 +93,19 @@ const LIST_TASK_STATES = new Set<string>([
 // adapters). Keep execution ownership on that shared server identity rather
 // than on whichever handler happened to start the Task. Detached unary calls
 // also register here so resubscribers can wait for their final status.
-const ACTIVE_STREAM_EXECUTIONS = new WeakMap<
-  A2XServer,
-  Map<
-    string,
-    {
-      execution: Promise<unknown | undefined>;
-      completed: AbortSignal;
-    }
-  >
->();
+interface ActiveTaskExecution {
+  execution: Promise<unknown | undefined>;
+  completed: AbortSignal;
+  interaction: { ended: boolean };
+}
+
+const ACTIVE_STREAM_EXECUTIONS = new WeakMap<A2XServer, Map<string, ActiveTaskExecution>>();
 
 export class DefaultRequestHandler {
   private readonly a2xServer: A2XServer;
   private readonly router: JsonRpcRouter;
   private readonly responseMapper: ResponseMapper;
-  private readonly activeStreamExecutions: Map<
-    string,
-    {
-      execution: Promise<unknown | undefined>;
-      completed: AbortSignal;
-    }
-  >;
+  private readonly activeStreamExecutions: Map<string, ActiveTaskExecution>;
 
   constructor(a2xServer: A2XServer) {
     this.a2xServer = a2xServer;
@@ -688,16 +679,20 @@ export class DefaultRequestHandler {
     }
 
     if (params.configuration?.blocking === false) {
+      // Once acknowledged, the caller may reuse its request object. Keep
+      // both execution inputs and the response independent of later writes.
+      const executionParams = cloneSnapshotValue(params);
       // Map a detached snapshot before execute() can mutate its argument.
       // Acceptance is durable, but execution belongs to this server process,
       // not the lifetime of the HTTP response or its AbortSignal.
       const accepted = this.responseMapper.mapTask(
-        structuredClone(sliceHistory(workingTask, params.configuration.historyLength)),
-        params.message,
+        cloneSnapshotValue(sliceHistory(workingTask, params.configuration.historyLength)),
+        cloneSnapshotValue(executionParams.message),
       );
       const completion = new AbortController();
-      const execution = this._runDetachedSendMessage(workingTask, params, context);
-      const activeExecution = { execution, completed: completion.signal };
+      const interaction = { ended: false };
+      const execution = this._runDetachedSendMessage(workingTask, executionParams, context, interaction);
+      const activeExecution = { execution, completed: completion.signal, interaction };
       this.activeStreamExecutions.set(workingTask.id, activeExecution);
       const clearExecution = () => {
         completion.abort();
@@ -742,16 +737,9 @@ export class DefaultRequestHandler {
     if (executed.artifacts) {
       update.artifacts = mergeArtifacts(priorArtifacts, executed.artifacts);
     }
-    let completedTask: Task;
-    try {
-      completedTask = await this._persistTaskState(workingTask.id, update);
-    } catch (error) {
-      if (params.configuration?.blocking !== false) throw error;
-      // A detached caller cannot retry the response. Retry the same outcome
-      // once so a transient store error does not turn completed work into a
-      // failed task or require another backend execution.
-      completedTask = await this._persistTaskState(workingTask.id, update);
-    }
+    const completedTask = params.configuration?.blocking === false
+      ? await this._persistDetachedOutcome(workingTask.id, update)
+      : await this._persistTaskState(workingTask.id, update);
 
     // Spec a2a-v0.3 §AgentCapabilities.pushNotifications: deliver
     // webhook callbacks for tasks that the client subscribed to. We fire
@@ -767,7 +755,8 @@ export class DefaultRequestHandler {
   private async _runDetachedSendMessage(
     task: Task,
     params: SendMessageParams,
-    context?: RouteContext,
+    context: RouteContext | undefined,
+    interaction: { ended: boolean },
   ): Promise<unknown | undefined> {
     try {
       let completed: Task;
@@ -776,7 +765,7 @@ export class DefaultRequestHandler {
         // and agents that do not support streaming.
         completed = await this._executeSendMessage(task, params, context);
       } catch (error) {
-        completed = await this._persistTaskState(task.id, {
+        completed = await this._persistDetachedOutcome(task.id, {
           status: {
             state: TaskState.FAILED,
             timestamp: new Date().toISOString(),
@@ -791,6 +780,7 @@ export class DefaultRequestHandler {
           void this._dispatchPushNotifications(completed);
         }
       }
+      interaction.ended = true;
       this.a2xServer.taskEventBus.publish(task.id, {
         taskId: completed.id,
         contextId: completed.contextId ?? completed.id,
@@ -808,6 +798,16 @@ export class DefaultRequestHandler {
       return error;
     }
     return undefined;
+  }
+
+  private async _persistDetachedOutcome(taskId: string, update: TaskUpdate): Promise<Task> {
+    try {
+      return await this._persistTaskState(taskId, update);
+    } catch {
+      // Retry returned results and thrown-executor failures alike. A caller
+      // that already received acceptance cannot retry the terminal write.
+      return this._persistTaskState(taskId, update);
+    }
   }
 
   /**
@@ -922,10 +922,12 @@ export class DefaultRequestHandler {
       ? this.responseMapper.mapTask(task, params.message)
       : undefined;
 
-    const execution = this._runStreamMessage(task, params, context);
+    const interaction = { ended: false };
+    const execution = this._runStreamMessage(task, params, context, interaction);
     const activeExecution = {
       execution,
       completed: completion.signal,
+      interaction,
     };
     this.activeStreamExecutions.set(task.id, activeExecution);
     const clearExecution = () => {
@@ -997,6 +999,7 @@ export class DefaultRequestHandler {
     task: Task,
     params: SendMessageParams,
     context?: RouteContext,
+    interaction = { ended: false },
   ): Promise<unknown | undefined> {
     const eventStream = this.a2xServer.agentExecutor.executeStream(
       task,
@@ -1008,7 +1011,6 @@ export class DefaultRequestHandler {
     const bus = this.a2xServer.taskEventBus;
 
     let reachedTerminal = false;
-    let interactionEnded = false;
     let streamFailure: unknown | undefined;
     let pendingStatusWrite:
       | { event: TaskStatusUpdateEvent; update: TaskUpdate }
@@ -1064,7 +1066,7 @@ export class DefaultRequestHandler {
           const authoritative = statusEventFromTask(event, persisted);
           const storeTerminal = TERMINAL_STATES.has(persisted.status.state);
           reachedTerminal ||= storeTerminal;
-          interactionEnded ||= isInteractionEndingStatus(authoritative);
+          interaction.ended ||= isInteractionEndingStatus(authoritative);
           bus.publish(task.id, authoritative);
 
           // Cancellation or another terminal transition can win a status
@@ -1091,7 +1093,7 @@ export class DefaultRequestHandler {
               persisted,
             );
             reachedTerminal = true;
-            interactionEnded = true;
+            interaction.ended = true;
             bus.publish(task.id, authoritative);
             return;
           }
@@ -1102,11 +1104,11 @@ export class DefaultRequestHandler {
       // A custom executor may end after an interrupted status marked
       // non-final. Only generator exhaustion makes that interaction final;
       // while the generator is alive it may resume on the same stream.
-      if (!interactionEnded) {
+      if (!interaction.ended) {
         const latest = await this.a2xServer.taskStore.getTask(task.id);
         if (latest && (latest.status.state === TaskState.INPUT_REQUIRED ||
           latest.status.state === TaskState.AUTH_REQUIRED)) {
-          interactionEnded = true;
+          interaction.ended = true;
           bus.publish(task.id, {
             taskId: latest.id,
             contextId: latest.contextId ?? latest.id,
@@ -1119,7 +1121,7 @@ export class DefaultRequestHandler {
       // An executor canceled through tasks/cancel exits without producing
       // another event. Complete the primary stream with the same durable
       // terminal state instead of silently ending or synthesizing completed.
-      if (!interactionEnded) {
+      if (!interaction.ended) {
         const persisted = await this._persistTaskState(task.id, {
           status: {
             state: TaskState.CANCELED,
@@ -1137,7 +1139,7 @@ export class DefaultRequestHandler {
           persisted,
         );
         reachedTerminal ||= TERMINAL_STATES.has(persisted.status.state);
-        interactionEnded = true;
+        interaction.ended = true;
         bus.publish(task.id, canceled);
       }
     } catch (error) {
@@ -1157,7 +1159,7 @@ export class DefaultRequestHandler {
             persisted,
           );
           reachedTerminal ||= TERMINAL_STATES.has(persisted.status.state);
-          interactionEnded ||= isInteractionEndingStatus(authoritative);
+          interaction.ended ||= isInteractionEndingStatus(authoritative);
           bus.publish(task.id, authoritative);
         } catch {
           // The original write error remains the primary stream failure.
@@ -1168,7 +1170,7 @@ export class DefaultRequestHandler {
       // and publish it so tasks/get and every active subscriber converge on
       // the same terminal state. If persistence itself is unavailable, the
       // primary stream still receives the original error after the bus ends.
-      if (!interactionEnded && streamFailure !== undefined) {
+      if (!interaction.ended && streamFailure !== undefined) {
         try {
           const persisted = await this._persistTaskState(task.id, {
             status: {
@@ -1199,7 +1201,7 @@ export class DefaultRequestHandler {
             persisted,
           );
           reachedTerminal ||= TERMINAL_STATES.has(persisted.status.state);
-          interactionEnded = true;
+          interaction.ended = true;
           bus.publish(task.id, failed);
           streamFailure = undefined;
         } catch {
@@ -1211,7 +1213,7 @@ export class DefaultRequestHandler {
 
       // An explicit tasks/cancel abort makes the executor end without an
       // additional event. Publish the store's authoritative terminal state.
-      if (!interactionEnded && streamFailure === undefined) {
+      if (!interaction.ended && streamFailure === undefined) {
         try {
           const persisted = await this._persistTaskState(task.id, {
             status: {
@@ -1230,7 +1232,7 @@ export class DefaultRequestHandler {
             persisted,
           );
           reachedTerminal ||= TERMINAL_STATES.has(persisted.status.state);
-          interactionEnded = true;
+          interaction.ended = true;
           bus.publish(task.id, canceled);
         } catch {
           // The task is already unwinding; no subscriber-side error should
@@ -1272,10 +1274,11 @@ export class DefaultRequestHandler {
     const activeExecution = this.activeStreamExecutions.get(params.id);
     // Tasks whose current interaction already ended replay a single status
     // update. INPUT_REQUIRED and AUTH_REQUIRED are not terminal task states,
-    // but their original stream is over and no live bus remains to follow.
+    // but their original interaction may already be over while its executor
+    // is still cleaning up. Only a non-final interruption remains live.
     if (
       TERMINAL_STATES.has(task.status.state) ||
-      (!activeExecution && (task.status.state === TaskState.INPUT_REQUIRED ||
+      ((!activeExecution || activeExecution.interaction.ended) && (task.status.state === TaskState.INPUT_REQUIRED ||
         task.status.state === TaskState.AUTH_REQUIRED))
     ) {
       const terminal: TaskStatusUpdateEvent = {
