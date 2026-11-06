@@ -70,6 +70,29 @@ A passing local suite is a prerequisite for CI.
 - Link any related issues (`Fixes #123`).
 - Keep the PR focused on a single concern. Split otherwise.
 
+## SDK releases
+
+The `Release SDK` workflow maintains the version PR. Merging that PR publishes
+`@a2x/sdk`, creates its GitHub release, and notifies `a2x-web` to refresh the docs.
+Publishing uses npm Trusted Publishing (OIDC), without an `NPM_TOKEN` secret.
+
+In the npm package's **Settings → Trusted publishing**, register GitHub Actions
+with organization `planetarium`, repository `a2x`, workflow filename
+`release-sdk.yml`, no environment name, and **Allow npm publish** enabled.
+This setup requires a package maintainer's npm login. See the
+[npm trusted publishing guide](https://docs.npmjs.com/trusted-publishers/).
+
+The workflow grants `id-token: write` and installs an OIDC-capable npm CLI;
+pnpm's publish command delegates the registry upload to npm. Changesets CLI 3
+uses `changesets/action@v2` so successful publishes also produce GitHub releases
+and trigger the docs notification.
+
+After fixing a publishing configuration failure, use **Actions → Release SDK →
+Run workflow** with branch `main`. Only `main` can run the release job. If the
+workflow itself changed, start a new run rather than re-running an old run,
+which would reuse the old workflow. Check the exact npm version and dist-tag,
+GitHub release, and workflow result before considering a release complete.
+
 ## Reporting bugs and requesting features
 
 Use the GitHub issue templates:
