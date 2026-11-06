@@ -88,6 +88,7 @@ export interface SendMessageParams {
 export interface SendMessageConfiguration {
   acceptedOutputModes?: string[];
   historyLength?: number;
+  /** Defaults to true. False acknowledges a persisted task before execution finishes. */
   blocking?: boolean;
   pushNotificationConfig?: PushNotificationConfig;
 }

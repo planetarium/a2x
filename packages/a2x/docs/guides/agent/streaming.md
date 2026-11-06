@@ -55,7 +55,47 @@ data: {"jsonrpc":"2.0","id":1,"result":{"kind":"status-update", …}}
 
 See [Consuming Streams](../client/streaming.md) for the client-side iteration pattern.
 
+## Nonblocking unary requests
+
+`message/send` with `configuration.blocking: false` persists a Task as `working`
+and returns its ID, context ID, and status without awaiting the executor result.
+The v1.0 equivalent is `configuration.returnImmediately: true` on `SendMessage`
+or HTTP+JSON `message:send`. Omitted flags and explicit blocking requests keep the
+existing synchronous behavior.
+
+The handler continues calling `AgentExecutor.execute()`, including custom unary
+overrides and `StreamingMode.NONE` executors. It does not substitute
+`executeStream()`. Custom executors that expose intermediate progress or files
+through `tasks/get` must persist those updates to the same Task store. The handler
+persists the final result, including artifacts, and sends configured terminal push
+notifications. `tasks/resubscribe` can observe the final status of detached unary
+work; use `tasks/get` to retrieve the artifacts.
+
+Closing the response or aborting its request signal does not stop accepted work.
+Explicit `tasks/cancel` remains authoritative over a late executor result. Thrown
+executor errors become queryable `failed` Tasks when the store is available.
+Request-scoped asynchronous context and activated extensions are preserved during
+background execution; the host must still enforce caller ownership on later reads
+and cancellations.
+
+This is process-local execution, not a durable job queue. A process crash, restart,
+or serverless runtime that freezes after returning a response can strand an
+accepted Task. Hosts must provide execution lifetime and restart recovery policies.
+The handler retries a failed outcome write once, including failure states from
+thrown executor errors. If neither the outcome nor the failure can be stored, it
+logs the infrastructure error and the host must
+reconcile the persisted Task. Nonblocking acknowledgement does not promise
+exactly-once submission or recovery after a lost acknowledgement.
+
 ## Client disconnect detaches the stream
+
+Custom streaming executors can keep an approval or input wait inside the same
+execution by emitting `auth-required` or `input-required` with `final: false`.
+Existing subscribers remain attached and new subscriptions can observe the later
+resumption, artifacts, and completion. Emit `final: true` when a new message is
+needed to continue instead. If the generator ends while interrupted, the handler
+publishes a final status for that interaction. Terminal task states always end
+the interaction regardless of the event's `final` flag.
 
 An SSE connection is a subscription to a Task, not ownership of its execution. When a client disconnects mid-stream — tab closed, network drop, process killed — A2X stops writing to that response but continues consuming the agent's event generator. Task-store persistence, push notifications, and task event-bus publication continue through the interaction-ending or terminal state, and other subscribers remain attached.
 
@@ -160,7 +200,7 @@ If a client loses connection mid-task, it can re-attach via the A2A `tasks/resub
 Semantics:
 
 - **Forward-only while active.** Events that fired before a live resubscribe call are not replayed.
-- **Interaction-ending replay.** Resubscribing after the current interaction ended yields one status update, then ends. This covers terminal states plus `input-required` and `auth-required`.
+- **Interaction-ending replay.** Resubscribing after the current interaction ended yields one status update, then ends. This covers terminal states plus final `input-required` and `auth-required` events, even while the executor is still cleaning up. A custom executor can keep an interruption live with `final: false`; resubscribers then follow subsequent events until an interaction-ending event or generator exhaustion.
 - **Disconnected primary streams keep running.** Closing the original HTTP connection does not cancel the Task. A live resubscriber receives subsequent events, and a later resubscribe replays the interaction-ending status.
 - **Unknown task.** Returns `TaskNotFoundError` (JSON-RPC error code `-32001`).
 
