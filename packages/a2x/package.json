@@ -90,7 +90,7 @@
     }
   },
   "devDependencies": {
-    "@a2a-js/sdk": "1.0.1",
+    "@a2a-js/sdk": "1.1.0",
     "@anthropic-ai/sdk": "^0.116.0",
     "@google/genai": "^1.52.0",
     "@types/express": "^5.0.6",
