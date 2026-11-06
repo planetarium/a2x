@@ -1,6 +1,7 @@
 name: Release SDK
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     # Only fire when SDK source / changesets actually move. Docs-only or
@@ -8,6 +9,7 @@ on:
     paths:
       - 'packages/a2x/**'
       - '.changeset/**'
+      - '.github/workflows/release-sdk.yml'
 
 permissions:
   contents: write
@@ -22,6 +24,7 @@ concurrency:
 
 jobs:
   release:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -34,19 +37,24 @@ jobs:
           node-version: 22
           cache: pnpm
 
+      # pnpm publish delegates to npm; Node 22's bundled npm predates OIDC.
+      - name: Install npm with trusted publishing support
+        run: npm install --global npm@11.21.2
+
       - run: pnpm install --frozen-lockfile
 
       - run: pnpm -r build
 
-      - uses: changesets/action@v1
+      # Changesets CLI 3 requires action v2 for publish-result detection.
+      - uses: changesets/action@v2
         id: changesets
         with:
-          title: "chore: version packages"
-          publish: pnpm changeset publish
-          version: pnpm changeset version
+          pr-title: "chore: version packages"
+          publish-script: pnpm changeset publish
+          version-script: pnpm changeset version
+          push-with-git-cli: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           # Enables npm supply-chain provenance for published packages
           # (requires `id-token: write` permission above).
           NPM_CONFIG_PROVENANCE: "true"
