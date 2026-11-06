@@ -1,5 +1,13 @@
 # @a2x/sdk
 
+## 0.25.1
+
+### Patch Changes
+
+- [#267](https://github.com/planetarium/a2x/pull/267) [`55e6634`](https://github.com/planetarium/a2x/commit/55e66341424edc3e907b3bb86b7399a9ebfc4cfb) Thanks [@longfin](https://github.com/longfin)! - Keep streaming subscribers attached when a custom executor emits an intermediate input-required or auth-required status with `final: false`. Allow the same execution to resume and deliver subsequent artifacts and completion; finalize an interrupted status only when the executor ends or explicitly marks the interaction final.
+
+- [#267](https://github.com/planetarium/a2x/pull/267) [`55e6634`](https://github.com/planetarium/a2x/commit/55e66341424edc3e907b3bb86b7399a9ebfc4cfb) Thanks [@longfin](https://github.com/longfin)! - Honor nonblocking message sends (`blocking: false`, or v1.0 `returnImmediately: true`) by acknowledging a persisted task before its unary executor finishes. Keep execution independent of the response connection, persist outcomes and background failures for later lookup, and preserve explicit cancellation and existing blocking defaults.
+
 ## 0.25.0
 
 ### Minor Changes
